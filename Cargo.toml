@@ -1,0 +1,56 @@
+[workspace]
+resolver = "2"
+members = ["crates/kiro-market-core", "crates/kiro-market"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85.0"
+license = "MIT"
+repository = "https://github.com/dwalleck/kiro-marketplace-cli"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = "warn"
+pedantic = "warn"
+
+[workspace.dependencies]
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+
+# Git
+git2 = "0.20"
+
+# Markdown
+pulldown-cmark = { version = "0.13", default-features = false }
+
+# Console
+colored = "3"
+
+# Error handling
+thiserror = "2"
+anyhow = "1"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# File paths
+dirs = "6"
+
+# Date/time
+chrono = { version = "0.4", features = ["serde"] }
+
+# Testing
+rstest = "0.26"
+tempfile = "3"
+
+# Internal
+kiro-market-core = { version = "0.1.0", path = "crates/kiro-market-core" }

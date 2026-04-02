@@ -1,0 +1,24 @@
+[package]
+name = "kiro-market-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Core library for kiro-market: Claude Code marketplace skill installer for Kiro CLI"
+
+[lints]
+workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+serde_yaml = { workspace = true }
+git2 = { workspace = true }
+pulldown-cmark = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+dirs = { workspace = true }
+chrono = { workspace = true }
+
+[dev-dependencies]
+rstest = { workspace = true }
+tempfile = { workspace = true }

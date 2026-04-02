@@ -1,0 +1,22 @@
+[package]
+name = "kiro-market"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "CLI tool to install Claude Code marketplace skills into Kiro CLI projects"
+
+[lints]
+workspace = true
+
+[dependencies]
+kiro-market-core = { workspace = true }
+clap = { workspace = true }
+anyhow = { workspace = true }
+colored = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+chrono = { workspace = true }
+
+[dev-dependencies]
+rstest = { workspace = true }
+tempfile = { workspace = true }
