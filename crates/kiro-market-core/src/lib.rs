@@ -8,4 +8,5 @@ pub mod error;
 pub mod git;
 pub mod marketplace;
 pub mod plugin;
+pub mod project;
 pub mod skill;
