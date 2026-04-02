@@ -22,7 +22,8 @@ pub fn run(plugin_ref: &str) -> Result<()> {
         format!("invalid plugin reference '{plugin_ref}': expected plugin@marketplace")
     })?;
 
-    let cache = CacheDir::default_location();
+    let cache = CacheDir::default_location()
+        .context("could not determine data directory; is $HOME set?")?;
     let marketplace_path = cache.marketplace_path(marketplace_name);
     if !marketplace_path.exists() {
         bail!(

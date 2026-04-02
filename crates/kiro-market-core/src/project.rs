@@ -228,7 +228,10 @@ impl KiroProject {
         Ok(())
     }
 
-    /// Persist the tracking file to disk.
+    /// Persist the tracking file to disk atomically.
+    ///
+    /// Uses [`crate::cache::atomic_write`] so that a crash mid-write cannot
+    /// leave truncated JSON.
     fn write_tracking(&self, installed: &InstalledSkills) -> crate::error::Result<()> {
         let path = self.tracking_path();
 
@@ -237,7 +240,7 @@ impl KiroProject {
         }
 
         let json = serde_json::to_string_pretty(installed)?;
-        fs::write(&path, json)?;
+        crate::cache::atomic_write(&path, json.as_bytes())?;
         Ok(())
     }
 }
@@ -436,5 +439,26 @@ mod tests {
 
         let installed = project.list_installed().expect("list");
         assert!(installed.skills.contains_key("listed"));
+    }
+
+    #[test]
+    fn tracking_file_contains_valid_json_after_install() {
+        let (_dir, project) = temp_project();
+        let content = "---\nname: atomic-check\ndescription: Checks atomic\n---\n";
+
+        project
+            .install_skill("atomic-check", content, sample_meta())
+            .expect("install");
+
+        let raw = fs::read(project.tracking_path()).expect("read tracking file");
+        let parsed: InstalledSkills =
+            serde_json::from_slice(&raw).expect("tracking file should be valid JSON");
+        assert!(parsed.skills.contains_key("atomic-check"));
+
+        // The temp file should not remain.
+        assert!(
+            !project.tracking_path().with_extension("tmp").exists(),
+            ".tmp file should be gone after atomic rename"
+        );
     }
 }

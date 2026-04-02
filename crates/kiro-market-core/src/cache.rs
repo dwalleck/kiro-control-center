@@ -6,6 +6,7 @@
 //! registry file.
 
 use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
@@ -62,20 +63,16 @@ pub struct CacheDir {
 const KNOWN_MARKETPLACES_FILE: &str = "known_marketplaces.json";
 
 impl CacheDir {
-    /// Return the platform default cache root.
+    /// Return the platform default cache root, if one can be determined.
     ///
     /// Uses `dirs::data_dir()` (e.g. `~/.local/share` on Linux) joined with
-    /// `kiro-market`.
-    ///
-    /// # Panics
-    ///
-    /// Panics if `dirs::data_dir()` returns `None` (no HOME directory set).
+    /// `kiro-market`. Returns `None` in environments without a home directory
+    /// (e.g. bare containers, some CI runners).
     #[must_use]
-    pub fn default_location() -> Self {
-        let data = dirs::data_dir().expect("could not determine data directory");
-        Self {
+    pub fn default_location() -> Option<Self> {
+        dirs::data_dir().map(|data| Self {
             root: data.join("kiro-market"),
-        }
+        })
     }
 
     /// Create a `CacheDir` rooted at an arbitrary path (useful for testing).
@@ -193,15 +190,34 @@ impl CacheDir {
         self.write_registry(&entries)
     }
 
-    /// Serialise and write the registry to disk.
+    /// Serialise and write the registry to disk atomically.
+    ///
+    /// Writes to a `.tmp` sibling first, then renames into place so that a
+    /// crash mid-write cannot leave truncated JSON on disk.
     fn write_registry(&self, entries: &[KnownMarketplace]) -> crate::error::Result<()> {
-        if let Some(parent) = self.registry_path().parent() {
+        let path = self.registry_path();
+        if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
         let json = serde_json::to_string_pretty(entries)?;
-        fs::write(self.registry_path(), json)?;
+        atomic_write(&path, json.as_bytes())?;
         Ok(())
     }
+}
+
+// ---------------------------------------------------------------------------
+// Atomic write helper
+// ---------------------------------------------------------------------------
+
+/// Write data to a file atomically by writing to a temp file then renaming.
+///
+/// The temp file is created in the same directory as the target to guarantee
+/// a same-filesystem rename (which is atomic on POSIX).
+pub(crate) fn atomic_write(path: &Path, data: &[u8]) -> io::Result<()> {
+    let tmp = path.with_extension("tmp");
+    fs::write(&tmp, data)?;
+    fs::rename(&tmp, path)?;
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -391,5 +407,51 @@ mod tests {
 
         let pp = cache.plugin_path("my-market", "my-plugin");
         assert!(pp.ends_with("plugins/my-market/my-plugin"));
+    }
+
+    #[test]
+    fn atomic_write_produces_valid_json() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("test.json");
+
+        let data = serde_json::json!({"key": "value"});
+        let bytes = serde_json::to_string_pretty(&data).expect("serialize");
+
+        atomic_write(&path, bytes.as_bytes()).expect("atomic write should succeed");
+
+        let read_back = fs::read(&path).expect("read");
+        let parsed: serde_json::Value =
+            serde_json::from_slice(&read_back).expect("should be valid JSON");
+        assert_eq!(parsed["key"], "value");
+
+        // The temp file should not remain.
+        assert!(
+            !path.with_extension("tmp").exists(),
+            ".tmp file should be gone after rename"
+        );
+    }
+
+    #[test]
+    fn write_registry_produces_valid_json_after_add() {
+        let (_dir, cache) = temp_cache();
+        cache.ensure_dirs().expect("ensure_dirs");
+
+        let entry = KnownMarketplace {
+            name: "atomic-test".into(),
+            source: MarketplaceSource::GitHub {
+                repo: "owner/repo".into(),
+            },
+            added_at: Utc::now(),
+        };
+
+        cache
+            .add_known_marketplace(entry)
+            .expect("add should succeed");
+
+        let raw = fs::read(cache.registry_path()).expect("read registry");
+        let parsed: Vec<KnownMarketplace> =
+            serde_json::from_slice(&raw).expect("registry should be valid JSON");
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0].name, "atomic-test");
     }
 }

@@ -32,7 +32,8 @@ pub fn run(plugin_ref: &str, skill_filter: Option<&str>, force: bool) -> Result<
         format!("invalid plugin reference '{plugin_ref}': expected plugin@marketplace")
     })?;
 
-    let cache = CacheDir::default_location();
+    let cache = CacheDir::default_location()
+        .context("could not determine data directory; is $HOME set?")?;
     let marketplace_path = cache.marketplace_path(marketplace_name);
     if !marketplace_path.exists() {
         bail!(
@@ -350,25 +351,51 @@ fn resolve_structured_source(
     }
 
     match source {
-        StructuredSource::GitHub { repo, git_ref, .. } => {
+        StructuredSource::GitHub {
+            repo, git_ref, sha, ..
+        } => {
             let url = git::github_repo_to_url(repo);
             debug!(url = %url, dest = %dest.display(), "cloning GitHub plugin");
-            git::clone_repo(&url, &dest, git_ref.as_deref())
+            print!("  Cloning {repo}...");
+            let repo_handle = git::clone_repo(&url, &dest, git_ref.as_deref())
                 .with_context(|| format!("failed to clone plugin from GitHub repo '{repo}'"))?;
+            println!(" done");
+            if let Some(expected) = sha {
+                git::verify_sha(&repo_handle, expected)
+                    .with_context(|| format!("SHA verification failed for '{repo}'"))?;
+            }
             Ok(dest)
         }
-        StructuredSource::GitUrl { url, git_ref, .. } => {
+        StructuredSource::GitUrl {
+            url, git_ref, sha, ..
+        } => {
             debug!(url = %url, dest = %dest.display(), "cloning git plugin");
-            git::clone_repo(url, &dest, git_ref.as_deref())
+            print!("  Cloning {url}...");
+            let repo_handle = git::clone_repo(url, &dest, git_ref.as_deref())
                 .with_context(|| format!("failed to clone plugin from '{url}'"))?;
+            println!(" done");
+            if let Some(expected) = sha {
+                git::verify_sha(&repo_handle, expected)
+                    .with_context(|| format!("SHA verification failed for '{url}'"))?;
+            }
             Ok(dest)
         }
         StructuredSource::GitSubdir {
-            url, path, git_ref, ..
+            url,
+            path,
+            git_ref,
+            sha,
+            ..
         } => {
             debug!(url = %url, path, dest = %dest.display(), "cloning git-subdir plugin");
-            git::clone_repo(url, &dest, git_ref.as_deref())
+            print!("  Cloning {url}...");
+            let repo_handle = git::clone_repo(url, &dest, git_ref.as_deref())
                 .with_context(|| format!("failed to clone plugin repo '{url}'"))?;
+            println!(" done");
+            if let Some(expected) = sha {
+                git::verify_sha(&repo_handle, expected)
+                    .with_context(|| format!("SHA verification failed for '{url}'"))?;
+            }
             Ok(dest.join(path))
         }
     }

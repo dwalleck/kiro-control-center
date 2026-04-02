@@ -5,7 +5,7 @@
 
 use std::path::Path;
 
-use git2::Repository;
+use git2::{Cred, FetchOptions, RemoteCallbacks, Repository};
 use tracing::debug;
 
 use crate::error::GitError;
@@ -16,10 +16,35 @@ pub fn github_repo_to_url(repo: &str) -> String {
     format!("https://github.com/{repo}.git")
 }
 
+/// Build fetch options with credential callbacks for SSH agent and git
+/// credential helpers.
+fn build_fetch_options<'a>() -> FetchOptions<'a> {
+    let mut callbacks = RemoteCallbacks::new();
+    callbacks.credentials(|url, username_from_url, allowed_types| {
+        if allowed_types.contains(git2::CredentialType::SSH_KEY)
+            && let Some(username) = username_from_url
+        {
+            return Cred::ssh_key_from_agent(username);
+        }
+        if allowed_types.contains(git2::CredentialType::USER_PASS_PLAINTEXT) {
+            return Cred::credential_helper(&git2::Config::open_default()?, url, username_from_url);
+        }
+        if allowed_types.contains(git2::CredentialType::DEFAULT) {
+            return Cred::default();
+        }
+        Err(git2::Error::from_str("no credentials available"))
+    });
+
+    let mut fetch_options = FetchOptions::new();
+    fetch_options.remote_callbacks(callbacks);
+    fetch_options
+}
+
 /// Clone a remote Git repository into `dest`.
 ///
-/// If `git_ref` is provided the working tree is checked out to that ref
-/// (branch, tag, or commit SHA) after the clone completes.
+/// Uses SSH agent and git credential helpers for authentication when
+/// available. If `git_ref` is provided the working tree is checked out to
+/// that ref (branch, tag, or commit SHA) after the clone completes.
 ///
 /// # Errors
 ///
@@ -27,10 +52,14 @@ pub fn github_repo_to_url(repo: &str) -> String {
 pub fn clone_repo(url: &str, dest: &Path, git_ref: Option<&str>) -> Result<Repository, GitError> {
     debug!(url, dest = %dest.display(), "cloning repository");
 
-    let repo = Repository::clone(url, dest).map_err(|source| GitError::CloneFailed {
-        url: url.to_owned(),
-        source,
-    })?;
+    let fetch_options = build_fetch_options();
+    let repo = git2::build::RepoBuilder::new()
+        .fetch_options(fetch_options)
+        .clone(url, dest)
+        .map_err(|source| GitError::CloneFailed {
+            url: url.to_owned(),
+            source,
+        })?;
 
     if let Some(refname) = git_ref {
         checkout_ref(&repo, refname).map_err(|source| GitError::CloneFailed {
@@ -40,6 +69,43 @@ pub fn clone_repo(url: &str, dest: &Path, git_ref: Option<&str>) -> Result<Repos
     }
 
     Ok(repo)
+}
+
+/// Verify the current HEAD of a repository matches the expected SHA prefix.
+///
+/// Both full and abbreviated SHAs are supported: the check passes if either
+/// string is a prefix of the other.
+///
+/// # Errors
+///
+/// Returns [`GitError::ShaMismatch`] if the actual commit SHA does not match.
+pub fn verify_sha(repo: &Repository, expected_sha: &str) -> Result<(), GitError> {
+    let head = repo.head().map_err(|source| GitError::OpenFailed {
+        path: repo
+            .workdir()
+            .unwrap_or_else(|| Path::new("<bare>"))
+            .to_path_buf(),
+        source,
+    })?;
+
+    let actual_oid = head.target().ok_or_else(|| GitError::OpenFailed {
+        path: repo
+            .workdir()
+            .unwrap_or_else(|| Path::new("<bare>"))
+            .to_path_buf(),
+        source: git2::Error::from_str("HEAD does not point to a commit"),
+    })?;
+
+    let actual_str = actual_oid.to_string();
+
+    if !actual_str.starts_with(expected_sha) && !expected_sha.starts_with(&actual_str) {
+        return Err(GitError::ShaMismatch {
+            expected: expected_sha.to_owned(),
+            actual: actual_str,
+        });
+    }
+
+    Ok(())
 }
 
 /// Pull (fetch + fast-forward) the default branch from `origin`.
@@ -66,8 +132,9 @@ pub fn pull_repo(path: &Path) -> Result<(), GitError> {
             source,
         })?;
 
+    let mut fetch_options = build_fetch_options();
     remote
-        .fetch(&[] as &[&str], None, None)
+        .fetch(&[] as &[&str], Some(&mut fetch_options), None)
         .map_err(|source| GitError::PullFailed {
             path: path.to_path_buf(),
             source,
@@ -250,6 +317,41 @@ mod tests {
         assert!(
             matches!(err, GitError::OpenFailed { .. }),
             "expected OpenFailed, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn verify_sha_matches_full_sha() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = create_local_repo(dir.path());
+
+        let head_oid = repo.head().expect("HEAD").target().expect("target");
+        let full_sha = head_oid.to_string();
+
+        verify_sha(&repo, &full_sha).expect("full SHA should match");
+    }
+
+    #[test]
+    fn verify_sha_matches_prefix() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = create_local_repo(dir.path());
+
+        let head_oid = repo.head().expect("HEAD").target().expect("target");
+        let prefix = &head_oid.to_string()[..7];
+
+        verify_sha(&repo, prefix).expect("SHA prefix should match");
+    }
+
+    #[test]
+    fn verify_sha_rejects_wrong_sha() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = create_local_repo(dir.path());
+
+        let err = verify_sha(&repo, "0000000deadbeef").expect_err("should fail on wrong SHA");
+
+        assert!(
+            matches!(err, GitError::ShaMismatch { .. }),
+            "expected ShaMismatch, got {err:?}"
         );
     }
 }

@@ -114,6 +114,10 @@ pub enum GitError {
         #[source]
         source: git2::Error,
     },
+
+    /// The checked-out commit SHA does not match the expected pinned SHA.
+    #[error("SHA mismatch: expected {expected}, got {actual}")]
+    ShaMismatch { expected: String, actual: String },
 }
 
 // ---------------------------------------------------------------------------
@@ -288,6 +292,18 @@ mod tests {
             source: git_err,
         };
         assert_eq!(err.to_string(), "failed to open repository at /tmp/nope");
+    }
+
+    #[test]
+    fn git_sha_mismatch_display() {
+        let err = GitError::ShaMismatch {
+            expected: "abc1234".into(),
+            actual: "def5678".into(),
+        };
+        assert_eq!(
+            err.to_string(),
+            "SHA mismatch: expected abc1234, got def5678"
+        );
     }
 
     // -----------------------------------------------------------------------

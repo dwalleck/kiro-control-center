@@ -70,7 +70,8 @@ fn source_label(source: &MarketplaceSource) -> &str {
 /// 5. Register in `known_marketplaces.json`.
 fn add(source: &str) -> Result<()> {
     let ms = detect_source(source);
-    let cache = CacheDir::default_location();
+    let cache = CacheDir::default_location()
+        .context("could not determine data directory; is $HOME set?")?;
     cache
         .ensure_dirs()
         .context("failed to create cache directories")?;
@@ -90,13 +91,17 @@ fn add(source: &str) -> Result<()> {
         MarketplaceSource::GitHub { repo } => {
             let url = git::github_repo_to_url(repo);
             debug!(url = %url, dest = %temp_dir.display(), "cloning GitHub marketplace");
+            print!("  Cloning {repo}...");
             git::clone_repo(&url, &temp_dir, None)
                 .with_context(|| format!("failed to clone {repo}"))?;
+            println!(" done");
         }
         MarketplaceSource::GitUrl { url } => {
             debug!(url = %url, dest = %temp_dir.display(), "cloning git marketplace");
+            print!("  Cloning {url}...");
             git::clone_repo(url, &temp_dir, None)
                 .with_context(|| format!("failed to clone {url}"))?;
+            println!(" done");
         }
         MarketplaceSource::LocalPath { path } => {
             let src = resolve_local_path(path)?;
@@ -194,7 +199,8 @@ fn resolve_local_path(path_str: &str) -> Result<std::path::PathBuf> {
 
 /// List all registered marketplaces.
 fn list() -> Result<()> {
-    let cache = CacheDir::default_location();
+    let cache = CacheDir::default_location()
+        .context("could not determine data directory; is $HOME set?")?;
     let entries = cache
         .load_known_marketplaces()
         .context("failed to load known marketplaces")?;
@@ -225,7 +231,8 @@ fn list() -> Result<()> {
 
 /// Update marketplace clone(s) from remote.
 fn update(name: Option<&str>) -> Result<()> {
-    let cache = CacheDir::default_location();
+    let cache = CacheDir::default_location()
+        .context("could not determine data directory; is $HOME set?")?;
     let entries = cache
         .load_known_marketplaces()
         .context("failed to load known marketplaces")?;
@@ -255,12 +262,13 @@ fn update(name: Option<&str>) -> Result<()> {
             continue;
         }
 
+        print!("  Updating {}...", entry.name.bold());
         match git::pull_repo(&mp_path) {
             Ok(()) => {
-                println!("  {} {} updated", "✓".green().bold(), entry.name.bold());
+                println!(" {}", "done".green());
             }
             Err(e) => {
-                println!("  {} {} failed: {}", "✗".red().bold(), entry.name.bold(), e);
+                println!(" {}: {}", "failed".red(), e);
             }
         }
     }
@@ -274,7 +282,8 @@ fn update(name: Option<&str>) -> Result<()> {
 
 /// Remove a registered marketplace and its cached data.
 fn remove(name: &str) -> Result<()> {
-    let cache = CacheDir::default_location();
+    let cache = CacheDir::default_location()
+        .context("could not determine data directory; is $HOME set?")?;
 
     // Remove from the registry first.
     cache

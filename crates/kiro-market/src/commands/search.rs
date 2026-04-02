@@ -15,7 +15,8 @@ use tracing::debug;
 /// Iterates all known marketplaces, discovers skills from relative-path plugins,
 /// and matches the query against skill names and descriptions (case-insensitive).
 pub fn run(query: &str) -> Result<()> {
-    let cache = CacheDir::default_location();
+    let cache = CacheDir::default_location()
+        .context("could not determine data directory; is $HOME set?")?;
     let entries = cache
         .load_known_marketplaces()
         .context("failed to load known marketplaces")?;
