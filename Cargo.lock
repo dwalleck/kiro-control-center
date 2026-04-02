@@ -567,6 +567,7 @@ dependencies = [
  "chrono",
  "clap",
  "colored",
+ "dirs",
  "kiro-market-core",
  "rstest",
  "tempfile",
