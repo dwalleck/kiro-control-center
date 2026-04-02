@@ -83,7 +83,6 @@ pub enum MarketplaceAction {
 ///
 /// Returns `None` if the string does not contain exactly one `@`.
 #[must_use]
-#[allow(dead_code)]
 pub fn parse_plugin_ref(plugin_ref: &str) -> Option<(&str, &str)> {
     plugin_ref.split_once('@')
 }
