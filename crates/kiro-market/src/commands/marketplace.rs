@@ -11,9 +11,6 @@ use tracing::debug;
 
 use crate::cli::MarketplaceAction;
 
-/// Path within a marketplace clone where the manifest lives.
-const MARKETPLACE_MANIFEST: &str = ".claude-plugin/marketplace.json";
-
 /// Dispatch to the appropriate marketplace subcommand.
 pub fn run(action: &MarketplaceAction) -> Result<()> {
     match action {
@@ -118,7 +115,7 @@ fn add(source: &str) -> Result<()> {
     }
 
     // Read marketplace manifest to get the real name.
-    let manifest_path = temp_dir.join(MARKETPLACE_MANIFEST);
+    let manifest_path = temp_dir.join(kiro_market_core::MARKETPLACE_MANIFEST_PATH);
     let manifest_bytes = fs::read(&manifest_path).with_context(|| {
         format!(
             "marketplace manifest not found at {}",

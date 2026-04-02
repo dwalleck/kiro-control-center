@@ -13,6 +13,7 @@ use serde::{Deserialize, Serialize};
 use tracing::debug;
 
 use crate::error::SkillError;
+use crate::validation;
 
 // ---------------------------------------------------------------------------
 // Types
@@ -141,6 +142,7 @@ impl KiroProject {
         content: &str,
         meta: InstalledSkillMeta,
     ) -> crate::error::Result<()> {
+        validation::validate_name(name)?;
         let dir = self.skill_dir(name);
 
         if dir.exists() {
@@ -164,6 +166,7 @@ impl KiroProject {
         content: &str,
         meta: InstalledSkillMeta,
     ) -> crate::error::Result<()> {
+        validation::validate_name(name)?;
         let dir = self.skill_dir(name);
 
         if dir.exists() {
@@ -184,6 +187,7 @@ impl KiroProject {
     /// - [`SkillError::SkillMdNotFound`] if the skill is not installed.
     /// - I/O or JSON serialisation errors.
     pub fn remove_skill(&self, name: &str) -> crate::error::Result<()> {
+        validation::validate_name(name)?;
         let dir = self.skill_dir(name);
 
         if !dir.exists() {
@@ -360,6 +364,65 @@ mod tests {
 
         let installed = project.load_installed().expect("load should succeed");
         assert!(installed.skills.is_empty());
+    }
+
+    #[test]
+    fn install_skill_rejects_path_traversal() {
+        let (_dir, project) = temp_project();
+        let content = "---\nname: evil\ndescription: Evil\n---\n";
+
+        let err = project
+            .install_skill("../escape", content, sample_meta())
+            .expect_err("should reject path traversal");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("invalid name"),
+            "expected 'invalid name', got: {msg}"
+        );
+    }
+
+    #[test]
+    fn install_skill_rejects_slash_in_name() {
+        let (_dir, project) = temp_project();
+        let content = "---\nname: evil\ndescription: Evil\n---\n";
+
+        let err = project
+            .install_skill("sub/dir", content, sample_meta())
+            .expect_err("should reject path separator");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("path separator"),
+            "expected 'path separator', got: {msg}"
+        );
+    }
+
+    #[test]
+    fn install_skill_force_rejects_path_traversal() {
+        let (_dir, project) = temp_project();
+        let content = "---\nname: evil\ndescription: Evil\n---\n";
+
+        let err = project
+            .install_skill_force("../escape", content, sample_meta())
+            .expect_err("should reject path traversal");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("invalid name"),
+            "expected 'invalid name', got: {msg}"
+        );
+    }
+
+    #[test]
+    fn remove_skill_rejects_path_traversal() {
+        let (_dir, project) = temp_project();
+
+        let err = project
+            .remove_skill("../escape")
+            .expect_err("should reject path traversal");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("invalid name"),
+            "expected 'invalid name', got: {msg}"
+        );
     }
 
     #[test]

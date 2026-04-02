@@ -81,10 +81,15 @@ pub enum MarketplaceAction {
 
 /// Parse a `"plugin@marketplace"` reference into `(plugin, marketplace)`.
 ///
-/// Returns `None` if the string does not contain exactly one `@`.
+/// Returns `None` if the string does not contain `@`, or if either the
+/// plugin or marketplace part is empty.
 #[must_use]
 pub fn parse_plugin_ref(plugin_ref: &str) -> Option<(&str, &str)> {
-    plugin_ref.split_once('@')
+    let (plugin, marketplace) = plugin_ref.split_once('@')?;
+    if plugin.is_empty() || marketplace.is_empty() {
+        return None;
+    }
+    Some((plugin, marketplace))
 }
 
 #[cfg(test)]
@@ -112,7 +117,7 @@ mod tests {
 
     #[test]
     fn parse_plugin_ref_empty_parts() {
-        assert_eq!(parse_plugin_ref("@marketplace"), Some(("", "marketplace")));
-        assert_eq!(parse_plugin_ref("plugin@"), Some(("plugin", "")));
+        assert_eq!(parse_plugin_ref("@marketplace"), None);
+        assert_eq!(parse_plugin_ref("plugin@"), None);
     }
 }

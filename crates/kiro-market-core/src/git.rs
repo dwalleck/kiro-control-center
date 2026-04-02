@@ -107,7 +107,7 @@ pub fn pull_repo(path: &Path) -> Result<(), GitError> {
 
         let refname = head_ref.name().ok_or_else(|| GitError::PullFailed {
             path: path.to_path_buf(),
-            source: git2::Error::from_str("HEAD has non-UTF-8 refname"),
+            source: git2::Error::from_str("HEAD ref name could not be resolved"),
         })?;
 
         let target_oid = fetch_commit.id();

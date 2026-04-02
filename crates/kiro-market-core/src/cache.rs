@@ -12,6 +12,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::error::MarketplaceError;
+use crate::validation;
 
 // ---------------------------------------------------------------------------
 // Types
@@ -159,6 +160,7 @@ impl CacheDir {
     ///   same name already exists.
     /// - I/O or JSON serialisation errors.
     pub fn add_known_marketplace(&self, entry: KnownMarketplace) -> crate::error::Result<()> {
+        validation::validate_name(&entry.name)?;
         let mut entries = self.load_known_marketplaces()?;
 
         if entries.iter().any(|e| e.name == entry.name) {
@@ -331,6 +333,52 @@ mod tests {
         assert!(
             msg.contains("not found"),
             "expected 'not found' in error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn add_known_marketplace_rejects_path_traversal() {
+        let (_dir, cache) = temp_cache();
+        cache.ensure_dirs().expect("ensure_dirs");
+
+        let entry = KnownMarketplace {
+            name: "../escape".into(),
+            source: MarketplaceSource::GitHub {
+                repo: "evil/repo".into(),
+            },
+            added_at: Utc::now(),
+        };
+
+        let err = cache
+            .add_known_marketplace(entry)
+            .expect_err("should reject path traversal");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("invalid name"),
+            "expected 'invalid name', got: {msg}"
+        );
+    }
+
+    #[test]
+    fn add_known_marketplace_rejects_slash_in_name() {
+        let (_dir, cache) = temp_cache();
+        cache.ensure_dirs().expect("ensure_dirs");
+
+        let entry = KnownMarketplace {
+            name: "sub/dir".into(),
+            source: MarketplaceSource::GitHub {
+                repo: "evil/repo".into(),
+            },
+            added_at: Utc::now(),
+        };
+
+        let err = cache
+            .add_known_marketplace(entry)
+            .expect_err("should reject slash");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("path separator"),
+            "expected 'path separator', got: {msg}"
         );
     }
 

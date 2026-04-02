@@ -10,3 +10,11 @@ pub mod marketplace;
 pub mod plugin;
 pub mod project;
 pub mod skill;
+pub mod validation;
+
+/// Path to the marketplace manifest within a marketplace repository.
+pub const MARKETPLACE_MANIFEST_PATH: &str = ".claude-plugin/marketplace.json";
+
+/// Default skill scan paths when a plugin has no `plugin.json` or its skills
+/// list is empty.
+pub const DEFAULT_SKILL_PATHS: &[&str] = &["./skills/"];

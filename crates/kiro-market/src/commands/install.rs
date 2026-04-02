@@ -16,12 +16,6 @@ use tracing::debug;
 
 use crate::cli;
 
-/// Path within a marketplace clone where the manifest lives.
-const MARKETPLACE_MANIFEST: &str = ".claude-plugin/marketplace.json";
-
-/// Default skill scan paths when a plugin has no `plugin.json` or empty skills list.
-const DEFAULT_SKILL_PATHS: &[&str] = &["./skills/"];
-
 /// Tracks installation results across skills.
 struct InstallStats {
     installed: u32,
@@ -37,12 +31,6 @@ pub fn run(plugin_ref: &str, skill_filter: Option<&str>, force: bool) -> Result<
     let (plugin_name, marketplace_name) = cli::parse_plugin_ref(plugin_ref).with_context(|| {
         format!("invalid plugin reference '{plugin_ref}': expected plugin@marketplace")
     })?;
-
-    if plugin_name.is_empty() || marketplace_name.is_empty() {
-        bail!(
-            "invalid plugin reference '{plugin_ref}': both plugin and marketplace names are required"
-        );
-    }
 
     let cache = CacheDir::default_location();
     let marketplace_path = cache.marketplace_path(marketplace_name);
@@ -97,7 +85,7 @@ fn find_plugin_entry(
     plugin_name: &str,
     marketplace_name: &str,
 ) -> Result<PluginEntry> {
-    let manifest_path = marketplace_path.join(MARKETPLACE_MANIFEST);
+    let manifest_path = marketplace_path.join(kiro_market_core::MARKETPLACE_MANIFEST_PATH);
     let manifest_bytes = fs::read(&manifest_path).with_context(|| {
         format!(
             "failed to read marketplace manifest at {}",
@@ -125,7 +113,7 @@ fn discover_plugin_skills(
         if let Some(manifest) = plugin_manifest.filter(|m| !m.skills.is_empty()) {
             manifest.skills.iter().map(String::as_str).collect()
         } else {
-            DEFAULT_SKILL_PATHS.to_vec()
+            kiro_market_core::DEFAULT_SKILL_PATHS.to_vec()
         };
 
     discover_skill_dirs(plugin_dir, &skill_paths)

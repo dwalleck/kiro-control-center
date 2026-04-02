@@ -117,6 +117,23 @@ pub enum GitError {
 }
 
 // ---------------------------------------------------------------------------
+// Validation errors
+// ---------------------------------------------------------------------------
+
+/// Errors related to path / name validation.
+#[derive(Debug, Error)]
+#[non_exhaustive]
+pub enum ValidationError {
+    /// A name used as a directory component contains unsafe characters.
+    #[error("invalid name `{name}`: {reason}")]
+    InvalidName { name: String, reason: String },
+
+    /// A relative path contains components that would escape its root.
+    #[error("invalid relative path `{path}`: {reason}")]
+    InvalidRelativePath { path: String, reason: String },
+}
+
+// ---------------------------------------------------------------------------
 // Top-level unified error
 // ---------------------------------------------------------------------------
 
@@ -138,6 +155,9 @@ pub enum Error {
 
     #[error(transparent)]
     Git(#[from] GitError),
+
+    #[error(transparent)]
+    Validation(#[from] ValidationError),
 
     #[error(transparent)]
     Io(#[from] std::io::Error),
@@ -224,6 +244,19 @@ mod tests {
         assert_eq!(err.to_string(), expected);
     }
 
+    #[rstest]
+    #[case::invalid_name(
+        ValidationError::InvalidName { name: "../escape".into(), reason: "contains `..`".into() },
+        "invalid name `../escape`: contains `..`"
+    )]
+    #[case::invalid_relative_path(
+        ValidationError::InvalidRelativePath { path: "../secret.md".into(), reason: "contains `..` component".into() },
+        "invalid relative path `../secret.md`: contains `..` component"
+    )]
+    fn validation_error_display(#[case] err: ValidationError, #[case] expected: &str) {
+        assert_eq!(err.to_string(), expected);
+    }
+
     #[test]
     fn git_clone_failed_display() {
         let git_err = git2::Error::from_str("network timeout");
@@ -296,6 +329,16 @@ mod tests {
         };
         let err: Error = inner.into();
         assert!(matches!(err, Error::Git(_)));
+    }
+
+    #[test]
+    fn from_validation_error() {
+        let inner = ValidationError::InvalidName {
+            name: "../bad".into(),
+            reason: "contains `..`".into(),
+        };
+        let err: Error = inner.into();
+        assert!(matches!(err, Error::Validation(_)));
     }
 
     #[test]

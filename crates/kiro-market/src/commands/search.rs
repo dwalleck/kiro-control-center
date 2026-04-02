@@ -10,12 +10,6 @@ use kiro_market_core::plugin::discover_skill_dirs;
 use kiro_market_core::skill::parse_frontmatter;
 use tracing::debug;
 
-/// Path within a marketplace clone where the manifest lives.
-const MARKETPLACE_MANIFEST: &str = ".claude-plugin/marketplace.json";
-
-/// Default skill scan paths when a plugin has no explicit skill list.
-const DEFAULT_SKILL_PATHS: &[&str] = &["./skills/"];
-
 /// Run the search command.
 ///
 /// Iterates all known marketplaces, discovers skills from relative-path plugins,
@@ -39,7 +33,7 @@ pub fn run(query: &str) -> Result<()> {
 
     for entry in &entries {
         let marketplace_path = cache.marketplace_path(&entry.name);
-        let manifest_path = marketplace_path.join(MARKETPLACE_MANIFEST);
+        let manifest_path = marketplace_path.join(kiro_market_core::MARKETPLACE_MANIFEST_PATH);
 
         let manifest_bytes = match fs::read(&manifest_path) {
             Ok(bytes) => bytes,
@@ -143,8 +137,14 @@ fn load_skill_paths(plugin_dir: &std::path::Path) -> Vec<String> {
     match fs::read(&manifest_path) {
         Ok(bytes) => match kiro_market_core::plugin::PluginManifest::from_json(&bytes) {
             Ok(manifest) if !manifest.skills.is_empty() => manifest.skills,
-            _ => DEFAULT_SKILL_PATHS.iter().map(|&s| s.to_owned()).collect(),
+            _ => kiro_market_core::DEFAULT_SKILL_PATHS
+                .iter()
+                .map(|&s| s.to_owned())
+                .collect(),
         },
-        Err(_) => DEFAULT_SKILL_PATHS.iter().map(|&s| s.to_owned()).collect(),
+        Err(_) => kiro_market_core::DEFAULT_SKILL_PATHS
+            .iter()
+            .map(|&s| s.to_owned())
+            .collect(),
     }
 }

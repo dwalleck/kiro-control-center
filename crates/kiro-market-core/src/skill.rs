@@ -122,6 +122,7 @@ pub fn extract_relative_md_links(markdown: &str) -> Vec<String> {
                 && !url.starts_with("http://")
                 && !url.starts_with("https://")
                 && !url.starts_with('/')
+                && !url.contains("..")
             {
                 links.push(url.to_owned());
             }
@@ -243,6 +244,16 @@ And a [root link](/absolute/path.md).
             links,
             vec!["references/type-mapping.md", "references/error-guide.md",]
         );
+    }
+
+    #[test]
+    fn extract_relative_md_links_rejects_parent_traversal() {
+        let markdown = r"
+See [escape](../secret.md) and [nested](sub/../../other.md).
+But [safe](companion.md) is fine.
+";
+        let links = extract_relative_md_links(markdown);
+        assert_eq!(links, vec!["companion.md"]);
     }
 
     #[test]

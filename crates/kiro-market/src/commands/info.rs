@@ -13,12 +13,6 @@ use tracing::debug;
 
 use crate::cli;
 
-/// Path within a marketplace clone where the manifest lives.
-const MARKETPLACE_MANIFEST: &str = ".claude-plugin/marketplace.json";
-
-/// Default skill scan paths when a plugin has no explicit skill list.
-const DEFAULT_SKILL_PATHS: &[&str] = &["./skills/"];
-
 /// Run the info command.
 ///
 /// Parses the plugin reference, finds the plugin in its marketplace, and
@@ -27,12 +21,6 @@ pub fn run(plugin_ref: &str) -> Result<()> {
     let (plugin_name, marketplace_name) = cli::parse_plugin_ref(plugin_ref).with_context(|| {
         format!("invalid plugin reference '{plugin_ref}': expected plugin@marketplace")
     })?;
-
-    if plugin_name.is_empty() || marketplace_name.is_empty() {
-        bail!(
-            "invalid plugin reference '{plugin_ref}': both plugin and marketplace names are required"
-        );
-    }
 
     let cache = CacheDir::default_location();
     let marketplace_path = cache.marketplace_path(marketplace_name);
@@ -62,7 +50,7 @@ fn find_plugin_entry(
     plugin_name: &str,
     marketplace_name: &str,
 ) -> Result<PluginEntry> {
-    let manifest_path = marketplace_path.join(MARKETPLACE_MANIFEST);
+    let manifest_path = marketplace_path.join(kiro_market_core::MARKETPLACE_MANIFEST_PATH);
     let manifest_bytes = fs::read(&manifest_path).with_context(|| {
         format!(
             "failed to read marketplace manifest at {}",
@@ -177,8 +165,14 @@ fn load_skill_paths(plugin_dir: &Path) -> Vec<String> {
     match fs::read(&manifest_path) {
         Ok(bytes) => match kiro_market_core::plugin::PluginManifest::from_json(&bytes) {
             Ok(manifest) if !manifest.skills.is_empty() => manifest.skills,
-            _ => DEFAULT_SKILL_PATHS.iter().map(|&s| s.to_owned()).collect(),
+            _ => kiro_market_core::DEFAULT_SKILL_PATHS
+                .iter()
+                .map(|&s| s.to_owned())
+                .collect(),
         },
-        Err(_) => DEFAULT_SKILL_PATHS.iter().map(|&s| s.to_owned()).collect(),
+        Err(_) => kiro_market_core::DEFAULT_SKILL_PATHS
+            .iter()
+            .map(|&s| s.to_owned())
+            .collect(),
     }
 }
