@@ -1,7 +1,8 @@
 //! Git operations for cloning and updating marketplace repositories.
 //!
-//! Uses `gix` for all Git interactions and maps errors into
-//! domain-specific [`GitError`] variants.
+//! Uses `gix` for clone and repository inspection, and shells out to the
+//! `git` CLI for operations that require working-tree updates (pull,
+//! checkout). Errors are mapped into domain-specific [`GitError`] variants.
 
 use std::num::NonZeroU32;
 use std::path::Path;
@@ -67,16 +68,12 @@ pub fn github_repo_to_url(repo: &str, protocol: GitProtocol) -> String {
 ///
 /// Uses `gix` for the clone operation. When `git_ref` is `None`, a shallow
 /// clone (depth 1) is used to reduce transfer size. When `git_ref` is
-/// provided, a full clone is performed followed by a checkout of the
-/// specified branch, tag, or SHA.
+/// provided, a full clone is performed followed by a `git checkout` of the
+/// specified branch, tag, or SHA (requires the `git` CLI in `$PATH`).
 ///
 /// # Errors
 ///
 /// Returns [`GitError::CloneFailed`] if the clone or checkout fails.
-///
-/// # Panics
-///
-/// Cannot panic. The internal `NonZeroU32::new(1)` call is infallible.
 pub fn clone_repo(url: &str, dest: &Path, git_ref: Option<&str>) -> Result<(), GitError> {
     debug!(url, dest = %dest.display(), git_ref, "cloning repository");
 
@@ -88,7 +85,7 @@ pub fn clone_repo(url: &str, dest: &Path, git_ref: Option<&str>) -> Result<(), G
     let mut prepare = gix::prepare_clone(url, dest).map_err(|e| map_err(Box::new(e)))?;
 
     if git_ref.is_none() {
-        let depth = NonZeroU32::new(1).expect("1 is non-zero");
+        let depth = NonZeroU32::MIN;
         prepare = prepare.with_shallow(gix::remote::fetch::Shallow::DepthAtRemote(depth));
     }
 
@@ -140,7 +137,7 @@ pub fn verify_sha(path: &Path, expected_sha: &str) -> Result<(), GitError> {
 
     let actual_sha = head_id.to_string();
 
-    if actual_sha.starts_with(expected_sha) && expected_sha.len() <= actual_sha.len() {
+    if actual_sha.starts_with(expected_sha) {
         Ok(())
     } else {
         Err(GitError::ShaMismatch {
