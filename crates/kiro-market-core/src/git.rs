@@ -9,7 +9,6 @@ use std::process::Command;
 use std::sync::atomic::AtomicBool;
 
 use gix::progress::Discard;
-use gix::remote::Direction;
 use serde::{Deserialize, Serialize};
 use tracing::debug;
 
@@ -151,68 +150,26 @@ pub fn verify_sha(path: &Path, expected_sha: &str) -> Result<(), GitError> {
     }
 }
 
-/// Pull (fetch + reset) the default branch from `origin`.
+/// Pull the default branch using `git pull --ff-only`.
 ///
-/// Opens the repository at `path`, fetches from the default remote using
-/// `gix`, then resets the working tree to match the updated HEAD using the
-/// native `git` binary.
+/// Opens the repository at `path` with `gix` to verify it is valid,
+/// then runs `git pull --ff-only` to fetch and fast-forward the local
+/// branch.
 ///
 /// # Errors
 ///
 /// Returns [`GitError::OpenFailed`] if the path is not a valid repository,
-/// or [`GitError::PullFailed`] if the fetch or working-tree update fails.
+/// or [`GitError::PullFailed`] if the pull fails.
 pub fn pull_repo(path: &Path) -> Result<(), GitError> {
     debug!(path = %path.display(), "pulling repository");
 
-    let repo = gix::open(path).map_err(|e| GitError::OpenFailed {
+    // Verify it's actually a git repo first (preserves the OpenFailed error).
+    let _repo = gix::open(path).map_err(|e| GitError::OpenFailed {
         path: path.to_path_buf(),
         source: Box::new(e),
     })?;
 
-    let remote = repo
-        .find_default_remote(Direction::Fetch)
-        .ok_or_else(|| GitError::PullFailed {
-            path: path.to_path_buf(),
-            source: "no fetch remote configured".to_owned().into(),
-        })?
-        .map_err(|e| GitError::PullFailed {
-            path: path.to_path_buf(),
-            source: Box::new(e),
-        })?;
-
-    let connection = remote
-        .connect(Direction::Fetch)
-        .map_err(|e| GitError::PullFailed {
-            path: path.to_path_buf(),
-            source: Box::new(e),
-        })?;
-
-    let should_interrupt = AtomicBool::new(false);
-
-    let prepared = connection
-        .prepare_fetch(Discard, gix::remote::ref_map::Options::default())
-        .map_err(|e| GitError::PullFailed {
-            path: path.to_path_buf(),
-            source: Box::new(e),
-        })?;
-
-    prepared
-        .receive(Discard, &should_interrupt)
-        .map_err(|e| GitError::PullFailed {
-            path: path.to_path_buf(),
-            source: Box::new(e),
-        })?;
-
-    // Update working tree via native git to avoid gix's complex checkout API.
-    let output = Command::new("git")
-        .args(["-C"])
-        .arg(path)
-        .args(["checkout", "--force", "HEAD"])
-        .output()
-        .map_err(|e| GitError::PullFailed {
-            path: path.to_path_buf(),
-            source: Box::new(e),
-        })?;
+    let output = run_git(&["pull", "--ff-only"], path)?;
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
@@ -396,5 +353,52 @@ mod tests {
             matches!(err, GitError::OpenFailed { .. }),
             "expected OpenFailed, got {err:?}"
         );
+    }
+
+    #[test]
+    fn pull_repo_fetches_new_commits() {
+        // Create a "remote" repo with one commit.
+        let origin_dir = tempfile::tempdir().expect("tempdir");
+        create_local_repo(origin_dir.path());
+
+        // Clone it locally.
+        let clone_dir = tempfile::tempdir().expect("tempdir");
+        let dest = clone_dir.path().join("cloned");
+        let url = format!("file://{}", origin_dir.path().display());
+        clone_repo(&url, &dest, None).expect("clone should succeed");
+
+        // Add a second commit to the origin.
+        let run = |args: &[&str], dir: &Path| {
+            let output = Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .env("GIT_AUTHOR_NAME", "Test")
+                .env("GIT_AUTHOR_EMAIL", "test@example.com")
+                .env("GIT_COMMITTER_NAME", "Test")
+                .env("GIT_COMMITTER_EMAIL", "test@example.com")
+                .output()
+                .expect("git command should run");
+            assert!(
+                output.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        std::fs::write(origin_dir.path().join("second.txt"), "second").expect("write");
+        run(&["add", "second.txt"], origin_dir.path());
+        run(
+            &["-c", "commit.gpgsign=false", "commit", "-m", "second commit"],
+            origin_dir.path(),
+        );
+
+        // Pull into the clone — the new file should appear.
+        pull_repo(&dest).expect("pull should succeed");
+
+        assert!(
+            dest.join("second.txt").exists(),
+            "second.txt should exist after pull"
+        );
+        let content = std::fs::read_to_string(dest.join("second.txt")).expect("read");
+        assert_eq!(content, "second");
     }
 }
