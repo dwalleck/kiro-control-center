@@ -102,7 +102,13 @@ pub fn clone_repo(url: &str, dest: &Path, git_ref: Option<&str>) -> Result<(), G
         .map_err(|e| map_err(Box::new(e)))?;
 
     if let Some(refname) = git_ref {
-        let output = run_git(&["checkout", "--", refname], dest)?;
+        if refname.starts_with('-') {
+            return Err(map_err(
+                format!("invalid git ref: '{refname}' must not start with '-'").into(),
+            ));
+        }
+
+        let output = run_git(&["checkout", refname], dest)?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);
