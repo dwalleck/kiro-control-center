@@ -389,12 +389,12 @@ fn resolve_structured_source(
 
     debug!(url = %url, dest = %dest.display(), "cloning plugin");
     print!("  Cloning {label}...");
-    let repo_handle = git::clone_repo(&url, &dest, git_ref)
+    git::clone_repo(&url, &dest, git_ref)
         .with_context(|| format!("failed to clone plugin from '{label}'"))?;
     println!(" done");
 
     if let Some(expected) = sha {
-        git::verify_sha(&repo_handle, expected)
+        git::verify_sha(&dest, expected)
             .with_context(|| format!("SHA verification failed for '{label}'"))?;
     }
 
