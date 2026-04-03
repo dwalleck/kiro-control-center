@@ -117,15 +117,6 @@ impl KiroProject {
         }
     }
 
-    /// Alias for [`Self::load_installed`].
-    ///
-    /// # Errors
-    ///
-    /// Same as [`Self::load_installed`].
-    pub fn list_installed(&self) -> crate::error::Result<InstalledSkills> {
-        self.load_installed()
-    }
-
     /// Install a skill into the project.
     ///
     /// Creates `.kiro/skills/<name>/SKILL.md` with the provided `content`
@@ -184,15 +175,15 @@ impl KiroProject {
     ///
     /// # Errors
     ///
-    /// - [`SkillError::SkillMdNotFound`] if the skill is not installed.
+    /// - [`SkillError::NotInstalled`] if the skill is not installed.
     /// - I/O or JSON serialisation errors.
     pub fn remove_skill(&self, name: &str) -> crate::error::Result<()> {
         validation::validate_name(name)?;
         let dir = self.skill_dir(name);
 
         if !dir.exists() {
-            return Err(SkillError::SkillMdNotFound {
-                path: dir.join(SKILL_MD),
+            return Err(SkillError::NotInstalled {
+                name: name.to_owned(),
             }
             .into());
         }
@@ -218,7 +209,7 @@ impl KiroProject {
     ) -> crate::error::Result<()> {
         let dir = self.skill_dir(name);
         fs::create_dir_all(&dir)?;
-        fs::write(dir.join(SKILL_MD), content)?;
+        crate::cache::atomic_write(&dir.join(SKILL_MD), content.as_bytes())?;
 
         let mut installed = self.load_installed()?;
         installed.skills.insert(name.to_owned(), meta);
@@ -356,8 +347,8 @@ mod tests {
 
         let msg = err.to_string();
         assert!(
-            msg.contains("SKILL.md not found"),
-            "expected 'SKILL.md not found', got: {msg}"
+            msg.contains("not installed"),
+            "expected 'not installed', got: {msg}"
         );
     }
 
@@ -429,7 +420,7 @@ mod tests {
     }
 
     #[test]
-    fn list_installed_delegates_to_load() {
+    fn load_installed_returns_installed_skills() {
         let (_dir, project) = temp_project();
         let content = "---\nname: listed\ndescription: Listed\n---\n";
 
@@ -437,7 +428,7 @@ mod tests {
             .install_skill("listed", content, sample_meta())
             .expect("install");
 
-        let installed = project.list_installed().expect("list");
+        let installed = project.load_installed().expect("load");
         assert!(installed.skills.contains_key("listed"));
     }
 
@@ -459,6 +450,28 @@ mod tests {
         assert!(
             !project.tracking_path().with_extension("tmp").exists(),
             ".tmp file should be gone after atomic rename"
+        );
+    }
+
+    #[test]
+    fn skill_md_written_atomically_no_tmp_leftover() {
+        let (_dir, project) = temp_project();
+        let content = "---\nname: atomic-skill\ndescription: Atomic write\n---\nBody.\n";
+
+        project
+            .install_skill("atomic-skill", content, sample_meta())
+            .expect("install");
+
+        let skill_md = project.skill_dir("atomic-skill").join("SKILL.md");
+        assert!(skill_md.exists(), "SKILL.md should exist");
+
+        let written = fs::read_to_string(&skill_md).expect("read SKILL.md");
+        assert_eq!(written, content, "content should match exactly");
+
+        // The atomic write temp file should not remain.
+        assert!(
+            !skill_md.with_extension("tmp").exists(),
+            "SKILL.md.tmp should be gone after atomic rename"
         );
     }
 }

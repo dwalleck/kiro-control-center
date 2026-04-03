@@ -1,5 +1,6 @@
 //! Command implementations for the kiro-market CLI.
 
+mod common;
 pub mod info;
 pub mod install;
 pub mod list;

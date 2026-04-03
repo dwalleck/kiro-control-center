@@ -7,12 +7,13 @@ use anyhow::{Context, Result, bail};
 use chrono::Utc;
 use colored::Colorize;
 use kiro_market_core::cache::CacheDir;
+use kiro_market_core::error::{Error as CoreError, SkillError};
 use kiro_market_core::git;
-use kiro_market_core::marketplace::{Marketplace, PluginEntry, PluginSource, StructuredSource};
+use kiro_market_core::marketplace::{PluginEntry, PluginSource, StructuredSource};
 use kiro_market_core::plugin::{PluginManifest, discover_skill_dirs};
 use kiro_market_core::project::{InstalledSkillMeta, KiroProject};
 use kiro_market_core::skill::{extract_relative_md_links, merge_skill, parse_frontmatter};
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::cli;
 
@@ -43,7 +44,8 @@ pub fn run(plugin_ref: &str, skill_filter: Option<&str>, force: bool) -> Result<
         );
     }
 
-    let plugin_entry = find_plugin_entry(&marketplace_path, plugin_name, marketplace_name)?;
+    let plugin_entry =
+        super::common::find_plugin_entry(&marketplace_path, plugin_name, marketplace_name)?;
 
     let plugin_dir = resolve_plugin_dir(&plugin_entry, &marketplace_path, &cache, marketplace_name)
         .with_context(|| format!("failed to resolve plugin directory for '{plugin_name}'"))?;
@@ -78,31 +80,6 @@ pub fn run(plugin_ref: &str, skill_filter: Option<&str>, force: bool) -> Result<
     }
 
     Ok(())
-}
-
-/// Read the marketplace manifest and find the matching plugin entry.
-fn find_plugin_entry(
-    marketplace_path: &Path,
-    plugin_name: &str,
-    marketplace_name: &str,
-) -> Result<PluginEntry> {
-    let manifest_path = marketplace_path.join(kiro_market_core::MARKETPLACE_MANIFEST_PATH);
-    let manifest_bytes = fs::read(&manifest_path).with_context(|| {
-        format!(
-            "failed to read marketplace manifest at {}",
-            manifest_path.display()
-        )
-    })?;
-    let manifest =
-        Marketplace::from_json(&manifest_bytes).context("failed to parse marketplace manifest")?;
-
-    manifest
-        .plugins
-        .into_iter()
-        .find(|p| p.name == plugin_name)
-        .with_context(|| {
-            format!("plugin '{plugin_name}' not found in marketplace '{marketplace_name}'")
-        })
 }
 
 /// Discover skill directories from a plugin, using its manifest or defaults.
@@ -175,22 +152,28 @@ fn process_skill(
     version: Option<&String>,
 ) -> SkillResult {
     let skill_md_path = skill_dir.join("SKILL.md");
-    let Ok(skill_content) = fs::read_to_string(&skill_md_path) else {
-        eprintln!(
-            "  {} Failed to read {}",
-            "✗".red().bold(),
-            skill_md_path.display()
-        );
-        return SkillResult::Failed;
+    let skill_content = match fs::read_to_string(&skill_md_path) {
+        Ok(content) => content,
+        Err(e) => {
+            eprintln!(
+                "  {} Failed to read {}: {e}",
+                "✗".red().bold(),
+                skill_md_path.display()
+            );
+            return SkillResult::Failed;
+        }
     };
 
-    let Ok((frontmatter, body_offset)) = parse_frontmatter(&skill_content) else {
-        eprintln!(
-            "  {} Failed to parse SKILL.md in {}",
-            "✗".red().bold(),
-            skill_dir.display()
-        );
-        return SkillResult::Failed;
+    let (frontmatter, body_offset) = match parse_frontmatter(&skill_content) {
+        Ok(result) => result,
+        Err(e) => {
+            eprintln!(
+                "  {} Failed to parse SKILL.md in {}: {e}",
+                "✗".red().bold(),
+                skill_dir.display()
+            );
+            return SkillResult::Failed;
+        }
     };
 
     // Apply skill filter if provided.
@@ -256,23 +239,21 @@ fn process_skill(
             );
             SkillResult::Installed
         }
+        Err(CoreError::Skill(SkillError::AlreadyInstalled { .. })) => {
+            println!(
+                "  {} Skill '{}' already installed (use --force to overwrite)",
+                "·".yellow().bold(),
+                frontmatter.name.bold()
+            );
+            SkillResult::Skipped
+        }
         Err(e) => {
-            let msg = e.to_string();
-            if msg.contains("already installed") {
-                println!(
-                    "  {} Skill '{}' already installed (use --force to overwrite)",
-                    "·".yellow().bold(),
-                    frontmatter.name.bold()
-                );
-                SkillResult::Skipped
-            } else {
-                eprintln!(
-                    "  {} Failed to install skill '{}': {e}",
-                    "✗".red().bold(),
-                    frontmatter.name
-                );
-                SkillResult::Failed
-            }
+            eprintln!(
+                "  {} Failed to install skill '{}': {e}",
+                "✗".red().bold(),
+                frontmatter.name
+            );
+            SkillResult::Failed
         }
     }
 }
@@ -341,64 +322,56 @@ fn resolve_structured_source(
 
     let dest = cache.plugin_path(marketplace_name, plugin_name);
 
-    // If already cloned, reuse the existing directory.
-    if dest.exists() {
-        debug!(dest = %dest.display(), "plugin already cached, reusing");
-        return match source {
-            StructuredSource::GitSubdir { path, .. } => Ok(dest.join(path)),
-            _ => Ok(dest),
-        };
-    }
-
-    match source {
-        StructuredSource::GitHub {
-            repo, git_ref, sha, ..
-        } => {
-            let url = git::github_repo_to_url(repo);
-            debug!(url = %url, dest = %dest.display(), "cloning GitHub plugin");
-            print!("  Cloning {repo}...");
-            let repo_handle = git::clone_repo(&url, &dest, git_ref.as_deref())
-                .with_context(|| format!("failed to clone plugin from GitHub repo '{repo}'"))?;
-            println!(" done");
-            if let Some(expected) = sha {
-                git::verify_sha(&repo_handle, expected)
-                    .with_context(|| format!("SHA verification failed for '{repo}'"))?;
-            }
-            Ok(dest)
-        }
-        StructuredSource::GitUrl {
-            url, git_ref, sha, ..
-        } => {
-            debug!(url = %url, dest = %dest.display(), "cloning git plugin");
-            print!("  Cloning {url}...");
-            let repo_handle = git::clone_repo(url, &dest, git_ref.as_deref())
-                .with_context(|| format!("failed to clone plugin from '{url}'"))?;
-            println!(" done");
-            if let Some(expected) = sha {
-                git::verify_sha(&repo_handle, expected)
-                    .with_context(|| format!("SHA verification failed for '{url}'"))?;
-            }
-            Ok(dest)
+    // Extract the varying parts from each source variant.
+    let (url, subdir, git_ref, sha, label) = match source {
+        StructuredSource::GitHub { repo, git_ref, sha } => (
+            git::github_repo_to_url(repo),
+            None,
+            git_ref.as_deref(),
+            sha.as_deref(),
+            repo.as_str(),
+        ),
+        StructuredSource::GitUrl { url, git_ref, sha } => {
+            (url.clone(), None, git_ref.as_deref(), sha.as_deref(), url.as_str())
         }
         StructuredSource::GitSubdir {
             url,
             path,
             git_ref,
             sha,
-            ..
-        } => {
-            debug!(url = %url, path, dest = %dest.display(), "cloning git-subdir plugin");
-            print!("  Cloning {url}...");
-            let repo_handle = git::clone_repo(url, &dest, git_ref.as_deref())
-                .with_context(|| format!("failed to clone plugin repo '{url}'"))?;
-            println!(" done");
-            if let Some(expected) = sha {
-                git::verify_sha(&repo_handle, expected)
-                    .with_context(|| format!("SHA verification failed for '{url}'"))?;
-            }
-            Ok(dest.join(path))
-        }
+        } => (
+            url.clone(),
+            Some(path.as_str()),
+            git_ref.as_deref(),
+            sha.as_deref(),
+            url.as_str(),
+        ),
+    };
+
+    // If already cloned, reuse the existing directory.
+    if dest.exists() {
+        debug!(dest = %dest.display(), "plugin already cached, reusing");
+        return Ok(match subdir {
+            Some(path) => dest.join(path),
+            None => dest,
+        });
     }
+
+    debug!(url = %url, dest = %dest.display(), "cloning plugin");
+    print!("  Cloning {label}...");
+    let repo_handle = git::clone_repo(&url, &dest, git_ref)
+        .with_context(|| format!("failed to clone plugin from '{label}'"))?;
+    println!(" done");
+
+    if let Some(expected) = sha {
+        git::verify_sha(&repo_handle, expected)
+            .with_context(|| format!("SHA verification failed for '{label}'"))?;
+    }
+
+    Ok(match subdir {
+        Some(path) => dest.join(path),
+        None => dest,
+    })
 }
 
 /// Load a `plugin.json` from the given directory, returning `None` if missing.
@@ -411,19 +384,26 @@ fn load_plugin_manifest(plugin_dir: &Path) -> Option<PluginManifest> {
                 Some(manifest)
             }
             Err(e) => {
-                debug!(
+                warn!(
                     path = %manifest_path.display(),
                     error = %e,
-                    "failed to parse plugin.json, using defaults"
+                    "plugin.json is malformed, falling back to defaults"
                 );
                 None
             }
         },
-        Err(e) => {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             debug!(
                 path = %manifest_path.display(),
-                error = %e,
                 "plugin.json not found, using defaults"
+            );
+            None
+        }
+        Err(e) => {
+            warn!(
+                path = %manifest_path.display(),
+                error = %e,
+                "failed to read plugin.json, falling back to defaults"
             );
             None
         }

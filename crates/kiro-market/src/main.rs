@@ -25,7 +25,7 @@ fn main() -> Result<()> {
 
     match &cli.command {
         cli::Command::Marketplace { action } => commands::marketplace::run(action),
-        cli::Command::Search { query } => commands::search::run(query),
+        cli::Command::Search { query } => commands::search::run(query.as_deref()),
         cli::Command::Install {
             plugin_ref,
             skill,

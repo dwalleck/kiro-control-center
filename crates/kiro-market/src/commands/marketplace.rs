@@ -131,6 +131,9 @@ fn add(source: &str) -> Result<()> {
         Marketplace::from_json(&manifest_bytes).context("failed to parse marketplace manifest")?;
 
     let name = manifest.name.clone();
+    kiro_market_core::validation::validate_name(&name).with_context(|| {
+        format!("marketplace manifest contains invalid name '{name}'")
+    })?;
     let plugin_count = manifest.plugins.len();
 
     // Rename temp dir to the real marketplace name.
@@ -169,6 +172,8 @@ fn add(source: &str) -> Result<()> {
         if plugin_count == 1 { "" } else { "s" }
     );
 
+    print_available_plugins(&manifest.plugins, &name);
+
     Ok(())
 }
 
@@ -191,6 +196,28 @@ fn resolve_local_path(path_str: &str) -> Result<std::path::PathBuf> {
     expanded
         .canonicalize()
         .with_context(|| format!("failed to resolve path: {path_str}"))
+}
+
+/// Print the list of available plugins after adding a marketplace.
+fn print_available_plugins(plugins: &[kiro_market_core::marketplace::PluginEntry], marketplace_name: &str) {
+    if plugins.is_empty() {
+        return;
+    }
+
+    println!();
+    println!("  {}", "Available plugins:".bold());
+    for plugin in plugins {
+        let desc = plugin
+            .description
+            .as_deref()
+            .unwrap_or("(no description)");
+        println!("    {} - {}", plugin.name.green(), desc);
+    }
+    println!();
+    println!(
+        "  Install with: {}",
+        format!("kiro-market install <plugin>@{marketplace_name}").bold()
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -252,6 +279,8 @@ fn update(name: Option<&str>) -> Result<()> {
         entries.iter().collect()
     };
 
+    let mut failures = 0u32;
+
     for entry in &targets {
         let mp_path = cache.marketplace_path(&entry.name);
 
@@ -269,8 +298,16 @@ fn update(name: Option<&str>) -> Result<()> {
             }
             Err(e) => {
                 println!(" {}: {}", "failed".red(), e);
+                failures += 1;
             }
         }
+    }
+
+    if failures > 0 {
+        bail!(
+            "{failures} marketplace{} failed to update",
+            if failures == 1 { "" } else { "s" }
+        );
     }
 
     Ok(())
