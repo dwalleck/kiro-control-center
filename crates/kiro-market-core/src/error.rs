@@ -70,6 +70,10 @@ pub enum SkillError {
     #[error("skill `{name}` is already installed")]
     AlreadyInstalled { name: String },
 
+    /// The skill is not installed in the target project.
+    #[error("skill `{name}` is not installed")]
+    NotInstalled { name: String },
+
     /// No `SKILL.md` was found for the skill.
     #[error("SKILL.md not found at {path}")]
     SkillMdNotFound { path: PathBuf },
@@ -232,6 +236,10 @@ mod tests {
         SkillError::AlreadyInstalled { name: "rust-check".into() },
         "skill `rust-check` is already installed"
     )]
+    #[case::skill_not_installed(
+        SkillError::NotInstalled { name: "missing-skill".into() },
+        "skill `missing-skill` is not installed"
+    )]
     #[case::skill_md_not_found(
         SkillError::SkillMdNotFound { path: PathBuf::from("skills/rust/SKILL.md") },
         "SKILL.md not found at skills/rust/SKILL.md"
@@ -335,6 +343,20 @@ mod tests {
         };
         let err: Error = inner.into();
         assert!(matches!(err, Error::Skill(_)));
+    }
+
+    #[test]
+    fn from_not_installed_error() {
+        let inner = SkillError::NotInstalled {
+            name: "missing".into(),
+        };
+        let err: Error = inner.into();
+        assert!(matches!(err, Error::Skill(SkillError::NotInstalled { .. })));
+        assert!(
+            err.to_string().contains("not installed"),
+            "display should contain 'not installed', got: {}",
+            err
+        );
     }
 
     #[test]

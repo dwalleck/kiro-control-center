@@ -73,8 +73,8 @@ pub fn clone_repo(url: &str, dest: &Path, git_ref: Option<&str>) -> Result<Repos
 
 /// Verify the current HEAD of a repository matches the expected SHA prefix.
 ///
-/// Both full and abbreviated SHAs are supported: the check passes if either
-/// string is a prefix of the other.
+/// Both full and abbreviated SHAs are supported: the check passes if the
+/// actual commit SHA starts with the expected string.
 ///
 /// # Errors
 ///
@@ -98,7 +98,7 @@ pub fn verify_sha(repo: &Repository, expected_sha: &str) -> Result<(), GitError>
 
     let actual_str = actual_oid.to_string();
 
-    if !actual_str.starts_with(expected_sha) && !expected_sha.starts_with(&actual_str) {
+    if !actual_str.starts_with(expected_sha) {
         return Err(GitError::ShaMismatch {
             expected: expected_sha.to_owned(),
             actual: actual_str,
@@ -348,6 +348,31 @@ mod tests {
         let repo = create_local_repo(dir.path());
 
         let err = verify_sha(&repo, "0000000deadbeef").expect_err("should fail on wrong SHA");
+
+        assert!(
+            matches!(err, GitError::ShaMismatch { .. }),
+            "expected ShaMismatch, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn verify_sha_rejects_expected_longer_than_actual_prefix() {
+        // Regression: the old bidirectional check would pass if the expected
+        // SHA *started with* the actual SHA (backwards logic). This test
+        // constructs an expected string that begins with the real prefix but
+        // has wrong trailing characters.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let repo = create_local_repo(dir.path());
+
+        let head_oid = repo.head().expect("HEAD").target().expect("target");
+        let actual_str = head_oid.to_string();
+        let prefix = &actual_str[..7];
+
+        // Build a fake expected that starts with the real prefix but diverges.
+        let fake_expected = format!("{prefix}ffffffffffffffffffffffffffffffff0");
+
+        let err = verify_sha(&repo, &fake_expected)
+            .expect_err("should reject when expected extends actual with wrong chars");
 
         assert!(
             matches!(err, GitError::ShaMismatch { .. }),

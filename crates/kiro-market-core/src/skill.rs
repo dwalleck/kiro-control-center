@@ -36,14 +36,6 @@ pub struct SkillFrontmatter {
     pub invocable: bool,
 }
 
-/// A fully parsed skill with both metadata and content.
-#[derive(Debug, Clone)]
-pub struct Skill {
-    pub name: String,
-    pub description: String,
-    pub content: String,
-}
-
 /// Parse YAML frontmatter from a `SKILL.md` file.
 ///
 /// Returns the parsed [`SkillFrontmatter`] together with the **byte offset**

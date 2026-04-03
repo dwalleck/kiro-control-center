@@ -1,6 +1,10 @@
 [workspace]
 resolver = "2"
-members = ["crates/kiro-market-core", "crates/kiro-market"]
+members = [
+    "crates/kiro-market-core",
+    "crates/kiro-market",
+    "crates/kiro-control-center/src-tauri",
+]
 
 [workspace.package]
 version = "0.1.0"

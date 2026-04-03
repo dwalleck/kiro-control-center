@@ -8,7 +8,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
-use tracing::debug;
+use tracing::{debug, warn};
 
 /// A plugin manifest as found in `plugin.json`.
 #[derive(Debug, Clone, Deserialize)]
@@ -50,13 +50,33 @@ pub fn discover_skill_dirs(plugin_root: &Path, skill_paths: &[&str]) -> Vec<Path
     let mut dirs = Vec::new();
 
     for &path_str in skill_paths {
+        if let Err(e) = crate::validation::validate_relative_path(path_str) {
+            warn!(
+                path = path_str,
+                error = %e,
+                "skipping skill path that fails validation"
+            );
+            continue;
+        }
+
         let candidate = plugin_root.join(path_str);
 
         if path_str.ends_with('/') {
             // Scan subdirectories for those containing SKILL.md.
             match fs::read_dir(&candidate) {
                 Ok(entries) => {
-                    for entry in entries.filter_map(Result::ok) {
+                    for entry in entries {
+                        let entry = match entry {
+                            Ok(e) => e,
+                            Err(e) => {
+                                warn!(
+                                    path = %candidate.display(),
+                                    error = %e,
+                                    "failed to read directory entry, skipping"
+                                );
+                                continue;
+                            }
+                        };
                         let entry_path = entry.path();
                         if entry_path.is_dir() && entry_path.join(SKILL_MD).exists() {
                             dirs.push(entry_path);
@@ -212,5 +232,41 @@ mod tests {
 
         let dirs = discover_skill_dirs(root, &["./nonexistent/"]);
         assert!(dirs.is_empty(), "should return empty for missing directory");
+    }
+
+    #[test]
+    fn discover_skills_rejects_path_traversal() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+
+        // Create a valid skill alongside the traversal attempt.
+        create_skill_md(&root.join("skills/legit"));
+
+        // The traversal path should be skipped; the valid one should still be found.
+        let dirs = discover_skill_dirs(root, &["../../etc/passwd", "./skills/legit"]);
+
+        assert_eq!(dirs.len(), 1, "traversal path should be skipped");
+        assert!(
+            dirs[0].ends_with("legit"),
+            "only the valid skill should be returned, got {:?}",
+            dirs[0]
+        );
+    }
+
+    #[test]
+    fn discover_skills_rejects_absolute_path() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+
+        create_skill_md(&root.join("skills/safe"));
+
+        let dirs = discover_skill_dirs(root, &["/etc/passwd", "./skills/safe"]);
+
+        assert_eq!(dirs.len(), 1, "absolute path should be skipped");
+        assert!(
+            dirs[0].ends_with("safe"),
+            "only the valid skill should be returned, got {:?}",
+            dirs[0]
+        );
     }
 }

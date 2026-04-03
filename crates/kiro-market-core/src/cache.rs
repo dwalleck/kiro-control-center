@@ -34,6 +34,76 @@ pub enum MarketplaceSource {
     LocalPath { path: String },
 }
 
+impl MarketplaceSource {
+    /// Classify a user-provided source string into a `MarketplaceSource`.
+    ///
+    /// Heuristics:
+    /// - Starts with `http://`, `https://`, or `git@` → `GitUrl`
+    /// - Starts with `/`, `./`, `../`, or `~` → `LocalPath`
+    /// - Anything else → `GitHub` (owner/repo shorthand)
+    #[must_use]
+    pub fn detect(source: &str) -> Self {
+        if source.starts_with("http://")
+            || source.starts_with("https://")
+            || source.starts_with("git@")
+        {
+            Self::GitUrl {
+                url: source.to_owned(),
+            }
+        } else if source.starts_with('/')
+            || source.starts_with("./")
+            || source.starts_with("../")
+            || source.starts_with('~')
+        {
+            Self::LocalPath {
+                path: source.to_owned(),
+            }
+        } else {
+            Self::GitHub {
+                repo: source.to_owned(),
+            }
+        }
+    }
+
+    /// Return a human-readable label for this source type.
+    #[must_use]
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::GitHub { .. } => "github",
+            Self::GitUrl { .. } => "git",
+            Self::LocalPath { .. } => "local",
+        }
+    }
+}
+
+/// Resolve a local path string to an absolute path.
+///
+/// Handles `~` expansion (via `dirs::home_dir()`) and canonicalization.
+///
+/// # Errors
+///
+/// Returns an I/O error if the home directory cannot be determined or the
+/// path cannot be canonicalized (e.g. does not exist).
+pub fn resolve_local_path(path_str: &str) -> std::io::Result<PathBuf> {
+    let expanded = if let Some(rest) = path_str.strip_prefix('~') {
+        let home = dirs::home_dir().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "could not determine home directory for ~ expansion",
+            )
+        })?;
+        if rest.is_empty() {
+            home
+        } else {
+            home.join(rest.trim_start_matches('/'))
+        }
+    } else {
+        PathBuf::from(path_str)
+    };
+
+    expanded.canonicalize()
+}
+
 /// An entry in the known-marketplaces registry.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KnownMarketplace {
@@ -453,5 +523,87 @@ mod tests {
             serde_json::from_slice(&raw).expect("registry should be valid JSON");
         assert_eq!(parsed.len(), 1);
         assert_eq!(parsed[0].name, "atomic-test");
+    }
+
+    // -----------------------------------------------------------------------
+    // MarketplaceSource::detect
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn detect_github_shorthand() {
+        let source = MarketplaceSource::detect("microsoft/dotnet-skills");
+        assert!(
+            matches!(source, MarketplaceSource::GitHub { repo } if repo == "microsoft/dotnet-skills")
+        );
+    }
+
+    #[test]
+    fn detect_https_url() {
+        let source = MarketplaceSource::detect("https://github.com/owner/repo.git");
+        assert!(
+            matches!(source, MarketplaceSource::GitUrl { url } if url == "https://github.com/owner/repo.git")
+        );
+    }
+
+    #[test]
+    fn detect_git_ssh_url() {
+        let source = MarketplaceSource::detect("git@github.com:owner/repo.git");
+        assert!(
+            matches!(source, MarketplaceSource::GitUrl { url } if url == "git@github.com:owner/repo.git")
+        );
+    }
+
+    #[test]
+    fn detect_http_url() {
+        let source = MarketplaceSource::detect("http://example.com/repo.git");
+        assert!(matches!(source, MarketplaceSource::GitUrl { .. }));
+    }
+
+    #[test]
+    fn detect_absolute_path() {
+        let source = MarketplaceSource::detect("/home/user/marketplace");
+        assert!(
+            matches!(source, MarketplaceSource::LocalPath { path } if path == "/home/user/marketplace")
+        );
+    }
+
+    #[test]
+    fn detect_relative_dot() {
+        let source = MarketplaceSource::detect("./my-marketplace");
+        assert!(matches!(source, MarketplaceSource::LocalPath { .. }));
+    }
+
+    #[test]
+    fn detect_relative_dotdot() {
+        let source = MarketplaceSource::detect("../other/marketplace");
+        assert!(matches!(source, MarketplaceSource::LocalPath { .. }));
+    }
+
+    #[test]
+    fn detect_tilde() {
+        let source = MarketplaceSource::detect("~/marketplaces/mine");
+        assert!(matches!(source, MarketplaceSource::LocalPath { .. }));
+    }
+
+    #[test]
+    fn label_values() {
+        assert_eq!(
+            MarketplaceSource::GitHub {
+                repo: String::new()
+            }
+            .label(),
+            "github"
+        );
+        assert_eq!(
+            MarketplaceSource::GitUrl { url: String::new() }.label(),
+            "git"
+        );
+        assert_eq!(
+            MarketplaceSource::LocalPath {
+                path: String::new()
+            }
+            .label(),
+            "local"
+        );
     }
 }

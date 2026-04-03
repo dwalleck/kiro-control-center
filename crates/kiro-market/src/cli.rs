@@ -24,8 +24,8 @@ pub enum Command {
     },
     /// Search plugins across all registered marketplaces.
     Search {
-        /// Search query string.
-        query: String,
+        /// Search query string. Lists all skills if omitted.
+        query: Option<String>,
     },
     /// Install a plugin (or a specific skill from a plugin).
     Install {

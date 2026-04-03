@@ -25,37 +25,8 @@ pub fn run(action: &MarketplaceAction) -> Result<()> {
 // Source detection
 // ---------------------------------------------------------------------------
 
-/// Classify a user-provided source string into a `MarketplaceSource`.
-fn detect_source(source: &str) -> MarketplaceSource {
-    if source.starts_with("http://") || source.starts_with("https://") || source.starts_with("git@")
-    {
-        MarketplaceSource::GitUrl {
-            url: source.to_owned(),
-        }
-    } else if source.starts_with('/')
-        || source.starts_with("./")
-        || source.starts_with("../")
-        || source.starts_with('~')
-    {
-        MarketplaceSource::LocalPath {
-            path: source.to_owned(),
-        }
-    } else {
-        // Treat as GitHub owner/repo shorthand.
-        MarketplaceSource::GitHub {
-            repo: source.to_owned(),
-        }
-    }
-}
-
-/// Return a human-readable label describing the source type.
-fn source_label(source: &MarketplaceSource) -> &str {
-    match source {
-        MarketplaceSource::GitHub { .. } => "github",
-        MarketplaceSource::GitUrl { .. } => "git",
-        MarketplaceSource::LocalPath { .. } => "local",
-    }
-}
+// detect_source and source_label are now methods on MarketplaceSource
+// in kiro_market_core::cache (MarketplaceSource::detect, .label())
 
 // ---------------------------------------------------------------------------
 // add
@@ -69,7 +40,7 @@ fn source_label(source: &MarketplaceSource) -> &str {
 /// 4. Rename the clone directory to the real marketplace name.
 /// 5. Register in `known_marketplaces.json`.
 fn add(source: &str) -> Result<()> {
-    let ms = detect_source(source);
+    let ms = MarketplaceSource::detect(source);
     let cache = CacheDir::default_location()
         .context("could not determine data directory; is $HOME set?")?;
     cache
@@ -104,7 +75,8 @@ fn add(source: &str) -> Result<()> {
             println!(" done");
         }
         MarketplaceSource::LocalPath { path } => {
-            let src = resolve_local_path(path)?;
+            let src = kiro_market_core::cache::resolve_local_path(path)
+                .with_context(|| format!("failed to resolve path: {path}"))?;
             debug!(src = %src.display(), dest = %temp_dir.display(), "symlinking local marketplace");
             #[cfg(unix)]
             std::os::unix::fs::symlink(&src, &temp_dir).with_context(|| {
@@ -131,6 +103,9 @@ fn add(source: &str) -> Result<()> {
         Marketplace::from_json(&manifest_bytes).context("failed to parse marketplace manifest")?;
 
     let name = manifest.name.clone();
+    kiro_market_core::validation::validate_name(&name).with_context(|| {
+        format!("marketplace manifest contains invalid name '{name}'")
+    })?;
     let plugin_count = manifest.plugins.len();
 
     // Rename temp dir to the real marketplace name.
@@ -169,28 +144,31 @@ fn add(source: &str) -> Result<()> {
         if plugin_count == 1 { "" } else { "s" }
     );
 
+    print_available_plugins(&manifest.plugins, &name);
+
     Ok(())
 }
 
-/// Resolve a local path string to an absolute path.
-///
-/// Handles `~` expansion and canonicalization.
-fn resolve_local_path(path_str: &str) -> Result<std::path::PathBuf> {
-    let expanded = if let Some(rest) = path_str.strip_prefix('~') {
-        let home = dirs::home_dir().context("could not determine home directory")?;
-        if rest.is_empty() {
-            home
-        } else {
-            // Strip the leading '/' from rest.
-            home.join(rest.trim_start_matches('/'))
-        }
-    } else {
-        std::path::PathBuf::from(path_str)
-    };
+/// Print the list of available plugins after adding a marketplace.
+fn print_available_plugins(plugins: &[kiro_market_core::marketplace::PluginEntry], marketplace_name: &str) {
+    if plugins.is_empty() {
+        return;
+    }
 
-    expanded
-        .canonicalize()
-        .with_context(|| format!("failed to resolve path: {path_str}"))
+    println!();
+    println!("  {}", "Available plugins:".bold());
+    for plugin in plugins {
+        let desc = plugin
+            .description
+            .as_deref()
+            .unwrap_or("(no description)");
+        println!("    {} - {}", plugin.name.green(), desc);
+    }
+    println!();
+    println!(
+        "  Install with: {}",
+        format!("kiro-market install <plugin>@{marketplace_name}").bold()
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -218,7 +196,7 @@ fn list() -> Result<()> {
         println!(
             "  {} ({})",
             entry.name.green().bold(),
-            source_label(&entry.source)
+            entry.source.label()
         );
     }
 
@@ -252,6 +230,8 @@ fn update(name: Option<&str>) -> Result<()> {
         entries.iter().collect()
     };
 
+    let mut failures = 0u32;
+
     for entry in &targets {
         let mp_path = cache.marketplace_path(&entry.name);
 
@@ -269,8 +249,16 @@ fn update(name: Option<&str>) -> Result<()> {
             }
             Err(e) => {
                 println!(" {}: {}", "failed".red(), e);
+                failures += 1;
             }
         }
+    }
+
+    if failures > 0 {
+        bail!(
+            "{failures} marketplace{} failed to update",
+            if failures == 1 { "" } else { "s" }
+        );
     }
 
     Ok(())
@@ -309,79 +297,5 @@ fn remove(name: &str) -> Result<()> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn detect_source_github_shorthand() {
-        let source = detect_source("microsoft/dotnet-skills");
-        assert!(
-            matches!(source, MarketplaceSource::GitHub { repo } if repo == "microsoft/dotnet-skills")
-        );
-    }
-
-    #[test]
-    fn detect_source_https_url() {
-        let source = detect_source("https://github.com/owner/repo.git");
-        assert!(
-            matches!(source, MarketplaceSource::GitUrl { url } if url == "https://github.com/owner/repo.git")
-        );
-    }
-
-    #[test]
-    fn detect_source_git_ssh_url() {
-        let source = detect_source("git@github.com:owner/repo.git");
-        assert!(
-            matches!(source, MarketplaceSource::GitUrl { url } if url == "git@github.com:owner/repo.git")
-        );
-    }
-
-    #[test]
-    fn detect_source_http_url() {
-        let source = detect_source("http://example.com/repo.git");
-        assert!(matches!(source, MarketplaceSource::GitUrl { .. }));
-    }
-
-    #[test]
-    fn detect_source_absolute_path() {
-        let source = detect_source("/home/user/marketplace");
-        assert!(
-            matches!(source, MarketplaceSource::LocalPath { path } if path == "/home/user/marketplace")
-        );
-    }
-
-    #[test]
-    fn detect_source_relative_dot() {
-        let source = detect_source("./my-marketplace");
-        assert!(matches!(source, MarketplaceSource::LocalPath { .. }));
-    }
-
-    #[test]
-    fn detect_source_relative_dotdot() {
-        let source = detect_source("../other/marketplace");
-        assert!(matches!(source, MarketplaceSource::LocalPath { .. }));
-    }
-
-    #[test]
-    fn detect_source_tilde() {
-        let source = detect_source("~/marketplaces/mine");
-        assert!(matches!(source, MarketplaceSource::LocalPath { .. }));
-    }
-
-    #[test]
-    fn source_label_values() {
-        assert_eq!(
-            source_label(&MarketplaceSource::GitHub {
-                repo: String::new()
-            }),
-            "github"
-        );
-        assert_eq!(
-            source_label(&MarketplaceSource::GitUrl { url: String::new() }),
-            "git"
-        );
-        assert_eq!(
-            source_label(&MarketplaceSource::LocalPath {
-                path: String::new()
-            }),
-            "local"
-        );
-    }
+    // detect_source and source_label tests moved to kiro-market-core::cache::tests
 }

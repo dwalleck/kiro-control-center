@@ -6,7 +6,7 @@ use std::path::Path;
 use anyhow::{Context, Result, bail};
 use colored::Colorize;
 use kiro_market_core::cache::CacheDir;
-use kiro_market_core::marketplace::{Marketplace, PluginEntry, PluginSource, StructuredSource};
+use kiro_market_core::marketplace::{PluginEntry, PluginSource, StructuredSource};
 use kiro_market_core::plugin::discover_skill_dirs;
 use kiro_market_core::skill::parse_frontmatter;
 use tracing::debug;
@@ -33,7 +33,8 @@ pub fn run(plugin_ref: &str) -> Result<()> {
         );
     }
 
-    let plugin_entry = find_plugin_entry(&marketplace_path, plugin_name, marketplace_name)?;
+    let plugin_entry =
+        super::common::find_plugin_entry(&marketplace_path, plugin_name, marketplace_name)?;
 
     print_plugin_details(&plugin_entry, marketplace_name);
     print_source_info(&plugin_entry.source);
@@ -43,31 +44,6 @@ pub fn run(plugin_ref: &str) -> Result<()> {
     }
 
     Ok(())
-}
-
-/// Read the marketplace manifest and find the matching plugin entry.
-fn find_plugin_entry(
-    marketplace_path: &Path,
-    plugin_name: &str,
-    marketplace_name: &str,
-) -> Result<PluginEntry> {
-    let manifest_path = marketplace_path.join(kiro_market_core::MARKETPLACE_MANIFEST_PATH);
-    let manifest_bytes = fs::read(&manifest_path).with_context(|| {
-        format!(
-            "failed to read marketplace manifest at {}",
-            manifest_path.display()
-        )
-    })?;
-    let manifest =
-        Marketplace::from_json(&manifest_bytes).context("failed to parse marketplace manifest")?;
-
-    manifest
-        .plugins
-        .into_iter()
-        .find(|p| p.name == plugin_name)
-        .with_context(|| {
-            format!("plugin '{plugin_name}' not found in marketplace '{marketplace_name}'")
-        })
 }
 
 /// Print the basic plugin details header.
@@ -131,7 +107,7 @@ fn print_skills(plugin_dir: &Path) {
         return;
     }
 
-    let skill_paths = load_skill_paths(plugin_dir);
+    let skill_paths = super::common::load_skill_paths(plugin_dir);
     let skill_path_refs: Vec<&str> = skill_paths.iter().map(String::as_str).collect();
     let skill_dirs = discover_skill_dirs(plugin_dir, &skill_path_refs);
 
@@ -144,12 +120,28 @@ fn print_skills(plugin_dir: &Path) {
 
     for skill_dir in &skill_dirs {
         let skill_md_path = skill_dir.join("SKILL.md");
-        let Ok(content) = fs::read_to_string(&skill_md_path) else {
-            continue;
+        let content = match fs::read_to_string(&skill_md_path) {
+            Ok(c) => c,
+            Err(e) => {
+                debug!(
+                    path = %skill_md_path.display(),
+                    error = %e,
+                    "failed to read SKILL.md, skipping"
+                );
+                continue;
+            }
         };
 
-        let Ok((frontmatter, _)) = parse_frontmatter(&content) else {
-            continue;
+        let frontmatter = match parse_frontmatter(&content) {
+            Ok((fm, _)) => fm,
+            Err(e) => {
+                debug!(
+                    path = %skill_md_path.display(),
+                    error = %e,
+                    "failed to parse SKILL.md frontmatter, skipping"
+                );
+                continue;
+            }
         };
 
         println!(
@@ -157,23 +149,5 @@ fn print_skills(plugin_dir: &Path) {
             frontmatter.name.green(),
             frontmatter.description
         );
-    }
-}
-
-/// Load skill paths from a plugin's `plugin.json`, falling back to defaults.
-fn load_skill_paths(plugin_dir: &Path) -> Vec<String> {
-    let manifest_path = plugin_dir.join("plugin.json");
-    match fs::read(&manifest_path) {
-        Ok(bytes) => match kiro_market_core::plugin::PluginManifest::from_json(&bytes) {
-            Ok(manifest) if !manifest.skills.is_empty() => manifest.skills,
-            _ => kiro_market_core::DEFAULT_SKILL_PATHS
-                .iter()
-                .map(|&s| s.to_owned())
-                .collect(),
-        },
-        Err(_) => kiro_market_core::DEFAULT_SKILL_PATHS
-            .iter()
-            .map(|&s| s.to_owned())
-            .collect(),
     }
 }
