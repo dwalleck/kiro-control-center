@@ -1,9 +1,12 @@
+# Configuration for cargo-deny
+# https://embarkstudios.github.io/cargo-deny/
+
 [advisories]
-vulnerability = "deny"
+db-path = "~/.cargo/advisory-db"
+db-urls = ["https://github.com/rustsec/advisory-db"]
 ignore = []
 
 [licenses]
-unlicensed = "deny"
 allow = [
     "MIT",
     "MIT-0",
@@ -31,4 +34,3 @@ wildcards = "allow"
 unknown-registry = "deny"
 unknown-git = "warn"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
-allow-git = []
