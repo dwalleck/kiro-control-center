@@ -15,6 +15,31 @@ use tracing::debug;
 
 use crate::error::GitError;
 
+/// Default SSH connect timeout in seconds applied via `GIT_SSH_COMMAND`.
+const SSH_CONNECT_TIMEOUT_SECS: u32 = 30;
+
+/// Run a `git` command with SSH connect-timeout protection.
+///
+/// Sets `GIT_SSH_COMMAND` with a 30-second `ConnectTimeout` to prevent
+/// indefinite hangs when SSH port 22 is firewalled. Detects a missing
+/// `git` binary and returns [`GitError::GitNotFound`].
+fn run_git(args: &[&str], dir: &Path) -> Result<std::process::Output, GitError> {
+    let ssh_cmd = format!("ssh -o ConnectTimeout={SSH_CONNECT_TIMEOUT_SECS}");
+
+    Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .env("GIT_SSH_COMMAND", &ssh_cmd)
+        .output()
+        .map_err(|e| match e.kind() {
+            std::io::ErrorKind::NotFound => GitError::GitNotFound,
+            _ => GitError::GitCommandFailed {
+                dir: dir.to_path_buf(),
+                source: Box::new(e),
+            },
+        })
+}
+
 /// Which transport protocol to use when cloning from a shorthand host
 /// reference (e.g. `owner/repo`).
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -77,12 +102,7 @@ pub fn clone_repo(url: &str, dest: &Path, git_ref: Option<&str>) -> Result<(), G
         .map_err(|e| map_err(Box::new(e)))?;
 
     if let Some(refname) = git_ref {
-        let output = Command::new("git")
-            .args(["-C"])
-            .arg(dest)
-            .args(["checkout", refname])
-            .output()
-            .map_err(|e| map_err(Box::new(e)))?;
+        let output = run_git(&["checkout", "--", refname], dest)?;
 
         if !output.status.success() {
             let stderr = String::from_utf8_lossy(&output.stderr);

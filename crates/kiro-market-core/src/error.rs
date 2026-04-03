@@ -122,6 +122,18 @@ pub enum GitError {
     /// The checked-out commit SHA does not match the expected pinned SHA.
     #[error("SHA mismatch: expected {expected}, got {actual}")]
     ShaMismatch { expected: String, actual: String },
+
+    /// The `git` command-line tool was not found in `$PATH`.
+    #[error("the 'git' command-line tool is required but was not found in PATH")]
+    GitNotFound,
+
+    /// A `git` subprocess failed to launch (not a missing binary).
+    #[error("git command failed in {dir}")]
+    GitCommandFailed {
+        dir: PathBuf,
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
 }
 
 // ---------------------------------------------------------------------------
