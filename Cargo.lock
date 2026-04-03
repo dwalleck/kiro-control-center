@@ -2093,6 +2093,7 @@ dependencies = [
  "clap",
  "colored",
  "dirs",
+ "git2",
  "kiro-market-core",
  "rstest",
  "tempfile",
@@ -2105,6 +2106,7 @@ name = "kiro-market-core"
 version = "0.1.0"
 dependencies = [
  "chrono",
+ "clap",
  "dirs",
  "git2",
  "pulldown-cmark",
@@ -2112,6 +2114,7 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
+ "specta",
  "tempfile",
  "thiserror 2.0.18",
  "tracing",

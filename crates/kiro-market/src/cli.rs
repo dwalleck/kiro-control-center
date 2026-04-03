@@ -1,6 +1,7 @@
 //! Command-line argument definitions using `clap` derive API.
 
 use clap::{Parser, Subcommand};
+use kiro_market_core::git::GitProtocol;
 
 /// Install Claude Code marketplace skills into Kiro CLI projects.
 #[derive(Parser, Debug)]
@@ -64,6 +65,9 @@ pub enum MarketplaceAction {
     Add {
         /// Source string: `owner/repo`, a git URL, or a local path.
         source: String,
+        /// Git protocol for GitHub sources (https or ssh). Defaults to https.
+        #[arg(long, value_enum, default_value_t = GitProtocol::Https)]
+        protocol: GitProtocol,
     },
     /// List all registered marketplaces.
     List,
@@ -119,5 +123,45 @@ mod tests {
     fn parse_plugin_ref_empty_parts() {
         assert_eq!(parse_plugin_ref("@marketplace"), None);
         assert_eq!(parse_plugin_ref("plugin@"), None);
+    }
+
+    #[test]
+    fn marketplace_add_defaults_to_https() {
+        let cli = Cli::try_parse_from([
+            "kiro-market",
+            "marketplace",
+            "add",
+            "owner/repo",
+        ])
+        .expect("should parse");
+        match cli.command {
+            Command::Marketplace {
+                action: MarketplaceAction::Add { protocol, .. },
+            } => {
+                assert_eq!(protocol, GitProtocol::Https);
+            }
+            _ => panic!("expected Marketplace Add"),
+        }
+    }
+
+    #[test]
+    fn marketplace_add_accepts_protocol_ssh() {
+        let cli = Cli::try_parse_from([
+            "kiro-market",
+            "marketplace",
+            "add",
+            "owner/repo",
+            "--protocol",
+            "ssh",
+        ])
+        .expect("should parse");
+        match cli.command {
+            Command::Marketplace {
+                action: MarketplaceAction::Add { protocol, .. },
+            } => {
+                assert_eq!(protocol, GitProtocol::Ssh);
+            }
+            _ => panic!("expected Marketplace Add"),
+        }
     }
 }

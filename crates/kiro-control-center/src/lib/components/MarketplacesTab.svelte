@@ -1,9 +1,10 @@
 <script lang="ts">
   import { commands } from "$lib/bindings";
-  import type { MarketplaceInfo } from "$lib/bindings";
+  import type { MarketplaceInfo, GitProtocol } from "$lib/bindings";
 
   let marketplaces: MarketplaceInfo[] = $state([]);
   let newSource: string = $state("");
+  let protocol: GitProtocol = $state("https");
 
   let loading: boolean = $state(false);
   let adding: boolean = $state(false);
@@ -32,7 +33,7 @@
     error = null;
     successMessage = null;
 
-    const result = await commands.addMarketplace(source);
+    const result = await commands.addMarketplace(source, protocol);
     if (result.status === "ok") {
       const { name, plugins } = result.data;
       successMessage = `Added "${name}" with ${plugins.length} plugin${plugins.length === 1 ? "" : "s"}`;
@@ -116,6 +117,14 @@
         disabled={adding}
         class="flex-1 px-3 py-2 text-sm rounded-md border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-800 text-gray-900 dark:text-gray-100 placeholder-gray-400 dark:placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent disabled:opacity-50"
       />
+      <select
+        bind:value={protocol}
+        disabled={adding}
+        class="px-3 py-2 text-sm rounded-md border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-800 text-gray-900 dark:text-gray-100 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent disabled:opacity-50"
+      >
+        <option value="https">HTTPS</option>
+        <option value="ssh">SSH</option>
+      </select>
       <button
         type="submit"
         disabled={adding || !newSource.trim()}

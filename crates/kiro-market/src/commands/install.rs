@@ -7,6 +7,7 @@ use anyhow::{Context, Result, bail};
 use chrono::Utc;
 use colored::Colorize;
 use kiro_market_core::cache::CacheDir;
+use kiro_market_core::git::GitProtocol;
 use kiro_market_core::error::{Error as CoreError, SkillError};
 use kiro_market_core::git;
 use kiro_market_core::marketplace::{PluginEntry, PluginSource, StructuredSource};
@@ -44,10 +45,33 @@ pub fn run(plugin_ref: &str, skill_filter: Option<&str>, force: bool) -> Result<
         );
     }
 
+    // Look up the stored protocol preference for this marketplace.
+    let protocol = match cache.load_known_marketplaces() {
+        Ok(entries) => entries
+            .into_iter()
+            .find(|e| e.name == marketplace_name)
+            .and_then(|e| e.protocol)
+            .unwrap_or_default(),
+        Err(e) => {
+            warn!(
+                marketplace = marketplace_name,
+                error = %e,
+                "failed to load marketplace registry; defaulting to HTTPS protocol"
+            );
+            GitProtocol::default()
+        }
+    };
+
     let plugin_entry =
         super::common::find_plugin_entry(&marketplace_path, plugin_name, marketplace_name)?;
 
-    let plugin_dir = resolve_plugin_dir(&plugin_entry, &marketplace_path, &cache, marketplace_name)
+    let plugin_dir = resolve_plugin_dir(
+        &plugin_entry,
+        &marketplace_path,
+        &cache,
+        marketplace_name,
+        protocol,
+    )
         .with_context(|| format!("failed to resolve plugin directory for '{plugin_name}'"))?;
 
     debug!(plugin_dir = %plugin_dir.display(), "resolved plugin directory");
@@ -294,6 +318,7 @@ fn resolve_plugin_dir(
     marketplace_path: &Path,
     cache: &CacheDir,
     marketplace_name: &str,
+    protocol: GitProtocol,
 ) -> Result<PathBuf> {
     match &entry.source {
         PluginSource::RelativePath(rel) => {
@@ -304,7 +329,7 @@ fn resolve_plugin_dir(
             Ok(resolved)
         }
         PluginSource::Structured(structured) => {
-            resolve_structured_source(structured, cache, marketplace_name, &entry.name)
+            resolve_structured_source(structured, cache, marketplace_name, &entry.name, protocol)
         }
     }
 }
@@ -315,6 +340,7 @@ fn resolve_structured_source(
     cache: &CacheDir,
     marketplace_name: &str,
     plugin_name: &str,
+    protocol: GitProtocol,
 ) -> Result<PathBuf> {
     cache
         .ensure_dirs()
@@ -325,7 +351,7 @@ fn resolve_structured_source(
     // Extract the varying parts from each source variant.
     let (url, subdir, git_ref, sha, label) = match source {
         StructuredSource::GitHub { repo, git_ref, sha } => (
-            git::github_repo_to_url(repo),
+            git::github_repo_to_url(repo, protocol),
             None,
             git_ref.as_deref(),
             sha.as_deref(),

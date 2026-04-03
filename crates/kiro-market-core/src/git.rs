@@ -6,15 +6,42 @@
 use std::path::Path;
 
 use git2::{Cred, FetchOptions, RemoteCallbacks, Repository};
+use serde::{Deserialize, Serialize};
 use tracing::debug;
 
 use crate::error::GitError;
 
-/// Convert a GitHub `owner/repo` shorthand into a full HTTPS clone URL.
-#[must_use]
-pub fn github_repo_to_url(repo: &str) -> String {
-    format!("https://github.com/{repo}.git")
+/// Which transport protocol to use when cloning from a shorthand host
+/// reference (e.g. `owner/repo`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "cli", derive(clap::ValueEnum))]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
+#[serde(rename_all = "lowercase")]
+pub enum GitProtocol {
+    /// Clone via HTTPS (works through firewalls, uses credential helpers).
+    #[default]
+    Https,
+    /// Clone via SSH (uses SSH agent / keys).
+    Ssh,
 }
+
+/// Convert a GitHub `owner/repo` shorthand into a clone URL using the
+/// specified protocol.
+#[must_use]
+pub fn github_repo_to_url(repo: &str, protocol: GitProtocol) -> String {
+    match protocol {
+        GitProtocol::Https => format!("https://github.com/{repo}.git"),
+        GitProtocol::Ssh => format!("git@github.com:{repo}.git"),
+    }
+}
+
+/// Default timeout (in milliseconds) for the initial TCP connection to a
+/// git server. Prevents infinite hangs when SSH port 22 is firewalled.
+///
+/// Binary crates should call
+/// `git2::opts::set_server_connect_timeout_in_milliseconds` with this
+/// value at startup.
+pub const CONNECT_TIMEOUT_MS: i32 = 30_000;
 
 /// Build fetch options with credential callbacks for SSH agent and git
 /// credential helpers.
@@ -292,10 +319,43 @@ mod tests {
     }
 
     #[test]
-    fn github_repo_to_url_formats_correctly() {
+    fn github_repo_to_url_https() {
         assert_eq!(
-            github_repo_to_url("owner/repo"),
+            github_repo_to_url("owner/repo", GitProtocol::Https),
             "https://github.com/owner/repo.git"
+        );
+    }
+
+    #[test]
+    fn github_repo_to_url_ssh() {
+        assert_eq!(
+            github_repo_to_url("owner/repo", GitProtocol::Ssh),
+            "git@github.com:owner/repo.git"
+        );
+    }
+
+    #[test]
+    fn git_protocol_default_is_https() {
+        assert_eq!(GitProtocol::default(), GitProtocol::Https);
+    }
+
+    #[test]
+    fn git_protocol_serde_roundtrip() {
+        assert_eq!(
+            serde_json::to_string(&GitProtocol::Https).expect("serialize"),
+            "\"https\""
+        );
+        assert_eq!(
+            serde_json::to_string(&GitProtocol::Ssh).expect("serialize"),
+            "\"ssh\""
+        );
+        assert_eq!(
+            serde_json::from_str::<GitProtocol>("\"https\"").expect("deserialize"),
+            GitProtocol::Https
+        );
+        assert_eq!(
+            serde_json::from_str::<GitProtocol>("\"ssh\"").expect("deserialize"),
+            GitProtocol::Ssh
         );
     }
 

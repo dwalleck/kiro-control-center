@@ -8,6 +8,11 @@ description = "Core library for kiro-market: Claude Code marketplace skill insta
 [lints]
 workspace = true
 
+[features]
+default = []
+cli = ["clap"]
+specta = ["dep:specta"]
+
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }
@@ -18,6 +23,8 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 dirs = { workspace = true }
 chrono = { workspace = true }
+clap = { workspace = true, optional = true }
+specta = { version = "2.0.0-rc.20", optional = true }
 
 [dev-dependencies]
 rstest = { workspace = true }

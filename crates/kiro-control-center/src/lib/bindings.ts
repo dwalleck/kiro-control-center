@@ -93,9 +93,9 @@ async removeSkill(name: string, projectPath: string) : Promise<Result<null, Comm
  * 5. Register in `known_marketplaces.json`.
  * 6. Return the name and discovered plugins.
  */
-async addMarketplace(source: string) : Promise<Result<MarketplaceAddResult, CommandError>> {
+async addMarketplace(source: string, protocol: GitProtocol | null) : Promise<Result<MarketplaceAddResult, CommandError>> {
     try {
-    return { status: "ok", data: await TAURI_INVOKE("add_marketplace", { source }) };
+    return { status: "ok", data: await TAURI_INVOKE("add_marketplace", { source, protocol }) };
 } catch (e) {
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
@@ -161,6 +161,19 @@ export type FailedSkill = { name: string; error: string }
  * A marketplace that failed to update, with the reason.
  */
 export type FailedUpdate = { name: string; error: string }
+/**
+ * Which transport protocol to use when cloning from a shorthand host
+ * reference (e.g. `owner/repo`).
+ */
+export type GitProtocol = 
+/**
+ * Clone via HTTPS (works through firewalls, uses credential helpers).
+ */
+"https" | 
+/**
+ * Clone via SSH (uses SSH agent / keys).
+ */
+"ssh"
 /**
  * Result of an install operation across multiple skills.
  */

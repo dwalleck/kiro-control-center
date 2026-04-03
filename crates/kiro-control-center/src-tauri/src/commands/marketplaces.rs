@@ -6,7 +6,7 @@ use serde::Serialize;
 use tracing::{debug, warn};
 
 use kiro_market_core::cache::{self, CacheDir, KnownMarketplace, MarketplaceSource};
-use kiro_market_core::git;
+use kiro_market_core::git::{self, GitProtocol};
 use kiro_market_core::marketplace::Marketplace;
 use kiro_market_core::validation;
 
@@ -75,7 +75,12 @@ fn get_cache() -> Result<CacheDir, CommandError> {
 /// 6. Return the name and discovered plugins.
 #[tauri::command]
 #[specta::specta]
-pub async fn add_marketplace(source: String) -> Result<MarketplaceAddResult, CommandError> {
+pub async fn add_marketplace(
+    source: String,
+    protocol: Option<GitProtocol>,
+) -> Result<MarketplaceAddResult, CommandError> {
+    let protocol = protocol.unwrap_or_default();
+    debug!(protocol = ?protocol, "resolved git protocol for marketplace add");
     let ms = MarketplaceSource::detect(&source);
     let cache = get_cache()?;
     cache.ensure_dirs().map_err(|e| {
@@ -102,13 +107,16 @@ pub async fn add_marketplace(source: String) -> Result<MarketplaceAddResult, Com
 
     match &ms {
         MarketplaceSource::GitHub { repo } => {
-            let url = git::github_repo_to_url(repo);
+            let url = git::github_repo_to_url(repo, protocol);
             debug!(url = %url, dest = %temp_dir.display(), "cloning GitHub marketplace");
             git::clone_repo(&url, &temp_dir, None).map_err(|e| {
                 CommandError::new(format!("failed to clone {repo}: {e}"), ErrorType::GitError)
             })?;
         }
         MarketplaceSource::GitUrl { url } => {
+            if protocol != GitProtocol::default() {
+                warn!("protocol parameter ignored for full git URL; the URL's own scheme is used");
+            }
             debug!(url = %url, dest = %temp_dir.display(), "cloning git marketplace");
             git::clone_repo(url, &temp_dir, None).map_err(|e| {
                 CommandError::new(format!("failed to clone {url}: {e}"), ErrorType::GitError)
@@ -196,6 +204,7 @@ pub async fn add_marketplace(source: String) -> Result<MarketplaceAddResult, Com
     let entry = KnownMarketplace {
         name: name.clone(),
         source: ms,
+        protocol: Some(protocol),
         added_at: chrono::Utc::now(),
     };
     cache

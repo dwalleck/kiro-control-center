@@ -9,8 +9,9 @@ description = "CLI tool to install Claude Code marketplace skills into Kiro CLI 
 workspace = true
 
 [dependencies]
-kiro-market-core = { workspace = true }
+kiro-market-core = { workspace = true, features = ["cli"] }
 clap = { workspace = true }
+git2 = { workspace = true }
 anyhow = { workspace = true }
 colored = { workspace = true }
 tracing = { workspace = true }

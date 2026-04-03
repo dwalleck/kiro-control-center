@@ -13,6 +13,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::error::MarketplaceError;
+use crate::git::GitProtocol;
 use crate::validation;
 
 // ---------------------------------------------------------------------------
@@ -109,6 +110,10 @@ pub fn resolve_local_path(path_str: &str) -> std::io::Result<PathBuf> {
 pub struct KnownMarketplace {
     pub name: String,
     pub source: MarketplaceSource,
+    /// Git protocol used when cloning GitHub shorthand sources.
+    /// `None` for entries created before protocol selection was added.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub protocol: Option<GitProtocol>,
     pub added_at: DateTime<Utc>,
 }
 
@@ -323,6 +328,7 @@ mod tests {
             source: MarketplaceSource::GitHub {
                 repo: "owner/repo".into(),
             },
+            protocol: None,
             added_at: Utc::now(),
         };
 
@@ -353,6 +359,7 @@ mod tests {
             source: MarketplaceSource::GitUrl {
                 url: "https://example.com/repo.git".into(),
             },
+            protocol: None,
             added_at: Utc::now(),
         };
 
@@ -390,6 +397,7 @@ mod tests {
             source: MarketplaceSource::LocalPath {
                 path: "/tmp/market".into(),
             },
+            protocol: None,
             added_at: Utc::now(),
         };
 
@@ -432,6 +440,7 @@ mod tests {
             source: MarketplaceSource::GitHub {
                 repo: "evil/repo".into(),
             },
+            protocol: None,
             added_at: Utc::now(),
         };
 
@@ -455,6 +464,7 @@ mod tests {
             source: MarketplaceSource::GitHub {
                 repo: "evil/repo".into(),
             },
+            protocol: None,
             added_at: Utc::now(),
         };
 
@@ -511,6 +521,7 @@ mod tests {
             source: MarketplaceSource::GitHub {
                 repo: "owner/repo".into(),
             },
+            protocol: None,
             added_at: Utc::now(),
         };
 
@@ -523,6 +534,19 @@ mod tests {
             serde_json::from_slice(&raw).expect("registry should be valid JSON");
         assert_eq!(parsed.len(), 1);
         assert_eq!(parsed[0].name, "atomic-test");
+    }
+
+    #[test]
+    fn known_marketplace_deserializes_without_protocol_field() {
+        let json = r#"{
+            "name": "legacy-market",
+            "source": {"type": "github", "repo": "owner/repo"},
+            "added_at": "2025-01-01T00:00:00Z"
+        }"#;
+        let entry: KnownMarketplace =
+            serde_json::from_str(json).expect("should deserialize without protocol");
+        assert_eq!(entry.name, "legacy-market");
+        assert!(entry.protocol.is_none());
     }
 
     // -----------------------------------------------------------------------

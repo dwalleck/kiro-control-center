@@ -14,7 +14,7 @@ license = "MIT"
 repository = "https://github.com/dwalleck/kiro-marketplace-cli"
 
 [workspace.lints.rust]
-unsafe_code = "forbid"
+unsafe_code = "deny"
 
 [workspace.lints.clippy]
 all = "warn"

@@ -7,14 +7,14 @@ use colored::Colorize;
 use kiro_market_core::cache::{CacheDir, KnownMarketplace, MarketplaceSource};
 use kiro_market_core::git;
 use kiro_market_core::marketplace::Marketplace;
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::cli::MarketplaceAction;
 
 /// Dispatch to the appropriate marketplace subcommand.
 pub fn run(action: &MarketplaceAction) -> Result<()> {
     match action {
-        MarketplaceAction::Add { source } => add(source),
+        MarketplaceAction::Add { source, protocol } => add(source, *protocol),
         MarketplaceAction::List => list(),
         MarketplaceAction::Update { name } => update(name.as_deref()),
         MarketplaceAction::Remove { name } => remove(name),
@@ -37,9 +37,10 @@ pub fn run(action: &MarketplaceAction) -> Result<()> {
 /// 1. Detect source type (GitHub, git URL, local path).
 /// 2. Clone (or symlink for local paths) into the cache.
 /// 3. Read the marketplace manifest to discover the real name.
-/// 4. Rename the clone directory to the real marketplace name.
-/// 5. Register in `known_marketplaces.json`.
-fn add(source: &str) -> Result<()> {
+/// 4. Validate the marketplace name.
+/// 5. Rename the clone directory to the real marketplace name.
+/// 6. Register in `known_marketplaces.json`.
+fn add(source: &str, protocol: git::GitProtocol) -> Result<()> {
     let ms = MarketplaceSource::detect(source);
     let cache = CacheDir::default_location()
         .context("could not determine data directory; is $HOME set?")?;
@@ -60,7 +61,7 @@ fn add(source: &str) -> Result<()> {
 
     match &ms {
         MarketplaceSource::GitHub { repo } => {
-            let url = git::github_repo_to_url(repo);
+            let url = git::github_repo_to_url(repo, protocol);
             debug!(url = %url, dest = %temp_dir.display(), "cloning GitHub marketplace");
             print!("  Cloning {repo}...");
             git::clone_repo(&url, &temp_dir, None)
@@ -68,6 +69,9 @@ fn add(source: &str) -> Result<()> {
             println!(" done");
         }
         MarketplaceSource::GitUrl { url } => {
+            if protocol != git::GitProtocol::default() {
+                warn!("--protocol ignored for full git URL; the URL's own scheme is used");
+            }
             debug!(url = %url, dest = %temp_dir.display(), "cloning git marketplace");
             print!("  Cloning {url}...");
             git::clone_repo(url, &temp_dir, None)
@@ -129,6 +133,7 @@ fn add(source: &str) -> Result<()> {
     let entry = KnownMarketplace {
         name: name.clone(),
         source: ms,
+        protocol: Some(protocol),
         added_at: chrono::Utc::now(),
     };
     cache

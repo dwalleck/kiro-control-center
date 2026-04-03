@@ -21,7 +21,8 @@ tauri-build = { version = "2", features = [] }
 tauri-specta = { version = "2.0.0-rc.20", features = ["typescript"] }
 
 [dependencies]
-kiro-market-core = { path = "../../kiro-market-core" }
+kiro-market-core = { path = "../../kiro-market-core", features = ["specta"] }
+git2 = { workspace = true }
 tauri = { version = "2", features = [] }
 tauri-plugin-opener = "2"
 tauri-specta = { version = "2.0.0-rc.20", features = ["typescript"] }
