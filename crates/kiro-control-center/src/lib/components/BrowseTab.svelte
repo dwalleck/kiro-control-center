@@ -94,13 +94,16 @@
 
   async function installSelected() {
     if (!selectedMarketplace || !selectedPlugin || selectedSkills.size === 0) return;
+    // Capture non-null values before await to satisfy TypeScript control flow
+    const mp = selectedMarketplace;
+    const pl = selectedPlugin;
     installing = true;
     error = null;
     installMessage = null;
 
     const result = await commands.installSkills(
-      selectedMarketplace,
-      selectedPlugin,
+      mp,
+      pl,
       Array.from(selectedSkills),
       forceInstall,
       projectPath
@@ -115,7 +118,7 @@
       installMessage = parts.join(" | ");
       selectedSkills.clear();
 
-      await selectPlugin(selectedMarketplace, selectedPlugin);
+      await selectPlugin(mp, pl);
     } else {
       error = result.error.message;
     }

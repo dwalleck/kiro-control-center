@@ -2068,7 +2068,9 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "dirs",
+ "git2",
  "kiro-market-core",
+ "rstest",
  "serde",
  "serde_json",
  "specta",
@@ -2077,6 +2079,7 @@ dependencies = [
  "tauri-build",
  "tauri-plugin-opener",
  "tauri-specta",
+ "tempfile",
  "tracing",
  "tracing-subscriber",
 ]

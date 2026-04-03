@@ -1,12 +1,11 @@
 //! Commands for managing marketplace sources.
 
 use std::fs;
-use std::path::PathBuf;
 
 use serde::Serialize;
 use tracing::{debug, warn};
 
-use kiro_market_core::cache::{CacheDir, KnownMarketplace, MarketplaceSource};
+use kiro_market_core::cache::{self, CacheDir, KnownMarketplace, MarketplaceSource};
 use kiro_market_core::git;
 use kiro_market_core::marketplace::Marketplace;
 use kiro_market_core::validation;
@@ -47,65 +46,6 @@ pub struct FailedUpdate {
 }
 
 // ---------------------------------------------------------------------------
-// Source detection
-// ---------------------------------------------------------------------------
-
-/// Classify a user-provided source string into a `MarketplaceSource`.
-///
-/// Mirrors the CLI `detect_source` logic in `kiro-market`.
-fn detect_source(source: &str) -> MarketplaceSource {
-    if source.starts_with("http://")
-        || source.starts_with("https://")
-        || source.starts_with("git@")
-    {
-        MarketplaceSource::GitUrl {
-            url: source.to_owned(),
-        }
-    } else if source.starts_with('/')
-        || source.starts_with("./")
-        || source.starts_with("../")
-        || source.starts_with('~')
-    {
-        MarketplaceSource::LocalPath {
-            path: source.to_owned(),
-        }
-    } else {
-        // Treat as GitHub owner/repo shorthand.
-        MarketplaceSource::GitHub {
-            repo: source.to_owned(),
-        }
-    }
-}
-
-/// Resolve a local path string to an absolute path.
-///
-/// Handles `~` expansion and canonicalization.
-fn resolve_local_path(path_str: &str) -> Result<PathBuf, CommandError> {
-    let expanded = if let Some(rest) = path_str.strip_prefix('~') {
-        let home = dirs::home_dir().ok_or_else(|| {
-            CommandError::new(
-                "could not determine home directory for ~ expansion",
-                ErrorType::IoError,
-            )
-        })?;
-        if rest.is_empty() {
-            home
-        } else {
-            home.join(rest.trim_start_matches('/'))
-        }
-    } else {
-        PathBuf::from(path_str)
-    };
-
-    expanded.canonicalize().map_err(|e| {
-        CommandError::new(
-            format!("failed to resolve path '{path_str}': {e}"),
-            ErrorType::IoError,
-        )
-    })
-}
-
-// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
@@ -136,7 +76,7 @@ fn get_cache() -> Result<CacheDir, CommandError> {
 #[tauri::command]
 #[specta::specta]
 pub async fn add_marketplace(source: String) -> Result<MarketplaceAddResult, CommandError> {
-    let ms = detect_source(&source);
+    let ms = MarketplaceSource::detect(&source);
     let cache = get_cache()?;
     cache.ensure_dirs().map_err(|e| {
         CommandError::new(
@@ -181,7 +121,12 @@ pub async fn add_marketplace(source: String) -> Result<MarketplaceAddResult, Com
             })?;
         }
         MarketplaceSource::LocalPath { path } => {
-            let src = resolve_local_path(path)?;
+            let src = cache::resolve_local_path(path).map_err(|e| {
+                CommandError::new(
+                    format!("failed to resolve path '{path}': {e}"),
+                    ErrorType::IoError,
+                )
+            })?;
             debug!(src = %src.display(), dest = %temp_dir.display(), "symlinking local marketplace");
             #[cfg(unix)]
             std::os::unix::fs::symlink(&src, &temp_dir).map_err(|e| {
@@ -384,63 +329,3 @@ pub async fn update_marketplace(
     Ok(result)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn detect_source_github_shorthand() {
-        let source = detect_source("microsoft/dotnet-skills");
-        assert!(
-            matches!(source, MarketplaceSource::GitHub { repo } if repo == "microsoft/dotnet-skills")
-        );
-    }
-
-    #[test]
-    fn detect_source_https_url() {
-        let source = detect_source("https://github.com/owner/repo.git");
-        assert!(
-            matches!(source, MarketplaceSource::GitUrl { url } if url == "https://github.com/owner/repo.git")
-        );
-    }
-
-    #[test]
-    fn detect_source_git_ssh_url() {
-        let source = detect_source("git@github.com:owner/repo.git");
-        assert!(
-            matches!(source, MarketplaceSource::GitUrl { url } if url == "git@github.com:owner/repo.git")
-        );
-    }
-
-    #[test]
-    fn detect_source_http_url() {
-        let source = detect_source("http://example.com/repo.git");
-        assert!(matches!(source, MarketplaceSource::GitUrl { .. }));
-    }
-
-    #[test]
-    fn detect_source_absolute_path() {
-        let source = detect_source("/home/user/marketplace");
-        assert!(
-            matches!(source, MarketplaceSource::LocalPath { path } if path == "/home/user/marketplace")
-        );
-    }
-
-    #[test]
-    fn detect_source_relative_dot() {
-        let source = detect_source("./my-marketplace");
-        assert!(matches!(source, MarketplaceSource::LocalPath { .. }));
-    }
-
-    #[test]
-    fn detect_source_relative_dotdot() {
-        let source = detect_source("../other/marketplace");
-        assert!(matches!(source, MarketplaceSource::LocalPath { .. }));
-    }
-
-    #[test]
-    fn detect_source_tilde() {
-        let source = detect_source("~/marketplaces/mine");
-        assert!(matches!(source, MarketplaceSource::LocalPath { .. }));
-    }
-}

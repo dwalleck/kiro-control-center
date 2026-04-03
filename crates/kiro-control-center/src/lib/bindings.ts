@@ -180,7 +180,12 @@ export type MarketplaceAddResult = { name: string; plugins: PluginBasicInfo[] }
 /**
  * Summary information about a registered marketplace.
  */
-export type MarketplaceInfo = { name: string; source_type: SourceType; plugin_count: number }
+export type MarketplaceInfo = { name: string; source_type: SourceType; plugin_count: number; 
+/**
+ * If the marketplace manifest could not be read or parsed, this field
+ * carries the error message so the frontend can show a warning.
+ */
+load_error: string | null }
 /**
  * Basic information about a plugin within a marketplace.
  */

@@ -87,17 +87,18 @@
   }
 
   function formatDate(iso: string): string {
-    try {
-      return new Date(iso).toLocaleDateString(undefined, {
-        year: "numeric",
-        month: "short",
-        day: "numeric",
-        hour: "2-digit",
-        minute: "2-digit",
-      });
-    } catch {
+    const date = new Date(iso);
+    if (isNaN(date.getTime())) {
+      console.warn(`Invalid date string from backend: "${iso}"`);
       return iso;
     }
+    return date.toLocaleDateString(undefined, {
+      year: "numeric",
+      month: "short",
+      day: "numeric",
+      hour: "2-digit",
+      minute: "2-digit",
+    });
   }
 
   $effect(() => {
