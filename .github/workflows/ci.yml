@@ -1,0 +1,348 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  # Validate conventional commit messages on PRs
+  commitlint:
+    name: Validate Commits
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Check commit messages
+        run: |
+          git fetch origin ${{ github.base_ref }}
+          COMMITS=$(git log --format="%s" origin/${{ github.base_ref }}..HEAD)
+          PATTERN="^(feat|fix|docs|style|refactor|perf|test|build|ci|chore)(\([a-z][a-z0-9-]*\))?!?: .{3,}"
+          FAILED=0
+          while IFS= read -r msg; do
+            if [[ -z "$msg" ]]; then continue; fi
+            if [[ ! "$msg" =~ $PATTERN ]] && [[ ! "$msg" =~ ^Merge ]]; then
+              echo "❌ Invalid commit: $msg"
+              FAILED=1
+            else
+              echo "✅ Valid commit: $msg"
+            fi
+          done <<< "$COMMITS"
+          if [[ $FAILED -eq 1 ]]; then
+            echo ""
+            echo "Expected format: <type>[optional scope]: <description>"
+            echo "Valid types: feat, fix, docs, style, refactor, perf, test, build, ci, chore"
+            exit 1
+          fi
+
+  # Check formatting across the workspace
+  format:
+    name: Format
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+  # Clippy linting (needs webview deps for the Tauri crate)
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev \
+            build-essential \
+            curl \
+            wget \
+            file \
+            libxdo-dev \
+            libssl-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev
+
+      - name: Setup Rust cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run clippy
+        run: cargo clippy --workspace -- -D warnings
+
+  # Run all Rust tests across platforms
+  test:
+    name: Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Linux dependencies
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev \
+            build-essential \
+            curl \
+            wget \
+            file \
+            libxdo-dev \
+            libssl-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev
+
+      - name: Setup Rust cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run tests
+        run: cargo test --workspace
+
+  # Svelte frontend type checking and build
+  frontend:
+    name: Frontend Check
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: crates/kiro-control-center
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: crates/kiro-control-center/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Svelte check
+        run: npm run check
+
+      - name: Build frontend
+        run: npm run build
+
+  # Build CLI binary on all platforms
+  build-cli:
+    name: Build CLI (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            artifact_name: kiro-market-linux
+            binary: target/release/kiro-market
+          - os: macos-latest
+            artifact_name: kiro-market-macos
+            binary: target/release/kiro-market
+          - os: windows-latest
+            artifact_name: kiro-market-windows
+            binary: target/release/kiro-market.exe
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Linux dependencies
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev \
+            build-essential \
+            curl \
+            wget \
+            file \
+            libxdo-dev \
+            libssl-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev
+
+      - name: Setup Rust cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build CLI (release)
+        run: cargo build --release -p kiro-market
+
+      - name: Upload CLI binary
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: ${{ matrix.binary }}
+
+  # Build Tauri desktop app on all platforms
+  build-tauri:
+    name: Build Tauri (${{ matrix.platform }})
+    needs: [frontend]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: ubuntu-latest
+            artifact_name: kcc-linux
+            artifact_path: target/release/bundle/deb/*.deb
+          - platform: macos-latest
+            artifact_name: kcc-macos
+            artifact_path: target/release/bundle/dmg/*.dmg
+          - platform: windows-latest
+            artifact_name: kcc-windows
+            artifact_path: target/release/bundle/msi/*.msi
+
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: crates/kiro-control-center/package-lock.json
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Linux dependencies
+        if: matrix.platform == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev \
+            build-essential \
+            curl \
+            wget \
+            file \
+            libxdo-dev \
+            libssl-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev
+
+      - name: Setup Rust cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install frontend dependencies
+        working-directory: crates/kiro-control-center
+        run: npm ci
+
+      - name: Build Tauri app
+        working-directory: crates/kiro-control-center
+        run: npx tauri build
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: ${{ matrix.artifact_path }}
+          if-no-files-found: warn
+
+  # Security and license audit
+  cargo-deny:
+    name: Cargo Deny
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run cargo-deny
+        uses: EmbarkStudios/cargo-deny-action@v2
+        with:
+          log-level: warn
+          command: check
+          arguments: --all-features
+
+  # Code coverage for Rust crates
+  coverage:
+    name: Code Coverage
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev \
+            build-essential \
+            curl \
+            wget \
+            file \
+            libxdo-dev \
+            libssl-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev
+
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
+
+      - name: Setup Rust cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Generate coverage
+        run: cargo llvm-cov --workspace --lcov --output-path lcov.info
+
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v4
+        with:
+          files: lcov.info
+          fail_ci_if_error: false
+
+  # Gate: all jobs must pass
+  ci-success:
+    name: CI Success
+    if: always()
+    needs: [commitlint, format, lint, test, frontend, build-cli, build-tauri, cargo-deny, coverage]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check all jobs
+        run: |
+          # commitlint is skipped on push events
+          if [[ "${{ needs.commitlint.result }}" != "success" ]] && \
+             [[ "${{ needs.commitlint.result }}" != "skipped" ]]; then
+            echo "Commit validation failed"
+            exit 1
+          fi
+          if [[ "${{ needs.format.result }}" != "success" ]] || \
+             [[ "${{ needs.lint.result }}" != "success" ]] || \
+             [[ "${{ needs.test.result }}" != "success" ]] || \
+             [[ "${{ needs.frontend.result }}" != "success" ]] || \
+             [[ "${{ needs.build-cli.result }}" != "success" ]] || \
+             [[ "${{ needs.build-tauri.result }}" != "success" ]] || \
+             [[ "${{ needs.cargo-deny.result }}" != "success" ]] || \
+             [[ "${{ needs.coverage.result }}" != "success" ]]; then
+            echo "One or more CI jobs failed"
+            exit 1
+          fi
+          echo "All CI jobs passed!"
