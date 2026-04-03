@@ -323,6 +323,35 @@ mod tests {
         );
     }
 
+    #[test]
+    fn git_not_found_display() {
+        let err = GitError::GitNotFound;
+        assert_eq!(
+            err.to_string(),
+            "the 'git' command-line tool is required but was not found in PATH"
+        );
+    }
+
+    #[test]
+    fn git_command_failed_display() {
+        let err = GitError::GitCommandFailed {
+            dir: PathBuf::from("/tmp/repo"),
+            source: "permission denied".to_owned().into(),
+        };
+        assert_eq!(err.to_string(), "git command failed in /tmp/repo");
+    }
+
+    #[test]
+    fn git_command_failed_has_source() {
+        use std::error::Error as _;
+        let err = GitError::GitCommandFailed {
+            dir: PathBuf::from("/tmp"),
+            source: "permission denied".to_owned().into(),
+        };
+        let source = err.source().expect("should have a source");
+        assert!(source.to_string().contains("permission denied"));
+    }
+
     // -----------------------------------------------------------------------
     // From conversions
     // -----------------------------------------------------------------------
