@@ -105,19 +105,13 @@ pub async fn add_marketplace(source: String) -> Result<MarketplaceAddResult, Com
             let url = git::github_repo_to_url(repo);
             debug!(url = %url, dest = %temp_dir.display(), "cloning GitHub marketplace");
             git::clone_repo(&url, &temp_dir, None).map_err(|e| {
-                CommandError::new(
-                    format!("failed to clone {repo}: {e}"),
-                    ErrorType::GitError,
-                )
+                CommandError::new(format!("failed to clone {repo}: {e}"), ErrorType::GitError)
             })?;
         }
         MarketplaceSource::GitUrl { url } => {
             debug!(url = %url, dest = %temp_dir.display(), "cloning git marketplace");
             git::clone_repo(url, &temp_dir, None).map_err(|e| {
-                CommandError::new(
-                    format!("failed to clone {url}: {e}"),
-                    ErrorType::GitError,
-                )
+                CommandError::new(format!("failed to clone {url}: {e}"), ErrorType::GitError)
             })?;
         }
         MarketplaceSource::LocalPath { path } => {
@@ -264,9 +258,7 @@ pub async fn remove_marketplace(name: String) -> Result<(), CommandError> {
 /// skipped since they always reflect the latest state on disk.
 #[tauri::command]
 #[specta::specta]
-pub async fn update_marketplace(
-    name: Option<String>,
-) -> Result<UpdateResult, CommandError> {
+pub async fn update_marketplace(name: Option<String>) -> Result<UpdateResult, CommandError> {
     let cache = get_cache()?;
     let entries = cache
         .load_known_marketplaces()
@@ -328,4 +320,3 @@ pub async fn update_marketplace(
 
     Ok(result)
 }
-

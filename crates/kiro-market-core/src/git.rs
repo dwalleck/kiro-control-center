@@ -274,7 +274,14 @@ mod tests {
 
         create_local_repo(source_dir.path());
 
-        let url = format!("file://{}", source_dir.path().display());
+        // file:// URLs: on Unix paths start with /, so file:// + /path works.
+        // On Windows, paths start with C:\, need file:///C:/path with forward slashes.
+        let path_str = source_dir.path().to_string_lossy().replace('\\', "/");
+        let url = if path_str.starts_with('/') {
+            format!("file://{path_str}")
+        } else {
+            format!("file:///{path_str}")
+        };
         let repo = clone_repo(&url, &dest, None).expect("clone should succeed");
 
         assert!(dest.join("hello.txt").exists(), "cloned file should exist");

@@ -331,9 +331,13 @@ fn resolve_structured_source(
             sha.as_deref(),
             repo.as_str(),
         ),
-        StructuredSource::GitUrl { url, git_ref, sha } => {
-            (url.clone(), None, git_ref.as_deref(), sha.as_deref(), url.as_str())
-        }
+        StructuredSource::GitUrl { url, git_ref, sha } => (
+            url.clone(),
+            None,
+            git_ref.as_deref(),
+            sha.as_deref(),
+            url.as_str(),
+        ),
         StructuredSource::GitSubdir {
             url,
             path,

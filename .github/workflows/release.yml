@@ -1,0 +1,123 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  # Build CLI binaries for all platforms
+  release-cli:
+    name: CLI - ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            artifact_name: kiro-market-linux-x86_64
+            binary: target/release/kiro-market
+          - os: macos-latest
+            artifact_name: kiro-market-macos-aarch64
+            binary: target/release/kiro-market
+          - os: windows-latest
+            artifact_name: kiro-market-windows-x86_64
+            binary: target/release/kiro-market.exe
+
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Setup Rust cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build CLI (release)
+        run: cargo build --release -p kiro-market
+
+      - name: Upload to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ matrix.binary }}
+          draft: true
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  # Build Tauri desktop app for all platforms
+  release-tauri:
+    name: Desktop App - ${{ matrix.platform }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: ubuntu-latest
+            artifact_path: target/release/bundle/deb/*.deb
+          - platform: macos-latest
+            artifact_path: target/release/bundle/dmg/*.dmg
+          - platform: windows-latest
+            artifact_path: target/release/bundle/msi/*.msi
+
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: crates/kiro-control-center/package-lock.json
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Linux dependencies
+        if: matrix.platform == 'ubuntu-latest'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev \
+            build-essential \
+            curl \
+            wget \
+            file \
+            libxdo-dev \
+            libssl-dev \
+            libayatana-appindicator3-dev \
+            librsvg2-dev
+
+      - name: Setup Rust cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install frontend dependencies
+        working-directory: crates/kiro-control-center
+        run: npm ci
+
+      - name: Build Tauri app
+        working-directory: crates/kiro-control-center
+        run: npx tauri build
+
+      - name: Verify artifacts exist
+        shell: bash
+        run: |
+          shopt -s nullglob
+          files=(${{ matrix.artifact_path }})
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "No artifacts found matching ${{ matrix.artifact_path }}"
+            exit 1
+          fi
+          echo "Found: ${files[@]}"
+
+      - name: Upload to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ matrix.artifact_path }}
+          draft: true
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

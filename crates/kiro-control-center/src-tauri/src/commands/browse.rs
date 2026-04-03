@@ -10,7 +10,7 @@ use tracing::{debug, warn};
 use kiro_market_core::cache::{CacheDir, MarketplaceSource};
 use kiro_market_core::error::{Error as CoreError, SkillError};
 use kiro_market_core::marketplace::{Marketplace, PluginEntry, PluginSource, StructuredSource};
-use kiro_market_core::plugin::{PluginManifest, discover_skill_dirs};
+use kiro_market_core::plugin::{discover_skill_dirs, PluginManifest};
 use kiro_market_core::project::{InstalledSkillMeta, KiroProject};
 use kiro_market_core::skill::{extract_relative_md_links, merge_skill, parse_frontmatter};
 
@@ -106,7 +106,9 @@ pub async fn list_marketplaces() -> Result<Vec<MarketplaceInfo>, CommandError> {
         )
     })?;
 
-    let known = cache.load_known_marketplaces().map_err(CommandError::from)?;
+    let known = cache
+        .load_known_marketplaces()
+        .map_err(CommandError::from)?;
 
     let mut results = Vec::with_capacity(known.len());
     for entry in &known {
@@ -504,10 +506,7 @@ fn resolve_local_plugin_dir(
             let resolved = marketplace_path.join(rel);
             if !resolved.exists() {
                 return Err(CommandError::new(
-                    format!(
-                        "plugin directory does not exist: {}",
-                        resolved.display()
-                    ),
+                    format!("plugin directory does not exist: {}", resolved.display()),
                     ErrorType::NotFound,
                 ));
             }
@@ -532,12 +531,11 @@ fn discover_skills_for_plugin(
     plugin_dir: &Path,
     manifest: Option<&PluginManifest>,
 ) -> Vec<PathBuf> {
-    let skill_paths: Vec<&str> =
-        if let Some(m) = manifest.filter(|m| !m.skills.is_empty()) {
-            m.skills.iter().map(String::as_str).collect()
-        } else {
-            kiro_market_core::DEFAULT_SKILL_PATHS.to_vec()
-        };
+    let skill_paths: Vec<&str> = if let Some(m) = manifest.filter(|m| !m.skills.is_empty()) {
+        m.skills.iter().map(String::as_str).collect()
+    } else {
+        kiro_market_core::DEFAULT_SKILL_PATHS.to_vec()
+    };
 
     discover_skill_dirs(plugin_dir, &skill_paths)
 }
@@ -565,7 +563,10 @@ fn load_plugin_manifest(plugin_dir: &Path) -> Result<Option<PluginManifest>, Com
                 "failed to read plugin.json"
             );
             return Err(CommandError::new(
-                format!("failed to read plugin.json at {}: {e}", manifest_path.display()),
+                format!(
+                    "failed to read plugin.json at {}: {e}",
+                    manifest_path.display()
+                ),
                 ErrorType::IoError,
             ));
         }
@@ -583,7 +584,10 @@ fn load_plugin_manifest(plugin_dir: &Path) -> Result<Option<PluginManifest>, Com
                 "plugin.json is malformed"
             );
             Err(CommandError::new(
-                format!("plugin.json at {} is malformed: {e}", manifest_path.display()),
+                format!(
+                    "plugin.json at {} is malformed: {e}",
+                    manifest_path.display()
+                ),
                 ErrorType::ParseError,
             ))
         }
@@ -660,7 +664,10 @@ mod tests {
         let source = MarketplaceSource::GitHub {
             repo: "owner/repo".into(),
         };
-        assert!(matches!(marketplace_source_type(&source), SourceType::GitHub));
+        assert!(matches!(
+            marketplace_source_type(&source),
+            SourceType::GitHub
+        ));
     }
 
     #[test]
@@ -676,7 +683,10 @@ mod tests {
         let source = MarketplaceSource::LocalPath {
             path: "/home/user/marketplace".into(),
         };
-        assert!(matches!(marketplace_source_type(&source), SourceType::Local));
+        assert!(matches!(
+            marketplace_source_type(&source),
+            SourceType::Local
+        ));
     }
 
     // -----------------------------------------------------------------------

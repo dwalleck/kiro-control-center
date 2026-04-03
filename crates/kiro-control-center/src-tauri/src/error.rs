@@ -1,6 +1,4 @@
-use kiro_market_core::error::{
-    Error as CoreError, MarketplaceError, PluginError, SkillError,
-};
+use kiro_market_core::error::{Error as CoreError, MarketplaceError, PluginError, SkillError};
 use serde::Serialize;
 use tracing::warn;
 
@@ -91,9 +89,7 @@ impl From<String> for CommandError {
 mod tests {
     use std::path::PathBuf;
 
-    use kiro_market_core::error::{
-        GitError, PluginError, SkillError, ValidationError,
-    };
+    use kiro_market_core::error::{GitError, PluginError, SkillError, ValidationError};
     use rstest::rstest;
 
     use super::*;

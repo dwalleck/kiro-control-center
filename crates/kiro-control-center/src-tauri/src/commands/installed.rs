@@ -58,10 +58,7 @@ pub async fn list_installed_skills(
 /// Remove an installed skill from a Kiro project.
 #[tauri::command]
 #[specta::specta]
-pub async fn remove_skill(
-    name: String,
-    project_path: String,
-) -> Result<(), CommandError> {
+pub async fn remove_skill(name: String, project_path: String) -> Result<(), CommandError> {
     let project = KiroProject::new(PathBuf::from(&project_path));
     project.remove_skill(&name).map_err(CommandError::from)?;
     debug!(skill = %name, "skill removed via control center");

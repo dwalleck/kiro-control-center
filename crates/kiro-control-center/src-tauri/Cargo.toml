@@ -2,6 +2,7 @@
 name = "kiro-control-center"
 version = "0.1.0"
 edition = "2021"
+license = "MIT"
 description = "Kiro Control Center — GUI for managing Claude Code marketplace skills"
 
 [lints]
