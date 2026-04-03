@@ -248,6 +248,64 @@ mod tests {
     }
 
     #[test]
+    fn clone_repo_with_git_ref_checks_out_branch() {
+        let origin_dir = tempfile::tempdir().expect("tempdir");
+        create_local_repo(origin_dir.path());
+
+        // Create a branch in the origin.
+        let run = |args: &[&str]| {
+            let output = Command::new("git")
+                .args(args)
+                .current_dir(origin_dir.path())
+                .env("GIT_AUTHOR_NAME", "Test")
+                .env("GIT_AUTHOR_EMAIL", "test@example.com")
+                .env("GIT_COMMITTER_NAME", "Test")
+                .env("GIT_COMMITTER_EMAIL", "test@example.com")
+                .output()
+                .expect("git command should run");
+            assert!(
+                output.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        run(&["checkout", "-b", "feature-branch"]);
+        std::fs::write(origin_dir.path().join("feature.txt"), "feature work").expect("write");
+        run(&["add", "feature.txt"]);
+        run(&["-c", "commit.gpgsign=false", "commit", "-m", "feature commit"]);
+
+        // Clone with git_ref pointing to the branch.
+        let clone_dir = tempfile::tempdir().expect("tempdir");
+        let dest = clone_dir.path().join("cloned");
+        let url = format!("file://{}", origin_dir.path().display());
+
+        clone_repo(&url, &dest, Some("feature-branch")).expect("clone with ref should succeed");
+
+        assert!(
+            dest.join("feature.txt").exists(),
+            "feature.txt should exist on checked-out branch"
+        );
+    }
+
+    #[test]
+    fn clone_repo_with_invalid_git_ref_returns_error() {
+        let origin_dir = tempfile::tempdir().expect("tempdir");
+        create_local_repo(origin_dir.path());
+
+        let clone_dir = tempfile::tempdir().expect("tempdir");
+        let dest = clone_dir.path().join("cloned");
+        let url = format!("file://{}", origin_dir.path().display());
+
+        let err = clone_repo(&url, &dest, Some("nonexistent-branch"))
+            .expect_err("should fail for nonexistent ref");
+
+        assert!(
+            matches!(err, GitError::CloneFailed { .. }),
+            "expected CloneFailed, got {err:?}"
+        );
+    }
+
+    #[test]
     fn github_repo_to_url_https() {
         assert_eq!(
             github_repo_to_url("owner/repo", GitProtocol::Https),
