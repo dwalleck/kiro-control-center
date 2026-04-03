@@ -103,9 +103,8 @@ fn add(source: &str) -> Result<()> {
         Marketplace::from_json(&manifest_bytes).context("failed to parse marketplace manifest")?;
 
     let name = manifest.name.clone();
-    kiro_market_core::validation::validate_name(&name).with_context(|| {
-        format!("marketplace manifest contains invalid name '{name}'")
-    })?;
+    kiro_market_core::validation::validate_name(&name)
+        .with_context(|| format!("marketplace manifest contains invalid name '{name}'"))?;
     let plugin_count = manifest.plugins.len();
 
     // Rename temp dir to the real marketplace name.
@@ -150,7 +149,10 @@ fn add(source: &str) -> Result<()> {
 }
 
 /// Print the list of available plugins after adding a marketplace.
-fn print_available_plugins(plugins: &[kiro_market_core::marketplace::PluginEntry], marketplace_name: &str) {
+fn print_available_plugins(
+    plugins: &[kiro_market_core::marketplace::PluginEntry],
+    marketplace_name: &str,
+) {
     if plugins.is_empty() {
         return;
     }
@@ -158,10 +160,7 @@ fn print_available_plugins(plugins: &[kiro_market_core::marketplace::PluginEntry
     println!();
     println!("  {}", "Available plugins:".bold());
     for plugin in plugins {
-        let desc = plugin
-            .description
-            .as_deref()
-            .unwrap_or("(no description)");
+        let desc = plugin.description.as_deref().unwrap_or("(no description)");
         println!("    {} - {}", plugin.name.green(), desc);
     }
     println!();
@@ -193,11 +192,7 @@ fn list() -> Result<()> {
 
     println!("{}", "Registered marketplaces:".bold());
     for entry in &entries {
-        println!(
-            "  {} ({})",
-            entry.name.green().bold(),
-            entry.source.label()
-        );
+        println!("  {} ({})", entry.name.green().bold(), entry.source.label());
     }
 
     Ok(())
@@ -293,9 +288,4 @@ fn remove(name: &str) -> Result<()> {
     Ok(())
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    // detect_source and source_label tests moved to kiro-market-core::cache::tests
-}
+// detect_source and source_label tests moved to kiro-market-core::cache::tests
