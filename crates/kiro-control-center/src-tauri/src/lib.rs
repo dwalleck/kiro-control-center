@@ -1,3 +1,13 @@
+// Tauri commands are public for the invoke handler but are internal to this app.
+// Pedantic doc lints don't add value here.
+#![allow(
+    clippy::missing_errors_doc,
+    clippy::missing_panics_doc,
+    clippy::cast_possible_truncation,
+    clippy::doc_markdown,
+    clippy::too_many_lines
+)]
+
 use tauri_specta::{collect_commands, Builder};
 
 pub mod commands;

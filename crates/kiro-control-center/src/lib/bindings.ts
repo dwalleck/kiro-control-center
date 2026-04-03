@@ -180,7 +180,7 @@ export type MarketplaceAddResult = { name: string; plugins: PluginBasicInfo[] }
 /**
  * Summary information about a registered marketplace.
  */
-export type MarketplaceInfo = { name: string; source_type: string; plugin_count: number }
+export type MarketplaceInfo = { name: string; source_type: SourceType; plugin_count: number }
 /**
  * Basic information about a plugin within a marketplace.
  */
@@ -188,7 +188,7 @@ export type PluginBasicInfo = { name: string; description: string | null }
 /**
  * Summary information about a plugin within a marketplace.
  */
-export type PluginInfo = { name: string; description: string | null; skill_count: number; source_type: string }
+export type PluginInfo = { name: string; description: string | null; skill_count: number; source_type: SourceType }
 /**
  * Summary information about a Kiro project directory.
  */
@@ -197,6 +197,13 @@ export type ProjectInfo = { path: string; kiro_initialized: boolean; installed_s
  * Information about a single skill, including installation status.
  */
 export type SkillInfo = { name: string; description: string; plugin: string; marketplace: string; installed: boolean }
+/**
+ * Source type classification for marketplaces and plugins.
+ * 
+ * Serialized as snake_case strings. The TypeScript side receives a union
+ * type like `"github" | "git" | "local" | "relative" | "git_subdir"`.
+ */
+export type SourceType = "github" | "git" | "local" | "relative" | "git-subdir"
 /**
  * Result of updating one or more marketplaces.
  */

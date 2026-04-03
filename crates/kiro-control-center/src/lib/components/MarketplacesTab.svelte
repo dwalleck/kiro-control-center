@@ -65,6 +65,10 @@
   }
 
   async function removeMarketplace(name: string) {
+    if (!confirm(`Remove marketplace "${name}"? This will delete the cached data.`)) {
+      return;
+    }
+
     removingName = name;
     error = null;
     successMessage = null;
@@ -80,7 +84,9 @@
   }
 
   function sourceTypeBadgeClass(sourceType: string): string {
-    switch (sourceType.toLowerCase()) {
+    switch (sourceType) {
+      case "github":
+        return "bg-blue-100 text-blue-800 dark:bg-blue-900/30 dark:text-blue-400";
       case "git":
         return "bg-purple-100 text-purple-800 dark:bg-purple-900/30 dark:text-purple-400";
       case "local":

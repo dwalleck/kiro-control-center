@@ -20,11 +20,29 @@ use crate::error::{CommandError, ErrorType};
 // Response types
 // ---------------------------------------------------------------------------
 
+/// Source type classification for marketplaces and plugins.
+///
+/// Serialized as snake_case strings. The TypeScript side receives a union
+/// type like `"github" | "git" | "local" | "relative" | "git_subdir"`.
+#[derive(Clone, Debug, Serialize, specta::Type)]
+pub enum SourceType {
+    #[serde(rename = "github")]
+    GitHub,
+    #[serde(rename = "git")]
+    Git,
+    #[serde(rename = "local")]
+    Local,
+    #[serde(rename = "relative")]
+    Relative,
+    #[serde(rename = "git-subdir")]
+    GitSubdir,
+}
+
 /// Summary information about a registered marketplace.
 #[derive(Clone, Debug, Serialize, specta::Type)]
 pub struct MarketplaceInfo {
     pub name: String,
-    pub source_type: String,
+    pub source_type: SourceType,
     pub plugin_count: u32,
 }
 
@@ -34,7 +52,7 @@ pub struct PluginInfo {
     pub name: String,
     pub description: Option<String>,
     pub skill_count: u32,
-    pub source_type: String,
+    pub source_type: SourceType,
 }
 
 /// Information about a single skill, including installation status.
@@ -89,7 +107,7 @@ pub async fn list_marketplaces() -> Result<Vec<MarketplaceInfo>, CommandError> {
 
     let mut results = Vec::with_capacity(known.len());
     for entry in &known {
-        let source_type = source_type_string(&entry.source);
+        let source_type = marketplace_source_type(&entry.source);
         let plugin_count = count_marketplace_plugins(&cache, &entry.name);
         results.push(MarketplaceInfo {
             name: entry.name.clone(),
@@ -117,7 +135,7 @@ pub async fn list_plugins(marketplace: String) -> Result<Vec<PluginInfo>, Comman
 
     let mut results = Vec::with_capacity(manifest.plugins.len());
     for plugin in &manifest.plugins {
-        let source_type = plugin_source_type_string(&plugin.source);
+        let source_type = plugin_source_type(&plugin.source);
         let skill_count = count_plugin_skills(plugin, &marketplace_path);
         results.push(PluginInfo {
             name: plugin.name.clone(),
@@ -335,7 +353,13 @@ pub async fn get_project_info(project_path: String) -> Result<ProjectInfo, Comma
     let installed_skill_count = project
         .load_installed()
         .map(|i| i.skills.len() as u32)
-        .unwrap_or(0);
+        .map_err(|e| {
+            warn!(path = %project_path, error = %e, "failed to load installed skills");
+            CommandError::new(
+                format!("failed to read installed skills: {e}"),
+                ErrorType::IoError,
+            )
+        })?;
 
     Ok(ProjectInfo {
         path: project_path,
@@ -348,22 +372,22 @@ pub async fn get_project_info(project_path: String) -> Result<ProjectInfo, Comma
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Map a `MarketplaceSource` to a human-readable source type string.
-fn source_type_string(source: &MarketplaceSource) -> String {
+/// Map a `MarketplaceSource` to a `SourceType`.
+fn marketplace_source_type(source: &MarketplaceSource) -> SourceType {
     match source {
-        MarketplaceSource::GitHub { .. } => "github".to_owned(),
-        MarketplaceSource::GitUrl { .. } => "git".to_owned(),
-        MarketplaceSource::LocalPath { .. } => "local".to_owned(),
+        MarketplaceSource::GitHub { .. } => SourceType::GitHub,
+        MarketplaceSource::GitUrl { .. } => SourceType::Git,
+        MarketplaceSource::LocalPath { .. } => SourceType::Local,
     }
 }
 
-/// Map a `PluginSource` to a human-readable source type string.
-fn plugin_source_type_string(source: &PluginSource) -> String {
+/// Map a `PluginSource` to a `SourceType`.
+fn plugin_source_type(source: &PluginSource) -> SourceType {
     match source {
-        PluginSource::RelativePath(_) => "relative".to_owned(),
-        PluginSource::Structured(StructuredSource::GitHub { .. }) => "github".to_owned(),
-        PluginSource::Structured(StructuredSource::GitUrl { .. }) => "git".to_owned(),
-        PluginSource::Structured(StructuredSource::GitSubdir { .. }) => "git-subdir".to_owned(),
+        PluginSource::RelativePath(_) => SourceType::Relative,
+        PluginSource::Structured(StructuredSource::GitHub { .. }) => SourceType::GitHub,
+        PluginSource::Structured(StructuredSource::GitUrl { .. }) => SourceType::Git,
+        PluginSource::Structured(StructuredSource::GitSubdir { .. }) => SourceType::GitSubdir,
     }
 }
 
@@ -538,19 +562,19 @@ fn prepare_merged_content(
     let body = &skill_content[body_offset..];
     let relative_links = extract_relative_md_links(body);
 
-    let companions: Vec<(String, String)> = relative_links
-        .iter()
-        .filter_map(|link| {
-            let companion_path = skill_dir.join(link);
-            match fs::read_to_string(&companion_path) {
-                Ok(content) => Some((link.clone(), content)),
-                Err(e) => {
-                    debug!(link, error = %e, "companion file not found, skipping");
-                    None
-                }
+    let mut companions: Vec<(String, String)> = Vec::new();
+    for link in &relative_links {
+        let companion_path = skill_dir.join(link);
+        match fs::read_to_string(&companion_path) {
+            Ok(content) => companions.push((link.clone(), content)),
+            Err(e) => {
+                return Err(format!(
+                    "companion file '{}' referenced by SKILL.md could not be read: {e}",
+                    companion_path.display()
+                ));
             }
-        })
-        .collect();
+        }
+    }
 
     let companion_refs: Vec<(&str, &str)> = companions
         .iter()

@@ -2,6 +2,7 @@ use kiro_market_core::error::{
     Error as CoreError, MarketplaceError, PluginError, SkillError,
 };
 use serde::Serialize;
+use tracing::warn;
 
 /// Machine-readable error classification for frontend conditional logic.
 ///
@@ -39,6 +40,7 @@ impl CommandError {
 }
 
 impl From<CoreError> for CommandError {
+    #[allow(clippy::match_same_arms)]
     fn from(err: CoreError) -> Self {
         let error_type = match &err {
             CoreError::Marketplace(MarketplaceError::NotFound { .. }) => ErrorType::NotFound,
@@ -48,14 +50,25 @@ impl From<CoreError> for CommandError {
             CoreError::Marketplace(_) => ErrorType::ParseError,
             CoreError::Skill(SkillError::AlreadyInstalled { .. }) => ErrorType::AlreadyExists,
             CoreError::Skill(SkillError::NotInstalled { .. }) => ErrorType::NotFound,
-            CoreError::Skill(_) => ErrorType::NotFound,
+            CoreError::Skill(SkillError::SkillMdNotFound { .. }) => ErrorType::NotFound,
+            CoreError::Skill(SkillError::MergeFailed { .. }) => ErrorType::IoError,
+            CoreError::Skill(_) => ErrorType::Unknown,
             CoreError::Validation(_) => ErrorType::Validation,
             CoreError::Git(_) => ErrorType::GitError,
             CoreError::Io(_) => ErrorType::IoError,
             CoreError::Json(_) => ErrorType::ParseError,
             CoreError::Plugin(PluginError::NotFound { .. }) => ErrorType::NotFound,
-            CoreError::Plugin(_) => ErrorType::NotFound,
-            _ => ErrorType::Unknown,
+            CoreError::Plugin(PluginError::ManifestNotFound { .. }) => ErrorType::NotFound,
+            CoreError::Plugin(PluginError::InvalidManifest { .. }) => ErrorType::ParseError,
+            CoreError::Plugin(PluginError::NoSkills { .. }) => ErrorType::Validation,
+            CoreError::Plugin(_) => {
+                warn!("unmapped Plugin error variant, defaulting to Unknown");
+                ErrorType::Unknown
+            }
+            _ => {
+                warn!("unmapped CoreError variant, defaulting to Unknown");
+                ErrorType::Unknown
+            }
         };
 
         Self {
