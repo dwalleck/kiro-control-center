@@ -4,13 +4,30 @@
 [advisories]
 db-path = "~/.cargo/advisory-db"
 db-urls = ["https://github.com/rustsec/advisory-db"]
-ignore = []
+ignore = [
+    # Tauri's GTK3 bindings are unmaintained but required for Linux webview support.
+    # These are transitive dependencies we cannot control.
+    "RUSTSEC-2024-0417", # gtk-rs GTK3 bindings
+    # paste is unmaintained, used transitively by Tauri
+    "RUSTSEC-2024-0436", # paste
+    # proc-macro-error is unmaintained, used transitively
+    "RUSTSEC-2024-0370", # proc-macro-error
+    # unic-* crates are unmaintained, used transitively by Tauri's HTML parser
+    "RUSTSEC-2025-0012", # unic-ucd-ident
+    "RUSTSEC-2025-0013", # unic-common
+    "RUSTSEC-2025-0014", # unic-char-range
+    "RUSTSEC-2025-0015", # unic-char-property
+    "RUSTSEC-2025-0016", # unic-ucd-version
+    # fxhash is unmaintained, used transitively
+    "RUSTSEC-2025-0009", # fxhash
+]
 
 [licenses]
 allow = [
     "MIT",
     "MIT-0",
     "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
     "BSD-2-Clause",
     "BSD-3-Clause",
     "ISC",
