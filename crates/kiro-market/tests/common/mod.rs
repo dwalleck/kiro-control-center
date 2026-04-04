@@ -26,3 +26,5 @@ pub fn stdout(output: &Output) -> String {
 pub fn stderr(output: &Output) -> String {
     String::from_utf8_lossy(&output.stderr).to_string()
 }
+
+pub mod fixtures;
