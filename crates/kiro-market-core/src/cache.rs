@@ -40,7 +40,7 @@ impl MarketplaceSource {
     ///
     /// Heuristics:
     /// - Starts with `http://`, `https://`, `file://`, or `git@` → `GitUrl`
-    /// - Starts with `/`, `./`, `../`, or `~` → `LocalPath`
+    /// - Is an absolute path or starts with `./`, `../`, `~` → `LocalPath`
     /// - Anything else → `GitHub` (owner/repo shorthand)
     #[must_use]
     pub fn detect(source: &str) -> Self {
@@ -52,7 +52,7 @@ impl MarketplaceSource {
             Self::GitUrl {
                 url: source.to_owned(),
             }
-        } else if source.starts_with('/')
+        } else if Path::new(source).is_absolute()
             || source.starts_with("./")
             || source.starts_with("../")
             || source.starts_with('~')
@@ -597,6 +597,36 @@ mod tests {
         let source = MarketplaceSource::detect("file:///home/user/marketplace");
         assert!(
             matches!(source, MarketplaceSource::GitUrl { url } if url == "file:///home/user/marketplace")
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn detect_windows_drive_path() {
+        let source = MarketplaceSource::detect(r"C:\Users\runner\marketplace");
+        assert!(
+            matches!(source, MarketplaceSource::LocalPath { .. }),
+            "expected LocalPath for Windows drive path, got {source:?}"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn detect_windows_drive_path_forward_slash() {
+        let source = MarketplaceSource::detect("D:/repos/marketplace");
+        assert!(
+            matches!(source, MarketplaceSource::LocalPath { .. }),
+            "expected LocalPath for Windows drive path, got {source:?}"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn detect_unc_path() {
+        let source = MarketplaceSource::detect(r"\\server\share\marketplace");
+        assert!(
+            matches!(source, MarketplaceSource::LocalPath { .. }),
+            "expected LocalPath for UNC path, got {source:?}"
         );
     }
 
