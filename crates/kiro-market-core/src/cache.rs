@@ -39,13 +39,14 @@ impl MarketplaceSource {
     /// Classify a user-provided source string into a `MarketplaceSource`.
     ///
     /// Heuristics:
-    /// - Starts with `http://`, `https://`, or `git@` → `GitUrl`
+    /// - Starts with `http://`, `https://`, `file://`, or `git@` → `GitUrl`
     /// - Starts with `/`, `./`, `../`, or `~` → `LocalPath`
     /// - Anything else → `GitHub` (owner/repo shorthand)
     #[must_use]
     pub fn detect(source: &str) -> Self {
         if source.starts_with("http://")
             || source.starts_with("https://")
+            || source.starts_with("file://")
             || source.starts_with("git@")
         {
             Self::GitUrl {
@@ -581,6 +582,14 @@ mod tests {
     fn detect_http_url() {
         let source = MarketplaceSource::detect("http://example.com/repo.git");
         assert!(matches!(source, MarketplaceSource::GitUrl { .. }));
+    }
+
+    #[test]
+    fn detect_file_url() {
+        let source = MarketplaceSource::detect("file:///home/user/marketplace");
+        assert!(
+            matches!(source, MarketplaceSource::GitUrl { url } if url == "file:///home/user/marketplace")
+        );
     }
 
     #[test]

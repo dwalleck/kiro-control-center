@@ -221,3 +221,76 @@ fn workflow_install_skill_and_verify_on_disk() {
         "expected 'test-skill' in list output:\n{out}"
     );
 }
+
+#[test]
+fn workflow_marketplace_update_fetches_new_content() {
+    let dir = TempDir::new().expect("temp dir");
+
+    // Create a local git repo marketplace — NOT a local path symlink,
+    // because symlinked marketplaces are skipped during update.
+    // We add it via its file:// URL so it gets cloned (not symlinked).
+    let marketplace_dir = dir.path().join("origin-marketplace");
+    std::fs::create_dir_all(&marketplace_dir).expect("create marketplace dir");
+    common::fixtures::create_marketplace_repo(&marketplace_dir);
+
+    let url = format!("file://{}", marketplace_dir.display());
+    let output = run_in_dir(dir.path(), &["marketplace", "add", &url]);
+    assert!(
+        output.status.success(),
+        "marketplace add failed: {}",
+        stderr(&output)
+    );
+
+    // Install a skill before the update.
+    let output = run_in_dir(
+        dir.path(),
+        &["install", "test-plugin@test-marketplace"],
+    );
+    assert!(
+        output.status.success(),
+        "install failed: {}",
+        stderr(&output)
+    );
+
+    // Read the installed skill content before update.
+    let skill_path = dir.path().join(".kiro/skills/test-skill/SKILL.md");
+    let before = std::fs::read_to_string(&skill_path).expect("read SKILL.md before");
+    assert!(
+        before.contains("This is a test skill."),
+        "expected original content:\n{before}"
+    );
+
+    // Add a second commit to the origin (simulating upstream update).
+    common::fixtures::add_marketplace_update(&marketplace_dir);
+
+    // Run marketplace update.
+    let output = run_in_dir(dir.path(), &["marketplace", "update"]);
+    assert!(
+        output.status.success(),
+        "marketplace update failed: {}",
+        stderr(&output)
+    );
+    let out = stdout(&output);
+    assert!(
+        out.contains("done") || out.contains("test-marketplace"),
+        "expected update confirmation in output:\n{out}"
+    );
+
+    // Re-install with --force to pick up the updated content.
+    let output = run_in_dir(
+        dir.path(),
+        &["install", "test-plugin@test-marketplace", "--force"],
+    );
+    assert!(
+        output.status.success(),
+        "re-install failed: {}",
+        stderr(&output)
+    );
+
+    // Verify the skill content was updated.
+    let after = std::fs::read_to_string(&skill_path).expect("read SKILL.md after");
+    assert!(
+        after.contains("updated"),
+        "expected updated content after marketplace update + reinstall:\n{after}"
+    );
+}
