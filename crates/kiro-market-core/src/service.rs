@@ -206,10 +206,6 @@ impl MarketplaceService {
     pub fn update(&self, name: Option<&str>) -> Result<UpdateResult, Error> {
         let entries = self.cache.load_known_marketplaces()?;
 
-        if entries.is_empty() {
-            return Ok(UpdateResult::default());
-        }
-
         let targets: Vec<_> = if let Some(filter_name) = name {
             let filtered: Vec<_> = entries.iter().filter(|e| e.name == *filter_name).collect();
             if filtered.is_empty() {
@@ -220,6 +216,9 @@ impl MarketplaceService {
             }
             filtered
         } else {
+            if entries.is_empty() {
+                return Ok(UpdateResult::default());
+            }
             entries.iter().collect()
         };
 
@@ -345,5 +344,146 @@ impl MarketplaceService {
                 .into())
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Mutex;
+
+    use super::*;
+    use crate::cache::CacheDir;
+    use crate::error::GitError;
+    use crate::git::CloneOptions;
+
+    /// Mock git backend that records calls and creates a minimal marketplace
+    /// manifest in the destination directory during clone.
+    #[derive(Debug, Default)]
+    struct MockGitBackend {
+        calls: Mutex<Vec<String>>,
+    }
+
+    impl GitBackend for MockGitBackend {
+        fn clone_repo(
+            &self,
+            url: &str,
+            dest: &Path,
+            _opts: &CloneOptions,
+        ) -> Result<(), GitError> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("clone:{url}"));
+            // Create dest with a minimal marketplace manifest.
+            let mp_dir = dest.join(".claude-plugin");
+            fs::create_dir_all(&mp_dir).unwrap();
+            fs::write(
+                mp_dir.join("marketplace.json"),
+                r#"{"name":"mock-market","owner":{"name":"Test"},"plugins":[{"name":"mock-plugin","description":"A mock plugin","source":"./plugins/mock"}]}"#,
+            )
+            .unwrap();
+            Ok(())
+        }
+
+        fn pull_repo(&self, path: &Path) -> Result<(), GitError> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("pull:{}", path.display()));
+            Ok(())
+        }
+
+        fn verify_sha(&self, _path: &Path, _expected: &str) -> Result<(), GitError> {
+            Ok(())
+        }
+    }
+
+    fn temp_service() -> (tempfile::TempDir, MarketplaceService) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cache = CacheDir::with_root(dir.path().to_path_buf());
+        cache.ensure_dirs().expect("ensure_dirs");
+        let svc = MarketplaceService::new(cache, MockGitBackend::default());
+        (dir, svc)
+    }
+
+    #[test]
+    fn add_marketplace_registers_and_returns_plugins() {
+        let (_dir, svc) = temp_service();
+        let result = svc
+            .add("owner/repo", GitProtocol::Https)
+            .expect("add should succeed");
+
+        assert_eq!(result.name, "mock-market");
+        assert_eq!(result.plugins.len(), 1);
+        assert_eq!(result.plugins[0].name, "mock-plugin");
+
+        let known = svc.list().expect("list");
+        assert_eq!(known.len(), 1);
+        assert_eq!(known[0].name, "mock-market");
+    }
+
+    #[test]
+    fn add_duplicate_marketplace_returns_error() {
+        let (_dir, svc) = temp_service();
+        svc.add("owner/repo", GitProtocol::Https)
+            .expect("first add");
+
+        let err = svc
+            .add("owner/repo", GitProtocol::Https)
+            .expect_err("duplicate should fail");
+
+        assert!(
+            err.to_string().contains("already"),
+            "expected 'already' in error: {err}"
+        );
+    }
+
+    #[test]
+    fn remove_marketplace_cleans_up() {
+        let (_dir, svc) = temp_service();
+        svc.add("owner/repo", GitProtocol::Https)
+            .expect("add");
+
+        svc.remove("mock-market").expect("remove");
+
+        let known = svc.list().expect("list");
+        assert!(known.is_empty());
+    }
+
+    #[test]
+    fn update_calls_pull_on_cloned_repos() {
+        let (_dir, svc) = temp_service();
+        svc.add("owner/repo", GitProtocol::Https)
+            .expect("add");
+
+        let result = svc.update(None).expect("update");
+
+        assert_eq!(result.updated.len(), 1);
+        assert_eq!(result.updated[0], "mock-market");
+        assert!(result.failed.is_empty());
+        assert!(result.skipped.is_empty());
+    }
+
+    #[test]
+    fn update_nonexistent_returns_error() {
+        let (_dir, svc) = temp_service();
+
+        let err = svc
+            .update(Some("nope"))
+            .expect_err("should fail for unknown marketplace");
+
+        assert!(
+            err.to_string().contains("not found"),
+            "expected 'not found' in error: {err}"
+        );
+    }
+
+    #[test]
+    fn list_empty_returns_empty_vec() {
+        let (_dir, svc) = temp_service();
+
+        let known = svc.list().expect("list");
+
+        assert!(known.is_empty());
     }
 }
