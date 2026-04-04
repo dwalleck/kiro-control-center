@@ -115,3 +115,53 @@ fn remove_nonexistent_skill_fails() {
         "expected skill name in stderr:\n{err}"
     );
 }
+
+#[test]
+fn workflow_add_marketplace_and_list_plugins() {
+    let dir = TempDir::new().expect("temp dir");
+
+    // Create a local git repo that looks like a marketplace.
+    let marketplace_dir = dir.path().join("origin-marketplace");
+    std::fs::create_dir_all(&marketplace_dir).expect("create marketplace dir");
+    common::fixtures::create_marketplace_repo(&marketplace_dir);
+
+    // Add it as a local path marketplace.
+    let source = marketplace_dir.to_str().expect("valid utf-8");
+    let output = run_in_dir(dir.path(), &["marketplace", "add", source]);
+    assert!(
+        output.status.success(),
+        "marketplace add failed: {}",
+        stderr(&output)
+    );
+    let out = stdout(&output);
+    assert!(
+        out.contains("test-marketplace"),
+        "expected marketplace name in output:\n{out}"
+    );
+
+    // List marketplaces — should show the newly added one.
+    let output = run_in_dir(dir.path(), &["marketplace", "list"]);
+    assert!(
+        output.status.success(),
+        "marketplace list failed: {}",
+        stderr(&output)
+    );
+    let out = stdout(&output);
+    assert!(
+        out.contains("test-marketplace"),
+        "expected 'test-marketplace' in list output:\n{out}"
+    );
+
+    // Search — should find the test plugin.
+    let output = run_in_dir(dir.path(), &["search", "test"]);
+    assert!(
+        output.status.success(),
+        "search failed: {}",
+        stderr(&output)
+    );
+    let out = stdout(&output);
+    assert!(
+        out.contains("test-plugin"),
+        "expected 'test-plugin' in search output:\n{out}"
+    );
+}
