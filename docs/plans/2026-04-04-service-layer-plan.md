@@ -1064,9 +1064,9 @@ needed.
 
 **Step 1: Update architecture section**
 
-Add a note about the service layer pattern and `GitBackend` trait.
+Add a note about the service layer pattern and `GitBackend` trait to CLAUDE.md.
 
-**Step 2: Run full verification**
+**Step 2: Run quality checks**
 
 ```bash
 cargo fmt --all --check
@@ -1074,7 +1074,26 @@ cargo clippy --workspace -- -D warnings
 cargo test --workspace
 ```
 
-**Step 3: Commit**
+**Step 3: Budget gate — verify git CLI calls are contained**
+
+Grep for `Command::new("git")` outside of `GixCliBackend` and test code:
+
+```bash
+# Should only find hits in git.rs (inside GixCliBackend impl) and test files
+grep -rn 'Command::new("git")' crates/ --include='*.rs' | grep -v '#\[cfg(test)\]' | grep -v 'mod tests' | grep -v 'fixtures.rs'
+```
+
+If any hit appears outside `git.rs`, it means git CLI calls leaked into service or handler code.
+
+**Step 4: Verify zero `let _ =` in non-test code**
+
+```bash
+grep -rn 'let _ =' crates/ --include='*.rs' | grep -v '#\[cfg(test)\]' | grep -v 'mod tests'
+```
+
+Any hits should be investigated and replaced with proper error handling.
+
+**Step 5: Commit**
 
 ```
 docs: update CLAUDE.md with service layer architecture
