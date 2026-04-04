@@ -4,7 +4,7 @@
 
 **Goal:** Eliminate duplicated marketplace logic between CLI and Tauri by introducing a `GitBackend` trait, a `platform` module for cross-platform local links, and a `MarketplaceService` that owns all marketplace operations.
 
-**Architecture:** The `GitBackend` trait abstracts git operations (clone/pull/verify). `GixCliBackend` implements it using the current gix+CLI hybrid. A `platform` module provides cross-platform `create_local_link`/`is_local_link`/`remove_local_link` functions. `MarketplaceService<G: GitBackend>` owns the marketplace lifecycle (add/remove/update/list), replacing the duplicated logic in both frontends. CLI and Tauri handlers become thin wrappers that call the service and format output.
+**Architecture:** The `GitBackend` trait abstracts git operations (clone/pull/verify). `GixCliBackend` implements it using the current gix+CLI hybrid. A `platform` module provides cross-platform `create_local_link`/`is_local_link`/`remove_local_link` functions. `MarketplaceService` stores the backend as `Box<dyn GitBackend>` (not a generic parameter — vtable cost is negligible relative to git I/O, and it simplifies all handler signatures). The service owns the marketplace lifecycle (add/remove/update/list), replacing the duplicated logic in both frontends. CLI and Tauri handlers become thin wrappers that call the service and format output.
 
 **Tech Stack:** Rust 1.85, gix 0.81, thiserror, junction crate (Windows-only)
 
@@ -24,9 +24,9 @@ At the top of `git.rs` (after the `use` block, before `SSH_CONNECT_TIMEOUT_SECS`
 #[derive(Clone, Debug, Default)]
 pub struct CloneOptions {
     /// Branch, tag, or SHA to check out after cloning.
+    /// When `None`, a shallow clone (depth 1) is used to reduce transfer size.
+    /// When `Some`, a full clone is performed followed by a checkout of the ref.
     pub git_ref: Option<String>,
-    /// Whether to perform a shallow clone (depth 1).
-    pub shallow: bool,
 }
 
 /// Trait abstracting git operations for testability and backend swapping.
@@ -44,6 +44,8 @@ pub trait GitBackend: Send + Sync {
     fn verify_sha(&self, path: &Path, expected_sha: &str) -> Result<(), GitError>;
 }
 ```
+
+**Design note:** `shallow` is not a separate field — it's derived from `git_ref` inside the implementation. When `git_ref` is `None`, clone is shallow. This avoids exposing a knob nobody turns independently.
 
 **Step 2: Run tests**
 
@@ -123,7 +125,6 @@ Replace the existing free functions with wrappers that call `GixCliBackend::defa
 pub fn clone_repo(url: &str, dest: &Path, git_ref: Option<&str>) -> Result<(), GitError> {
     let opts = CloneOptions {
         git_ref: git_ref.map(ToOwned::to_owned),
-        shallow: git_ref.is_none(),
     };
     GixCliBackend::default().clone_repo(url, dest, &opts)
 }
@@ -137,7 +138,7 @@ pub fn verify_sha(path: &Path, expected_sha: &str) -> Result<(), GitError> {
 }
 ```
 
-This keeps all existing callers working without changes. The wrappers get removed in Task 6.
+This keeps all existing callers working without changes. The wrappers get removed in Task 8.
 
 **Step 3: Fix tests to use GixCliBackend directly**
 
@@ -296,19 +297,96 @@ mod sys {
 
 Add `pub mod platform;` after `pub mod plugin;`.
 
-**Step 4: Run tests**
+**Step 4: Add platform module tests**
 
-Run: `cargo test -p kiro-market-core`
+Add a `#[cfg(test)] mod tests` at the bottom of `platform.rs`:
+
+```rust
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn create_and_detect_local_link() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let src = dir.path().join("source");
+        std::fs::create_dir_all(&src).expect("create source");
+        std::fs::write(src.join("file.txt"), "hello").expect("write");
+
+        let dest = dir.path().join("link");
+        create_local_link(&src, &dest).expect("create link");
+
+        assert!(is_local_link(&dest), "dest should be detected as a link");
+        assert!(
+            dest.join("file.txt").exists(),
+            "linked content should be visible"
+        );
+    }
+
+    #[test]
+    fn remove_local_link_does_not_delete_target() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let src = dir.path().join("source");
+        std::fs::create_dir_all(&src).expect("create source");
+        std::fs::write(src.join("file.txt"), "hello").expect("write");
+
+        let dest = dir.path().join("link");
+        create_local_link(&src, &dest).expect("create link");
+        remove_local_link(&dest).expect("remove link");
+
+        assert!(!dest.exists(), "link should be gone");
+        assert!(src.join("file.txt").exists(), "source should be intact");
+    }
+
+    #[test]
+    fn is_local_link_false_for_regular_dir() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let regular = dir.path().join("regular");
+        std::fs::create_dir_all(&regular).expect("create dir");
+
+        assert!(!is_local_link(&regular), "regular dir is not a link");
+    }
+}
+```
+
+**Important:** On Windows, the junction fallback may trigger `copy_dir_recursive` instead of creating a true link. The `is_local_link` test will return `false` for copies, which means `create_and_detect_local_link` may fail on some Windows configurations (non-NTFS, no junction support). Add a note to the test acknowledging this and skip if `is_local_link` returns false after creation:
+
+```rust
+    // On Windows, if junctions aren't supported, create_local_link falls
+    // back to a directory copy. In that case is_local_link returns false
+    // and the test still passes — we just verify the content is accessible.
+```
+
+**Step 5: Handle junction preconditions on Windows**
+
+The `junction::create` function requires:
+- `src` must be an absolute path
+- `dest` must not already exist
+
+Add canonicalization of `src` before calling `junction::create` in the Windows implementation:
+
+```rust
+    pub fn create_local_link(src: &Path, dest: &Path) -> io::Result<()> {
+        // Junctions require absolute source paths.
+        let src = std::fs::canonicalize(src)?;
+        // ...
+    }
+```
+
+**Step 6: Run tests**
+
+Run: `cargo test -p kiro-market-core platform`
 Run: `cargo clippy --workspace -- -D warnings`
 Expected: All pass.
 
-**Step 5: Commit**
+**Step 7: Commit**
 
 ```
 feat: add platform module for cross-platform local marketplace links
 
 Unix uses symlinks, Windows uses directory junctions with copy
-fallback. Replaces scattered #[cfg(unix)] blocks in UI-layer code.
+fallback. Includes unit tests for link creation, detection, and
+removal. Replaces scattered #[cfg(unix)] blocks in UI-layer code.
 ```
 
 ---
@@ -345,24 +423,24 @@ use crate::{platform, validation};
 // ---------------------------------------------------------------------------
 
 /// Result of adding a new marketplace.
-#[derive(Clone, Debug)]
-#[cfg_attr(feature = "specta", derive(serde::Serialize, specta::Type))]
+#[derive(Clone, Debug, serde::Serialize)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
 pub struct MarketplaceAddResult {
     pub name: String,
     pub plugins: Vec<PluginBasicInfo>,
 }
 
 /// Basic information about a plugin within a marketplace.
-#[derive(Clone, Debug)]
-#[cfg_attr(feature = "specta", derive(serde::Serialize, specta::Type))]
+#[derive(Clone, Debug, serde::Serialize)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
 pub struct PluginBasicInfo {
     pub name: String,
     pub description: Option<String>,
 }
 
 /// Result of updating one or more marketplaces.
-#[derive(Clone, Debug, Default)]
-#[cfg_attr(feature = "specta", derive(serde::Serialize, specta::Type))]
+#[derive(Clone, Debug, Default, serde::Serialize)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
 pub struct UpdateResult {
     pub updated: Vec<String>,
     pub failed: Vec<FailedUpdate>,
@@ -370,26 +448,32 @@ pub struct UpdateResult {
 }
 
 /// A marketplace that failed to update, with the reason.
-#[derive(Clone, Debug)]
-#[cfg_attr(feature = "specta", derive(serde::Serialize, specta::Type))]
+#[derive(Clone, Debug, serde::Serialize)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
 pub struct FailedUpdate {
     pub name: String,
     pub error: String,
 }
+
+**Design note:** `serde::Serialize` is unconditional (Tauri needs it for IPC). Only `specta::Type` is feature-gated.
 
 // ---------------------------------------------------------------------------
 // Service
 // ---------------------------------------------------------------------------
 
 /// Manages the marketplace lifecycle: add, remove, update, list.
-pub struct MarketplaceService<G: GitBackend> {
+///
+/// Uses `Box<dyn GitBackend>` rather than a generic parameter to keep
+/// handler signatures clean. The vtable cost is negligible relative to
+/// git I/O.
+pub struct MarketplaceService {
     cache: CacheDir,
-    git: G,
+    git: Box<dyn GitBackend>,
 }
 
-impl<G: GitBackend> MarketplaceService<G> {
-    pub fn new(cache: CacheDir, git: G) -> Self {
-        Self { cache, git }
+impl MarketplaceService {
+    pub fn new(cache: CacheDir, git: impl GitBackend + 'static) -> Self {
+        Self { cache, git: Box::new(git) }
     }
 
     /// Add a new marketplace source.
@@ -420,7 +504,9 @@ impl<G: GitBackend> MarketplaceService<G> {
         // Clone or link based on source type.
         let clone_result = self.clone_or_link(&ms, protocol, &temp_dir);
         if let Err(e) = clone_result {
-            let _ = fs::remove_dir_all(&temp_dir);
+            if let Err(e) = fs::remove_dir_all(&temp_dir) {
+                warn!(path = %temp_dir.display(), error = %e, "failed to clean up temp directory");
+            }
             return Err(e);
         }
 
@@ -429,7 +515,9 @@ impl<G: GitBackend> MarketplaceService<G> {
         let manifest_bytes = match fs::read(&manifest_path) {
             Ok(bytes) => bytes,
             Err(e) => {
-                let _ = fs::remove_dir_all(&temp_dir);
+                if let Err(e) = fs::remove_dir_all(&temp_dir) {
+                warn!(path = %temp_dir.display(), error = %e, "failed to clean up temp directory");
+            }
                 return Err(crate::error::MarketplaceError::ManifestNotFound {
                     path: manifest_path,
                 }.into());
@@ -439,7 +527,9 @@ impl<G: GitBackend> MarketplaceService<G> {
         let manifest = match Marketplace::from_json(&manifest_bytes) {
             Ok(m) => m,
             Err(e) => {
-                let _ = fs::remove_dir_all(&temp_dir);
+                if let Err(e) = fs::remove_dir_all(&temp_dir) {
+                warn!(path = %temp_dir.display(), error = %e, "failed to clean up temp directory");
+            }
                 return Err(crate::error::MarketplaceError::InvalidManifest {
                     reason: e.to_string(),
                 }.into());
@@ -449,14 +539,18 @@ impl<G: GitBackend> MarketplaceService<G> {
         let name = manifest.name.clone();
 
         if let Err(e) = validation::validate_name(&name) {
-            let _ = fs::remove_dir_all(&temp_dir);
+            if let Err(e) = fs::remove_dir_all(&temp_dir) {
+                warn!(path = %temp_dir.display(), error = %e, "failed to clean up temp directory");
+            }
             return Err(e.into());
         }
 
         // Rename temp dir to final location.
         let final_dir = self.cache.marketplace_path(&name);
         if final_dir.exists() {
-            let _ = fs::remove_dir_all(&temp_dir);
+            if let Err(e) = fs::remove_dir_all(&temp_dir) {
+                warn!(path = %temp_dir.display(), error = %e, "failed to clean up temp directory");
+            }
             return Err(crate::error::MarketplaceError::AlreadyRegistered {
                 name: name.clone(),
             }.into());
@@ -497,7 +591,7 @@ impl<G: GitBackend> MarketplaceService<G> {
             MarketplaceSource::GitHub { repo } => {
                 let url = crate::git::github_repo_to_url(repo, protocol);
                 debug!(url = %url, dest = %dest.display(), "cloning GitHub marketplace");
-                let opts = crate::git::CloneOptions { shallow: true, ..Default::default() };
+                let opts = crate::git::CloneOptions::default();
                 self.git.clone_repo(&url, dest, &opts)?;
             }
             MarketplaceSource::GitUrl { url } => {
@@ -505,7 +599,7 @@ impl<G: GitBackend> MarketplaceService<G> {
                     warn!("protocol parameter ignored for full git URL; the URL's own scheme is used");
                 }
                 debug!(url = %url, dest = %dest.display(), "cloning git marketplace");
-                let opts = crate::git::CloneOptions { shallow: true, ..Default::default() };
+                let opts = crate::git::CloneOptions::default();
                 self.git.clone_repo(url, dest, &opts)?;
             }
             MarketplaceSource::LocalPath { path } => {
@@ -560,8 +654,17 @@ impl<G: GitBackend> MarketplaceService<G> {
         for entry in &targets {
             let mp_path = self.cache.marketplace_path(&entry.name);
 
+            // Skip locally linked marketplaces — they always reflect disk state.
+            // Also skip if the directory is not a git repo (e.g. copy-fallback
+            // on Windows where junctions weren't available).
             if platform::is_local_link(&mp_path) {
                 debug!(marketplace = %entry.name, "skipping local marketplace");
+                result.skipped.push(entry.name.clone());
+                continue;
+            }
+
+            if matches!(entry.source, MarketplaceSource::LocalPath { .. }) {
+                debug!(marketplace = %entry.name, "skipping local marketplace (directory copy)");
                 result.skipped.push(entry.name.clone());
                 continue;
             }
@@ -662,7 +765,7 @@ mod tests {
         }
     }
 
-    fn temp_service() -> (tempfile::TempDir, MarketplaceService<MockGitBackend>) {
+    fn temp_service() -> (tempfile::TempDir, MarketplaceService) {
         let dir = tempfile::tempdir().expect("tempdir");
         let cache = CacheDir::with_root(dir.path().to_path_buf());
         cache.ensure_dirs().expect("ensure_dirs");
@@ -779,7 +882,7 @@ pub fn run(action: &MarketplaceAction) -> Result<()> {
     }
 }
 
-fn add(svc: &MarketplaceService<GixCliBackend>, source: &str, protocol: GitProtocol) -> Result<()> {
+fn add(svc: &MarketplaceService, source: &str, protocol: GitProtocol) -> Result<()> {
     print!("  Adding marketplace...");
     let result = svc.add(source, protocol)
         .context("failed to add marketplace")?;
@@ -809,7 +912,7 @@ fn add(svc: &MarketplaceService<GixCliBackend>, source: &str, protocol: GitProto
     Ok(())
 }
 
-fn list(svc: &MarketplaceService<GixCliBackend>) -> Result<()> {
+fn list(svc: &MarketplaceService) -> Result<()> {
     let entries = svc.list().context("failed to load marketplaces")?;
 
     if entries.is_empty() {
@@ -828,7 +931,7 @@ fn list(svc: &MarketplaceService<GixCliBackend>) -> Result<()> {
     Ok(())
 }
 
-fn update(svc: &MarketplaceService<GixCliBackend>, name: Option<&str>) -> Result<()> {
+fn update(svc: &MarketplaceService, name: Option<&str>) -> Result<()> {
     let result = svc.update(name).context("failed to update marketplaces")?;
 
     for name in &result.skipped {
@@ -852,7 +955,7 @@ fn update(svc: &MarketplaceService<GixCliBackend>, name: Option<&str>) -> Result
     Ok(())
 }
 
-fn remove(svc: &MarketplaceService<GixCliBackend>, name: &str) -> Result<()> {
+fn remove(svc: &MarketplaceService, name: &str) -> Result<()> {
     svc.remove(name)
         .with_context(|| format!("failed to remove marketplace '{name}'"))?;
     println!("{} Removed marketplace {}", "✓".green().bold(), name.bold());
@@ -918,9 +1021,19 @@ from kiro_market_core::service. Duplicate logic eliminated.
 
 **Step 1: Update remaining callers**
 
-Search for any remaining calls to `git::clone_repo`, `git::pull_repo`, `git::verify_sha` free functions. Update them to use `GixCliBackend::default()` or receive a `&dyn GitBackend`.
+Search for any remaining calls to `git::clone_repo`, `git::pull_repo`, `git::verify_sha` free functions. Update them to use `GixCliBackend` directly.
 
-The main caller is `install.rs` which calls `git::clone_repo` and `git::verify_sha` for plugin installation.
+The main caller is `install.rs` which calls `git::clone_repo` and `git::verify_sha` for plugin cloning. Update `install.rs` to construct a `GixCliBackend::default()` and call through it:
+
+```rust
+let git = GixCliBackend::default();
+let opts = CloneOptions { git_ref: git_ref.map(ToOwned::to_owned) };
+git.clone_repo(&url, &dest, &opts)?;
+// ...
+git.verify_sha(&dest, expected)?;
+```
+
+The Tauri `browse.rs` does NOT call git functions (it reads manifests from disk), so no changes needed there.
 
 **Step 2: Remove the deprecated wrappers from `git.rs`**
 
