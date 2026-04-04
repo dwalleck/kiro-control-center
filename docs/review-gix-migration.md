@@ -1,3 +1,5 @@
+> **Status: RESOLVED** — All critical, important, and suggested issues below were fixed in commits `6342c5b` through `e6f58b6` on the `feature/use-gix` branch. This document is retained for historical context only.
+
 # PR Review: git2 to gix Migration
 
 **Branch:** `feature/use-gix`
