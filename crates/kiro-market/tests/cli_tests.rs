@@ -126,9 +126,10 @@ fn workflow_add_marketplace_and_list_plugins() {
     std::fs::create_dir_all(&marketplace_dir).expect("create marketplace dir");
     common::fixtures::create_marketplace_repo(&marketplace_dir);
 
-    // Add it as a local path marketplace.
-    let source = marketplace_dir.to_str().expect("valid utf-8");
-    let output = run_in_dir(dir.path(), &["marketplace", "add", source]);
+    // Add via file:// URL so it gets cloned (not symlinked).
+    // Local path symlinks are Unix-only; file:// works on all platforms.
+    let url = path_to_file_url(&marketplace_dir);
+    let output = run_in_dir(dir.path(), &["marketplace", "add", &url]);
     assert!(
         output.status.success(),
         "marketplace add failed: {}",
@@ -171,13 +172,13 @@ fn workflow_add_marketplace_and_list_plugins() {
 fn workflow_install_skill_and_verify_on_disk() {
     let dir = TempDir::new().expect("temp dir");
 
-    // Create and add a local marketplace.
+    // Create and add a local marketplace via file:// URL (cross-platform).
     let marketplace_dir = dir.path().join("origin-marketplace");
     std::fs::create_dir_all(&marketplace_dir).expect("create marketplace dir");
     common::fixtures::create_marketplace_repo(&marketplace_dir);
 
-    let source = marketplace_dir.to_str().expect("valid utf-8");
-    let output = run_in_dir(dir.path(), &["marketplace", "add", source]);
+    let url = path_to_file_url(&marketplace_dir);
+    let output = run_in_dir(dir.path(), &["marketplace", "add", &url]);
     assert!(
         output.status.success(),
         "marketplace add failed: {}",
