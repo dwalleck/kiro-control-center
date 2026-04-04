@@ -1,191 +1,65 @@
 //! `marketplace` subcommand: add, list, update, and remove marketplace sources.
 
-use std::fs;
-
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use colored::Colorize;
-use kiro_market_core::cache::{CacheDir, KnownMarketplace, MarketplaceSource};
-use kiro_market_core::git;
-use kiro_market_core::marketplace::Marketplace;
-use tracing::{debug, warn};
+use kiro_market_core::cache::CacheDir;
+use kiro_market_core::git::GixCliBackend;
+use kiro_market_core::service::MarketplaceService;
 
 use crate::cli::MarketplaceAction;
 
 /// Dispatch to the appropriate marketplace subcommand.
 pub fn run(action: &MarketplaceAction) -> Result<()> {
+    let cache = CacheDir::default_location()
+        .context("could not determine data directory; is $HOME set?")?;
+    let git = GixCliBackend::default();
+    let svc = MarketplaceService::new(cache, git);
+
     match action {
-        MarketplaceAction::Add { source, protocol } => add(source, *protocol),
-        MarketplaceAction::List => list(),
-        MarketplaceAction::Update { name } => update(name.as_deref()),
-        MarketplaceAction::Remove { name } => remove(name),
+        MarketplaceAction::Add { source, protocol } => add(&svc, source, *protocol),
+        MarketplaceAction::List => list(&svc),
+        MarketplaceAction::Update { name } => update(&svc, name.as_deref()),
+        MarketplaceAction::Remove { name } => remove(&svc, name),
     }
 }
 
-// ---------------------------------------------------------------------------
-// Source detection
-// ---------------------------------------------------------------------------
-
-// detect_source and source_label are now methods on MarketplaceSource
-// in kiro_market_core::cache (MarketplaceSource::detect, .label())
-
-// ---------------------------------------------------------------------------
-// add
-// ---------------------------------------------------------------------------
-
-/// Add a new marketplace source.
-///
-/// 1. Detect source type (GitHub, git URL, local path).
-/// 2. Clone (or symlink for local paths) into the cache.
-/// 3. Read the marketplace manifest to discover the real name.
-/// 4. Validate the marketplace name.
-/// 5. Rename the clone directory to the real marketplace name.
-/// 6. Register in `known_marketplaces.json`.
-fn add(source: &str, protocol: git::GitProtocol) -> Result<()> {
-    let ms = MarketplaceSource::detect(source);
-    let cache = CacheDir::default_location()
-        .context("could not determine data directory; is $HOME set?")?;
-    cache
-        .ensure_dirs()
-        .context("failed to create cache directories")?;
-
-    // Clone or symlink into a temporary name first, then rename once we
-    // know the real marketplace name from the manifest.
-    let temp_name = format!("_pending_{}", std::process::id());
-    let temp_dir = cache.marketplace_path(&temp_name);
-
-    // Clean up any leftover temp directory from a prior interrupted run.
-    if temp_dir.exists() {
-        fs::remove_dir_all(&temp_dir)
-            .with_context(|| format!("failed to clean up {}", temp_dir.display()))?;
-    }
-
-    match &ms {
-        MarketplaceSource::GitHub { repo } => {
-            let url = git::github_repo_to_url(repo, protocol);
-            debug!(url = %url, dest = %temp_dir.display(), "cloning GitHub marketplace");
-            print!("  Cloning {repo}...");
-            git::clone_repo(&url, &temp_dir, None)
-                .with_context(|| format!("failed to clone {repo}"))?;
-            println!(" done");
-        }
-        MarketplaceSource::GitUrl { url } => {
-            if protocol != git::GitProtocol::default() {
-                warn!("--protocol ignored for full git URL; the URL's own scheme is used");
-            }
-            debug!(url = %url, dest = %temp_dir.display(), "cloning git marketplace");
-            print!("  Cloning {url}...");
-            git::clone_repo(url, &temp_dir, None)
-                .with_context(|| format!("failed to clone {url}"))?;
-            println!(" done");
-        }
-        MarketplaceSource::LocalPath { path } => {
-            let src = kiro_market_core::cache::resolve_local_path(path)
-                .with_context(|| format!("failed to resolve path: {path}"))?;
-            debug!(src = %src.display(), dest = %temp_dir.display(), "symlinking local marketplace");
-            #[cfg(unix)]
-            std::os::unix::fs::symlink(&src, &temp_dir).with_context(|| {
-                format!(
-                    "failed to symlink {} -> {}",
-                    src.display(),
-                    temp_dir.display()
-                )
-            })?;
-            #[cfg(not(unix))]
-            bail!("local path marketplaces are only supported on Unix");
-        }
-    }
-
-    // Read marketplace manifest to get the real name.
-    let manifest_path = temp_dir.join(kiro_market_core::MARKETPLACE_MANIFEST_PATH);
-    let manifest_bytes = fs::read(&manifest_path).with_context(|| {
-        format!(
-            "marketplace manifest not found at {}",
-            manifest_path.display()
-        )
-    })?;
-    let manifest =
-        Marketplace::from_json(&manifest_bytes).context("failed to parse marketplace manifest")?;
-
-    let name = manifest.name.clone();
-    kiro_market_core::validation::validate_name(&name)
-        .with_context(|| format!("marketplace manifest contains invalid name '{name}'"))?;
-    let plugin_count = manifest.plugins.len();
-
-    // Rename temp dir to the real marketplace name.
-    let final_dir = cache.marketplace_path(&name);
-    if final_dir.exists() {
-        // Clean up the temp clone before reporting the error.
-        let _ = fs::remove_dir_all(&temp_dir);
-        bail!(
-            "marketplace directory already exists at {}",
-            final_dir.display()
-        );
-    }
-    fs::rename(&temp_dir, &final_dir).with_context(|| {
-        format!(
-            "failed to rename {} -> {}",
-            temp_dir.display(),
-            final_dir.display()
-        )
-    })?;
-
-    // Register in known_marketplaces.json.
-    let entry = KnownMarketplace {
-        name: name.clone(),
-        source: ms,
-        protocol: Some(protocol),
-        added_at: chrono::Utc::now(),
-    };
-    cache
-        .add_known_marketplace(entry)
-        .with_context(|| format!("failed to register marketplace '{name}'"))?;
+fn add(
+    svc: &MarketplaceService,
+    source: &str,
+    protocol: kiro_market_core::git::GitProtocol,
+) -> Result<()> {
+    print!("  Adding marketplace...");
+    let result = svc
+        .add(source, protocol)
+        .context("failed to add marketplace")?;
 
     println!(
-        "{} Added marketplace {} ({} plugin{})",
+        " {} Added {} ({} plugin{})",
         "✓".green().bold(),
-        name.bold(),
-        plugin_count,
-        if plugin_count == 1 { "" } else { "s" }
+        result.name.bold(),
+        result.plugins.len(),
+        if result.plugins.len() == 1 { "" } else { "s" }
     );
 
-    print_available_plugins(&manifest.plugins, &name);
+    if !result.plugins.is_empty() {
+        println!();
+        println!("  {}", "Available plugins:".bold());
+        for plugin in &result.plugins {
+            let desc = plugin.description.as_deref().unwrap_or("(no description)");
+            println!("    {} - {}", plugin.name.green(), desc);
+        }
+        println!();
+        println!(
+            "  Install with: {}",
+            format!("kiro-market install <plugin>@{}", result.name).bold()
+        );
+    }
 
     Ok(())
 }
 
-/// Print the list of available plugins after adding a marketplace.
-fn print_available_plugins(
-    plugins: &[kiro_market_core::marketplace::PluginEntry],
-    marketplace_name: &str,
-) {
-    if plugins.is_empty() {
-        return;
-    }
-
-    println!();
-    println!("  {}", "Available plugins:".bold());
-    for plugin in plugins {
-        let desc = plugin.description.as_deref().unwrap_or("(no description)");
-        println!("    {} - {}", plugin.name.green(), desc);
-    }
-    println!();
-    println!(
-        "  Install with: {}",
-        format!("kiro-market install <plugin>@{marketplace_name}").bold()
-    );
-}
-
-// ---------------------------------------------------------------------------
-// list
-// ---------------------------------------------------------------------------
-
-/// List all registered marketplaces.
-fn list() -> Result<()> {
-    let cache = CacheDir::default_location()
-        .context("could not determine data directory; is $HOME set?")?;
-    let entries = cache
-        .load_known_marketplaces()
-        .context("failed to load known marketplaces")?;
+fn list(svc: &MarketplaceService) -> Result<()> {
+    let entries = svc.list().context("failed to load marketplaces")?;
 
     if entries.is_empty() {
         println!(
@@ -203,94 +77,43 @@ fn list() -> Result<()> {
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// update
-// ---------------------------------------------------------------------------
+fn update(svc: &MarketplaceService, name: Option<&str>) -> Result<()> {
+    let result = svc.update(name).context("failed to update marketplaces")?;
 
-/// Update marketplace clone(s) from remote.
-fn update(name: Option<&str>) -> Result<()> {
-    let cache = CacheDir::default_location()
-        .context("could not determine data directory; is $HOME set?")?;
-    let entries = cache
-        .load_known_marketplaces()
-        .context("failed to load known marketplaces")?;
-
-    if entries.is_empty() {
-        println!("No marketplaces registered.");
-        return Ok(());
+    for name in &result.skipped {
+        println!("  {} {} (local, skipped)", "·".bold(), name.bold());
+    }
+    for name in &result.updated {
+        println!(
+            "  {} {} {}",
+            "✓".green().bold(),
+            name.bold(),
+            "done".green()
+        );
+    }
+    for fail in &result.failed {
+        println!(
+            "  {} {} {}",
+            "✗".red().bold(),
+            fail.name.bold(),
+            fail.error.red()
+        );
     }
 
-    let targets: Vec<_> = if let Some(name) = name {
-        let filtered: Vec<_> = entries.iter().filter(|e| e.name == name).collect();
-        if filtered.is_empty() {
-            bail!("marketplace '{name}' is not registered");
-        }
-        filtered
-    } else {
-        entries.iter().collect()
-    };
-
-    let mut failures = 0u32;
-
-    for entry in &targets {
-        let mp_path = cache.marketplace_path(&entry.name);
-
-        // Skip symlinked (local) marketplaces -- they always reflect the
-        // latest state on disk.
-        if mp_path.is_symlink() {
-            println!("  {} {} (local, skipped)", "·".bold(), entry.name.bold());
-            continue;
-        }
-
-        print!("  Updating {}...", entry.name.bold());
-        match git::pull_repo(&mp_path) {
-            Ok(()) => {
-                println!(" {}", "done".green());
-            }
-            Err(e) => {
-                println!(" {}: {}", "failed".red(), e);
-                failures += 1;
-            }
-        }
-    }
-
-    if failures > 0 {
-        bail!(
-            "{failures} marketplace{} failed to update",
-            if failures == 1 { "" } else { "s" }
+    if !result.failed.is_empty() {
+        anyhow::bail!(
+            "{} marketplace{} failed to update",
+            result.failed.len(),
+            if result.failed.len() == 1 { "" } else { "s" }
         );
     }
 
     Ok(())
 }
 
-// ---------------------------------------------------------------------------
-// remove
-// ---------------------------------------------------------------------------
-
-/// Remove a registered marketplace and its cached data.
-fn remove(name: &str) -> Result<()> {
-    let cache = CacheDir::default_location()
-        .context("could not determine data directory; is $HOME set?")?;
-
-    // Remove from the registry first.
-    cache
-        .remove_known_marketplace(name)
+fn remove(svc: &MarketplaceService, name: &str) -> Result<()> {
+    svc.remove(name)
         .with_context(|| format!("failed to remove marketplace '{name}'"))?;
-
-    // Remove the cloned directory or symlink.
-    let mp_path = cache.marketplace_path(name);
-    if mp_path.is_symlink() {
-        fs::remove_file(&mp_path)
-            .with_context(|| format!("failed to remove symlink {}", mp_path.display()))?;
-    } else if mp_path.exists() {
-        fs::remove_dir_all(&mp_path)
-            .with_context(|| format!("failed to remove directory {}", mp_path.display()))?;
-    }
-
     println!("{} Removed marketplace {}", "✓".green().bold(), name.bold());
-
     Ok(())
 }
-
-// detect_source and source_label tests moved to kiro-market-core::cache::tests

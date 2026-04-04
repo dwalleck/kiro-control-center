@@ -364,16 +364,8 @@ mod tests {
     }
 
     impl GitBackend for MockGitBackend {
-        fn clone_repo(
-            &self,
-            url: &str,
-            dest: &Path,
-            _opts: &CloneOptions,
-        ) -> Result<(), GitError> {
-            self.calls
-                .lock()
-                .unwrap()
-                .push(format!("clone:{url}"));
+        fn clone_repo(&self, url: &str, dest: &Path, _opts: &CloneOptions) -> Result<(), GitError> {
+            self.calls.lock().unwrap().push(format!("clone:{url}"));
             // Create dest with a minimal marketplace manifest.
             let mp_dir = dest.join(".claude-plugin");
             fs::create_dir_all(&mp_dir).unwrap();
@@ -441,8 +433,7 @@ mod tests {
     #[test]
     fn remove_marketplace_cleans_up() {
         let (_dir, svc) = temp_service();
-        svc.add("owner/repo", GitProtocol::Https)
-            .expect("add");
+        svc.add("owner/repo", GitProtocol::Https).expect("add");
 
         svc.remove("mock-market").expect("remove");
 
@@ -453,8 +444,7 @@ mod tests {
     #[test]
     fn update_calls_pull_on_cloned_repos() {
         let (_dir, svc) = temp_service();
-        svc.add("owner/repo", GitProtocol::Https)
-            .expect("add");
+        svc.add("owner/repo", GitProtocol::Https).expect("add");
 
         let result = svc.update(None).expect("update");
 

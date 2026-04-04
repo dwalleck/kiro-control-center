@@ -59,37 +59,62 @@ pub trait GitBackend: Send + Sync {
     fn verify_sha(&self, path: &Path, expected_sha: &str) -> Result<(), GitError>;
 }
 
+// ---------------------------------------------------------------------------
+// Gix + CLI backend
+// ---------------------------------------------------------------------------
+
+/// Git backend using `gix` for clone/open and the system `git` CLI for
+/// pull and ref checkout.
+///
+/// SSH connect-timeout protection is applied when no custom `GIT_SSH_COMMAND`
+/// or `GIT_SSH` is configured. `GIT_TERMINAL_PROMPT=0` prevents interactive
+/// prompts from hanging non-interactive contexts.
+#[derive(Debug)]
+pub struct GixCliBackend {
+    ssh_connect_timeout: u32,
+}
+
+impl Default for GixCliBackend {
+    fn default() -> Self {
+        Self {
+            ssh_connect_timeout: SSH_CONNECT_TIMEOUT_SECS,
+        }
+    }
+}
+
 /// Default SSH connect timeout in seconds applied via `GIT_SSH_COMMAND`.
 const SSH_CONNECT_TIMEOUT_SECS: u32 = 30;
 
-/// Run a `git` command with SSH connect-timeout protection.
-///
-/// Sets `GIT_SSH_COMMAND` with a 30-second `ConnectTimeout` to prevent
-/// indefinite hangs when SSH port 22 is firewalled. Detects a missing
-/// `git` binary and returns [`GitError::GitNotFound`].
-fn run_git(args: &[&str], dir: &Path) -> Result<std::process::Output, GitError> {
-    let mut cmd = Command::new("git");
-    cmd.args(args)
-        .current_dir(dir)
-        .env("GIT_TERMINAL_PROMPT", "0");
+impl GixCliBackend {
+    /// Run a `git` command with SSH connect-timeout protection.
+    ///
+    /// Sets `GIT_SSH_COMMAND` with a configurable `ConnectTimeout` to prevent
+    /// indefinite hangs when SSH port 22 is firewalled. Detects a missing
+    /// `git` binary and returns [`GitError::GitNotFound`].
+    fn run_git(&self, args: &[&str], dir: &Path) -> Result<std::process::Output, GitError> {
+        let mut cmd = Command::new("git");
+        cmd.args(args)
+            .current_dir(dir)
+            .env("GIT_TERMINAL_PROMPT", "0");
 
-    // Only set SSH timeout when no custom SSH configuration exists.
-    // GIT_SSH_COMMAND takes precedence over GIT_SSH in git's resolution;
-    // setting it when GIT_SSH points to plink would silently override it.
-    if std::env::var_os("GIT_SSH_COMMAND").is_none() && std::env::var_os("GIT_SSH").is_none() {
-        cmd.env(
-            "GIT_SSH_COMMAND",
-            format!("ssh -o ConnectTimeout={SSH_CONNECT_TIMEOUT_SECS}"),
-        );
+        // Only set SSH timeout when no custom SSH configuration exists.
+        // GIT_SSH_COMMAND takes precedence over GIT_SSH in git's resolution;
+        // setting it when GIT_SSH points to plink would silently override it.
+        if std::env::var_os("GIT_SSH_COMMAND").is_none() && std::env::var_os("GIT_SSH").is_none() {
+            cmd.env(
+                "GIT_SSH_COMMAND",
+                format!("ssh -o ConnectTimeout={}", self.ssh_connect_timeout),
+            );
+        }
+
+        cmd.output().map_err(|e| match e.kind() {
+            std::io::ErrorKind::NotFound => GitError::GitNotFound,
+            _ => GitError::GitCommandFailed {
+                dir: dir.to_path_buf(),
+                source: Box::new(e),
+            },
+        })
     }
-
-    cmd.output().map_err(|e| match e.kind() {
-        std::io::ErrorKind::NotFound => GitError::GitNotFound,
-        _ => GitError::GitCommandFailed {
-            dir: dir.to_path_buf(),
-            source: Box::new(e),
-        },
-    })
 }
 
 /// Extract a useful error message from a failed git command.
@@ -106,6 +131,108 @@ fn git_error_detail(output: &std::process::Output) -> String {
         return stdout.trim().to_owned();
     }
     format!("git exited with {}", output.status)
+}
+
+impl GitBackend for GixCliBackend {
+    fn clone_repo(&self, url: &str, dest: &Path, opts: &CloneOptions) -> Result<(), GitError> {
+        debug!(url, dest = %dest.display(), git_ref = opts.git_ref.as_deref(), "cloning repository");
+
+        let map_err = |e: Box<dyn std::error::Error + Send + Sync>| GitError::CloneFailed {
+            url: url.to_owned(),
+            source: e,
+        };
+
+        let mut prepare = gix::prepare_clone(url, dest).map_err(|e| map_err(Box::new(e)))?;
+
+        if opts.git_ref.is_none() {
+            let depth = NonZeroU32::MIN;
+            prepare = prepare.with_shallow(gix::remote::fetch::Shallow::DepthAtRemote(depth));
+        }
+
+        let (mut checkout, _outcome) = prepare
+            .fetch_then_checkout(Discard, &AtomicBool::new(false))
+            .map_err(|e| map_err(Box::new(e)))?;
+
+        let (_repo, _outcome) = checkout
+            .main_worktree(Discard, &AtomicBool::new(false))
+            .map_err(|e| map_err(Box::new(e)))?;
+
+        if let Some(refname) = opts.git_ref.as_deref() {
+            if refname.starts_with('-') {
+                return Err(map_err(
+                    format!("invalid git ref: '{refname}' must not start with '-'").into(),
+                ));
+            }
+
+            let output = self
+                .run_git(&["checkout", refname], dest)
+                .map_err(|e| map_err(Box::new(e)))?;
+
+            if !output.status.success() {
+                let detail = git_error_detail(&output);
+                return Err(map_err(detail.into()));
+            }
+        }
+
+        Ok(())
+    }
+
+    fn pull_repo(&self, path: &Path) -> Result<(), GitError> {
+        debug!(path = %path.display(), "pulling repository");
+
+        // Verify it's actually a git repo first (preserves the OpenFailed error).
+        let _repo = gix::open(path).map_err(|e| GitError::OpenFailed {
+            path: path.to_path_buf(),
+            source: Box::new(e),
+        })?;
+
+        let output =
+            self.run_git(&["pull", "--ff-only"], path)
+                .map_err(|e| GitError::PullFailed {
+                    path: path.to_path_buf(),
+                    source: Box::new(e),
+                })?;
+
+        if !output.status.success() {
+            let detail = git_error_detail(&output);
+            return Err(GitError::PullFailed {
+                path: path.to_path_buf(),
+                source: detail.into(),
+            });
+        }
+
+        Ok(())
+    }
+
+    fn verify_sha(&self, path: &Path, expected_sha: &str) -> Result<(), GitError> {
+        if expected_sha.is_empty() {
+            return Err(GitError::ShaMismatch {
+                expected: "(empty)".to_owned(),
+                actual: "(not checked)".to_owned(),
+            });
+        }
+
+        let repo = gix::open(path).map_err(|e| GitError::OpenFailed {
+            path: path.to_path_buf(),
+            source: Box::new(e),
+        })?;
+
+        let head_id = repo.head_id().map_err(|e| GitError::OpenFailed {
+            path: path.to_path_buf(),
+            source: Box::new(e),
+        })?;
+
+        let actual_sha = head_id.to_string();
+
+        if actual_sha.starts_with(expected_sha) {
+            Ok(())
+        } else {
+            Err(GitError::ShaMismatch {
+                expected: expected_sha.to_owned(),
+                actual: actual_sha,
+            })
+        }
+    }
 }
 
 /// Which transport protocol to use when cloning from a shorthand host
@@ -132,129 +259,40 @@ pub fn github_repo_to_url(repo: &str, protocol: GitProtocol) -> String {
     }
 }
 
-/// Clone a remote Git repository into `dest`.
-///
-/// Uses `gix` for the clone operation. When `git_ref` is `None`, a shallow
-/// clone (depth 1) is used to reduce transfer size. When `git_ref` is
-/// provided, a full clone is performed followed by a `git checkout` of the
-/// specified branch, tag, or SHA (requires the `git` CLI in `$PATH`).
+// ---------------------------------------------------------------------------
+// Deprecated free-function wrappers (removed in Task 8)
+// ---------------------------------------------------------------------------
+
+/// Deprecated: use [`GixCliBackend`] directly or `MarketplaceService`.
 ///
 /// # Errors
 ///
 /// Returns [`GitError::CloneFailed`] if the clone or checkout fails.
 pub fn clone_repo(url: &str, dest: &Path, git_ref: Option<&str>) -> Result<(), GitError> {
-    debug!(url, dest = %dest.display(), git_ref, "cloning repository");
-
-    let map_err = |e: Box<dyn std::error::Error + Send + Sync>| GitError::CloneFailed {
-        url: url.to_owned(),
-        source: e,
+    let opts = CloneOptions {
+        git_ref: git_ref.map(ToOwned::to_owned),
     };
-
-    let mut prepare = gix::prepare_clone(url, dest).map_err(|e| map_err(Box::new(e)))?;
-
-    if git_ref.is_none() {
-        let depth = NonZeroU32::MIN;
-        prepare = prepare.with_shallow(gix::remote::fetch::Shallow::DepthAtRemote(depth));
-    }
-
-    let (mut checkout, _outcome) = prepare
-        .fetch_then_checkout(Discard, &AtomicBool::new(false))
-        .map_err(|e| map_err(Box::new(e)))?;
-
-    let (_repo, _outcome) = checkout
-        .main_worktree(Discard, &AtomicBool::new(false))
-        .map_err(|e| map_err(Box::new(e)))?;
-
-    if let Some(refname) = git_ref {
-        if refname.starts_with('-') {
-            return Err(map_err(
-                format!("invalid git ref: '{refname}' must not start with '-'").into(),
-            ));
-        }
-
-        let output = run_git(&["checkout", refname], dest).map_err(|e| map_err(Box::new(e)))?;
-
-        if !output.status.success() {
-            let detail = git_error_detail(&output);
-            return Err(map_err(detail.into()));
-        }
-    }
-
-    Ok(())
+    GixCliBackend::default().clone_repo(url, dest, &opts)
 }
 
-/// Verify the current HEAD of a repository matches the expected SHA prefix.
-///
-/// Both full and abbreviated SHAs are supported: the check passes if the
-/// actual commit SHA starts with the expected string.
-///
-/// # Errors
-///
-/// Returns [`GitError::ShaMismatch`] if the actual commit SHA does not match.
-/// Returns [`GitError::OpenFailed`] if the repository cannot be read.
-pub fn verify_sha(path: &Path, expected_sha: &str) -> Result<(), GitError> {
-    if expected_sha.is_empty() {
-        return Err(GitError::ShaMismatch {
-            expected: "(empty)".to_owned(),
-            actual: "(not checked)".to_owned(),
-        });
-    }
-
-    let repo = gix::open(path).map_err(|e| GitError::OpenFailed {
-        path: path.to_path_buf(),
-        source: Box::new(e),
-    })?;
-
-    let head_id = repo.head_id().map_err(|e| GitError::OpenFailed {
-        path: path.to_path_buf(),
-        source: Box::new(e),
-    })?;
-
-    let actual_sha = head_id.to_string();
-
-    if actual_sha.starts_with(expected_sha) {
-        Ok(())
-    } else {
-        Err(GitError::ShaMismatch {
-            expected: expected_sha.to_owned(),
-            actual: actual_sha,
-        })
-    }
-}
-
-/// Pull the default branch using `git pull --ff-only`.
-///
-/// Opens the repository at `path` with `gix` to verify it is valid,
-/// then runs `git pull --ff-only` to fetch and fast-forward the local
-/// branch.
+/// Deprecated: use [`GixCliBackend`] directly or `MarketplaceService`.
 ///
 /// # Errors
 ///
 /// Returns [`GitError::OpenFailed`] if the path is not a valid repository,
 /// or [`GitError::PullFailed`] if the pull fails.
 pub fn pull_repo(path: &Path) -> Result<(), GitError> {
-    debug!(path = %path.display(), "pulling repository");
+    GixCliBackend::default().pull_repo(path)
+}
 
-    // Verify it's actually a git repo first (preserves the OpenFailed error).
-    let _repo = gix::open(path).map_err(|e| GitError::OpenFailed {
-        path: path.to_path_buf(),
-        source: Box::new(e),
-    })?;
-
-    let output = run_git(&["pull", "--ff-only"], path).map_err(|e| GitError::PullFailed {
-        path: path.to_path_buf(),
-        source: Box::new(e),
-    })?;
-
-    if !output.status.success() {
-        let detail = git_error_detail(&output);
-        return Err(GitError::PullFailed {
-            path: path.to_path_buf(),
-            source: detail.into(),
-        });
-    }
-
-    Ok(())
+/// Deprecated: use [`GixCliBackend`] directly or `MarketplaceService`.
+///
+/// # Errors
+///
+/// Returns [`GitError::ShaMismatch`] if the SHA does not match.
+/// Returns [`GitError::OpenFailed`] if the repository cannot be read.
+pub fn verify_sha(path: &Path, expected_sha: &str) -> Result<(), GitError> {
+    GixCliBackend::default().verify_sha(path, expected_sha)
 }
 
 #[cfg(test)]
