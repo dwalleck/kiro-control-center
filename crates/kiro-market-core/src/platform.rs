@@ -6,30 +6,50 @@
 use std::io;
 use std::path::Path;
 
+/// What `create_local_link` actually did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LinkResult {
+    /// A true link was created (symlink on Unix, junction on Windows).
+    /// Changes to the source are reflected immediately.
+    Linked,
+    /// The source was copied into the destination (Windows fallback).
+    /// Changes to the source will NOT be reflected.
+    Copied,
+}
+
 /// Create a local link from `src` to `dest` for live marketplace tracking.
+///
+/// Returns [`LinkResult`] indicating whether a true link or a copy was used,
+/// so callers can inform the user about live-tracking behavior.
 ///
 /// # Platform behavior
 ///
-/// - **Unix:** Creates a symbolic link.
+/// - **Unix:** Creates a symbolic link. Always returns `Linked`.
 /// - **Windows:** Tries a directory junction (NTFS, no admin required).
-///   Falls back to copying `src` into `dest` if junctions fail, logging
-///   a warning that changes won't be live-tracked.
+///   Falls back to copying `src` into `dest` if junctions fail, returning
+///   `Copied` so the caller can warn the user.
 ///
 /// # Errors
 ///
 /// Returns an error if the link or copy operation fails (e.g. `src` does
-/// not exist, `dest` already exists, or insufficient permissions).
-pub fn create_local_link(src: &Path, dest: &Path) -> io::Result<()> {
+/// not exist or insufficient permissions).
+pub fn create_local_link(src: &Path, dest: &Path) -> io::Result<LinkResult> {
     sys::create_local_link(src, dest)
 }
 
 /// Check whether `path` is a local link (symlink or directory junction).
+///
+/// Returns `false` for regular directories (including copy-fallback dirs),
+/// nonexistent paths, and files.
 #[must_use]
 pub fn is_local_link(path: &Path) -> bool {
     sys::is_local_link(path)
 }
 
 /// Remove a local link without removing the target contents.
+///
+/// Should only be called when [`is_local_link`] returns `true`. For
+/// regular directories (e.g. copy-fallback), use `fs::remove_dir_all`.
 ///
 /// # Errors
 ///
@@ -44,8 +64,11 @@ mod sys {
     use std::io;
     use std::path::Path;
 
-    pub fn create_local_link(src: &Path, dest: &Path) -> io::Result<()> {
-        std::os::unix::fs::symlink(src, dest)
+    use super::LinkResult;
+
+    pub fn create_local_link(src: &Path, dest: &Path) -> io::Result<LinkResult> {
+        std::os::unix::fs::symlink(src, dest)?;
+        Ok(LinkResult::Linked)
     }
 
     pub fn is_local_link(path: &Path) -> bool {
@@ -62,13 +85,15 @@ mod sys {
     use std::io;
     use std::path::Path;
 
-    pub fn create_local_link(src: &Path, dest: &Path) -> io::Result<()> {
+    use super::LinkResult;
+
+    pub fn create_local_link(src: &Path, dest: &Path) -> io::Result<LinkResult> {
         // Junctions require absolute source paths.
         let src = std::fs::canonicalize(src)?;
 
         // Try directory junction first (works without admin on NTFS).
         match junction::create(&src, dest) {
-            Ok(()) => return Ok(()),
+            Ok(()) => return Ok(LinkResult::Linked),
             Err(e) => {
                 tracing::debug!(
                     error = %e,
@@ -79,22 +104,20 @@ mod sys {
 
         // Fallback: copy the directory tree.
         copy_dir_recursive(&src, dest)?;
-        tracing::warn!(
-            src = %src.display(),
-            dest = %dest.display(),
-            "used directory copy instead of junction — local changes will NOT be live-tracked"
-        );
-        Ok(())
+        Ok(LinkResult::Copied)
     }
 
     pub fn is_local_link(path: &Path) -> bool {
-        path.is_symlink()
+        // Check for both symlinks (IO_REPARSE_TAG_SYMLINK) and directory
+        // junctions (IO_REPARSE_TAG_MOUNT_POINT). Path::is_symlink() only
+        // detects symlinks, so we also check via the junction crate.
+        path.is_symlink() || junction::exists(path).unwrap_or(false)
     }
 
     pub fn remove_local_link(path: &Path) -> io::Result<()> {
         // Junctions are directory reparse points — remove_dir removes the
         // junction without deleting the target. Symlinks use remove_file.
-        if path.is_dir() {
+        if junction::exists(path).unwrap_or(false) || path.is_dir() {
             std::fs::remove_dir(path)
         } else {
             std::fs::remove_file(path)

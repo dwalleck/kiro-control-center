@@ -1,10 +1,11 @@
 //! Marketplace lifecycle operations.
 //!
-//! [`MarketplaceService`] owns the add/remove/update/list logic that was
-//! previously duplicated between the CLI and Tauri frontends.
+//! [`MarketplaceService`] centralizes add/remove/update/list logic so that
+//! CLI and Tauri frontends remain thin presentation wrappers.
 
+use std::error::Error as _;
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 use tracing::{debug, warn};
@@ -13,7 +14,47 @@ use crate::cache::{CacheDir, KnownMarketplace, MarketplaceSource};
 use crate::error::{Error, MarketplaceError};
 use crate::git::{self, CloneOptions, GitBackend, GitProtocol};
 use crate::marketplace::Marketplace;
+use crate::platform::LinkResult;
 use crate::{platform, validation};
+
+// ---------------------------------------------------------------------------
+// Temp directory cleanup guard
+// ---------------------------------------------------------------------------
+
+/// RAII guard that removes a temp directory on drop unless defused.
+/// Prevents orphaned `_pending_*` directories when `add()` fails.
+struct TempDirGuard {
+    path: PathBuf,
+    defused: bool,
+}
+
+impl TempDirGuard {
+    fn new(path: PathBuf) -> Self {
+        Self {
+            path,
+            defused: false,
+        }
+    }
+
+    /// Prevent cleanup on drop (call after successful rename).
+    fn defuse(&mut self) {
+        self.defused = true;
+    }
+}
+
+impl Drop for TempDirGuard {
+    fn drop(&mut self) {
+        if !self.defused
+            && let Err(e) = fs::remove_dir_all(&self.path)
+        {
+            warn!(
+                path = %self.path.display(),
+                error = %e,
+                "failed to clean up temp directory"
+            );
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Result types
@@ -106,50 +147,34 @@ impl MarketplaceService {
             );
         }
 
+        // Guard auto-cleans temp_dir on any early return. Defuse after rename.
+        let mut guard = TempDirGuard::new(temp_dir.clone());
+
         // Clone or link based on source type.
-        if let Err(e) = self.clone_or_link(&ms, protocol, &temp_dir) {
-            if let Err(cleanup_err) = fs::remove_dir_all(&temp_dir) {
-                warn!(
-                    path = %temp_dir.display(),
-                    error = %cleanup_err,
-                    "failed to clean up temp directory after clone failure"
-                );
-            }
-            return Err(e);
+        let link_result = self.clone_or_link(&ms, protocol, &temp_dir)?;
+
+        if link_result == LinkResult::Copied {
+            warn!(
+                source = %source,
+                "marketplace was copied, not linked — local changes will NOT be live-tracked"
+            );
         }
 
         // Read marketplace manifest.
         let manifest_path = temp_dir.join(crate::MARKETPLACE_MANIFEST_PATH);
-        let manifest = Self::read_and_validate_manifest(&manifest_path, &temp_dir)?;
+        let manifest = Self::read_manifest(&manifest_path)?;
 
         let name = manifest.name.clone();
-
-        // Validate name before any filesystem operation that uses it.
-        if let Err(e) = validation::validate_name(&name) {
-            if let Err(cleanup_err) = fs::remove_dir_all(&temp_dir) {
-                warn!(
-                    path = %temp_dir.display(),
-                    error = %cleanup_err,
-                    "failed to clean up temp directory after validation failure"
-                );
-            }
-            return Err(e.into());
-        }
+        validation::validate_name(&name)?;
 
         // Rename temp dir to final location.
         let final_dir = self.cache.marketplace_path(&name);
         if final_dir.exists() {
-            if let Err(cleanup_err) = fs::remove_dir_all(&temp_dir) {
-                warn!(
-                    path = %temp_dir.display(),
-                    error = %cleanup_err,
-                    "failed to clean up temp directory"
-                );
-            }
             return Err(MarketplaceError::AlreadyRegistered { name: name.clone() }.into());
         }
 
         fs::rename(&temp_dir, &final_dir)?;
+        guard.defuse(); // Rename succeeded — don't clean up.
 
         // Register in known_marketplaces.json.
         let entry = KnownMarketplace {
@@ -251,9 +276,17 @@ impl MarketplaceService {
                 }
                 Err(e) => {
                     warn!(marketplace = %entry.name, error = %e, "failed to update");
+                    // Walk the error source chain for a complete message.
+                    let mut detail = e.to_string();
+                    let mut source: Option<&dyn std::error::Error> = e.source();
+                    while let Some(cause) = source {
+                        detail.push_str(": ");
+                        detail.push_str(&cause.to_string());
+                        source = cause.source();
+                    }
                     result.failed.push(FailedUpdate {
                         name: entry.name.clone(),
-                        error: e.to_string(),
+                        error: detail,
                     });
                 }
             }
@@ -280,13 +313,14 @@ impl MarketplaceService {
         ms: &MarketplaceSource,
         protocol: GitProtocol,
         dest: &Path,
-    ) -> Result<(), Error> {
+    ) -> Result<LinkResult, Error> {
         match ms {
             MarketplaceSource::GitHub { repo } => {
                 let url = git::github_repo_to_url(repo, protocol);
                 debug!(url = %url, dest = %dest.display(), "cloning GitHub marketplace");
                 let opts = CloneOptions::default();
                 self.git.clone_repo(&url, dest, &opts)?;
+                Ok(LinkResult::Linked)
             }
             MarketplaceSource::GitUrl { url } => {
                 if protocol != GitProtocol::default() {
@@ -297,53 +331,38 @@ impl MarketplaceService {
                 debug!(url = %url, dest = %dest.display(), "cloning git marketplace");
                 let opts = CloneOptions::default();
                 self.git.clone_repo(url, dest, &opts)?;
+                Ok(LinkResult::Linked)
             }
             MarketplaceSource::LocalPath { path } => {
                 let src = crate::cache::resolve_local_path(path)?;
                 debug!(src = %src.display(), dest = %dest.display(), "linking local marketplace");
-                platform::create_local_link(&src, dest)?;
+                Ok(platform::create_local_link(&src, dest)?)
             }
         }
-        Ok(())
     }
 
-    fn read_and_validate_manifest(
-        manifest_path: &Path,
-        temp_dir: &Path,
-    ) -> Result<Marketplace, Error> {
+    /// Read and parse the marketplace manifest. Does NOT do cleanup — the
+    /// caller (or its `TempDirGuard`) owns temp directory lifecycle.
+    fn read_manifest(manifest_path: &Path) -> Result<Marketplace, Error> {
         let manifest_bytes = match fs::read(manifest_path) {
             Ok(bytes) => bytes,
-            Err(_e) => {
-                if let Err(cleanup_err) = fs::remove_dir_all(temp_dir) {
-                    warn!(
-                        path = %temp_dir.display(),
-                        error = %cleanup_err,
-                        "failed to clean up temp directory after manifest read failure"
-                    );
-                }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 return Err(MarketplaceError::ManifestNotFound {
                     path: manifest_path.to_path_buf(),
                 }
                 .into());
             }
+            Err(e) => {
+                // Permission denied, I/O error, etc. — propagate the real cause.
+                return Err(e.into());
+            }
         };
 
-        match Marketplace::from_json(&manifest_bytes) {
-            Ok(m) => Ok(m),
-            Err(e) => {
-                if let Err(cleanup_err) = fs::remove_dir_all(temp_dir) {
-                    warn!(
-                        path = %temp_dir.display(),
-                        error = %cleanup_err,
-                        "failed to clean up temp directory after manifest parse failure"
-                    );
-                }
-                Err(MarketplaceError::InvalidManifest {
-                    reason: e.to_string(),
-                }
-                .into())
-            }
-        }
+        Marketplace::from_json(&manifest_bytes).map_err(|e| {
+            Error::from(MarketplaceError::InvalidManifest {
+                reason: e.to_string(),
+            })
+        })
     }
 }
 
@@ -475,5 +494,131 @@ mod tests {
         let known = svc.list().expect("list");
 
         assert!(known.is_empty());
+    }
+
+    // -----------------------------------------------------------------------
+    // Additional tests for review findings
+    // -----------------------------------------------------------------------
+
+    /// A git backend that always fails on clone.
+    #[derive(Debug, Default)]
+    struct FailingGitBackend;
+
+    impl GitBackend for FailingGitBackend {
+        fn clone_repo(
+            &self,
+            url: &str,
+            _dest: &Path,
+            _opts: &CloneOptions,
+        ) -> Result<(), GitError> {
+            Err(GitError::CloneFailed {
+                url: url.to_owned(),
+                source: "simulated failure".to_owned().into(),
+            })
+        }
+
+        fn pull_repo(&self, path: &Path) -> Result<(), GitError> {
+            Err(GitError::PullFailed {
+                path: path.to_path_buf(),
+                source: "simulated pull failure".to_owned().into(),
+            })
+        }
+
+        fn verify_sha(&self, _path: &Path, _expected: &str) -> Result<(), GitError> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn add_with_clone_failure_cleans_up_temp_dir() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cache = CacheDir::with_root(dir.path().to_path_buf());
+        cache.ensure_dirs().expect("ensure_dirs");
+        let svc = MarketplaceService::new(cache, FailingGitBackend);
+
+        let err = svc
+            .add("owner/repo", GitProtocol::Https)
+            .expect_err("should fail");
+
+        assert!(
+            err.to_string().contains("clone"),
+            "expected clone error: {err}"
+        );
+
+        // Verify no _pending_ directory remains.
+        let marketplaces_dir = dir.path().join("marketplaces");
+        if marketplaces_dir.exists() {
+            let entries: Vec<_> = fs::read_dir(&marketplaces_dir).expect("read dir").collect();
+            assert!(
+                entries.is_empty(),
+                "expected no leftover temp dirs, found: {entries:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn add_with_git_url_passes_url_verbatim() {
+        let (_dir, svc) = temp_service();
+        let result = svc
+            .add("https://github.com/owner/repo.git", GitProtocol::Https)
+            .expect("add with git URL");
+
+        assert_eq!(result.name, "mock-market");
+
+        // Verify the mock received the verbatim URL, not a GitHub-reformatted one.
+        // The mock backend is inside the Box, so we check via the registry.
+        let known = svc.list().expect("list");
+        assert_eq!(known.len(), 1);
+        assert!(
+            matches!(
+                &known[0].source,
+                MarketplaceSource::GitUrl { url } if url == "https://github.com/owner/repo.git"
+            ),
+            "expected GitUrl source, got {:?}",
+            known[0].source
+        );
+    }
+
+    #[test]
+    fn update_with_pull_failure_records_in_failed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cache = CacheDir::with_root(dir.path().to_path_buf());
+        cache.ensure_dirs().expect("ensure_dirs");
+
+        // First add a marketplace with the working mock.
+        let svc = MarketplaceService::new(
+            CacheDir::with_root(dir.path().to_path_buf()),
+            MockGitBackend::default(),
+        );
+        svc.add("owner/repo", GitProtocol::Https).expect("add");
+
+        // Now create a new service with the failing backend to test update.
+        let svc = MarketplaceService::new(
+            CacheDir::with_root(dir.path().to_path_buf()),
+            FailingGitBackend,
+        );
+        let result = svc
+            .update(None)
+            .expect("update should return Ok with failures");
+
+        assert!(result.updated.is_empty());
+        assert_eq!(result.failed.len(), 1);
+        assert_eq!(result.failed[0].name, "mock-market");
+        assert!(
+            result.failed[0].error.contains("pull"),
+            "expected pull error: {}",
+            result.failed[0].error
+        );
+    }
+
+    #[test]
+    fn update_specific_marketplace_by_name() {
+        let (_dir, svc) = temp_service();
+        svc.add("owner/repo", GitProtocol::Https).expect("add");
+
+        let result = svc.update(Some("mock-market")).expect("update by name");
+
+        assert_eq!(result.updated.len(), 1);
+        assert_eq!(result.updated[0], "mock-market");
     }
 }

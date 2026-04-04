@@ -80,6 +80,11 @@ fn list(svc: &MarketplaceService) -> Result<()> {
 fn update(svc: &MarketplaceService, name: Option<&str>) -> Result<()> {
     let result = svc.update(name).context("failed to update marketplaces")?;
 
+    if result.updated.is_empty() && result.failed.is_empty() && result.skipped.is_empty() {
+        println!("No marketplaces registered.");
+        return Ok(());
+    }
+
     for name in &result.skipped {
         println!("  {} {} (local, skipped)", "·".bold(), name.bold());
     }
