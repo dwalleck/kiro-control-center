@@ -15,6 +15,50 @@ use tracing::debug;
 
 use crate::error::GitError;
 
+// ---------------------------------------------------------------------------
+// Git backend trait
+// ---------------------------------------------------------------------------
+
+/// Options for cloning a repository.
+///
+/// When `git_ref` is `None`, the implementation should use a shallow clone
+/// (depth 1) to reduce transfer size. When `git_ref` is `Some`, a full
+/// clone is performed followed by a checkout of the specified ref.
+#[derive(Clone, Debug, Default)]
+pub struct CloneOptions {
+    /// Branch, tag, or SHA to check out after cloning.
+    pub git_ref: Option<String>,
+}
+
+/// Trait abstracting git operations for testability and backend swapping.
+///
+/// Implementations must be `Send + Sync` to support sharing across async
+/// Tauri command handlers via `Arc` or `Box`.
+pub trait GitBackend: Send + Sync {
+    /// Clone a remote repository into `dest`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GitError::CloneFailed`] if the clone or checkout fails.
+    fn clone_repo(&self, url: &str, dest: &Path, opts: &CloneOptions) -> Result<(), GitError>;
+
+    /// Pull (fast-forward only) the default branch.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GitError::OpenFailed`] if the path is not a valid repository,
+    /// or [`GitError::PullFailed`] if the pull fails.
+    fn pull_repo(&self, path: &Path) -> Result<(), GitError>;
+
+    /// Verify the HEAD commit matches the expected SHA prefix.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GitError::ShaMismatch`] if the SHA does not match.
+    /// Returns [`GitError::OpenFailed`] if the repository cannot be read.
+    fn verify_sha(&self, path: &Path, expected_sha: &str) -> Result<(), GitError>;
+}
+
 /// Default SSH connect timeout in seconds applied via `GIT_SSH_COMMAND`.
 const SSH_CONNECT_TIMEOUT_SECS: u32 = 30;
 
