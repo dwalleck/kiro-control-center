@@ -24,21 +24,27 @@ const SSH_CONNECT_TIMEOUT_SECS: u32 = 30;
 /// indefinite hangs when SSH port 22 is firewalled. Detects a missing
 /// `git` binary and returns [`GitError::GitNotFound`].
 fn run_git(args: &[&str], dir: &Path) -> Result<std::process::Output, GitError> {
-    let base_ssh = std::env::var("GIT_SSH_COMMAND").unwrap_or_else(|_| "ssh".to_owned());
-    let ssh_cmd = format!("{base_ssh} -o ConnectTimeout={SSH_CONNECT_TIMEOUT_SECS}");
-
-    Command::new("git")
-        .args(args)
+    let mut cmd = Command::new("git");
+    cmd.args(args)
         .current_dir(dir)
-        .env("GIT_SSH_COMMAND", &ssh_cmd)
-        .output()
-        .map_err(|e| match e.kind() {
-            std::io::ErrorKind::NotFound => GitError::GitNotFound,
-            _ => GitError::GitCommandFailed {
-                dir: dir.to_path_buf(),
-                source: Box::new(e),
-            },
-        })
+        .env("GIT_TERMINAL_PROMPT", "0");
+
+    // Only set SSH timeout when no custom GIT_SSH_COMMAND is configured,
+    // to avoid breaking non-OpenSSH helpers (e.g. plink/TortoisePlink).
+    if std::env::var_os("GIT_SSH_COMMAND").is_none() {
+        cmd.env(
+            "GIT_SSH_COMMAND",
+            format!("ssh -o ConnectTimeout={SSH_CONNECT_TIMEOUT_SECS}"),
+        );
+    }
+
+    cmd.output().map_err(|e| match e.kind() {
+        std::io::ErrorKind::NotFound => GitError::GitNotFound,
+        _ => GitError::GitCommandFailed {
+            dir: dir.to_path_buf(),
+            source: Box::new(e),
+        },
+    })
 }
 
 /// Extract a useful error message from a failed git command.
@@ -210,6 +216,21 @@ pub fn pull_repo(path: &Path) -> Result<(), GitError> {
 mod tests {
     use super::*;
 
+    /// Convert a local path into a valid `file://` URL on all platforms.
+    ///
+    /// On Windows, `Path::display()` produces backslashes and
+    /// `format!("file://{}")` yields `file://C:\...` which git rejects.
+    /// This helper normalises to forward slashes with the triple-slash form.
+    fn path_to_file_url(path: &Path) -> String {
+        let s = path.display().to_string().replace('\\', "/");
+        if s.starts_with('/') {
+            format!("file://{s}")
+        } else {
+            // Windows: C:/foo → file:///C:/foo
+            format!("file:///{s}")
+        }
+    }
+
     /// Create a local git repository with a single commit for testing.
     fn create_local_repo(dir: &Path) {
         let run = |args: &[&str]| {
@@ -248,7 +269,7 @@ mod tests {
         let clone_dir = tempfile::tempdir().expect("tempdir");
         let dest = clone_dir.path().join("cloned");
 
-        let url = format!("file://{}", origin_dir.path().display());
+        let url = path_to_file_url(origin_dir.path());
         clone_repo(&url, &dest, None).expect("clone should succeed");
 
         let content = std::fs::read_to_string(dest.join("hello.txt")).expect("read hello.txt");
@@ -307,7 +328,7 @@ mod tests {
         // Clone with git_ref pointing to the branch.
         let clone_dir = tempfile::tempdir().expect("tempdir");
         let dest = clone_dir.path().join("cloned");
-        let url = format!("file://{}", origin_dir.path().display());
+        let url = path_to_file_url(origin_dir.path());
 
         clone_repo(&url, &dest, Some("feature-branch")).expect("clone with ref should succeed");
 
@@ -324,7 +345,7 @@ mod tests {
 
         let clone_dir = tempfile::tempdir().expect("tempdir");
         let dest = clone_dir.path().join("cloned");
-        let url = format!("file://{}", origin_dir.path().display());
+        let url = path_to_file_url(origin_dir.path());
 
         let err = clone_repo(&url, &dest, Some("nonexistent-branch"))
             .expect_err("should fail for nonexistent ref");
@@ -342,7 +363,7 @@ mod tests {
 
         let clone_dir = tempfile::tempdir().expect("tempdir");
         let dest = clone_dir.path().join("cloned");
-        let url = format!("file://{}", origin_dir.path().display());
+        let url = path_to_file_url(origin_dir.path());
 
         let err = clone_repo(&url, &dest, Some("--orphan=malicious"))
             .expect_err("should reject dash-prefixed ref");
@@ -483,7 +504,7 @@ mod tests {
         // Clone it locally.
         let clone_dir = tempfile::tempdir().expect("tempdir");
         let dest = clone_dir.path().join("cloned");
-        let url = format!("file://{}", origin_dir.path().display());
+        let url = path_to_file_url(origin_dir.path());
         clone_repo(&url, &dest, None).expect("clone should succeed");
 
         // Add a second commit to the origin.
