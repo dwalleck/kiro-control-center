@@ -145,7 +145,7 @@ mod tests {
     #[case::git_clone_failed(
         CoreError::Git(GitError::CloneFailed {
             url: "https://github.com/x/y.git".into(),
-            source: git2::Error::from_str("network timeout"),
+            source: "network timeout".to_owned().into(),
         }),
         ErrorType::GitError
     )]

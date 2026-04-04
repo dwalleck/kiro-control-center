@@ -100,7 +100,7 @@ pub enum GitError {
     CloneFailed {
         url: String,
         #[source]
-        source: git2::Error,
+        source: Box<dyn std::error::Error + Send + Sync>,
     },
 
     /// Pulling updates into an existing clone failed.
@@ -108,7 +108,7 @@ pub enum GitError {
     PullFailed {
         path: PathBuf,
         #[source]
-        source: git2::Error,
+        source: Box<dyn std::error::Error + Send + Sync>,
     },
 
     /// Opening an existing repository failed.
@@ -116,12 +116,24 @@ pub enum GitError {
     OpenFailed {
         path: PathBuf,
         #[source]
-        source: git2::Error,
+        source: Box<dyn std::error::Error + Send + Sync>,
     },
 
     /// The checked-out commit SHA does not match the expected pinned SHA.
     #[error("SHA mismatch: expected {expected}, got {actual}")]
     ShaMismatch { expected: String, actual: String },
+
+    /// The `git` command-line tool was not found in `$PATH`.
+    #[error("the 'git' command-line tool is required but was not found in PATH")]
+    GitNotFound,
+
+    /// A `git` subprocess failed to launch (not a missing binary).
+    #[error("git command failed in {dir}")]
+    GitCommandFailed {
+        dir: PathBuf,
+        #[source]
+        source: Box<dyn std::error::Error + Send + Sync>,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -271,10 +283,9 @@ mod tests {
 
     #[test]
     fn git_clone_failed_display() {
-        let git_err = git2::Error::from_str("network timeout");
         let err = GitError::CloneFailed {
             url: "https://github.com/x/y.git".into(),
-            source: git_err,
+            source: "network timeout".to_owned().into(),
         };
         assert_eq!(
             err.to_string(),
@@ -284,20 +295,18 @@ mod tests {
 
     #[test]
     fn git_pull_failed_display() {
-        let git_err = git2::Error::from_str("merge conflict");
         let err = GitError::PullFailed {
             path: PathBuf::from("/tmp/repo"),
-            source: git_err,
+            source: "merge conflict".to_owned().into(),
         };
         assert_eq!(err.to_string(), "failed to pull in /tmp/repo");
     }
 
     #[test]
     fn git_open_failed_display() {
-        let git_err = git2::Error::from_str("not a repository");
         let err = GitError::OpenFailed {
             path: PathBuf::from("/tmp/nope"),
-            source: git_err,
+            source: "not a repository".to_owned().into(),
         };
         assert_eq!(err.to_string(), "failed to open repository at /tmp/nope");
     }
@@ -312,6 +321,35 @@ mod tests {
             err.to_string(),
             "SHA mismatch: expected abc1234, got def5678"
         );
+    }
+
+    #[test]
+    fn git_not_found_display() {
+        let err = GitError::GitNotFound;
+        assert_eq!(
+            err.to_string(),
+            "the 'git' command-line tool is required but was not found in PATH"
+        );
+    }
+
+    #[test]
+    fn git_command_failed_display() {
+        let err = GitError::GitCommandFailed {
+            dir: PathBuf::from("/tmp/repo"),
+            source: "permission denied".to_owned().into(),
+        };
+        assert_eq!(err.to_string(), "git command failed in /tmp/repo");
+    }
+
+    #[test]
+    fn git_command_failed_has_source() {
+        use std::error::Error as _;
+        let err = GitError::GitCommandFailed {
+            dir: PathBuf::from("/tmp"),
+            source: "permission denied".to_owned().into(),
+        };
+        let source = err.source().expect("should have a source");
+        assert!(source.to_string().contains("permission denied"));
     }
 
     // -----------------------------------------------------------------------
@@ -363,7 +401,7 @@ mod tests {
     fn from_git_error() {
         let inner = GitError::CloneFailed {
             url: "https://example.com".into(),
-            source: git2::Error::from_str("fail"),
+            source: "fail".to_owned().into(),
         };
         let err: Error = inner.into();
         assert!(matches!(err, Error::Git(_)));
@@ -400,36 +438,33 @@ mod tests {
     #[test]
     fn git_clone_failed_has_source() {
         use std::error::Error as _;
-        let git_err = git2::Error::from_str("timeout");
         let err = GitError::CloneFailed {
             url: "https://x.com/r.git".into(),
-            source: git_err,
+            source: "timeout".to_owned().into(),
         };
         let source = err.source().expect("should have a source");
-        assert!(source.downcast_ref::<git2::Error>().is_some());
+        assert!(source.to_string().contains("timeout"));
     }
 
     #[test]
     fn git_pull_failed_has_source() {
         use std::error::Error as _;
-        let git_err = git2::Error::from_str("conflict");
         let err = GitError::PullFailed {
             path: PathBuf::from("/tmp"),
-            source: git_err,
+            source: "conflict".to_owned().into(),
         };
         let source = err.source().expect("should have a source");
-        assert!(source.downcast_ref::<git2::Error>().is_some());
+        assert!(source.to_string().contains("conflict"));
     }
 
     #[test]
     fn git_open_failed_has_source() {
         use std::error::Error as _;
-        let git_err = git2::Error::from_str("bad repo");
         let err = GitError::OpenFailed {
             path: PathBuf::from("/tmp"),
-            source: git_err,
+            source: "bad repo".to_owned().into(),
         };
         let source = err.source().expect("should have a source");
-        assert!(source.downcast_ref::<git2::Error>().is_some());
+        assert!(source.to_string().contains("bad repo"));
     }
 }

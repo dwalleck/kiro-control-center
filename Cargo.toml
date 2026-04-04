@@ -30,7 +30,7 @@ serde_yaml = "0.9"
 clap = { version = "4", features = ["derive"] }
 
 # Git
-git2 = "0.20"
+gix = { version = "0.81", default-features = true, features = ["blocking-network-client", "blocking-http-transport-curl"] }
 
 # Markdown
 pulldown-cmark = { version = "0.13", default-features = false }

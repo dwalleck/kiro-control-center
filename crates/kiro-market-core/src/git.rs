@@ -1,15 +1,68 @@
 //! Git operations for cloning and updating marketplace repositories.
 //!
-//! Uses [`git2`] for all Git interactions and maps errors into
-//! domain-specific [`GitError`] variants.
+//! Uses `gix` for clone and repository inspection, and shells out to the
+//! `git` CLI for operations that require working-tree updates (pull,
+//! checkout). Errors are mapped into domain-specific [`GitError`] variants.
 
+use std::num::NonZeroU32;
 use std::path::Path;
+use std::process::Command;
+use std::sync::atomic::AtomicBool;
 
-use git2::{Cred, FetchOptions, RemoteCallbacks, Repository};
+use gix::progress::Discard;
 use serde::{Deserialize, Serialize};
 use tracing::debug;
 
 use crate::error::GitError;
+
+/// Default SSH connect timeout in seconds applied via `GIT_SSH_COMMAND`.
+const SSH_CONNECT_TIMEOUT_SECS: u32 = 30;
+
+/// Run a `git` command with SSH connect-timeout protection.
+///
+/// Sets `GIT_SSH_COMMAND` with a 30-second `ConnectTimeout` to prevent
+/// indefinite hangs when SSH port 22 is firewalled. Detects a missing
+/// `git` binary and returns [`GitError::GitNotFound`].
+fn run_git(args: &[&str], dir: &Path) -> Result<std::process::Output, GitError> {
+    let mut cmd = Command::new("git");
+    cmd.args(args)
+        .current_dir(dir)
+        .env("GIT_TERMINAL_PROMPT", "0");
+
+    // Only set SSH timeout when no custom SSH configuration exists.
+    // GIT_SSH_COMMAND takes precedence over GIT_SSH in git's resolution;
+    // setting it when GIT_SSH points to plink would silently override it.
+    if std::env::var_os("GIT_SSH_COMMAND").is_none() && std::env::var_os("GIT_SSH").is_none() {
+        cmd.env(
+            "GIT_SSH_COMMAND",
+            format!("ssh -o ConnectTimeout={SSH_CONNECT_TIMEOUT_SECS}"),
+        );
+    }
+
+    cmd.output().map_err(|e| match e.kind() {
+        std::io::ErrorKind::NotFound => GitError::GitNotFound,
+        _ => GitError::GitCommandFailed {
+            dir: dir.to_path_buf(),
+            source: Box::new(e),
+        },
+    })
+}
+
+/// Extract a useful error message from a failed git command.
+///
+/// Prefers stderr, falls back to stdout, and ultimately includes the exit
+/// code if both are empty.
+fn git_error_detail(output: &std::process::Output) -> String {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if !stderr.trim().is_empty() {
+        return stderr.trim().to_owned();
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    if !stdout.trim().is_empty() {
+        return stdout.trim().to_owned();
+    }
+    format!("git exited with {}", output.status)
+}
 
 /// Which transport protocol to use when cloning from a shorthand host
 /// reference (e.g. `owner/repo`).
@@ -35,67 +88,55 @@ pub fn github_repo_to_url(repo: &str, protocol: GitProtocol) -> String {
     }
 }
 
-/// Default timeout (in milliseconds) for the initial TCP connection to a
-/// git server. Prevents infinite hangs when SSH port 22 is firewalled.
-///
-/// Binary crates should call
-/// `git2::opts::set_server_connect_timeout_in_milliseconds` with this
-/// value at startup.
-pub const CONNECT_TIMEOUT_MS: i32 = 30_000;
-
-/// Build fetch options with credential callbacks for SSH agent and git
-/// credential helpers.
-fn build_fetch_options<'a>() -> FetchOptions<'a> {
-    let mut callbacks = RemoteCallbacks::new();
-    callbacks.credentials(|url, username_from_url, allowed_types| {
-        if allowed_types.contains(git2::CredentialType::SSH_KEY)
-            && let Some(username) = username_from_url
-        {
-            return Cred::ssh_key_from_agent(username);
-        }
-        if allowed_types.contains(git2::CredentialType::USER_PASS_PLAINTEXT) {
-            return Cred::credential_helper(&git2::Config::open_default()?, url, username_from_url);
-        }
-        if allowed_types.contains(git2::CredentialType::DEFAULT) {
-            return Cred::default();
-        }
-        Err(git2::Error::from_str("no credentials available"))
-    });
-
-    let mut fetch_options = FetchOptions::new();
-    fetch_options.remote_callbacks(callbacks);
-    fetch_options
-}
-
 /// Clone a remote Git repository into `dest`.
 ///
-/// Uses SSH agent and git credential helpers for authentication when
-/// available. If `git_ref` is provided the working tree is checked out to
-/// that ref (branch, tag, or commit SHA) after the clone completes.
+/// Uses `gix` for the clone operation. When `git_ref` is `None`, a shallow
+/// clone (depth 1) is used to reduce transfer size. When `git_ref` is
+/// provided, a full clone is performed followed by a `git checkout` of the
+/// specified branch, tag, or SHA (requires the `git` CLI in `$PATH`).
 ///
 /// # Errors
 ///
 /// Returns [`GitError::CloneFailed`] if the clone or checkout fails.
-pub fn clone_repo(url: &str, dest: &Path, git_ref: Option<&str>) -> Result<Repository, GitError> {
-    debug!(url, dest = %dest.display(), "cloning repository");
+pub fn clone_repo(url: &str, dest: &Path, git_ref: Option<&str>) -> Result<(), GitError> {
+    debug!(url, dest = %dest.display(), git_ref, "cloning repository");
 
-    let fetch_options = build_fetch_options();
-    let repo = git2::build::RepoBuilder::new()
-        .fetch_options(fetch_options)
-        .clone(url, dest)
-        .map_err(|source| GitError::CloneFailed {
-            url: url.to_owned(),
-            source,
-        })?;
+    let map_err = |e: Box<dyn std::error::Error + Send + Sync>| GitError::CloneFailed {
+        url: url.to_owned(),
+        source: e,
+    };
 
-    if let Some(refname) = git_ref {
-        checkout_ref(&repo, refname).map_err(|source| GitError::CloneFailed {
-            url: url.to_owned(),
-            source,
-        })?;
+    let mut prepare = gix::prepare_clone(url, dest).map_err(|e| map_err(Box::new(e)))?;
+
+    if git_ref.is_none() {
+        let depth = NonZeroU32::MIN;
+        prepare = prepare.with_shallow(gix::remote::fetch::Shallow::DepthAtRemote(depth));
     }
 
-    Ok(repo)
+    let (mut checkout, _outcome) = prepare
+        .fetch_then_checkout(Discard, &AtomicBool::new(false))
+        .map_err(|e| map_err(Box::new(e)))?;
+
+    let (_repo, _outcome) = checkout
+        .main_worktree(Discard, &AtomicBool::new(false))
+        .map_err(|e| map_err(Box::new(e)))?;
+
+    if let Some(refname) = git_ref {
+        if refname.starts_with('-') {
+            return Err(map_err(
+                format!("invalid git ref: '{refname}' must not start with '-'").into(),
+            ));
+        }
+
+        let output = run_git(&["checkout", refname], dest).map_err(|e| map_err(Box::new(e)))?;
+
+        if !output.status.success() {
+            let detail = git_error_detail(&output);
+            return Err(map_err(detail.into()));
+        }
+    }
+
+    Ok(())
 }
 
 /// Verify the current HEAD of a repository matches the expected SHA prefix.
@@ -106,156 +147,67 @@ pub fn clone_repo(url: &str, dest: &Path, git_ref: Option<&str>) -> Result<Repos
 /// # Errors
 ///
 /// Returns [`GitError::ShaMismatch`] if the actual commit SHA does not match.
-pub fn verify_sha(repo: &Repository, expected_sha: &str) -> Result<(), GitError> {
-    let head = repo.head().map_err(|source| GitError::OpenFailed {
-        path: repo
-            .workdir()
-            .unwrap_or_else(|| Path::new("<bare>"))
-            .to_path_buf(),
-        source,
-    })?;
-
-    let actual_oid = head.target().ok_or_else(|| GitError::OpenFailed {
-        path: repo
-            .workdir()
-            .unwrap_or_else(|| Path::new("<bare>"))
-            .to_path_buf(),
-        source: git2::Error::from_str("HEAD does not point to a commit"),
-    })?;
-
-    let actual_str = actual_oid.to_string();
-
-    if !actual_str.starts_with(expected_sha) {
+/// Returns [`GitError::OpenFailed`] if the repository cannot be read.
+pub fn verify_sha(path: &Path, expected_sha: &str) -> Result<(), GitError> {
+    if expected_sha.is_empty() {
         return Err(GitError::ShaMismatch {
-            expected: expected_sha.to_owned(),
-            actual: actual_str,
+            expected: "(empty)".to_owned(),
+            actual: "(not checked)".to_owned(),
         });
     }
 
-    Ok(())
+    let repo = gix::open(path).map_err(|e| GitError::OpenFailed {
+        path: path.to_path_buf(),
+        source: Box::new(e),
+    })?;
+
+    let head_id = repo.head_id().map_err(|e| GitError::OpenFailed {
+        path: path.to_path_buf(),
+        source: Box::new(e),
+    })?;
+
+    let actual_sha = head_id.to_string();
+
+    if actual_sha.starts_with(expected_sha) {
+        Ok(())
+    } else {
+        Err(GitError::ShaMismatch {
+            expected: expected_sha.to_owned(),
+            actual: actual_sha,
+        })
+    }
 }
 
-/// Pull (fetch + fast-forward) the default branch from `origin`.
+/// Pull the default branch using `git pull --ff-only`.
 ///
-/// Opens the repository at `path`, fetches from the `origin` remote, and
-/// attempts a fast-forward merge of the current branch to the fetched head.
+/// Opens the repository at `path` with `gix` to verify it is valid,
+/// then runs `git pull --ff-only` to fetch and fast-forward the local
+/// branch.
 ///
 /// # Errors
 ///
 /// Returns [`GitError::OpenFailed`] if the path is not a valid repository,
-/// or [`GitError::PullFailed`] if the fetch or fast-forward fails.
+/// or [`GitError::PullFailed`] if the pull fails.
 pub fn pull_repo(path: &Path) -> Result<(), GitError> {
     debug!(path = %path.display(), "pulling repository");
 
-    let repo = Repository::open(path).map_err(|source| GitError::OpenFailed {
+    // Verify it's actually a git repo first (preserves the OpenFailed error).
+    let _repo = gix::open(path).map_err(|e| GitError::OpenFailed {
         path: path.to_path_buf(),
-        source,
+        source: Box::new(e),
     })?;
 
-    let mut remote = repo
-        .find_remote("origin")
-        .map_err(|source| GitError::PullFailed {
-            path: path.to_path_buf(),
-            source,
-        })?;
+    let output = run_git(&["pull", "--ff-only"], path).map_err(|e| GitError::PullFailed {
+        path: path.to_path_buf(),
+        source: Box::new(e),
+    })?;
 
-    let mut fetch_options = build_fetch_options();
-    remote
-        .fetch(&[] as &[&str], Some(&mut fetch_options), None)
-        .map_err(|source| GitError::PullFailed {
-            path: path.to_path_buf(),
-            source,
-        })?;
-
-    let fetch_head = repo
-        .find_reference("FETCH_HEAD")
-        .map_err(|source| GitError::PullFailed {
-            path: path.to_path_buf(),
-            source,
-        })?;
-
-    let fetch_commit = repo
-        .reference_to_annotated_commit(&fetch_head)
-        .map_err(|source| GitError::PullFailed {
-            path: path.to_path_buf(),
-            source,
-        })?;
-
-    let (analysis, _) =
-        repo.merge_analysis(&[&fetch_commit])
-            .map_err(|source| GitError::PullFailed {
-                path: path.to_path_buf(),
-                source,
-            })?;
-
-    if analysis.is_up_to_date() {
-        debug!(path = %path.display(), "already up to date");
-        return Ok(());
-    }
-
-    if analysis.is_fast_forward() {
-        let head_ref = repo.head().map_err(|source| GitError::PullFailed {
-            path: path.to_path_buf(),
-            source,
-        })?;
-
-        let refname = head_ref.name().ok_or_else(|| GitError::PullFailed {
-            path: path.to_path_buf(),
-            source: git2::Error::from_str("HEAD ref name could not be resolved"),
-        })?;
-
-        let target_oid = fetch_commit.id();
-
-        repo.find_reference(refname)
-            .and_then(|mut r| r.set_target(target_oid, "kiro-market: fast-forward pull"))
-            .map_err(|source| GitError::PullFailed {
-                path: path.to_path_buf(),
-                source,
-            })?;
-
-        repo.set_head(refname)
-            .map_err(|source| GitError::PullFailed {
-                path: path.to_path_buf(),
-                source,
-            })?;
-
-        repo.checkout_head(Some(git2::build::CheckoutBuilder::default().force()))
-            .map_err(|source| GitError::PullFailed {
-                path: path.to_path_buf(),
-                source,
-            })?;
-
-        debug!(path = %path.display(), "fast-forwarded to {}", target_oid);
-    } else {
+    if !output.status.success() {
+        let detail = git_error_detail(&output);
         return Err(GitError::PullFailed {
             path: path.to_path_buf(),
-            source: git2::Error::from_str("cannot fast-forward; manual merge required"),
+            source: detail.into(),
         });
-    }
-
-    Ok(())
-}
-
-/// Check out a named ref (branch, tag, or commit SHA) in the given repository.
-fn checkout_ref(repo: &Repository, refname: &str) -> Result<(), git2::Error> {
-    // Try as a direct OID first (for commit SHA), then fall back to revparse.
-    let object = repo.revparse_single(refname)?;
-
-    repo.checkout_tree(
-        &object,
-        Some(git2::build::CheckoutBuilder::default().force()),
-    )?;
-
-    // If it resolves to a branch or tag reference, set HEAD symbolically.
-    if let Ok(reference) = repo.find_reference(&format!("refs/remotes/origin/{refname}")) {
-        repo.set_head(
-            reference
-                .name()
-                .ok_or_else(|| git2::Error::from_str("non-UTF-8 reference name"))?,
-        )?;
-    } else {
-        // Detached HEAD for tags or direct SHAs.
-        repo.set_head_detached(object.id())?;
     }
 
     Ok(())
@@ -263,59 +215,151 @@ fn checkout_ref(repo: &Repository, refname: &str) -> Result<(), git2::Error> {
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
-
     use super::*;
 
-    /// Create a bare-bones local Git repository with a single committed file.
-    fn create_local_repo(dir: &Path) -> Repository {
-        let repo = Repository::init(dir).expect("init should succeed");
+    use crate::test_utils::path_to_file_url;
 
-        // Configure a dummy author for the commit.
-        let sig = git2::Signature::now("Test", "test@example.com").expect("signature");
-
-        let file_path = dir.join("hello.txt");
-        fs::write(&file_path, "Hello, world!").expect("write file");
-
-        let mut index = repo.index().expect("index");
-        index.add_path(Path::new("hello.txt")).expect("add_path");
-        index.write().expect("write index");
-
-        let tree_oid = index.write_tree().expect("write_tree");
-        let tree = repo.find_tree(tree_oid).expect("find_tree");
-
-        repo.commit(Some("HEAD"), &sig, &sig, "initial commit", &tree, &[])
-            .expect("commit");
-
-        // Drop `tree` before moving `repo` out of this function.
-        drop(tree);
-
-        repo
+    /// Create a local git repository with a single commit for testing.
+    fn create_local_repo(dir: &Path) {
+        let run = |args: &[&str]| {
+            let output = Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .env("GIT_AUTHOR_NAME", "Test")
+                .env("GIT_AUTHOR_EMAIL", "test@example.com")
+                .env("GIT_COMMITTER_NAME", "Test")
+                .env("GIT_COMMITTER_EMAIL", "test@example.com")
+                .output()
+                .expect("git command should run");
+            assert!(
+                output.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        run(&["init"]);
+        std::fs::write(dir.join("hello.txt"), "Hello, world!").expect("write file");
+        run(&["add", "hello.txt"]);
+        run(&[
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-m",
+            "initial commit",
+        ]);
     }
 
     #[test]
     fn clone_local_repo() {
-        let source_dir = tempfile::tempdir().expect("tempdir");
-        let dest_dir = tempfile::tempdir().expect("tempdir");
-        let dest = dest_dir.path().join("cloned");
+        let origin_dir = tempfile::tempdir().expect("tempdir");
+        create_local_repo(origin_dir.path());
 
-        create_local_repo(source_dir.path());
+        let clone_dir = tempfile::tempdir().expect("tempdir");
+        let dest = clone_dir.path().join("cloned");
 
-        // file:// URLs: on Unix paths start with /, so file:// + /path works.
-        // On Windows, paths start with C:\, need file:///C:/path with forward slashes.
-        let path_str = source_dir.path().to_string_lossy().replace('\\', "/");
-        let url = if path_str.starts_with('/') {
-            format!("file://{path_str}")
-        } else {
-            format!("file:///{path_str}")
-        };
-        let repo = clone_repo(&url, &dest, None).expect("clone should succeed");
+        let url = path_to_file_url(origin_dir.path());
+        clone_repo(&url, &dest, None).expect("clone should succeed");
 
-        assert!(dest.join("hello.txt").exists(), "cloned file should exist");
-        assert!(repo.head().is_ok(), "cloned repo should have a valid HEAD");
-
-        let content = fs::read_to_string(dest.join("hello.txt")).expect("read");
+        let content = std::fs::read_to_string(dest.join("hello.txt")).expect("read hello.txt");
         assert_eq!(content, "Hello, world!");
+    }
+
+    #[test]
+    fn clone_nonexistent_url_returns_error() {
+        let dest_dir = tempfile::tempdir().expect("tempdir");
+        let dest = dest_dir.path().join("bad-clone");
+
+        let err = match clone_repo("file:///nonexistent/repo", &dest, None) {
+            Err(e) => e,
+            Ok(()) => panic!("clone should fail for nonexistent URL"),
+        };
+
+        assert!(
+            matches!(err, GitError::CloneFailed { .. }),
+            "expected CloneFailed, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn clone_repo_with_git_ref_checks_out_branch() {
+        let origin_dir = tempfile::tempdir().expect("tempdir");
+        create_local_repo(origin_dir.path());
+
+        // Create a branch in the origin.
+        let run = |args: &[&str]| {
+            let output = Command::new("git")
+                .args(args)
+                .current_dir(origin_dir.path())
+                .env("GIT_AUTHOR_NAME", "Test")
+                .env("GIT_AUTHOR_EMAIL", "test@example.com")
+                .env("GIT_COMMITTER_NAME", "Test")
+                .env("GIT_COMMITTER_EMAIL", "test@example.com")
+                .output()
+                .expect("git command should run");
+            assert!(
+                output.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        run(&["checkout", "-b", "feature-branch"]);
+        std::fs::write(origin_dir.path().join("feature.txt"), "feature work").expect("write");
+        run(&["add", "feature.txt"]);
+        run(&[
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-m",
+            "feature commit",
+        ]);
+
+        // Clone with git_ref pointing to the branch.
+        let clone_dir = tempfile::tempdir().expect("tempdir");
+        let dest = clone_dir.path().join("cloned");
+        let url = path_to_file_url(origin_dir.path());
+
+        clone_repo(&url, &dest, Some("feature-branch")).expect("clone with ref should succeed");
+
+        assert!(
+            dest.join("feature.txt").exists(),
+            "feature.txt should exist on checked-out branch"
+        );
+    }
+
+    #[test]
+    fn clone_repo_with_invalid_git_ref_returns_error() {
+        let origin_dir = tempfile::tempdir().expect("tempdir");
+        create_local_repo(origin_dir.path());
+
+        let clone_dir = tempfile::tempdir().expect("tempdir");
+        let dest = clone_dir.path().join("cloned");
+        let url = path_to_file_url(origin_dir.path());
+
+        let err = clone_repo(&url, &dest, Some("nonexistent-branch"))
+            .expect_err("should fail for nonexistent ref");
+
+        assert!(
+            matches!(err, GitError::CloneFailed { .. }),
+            "expected CloneFailed, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn clone_repo_with_dash_prefixed_ref_returns_error() {
+        let origin_dir = tempfile::tempdir().expect("tempdir");
+        create_local_repo(origin_dir.path());
+
+        let clone_dir = tempfile::tempdir().expect("tempdir");
+        let dest = clone_dir.path().join("cloned");
+        let url = path_to_file_url(origin_dir.path());
+
+        let err = clone_repo(&url, &dest, Some("--orphan=malicious"))
+            .expect_err("should reject dash-prefixed ref");
+
+        assert!(
+            matches!(err, GitError::CloneFailed { .. }),
+            "expected CloneFailed, got {err:?}"
+        );
     }
 
     #[test]
@@ -360,18 +404,70 @@ mod tests {
     }
 
     #[test]
-    fn clone_nonexistent_url_returns_error() {
-        let dest_dir = tempfile::tempdir().expect("tempdir");
-        let dest = dest_dir.path().join("bad-clone");
+    fn verify_sha_matches_full_sha() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        create_local_repo(dir.path());
 
-        let err = match clone_repo("file:///nonexistent/repo", &dest, None) {
-            Err(e) => e,
-            Ok(_) => panic!("clone should fail for nonexistent URL"),
-        };
+        let repo = gix::open(dir.path()).expect("open repo");
+        let head_sha = repo.head_id().expect("head_id").to_string();
+
+        verify_sha(dir.path(), &head_sha).expect("full SHA should match");
+    }
+
+    #[test]
+    fn verify_sha_matches_prefix() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        create_local_repo(dir.path());
+
+        let repo = gix::open(dir.path()).expect("open repo");
+        let head_sha = repo.head_id().expect("head_id").to_string();
+        let prefix = &head_sha[..7];
+
+        verify_sha(dir.path(), prefix).expect("7-char prefix should match");
+    }
+
+    #[test]
+    fn verify_sha_rejects_wrong_sha() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        create_local_repo(dir.path());
+
+        let err = verify_sha(dir.path(), "0000000deadbeef").expect_err("should reject wrong SHA");
 
         assert!(
-            matches!(err, GitError::CloneFailed { .. }),
-            "expected CloneFailed, got {err:?}"
+            matches!(err, GitError::ShaMismatch { .. }),
+            "expected ShaMismatch, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn verify_sha_rejects_empty_expected() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        create_local_repo(dir.path());
+
+        let err = verify_sha(dir.path(), "").expect_err("should reject empty SHA");
+
+        assert!(
+            matches!(err, GitError::ShaMismatch { .. }),
+            "expected ShaMismatch, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn verify_sha_rejects_expected_longer_than_actual_prefix() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        create_local_repo(dir.path());
+
+        let repo = gix::open(dir.path()).expect("open repo");
+        let head_sha = repo.head_id().expect("head_id").to_string();
+
+        // Append extra characters to the actual SHA so it can never be a valid prefix.
+        let too_long = format!("{head_sha}extra");
+        let err =
+            verify_sha(dir.path(), &too_long).expect_err("should reject overly long expected SHA");
+
+        assert!(
+            matches!(err, GitError::ShaMismatch { .. }),
+            "expected ShaMismatch, got {err:?}"
         );
     }
 
@@ -388,62 +484,55 @@ mod tests {
     }
 
     #[test]
-    fn verify_sha_matches_full_sha() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let repo = create_local_repo(dir.path());
+    fn pull_repo_fetches_new_commits() {
+        // Create a "remote" repo with one commit.
+        let origin_dir = tempfile::tempdir().expect("tempdir");
+        create_local_repo(origin_dir.path());
 
-        let head_oid = repo.head().expect("HEAD").target().expect("target");
-        let full_sha = head_oid.to_string();
+        // Clone it locally.
+        let clone_dir = tempfile::tempdir().expect("tempdir");
+        let dest = clone_dir.path().join("cloned");
+        let url = path_to_file_url(origin_dir.path());
+        clone_repo(&url, &dest, None).expect("clone should succeed");
 
-        verify_sha(&repo, &full_sha).expect("full SHA should match");
-    }
+        // Add a second commit to the origin.
+        let run = |args: &[&str], dir: &Path| {
+            let output = Command::new("git")
+                .args(args)
+                .current_dir(dir)
+                .env("GIT_AUTHOR_NAME", "Test")
+                .env("GIT_AUTHOR_EMAIL", "test@example.com")
+                .env("GIT_COMMITTER_NAME", "Test")
+                .env("GIT_COMMITTER_EMAIL", "test@example.com")
+                .output()
+                .expect("git command should run");
+            assert!(
+                output.status.success(),
+                "git {args:?} failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        std::fs::write(origin_dir.path().join("second.txt"), "second").expect("write");
+        run(&["add", "second.txt"], origin_dir.path());
+        run(
+            &[
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-m",
+                "second commit",
+            ],
+            origin_dir.path(),
+        );
 
-    #[test]
-    fn verify_sha_matches_prefix() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let repo = create_local_repo(dir.path());
-
-        let head_oid = repo.head().expect("HEAD").target().expect("target");
-        let prefix = &head_oid.to_string()[..7];
-
-        verify_sha(&repo, prefix).expect("SHA prefix should match");
-    }
-
-    #[test]
-    fn verify_sha_rejects_wrong_sha() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let repo = create_local_repo(dir.path());
-
-        let err = verify_sha(&repo, "0000000deadbeef").expect_err("should fail on wrong SHA");
+        // Pull into the clone — the new file should appear.
+        pull_repo(&dest).expect("pull should succeed");
 
         assert!(
-            matches!(err, GitError::ShaMismatch { .. }),
-            "expected ShaMismatch, got {err:?}"
+            dest.join("second.txt").exists(),
+            "second.txt should exist after pull"
         );
-    }
-
-    #[test]
-    fn verify_sha_rejects_expected_longer_than_actual_prefix() {
-        // Regression: the old bidirectional check would pass if the expected
-        // SHA *started with* the actual SHA (backwards logic). This test
-        // constructs an expected string that begins with the real prefix but
-        // has wrong trailing characters.
-        let dir = tempfile::tempdir().expect("tempdir");
-        let repo = create_local_repo(dir.path());
-
-        let head_oid = repo.head().expect("HEAD").target().expect("target");
-        let actual_str = head_oid.to_string();
-        let prefix = &actual_str[..7];
-
-        // Build a fake expected that starts with the real prefix but diverges.
-        let fake_expected = format!("{prefix}ffffffffffffffffffffffffffffffff0");
-
-        let err = verify_sha(&repo, &fake_expected)
-            .expect_err("should reject when expected extends actual with wrong chars");
-
-        assert!(
-            matches!(err, GitError::ShaMismatch { .. }),
-            "expected ShaMismatch, got {err:?}"
-        );
+        let content = std::fs::read_to_string(dest.join("second.txt")).expect("read");
+        assert_eq!(content, "second");
     }
 }

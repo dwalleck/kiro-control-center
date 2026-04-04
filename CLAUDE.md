@@ -37,7 +37,7 @@ Multi-file Claude Code skills (SKILL.md + companion .md files) are merged into a
 single SKILL.md since Kiro doesn't support deferred loading of companion files.
 
 ## Key Crate Dependencies
-- `git2` — git clone/pull operations
+- `gix` + system `git` CLI — git operations (gix for clone/open, system git for pull/checkout)
 - `clap` (derive) — CLI framework
 - `pulldown-cmark` — markdown parsing for skill merging
 - `serde` / `serde_json` / `serde_yaml` — JSON and YAML parsing

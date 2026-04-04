@@ -127,13 +127,8 @@ mod tests {
 
     #[test]
     fn marketplace_add_defaults_to_https() {
-        let cli = Cli::try_parse_from([
-            "kiro-market",
-            "marketplace",
-            "add",
-            "owner/repo",
-        ])
-        .expect("should parse");
+        let cli = Cli::try_parse_from(["kiro-market", "marketplace", "add", "owner/repo"])
+            .expect("should parse");
         match cli.command {
             Command::Marketplace {
                 action: MarketplaceAction::Add { protocol, .. },

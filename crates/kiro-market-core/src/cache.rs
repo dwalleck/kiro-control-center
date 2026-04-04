@@ -39,19 +39,21 @@ impl MarketplaceSource {
     /// Classify a user-provided source string into a `MarketplaceSource`.
     ///
     /// Heuristics:
-    /// - Starts with `http://`, `https://`, or `git@` → `GitUrl`
-    /// - Starts with `/`, `./`, `../`, or `~` → `LocalPath`
+    /// - Starts with `http://`, `https://`, `file://`, or `git@` → `GitUrl`
+    /// - Is an absolute path or starts with `./`, `../`, `~` → `LocalPath`
     /// - Anything else → `GitHub` (owner/repo shorthand)
     #[must_use]
     pub fn detect(source: &str) -> Self {
         if source.starts_with("http://")
             || source.starts_with("https://")
+            || source.starts_with("file://")
             || source.starts_with("git@")
         {
             Self::GitUrl {
                 url: source.to_owned(),
             }
-        } else if source.starts_with('/')
+        } else if Path::new(source).is_absolute()
+            || source.starts_with('/')
             || source.starts_with("./")
             || source.starts_with("../")
             || source.starts_with('~')
@@ -145,6 +147,14 @@ impl CacheDir {
     /// (e.g. bare containers, some CI runners).
     #[must_use]
     pub fn default_location() -> Option<Self> {
+        // Allow overriding the data directory for testing and CI. The `dirs`
+        // crate uses platform-native APIs on macOS/Windows that ignore
+        // `XDG_DATA_HOME`, so this env var provides cross-platform isolation.
+        if let Ok(path) = std::env::var("KIRO_MARKET_DATA_DIR") {
+            return Some(Self {
+                root: PathBuf::from(path),
+            });
+        }
         dirs::data_dir().map(|data| Self {
             root: data.join("kiro-market"),
         })
@@ -581,6 +591,44 @@ mod tests {
     fn detect_http_url() {
         let source = MarketplaceSource::detect("http://example.com/repo.git");
         assert!(matches!(source, MarketplaceSource::GitUrl { .. }));
+    }
+
+    #[test]
+    fn detect_file_url() {
+        let source = MarketplaceSource::detect("file:///home/user/marketplace");
+        assert!(
+            matches!(source, MarketplaceSource::GitUrl { url } if url == "file:///home/user/marketplace")
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn detect_windows_drive_path() {
+        let source = MarketplaceSource::detect(r"C:\Users\runner\marketplace");
+        assert!(
+            matches!(source, MarketplaceSource::LocalPath { .. }),
+            "expected LocalPath for Windows drive path, got {source:?}"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn detect_windows_drive_path_forward_slash() {
+        let source = MarketplaceSource::detect("D:/repos/marketplace");
+        assert!(
+            matches!(source, MarketplaceSource::LocalPath { .. }),
+            "expected LocalPath for Windows drive path, got {source:?}"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn detect_unc_path() {
+        let source = MarketplaceSource::detect(r"\\server\share\marketplace");
+        assert!(
+            matches!(source, MarketplaceSource::LocalPath { .. }),
+            "expected LocalPath for UNC path, got {source:?}"
+        );
     }
 
     #[test]

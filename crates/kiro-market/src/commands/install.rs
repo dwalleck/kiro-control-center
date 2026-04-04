@@ -7,9 +7,9 @@ use anyhow::{Context, Result, bail};
 use chrono::Utc;
 use colored::Colorize;
 use kiro_market_core::cache::CacheDir;
-use kiro_market_core::git::GitProtocol;
 use kiro_market_core::error::{Error as CoreError, SkillError};
 use kiro_market_core::git;
+use kiro_market_core::git::GitProtocol;
 use kiro_market_core::marketplace::{PluginEntry, PluginSource, StructuredSource};
 use kiro_market_core::plugin::{PluginManifest, discover_skill_dirs};
 use kiro_market_core::project::{InstalledSkillMeta, KiroProject};
@@ -72,7 +72,7 @@ pub fn run(plugin_ref: &str, skill_filter: Option<&str>, force: bool) -> Result<
         marketplace_name,
         protocol,
     )
-        .with_context(|| format!("failed to resolve plugin directory for '{plugin_name}'"))?;
+    .with_context(|| format!("failed to resolve plugin directory for '{plugin_name}'"))?;
 
     debug!(plugin_dir = %plugin_dir.display(), "resolved plugin directory");
 
@@ -389,12 +389,12 @@ fn resolve_structured_source(
 
     debug!(url = %url, dest = %dest.display(), "cloning plugin");
     print!("  Cloning {label}...");
-    let repo_handle = git::clone_repo(&url, &dest, git_ref)
+    git::clone_repo(&url, &dest, git_ref)
         .with_context(|| format!("failed to clone plugin from '{label}'"))?;
     println!(" done");
 
     if let Some(expected) = sha {
-        git::verify_sha(&repo_handle, expected)
+        git::verify_sha(&dest, expected)
             .with_context(|| format!("SHA verification failed for '{label}'"))?;
     }
 

@@ -12,12 +12,13 @@ workspace = true
 default = []
 cli = ["clap"]
 specta = ["dep:specta"]
+test-support = []
 
 [dependencies]
 serde = { workspace = true }
 serde_json = { workspace = true }
 serde_yaml = { workspace = true }
-git2 = { workspace = true }
+gix = { workspace = true }
 pulldown-cmark = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
