@@ -7,6 +7,7 @@ pub mod cache;
 pub mod error;
 pub mod git;
 pub mod marketplace;
+pub mod platform;
 pub mod plugin;
 pub mod project;
 pub mod skill;
