@@ -10,6 +10,8 @@ pub mod marketplace;
 pub mod plugin;
 pub mod project;
 pub mod skill;
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_utils;
 pub mod validation;
 
 /// Path to the marketplace manifest within a marketplace repository.

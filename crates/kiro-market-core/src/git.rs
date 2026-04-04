@@ -217,20 +217,7 @@ pub fn pull_repo(path: &Path) -> Result<(), GitError> {
 mod tests {
     use super::*;
 
-    /// Convert a local path into a valid `file://` URL on all platforms.
-    ///
-    /// On Windows, `Path::display()` produces backslashes and
-    /// `format!("file://{}")` yields `file://C:\...` which git rejects.
-    /// This helper normalises to forward slashes with the triple-slash form.
-    fn path_to_file_url(path: &Path) -> String {
-        let s = path.display().to_string().replace('\\', "/");
-        if s.starts_with('/') {
-            format!("file://{s}")
-        } else {
-            // Windows: C:/foo → file:///C:/foo
-            format!("file:///{s}")
-        }
-    }
+    use crate::test_utils::path_to_file_url;
 
     /// Create a local git repository with a single commit for testing.
     fn create_local_repo(dir: &Path) {

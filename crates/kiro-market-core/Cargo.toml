@@ -12,6 +12,7 @@ workspace = true
 default = []
 cli = ["clap"]
 specta = ["dep:specta"]
+test-support = []
 
 [dependencies]
 serde = { workspace = true }

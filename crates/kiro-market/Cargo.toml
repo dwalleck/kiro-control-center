@@ -19,5 +19,6 @@ chrono = { workspace = true }
 dirs = { workspace = true }
 
 [dev-dependencies]
+kiro-market-core = { workspace = true, features = ["test-support"] }
 rstest = { workspace = true }
 tempfile = { workspace = true }

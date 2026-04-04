@@ -1,19 +1,8 @@
 mod common;
 
-use std::path::Path;
-
 use common::{run_in_dir, stderr, stdout};
+use kiro_market_core::test_utils::path_to_file_url;
 use tempfile::TempDir;
-
-/// Convert a local path into a valid `file://` URL on all platforms.
-fn path_to_file_url(path: &Path) -> String {
-    let s = path.display().to_string().replace('\\', "/");
-    if s.starts_with('/') {
-        format!("file://{s}")
-    } else {
-        format!("file:///{s}")
-    }
-}
 
 #[test]
 fn help_shows_usage() {
