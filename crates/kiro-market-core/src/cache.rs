@@ -146,6 +146,14 @@ impl CacheDir {
     /// (e.g. bare containers, some CI runners).
     #[must_use]
     pub fn default_location() -> Option<Self> {
+        // Allow overriding the data directory for testing and CI. The `dirs`
+        // crate uses platform-native APIs on macOS/Windows that ignore
+        // `XDG_DATA_HOME`, so this env var provides cross-platform isolation.
+        if let Ok(path) = std::env::var("KIRO_MARKET_DATA_DIR") {
+            return Some(Self {
+                root: PathBuf::from(path),
+            });
+        }
         dirs::data_dir().map(|data| Self {
             root: data.join("kiro-market"),
         })

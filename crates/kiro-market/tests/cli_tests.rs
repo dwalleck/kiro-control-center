@@ -184,10 +184,7 @@ fn workflow_install_skill_and_verify_on_disk() {
     );
 
     // Install a skill from the marketplace.
-    let output = run_in_dir(
-        dir.path(),
-        &["install", "test-plugin@test-marketplace"],
-    );
+    let output = run_in_dir(dir.path(), &["install", "test-plugin@test-marketplace"]);
     assert!(
         output.status.success(),
         "install failed: {}",
@@ -210,11 +207,7 @@ fn workflow_install_skill_and_verify_on_disk() {
 
     // List installed skills — should show the installed skill.
     let output = run_in_dir(dir.path(), &["list"]);
-    assert!(
-        output.status.success(),
-        "list failed: {}",
-        stderr(&output)
-    );
+    assert!(output.status.success(), "list failed: {}", stderr(&output));
     let out = stdout(&output);
     assert!(
         out.contains("test-skill"),
@@ -242,10 +235,7 @@ fn workflow_marketplace_update_fetches_new_content() {
     );
 
     // Install a skill before the update.
-    let output = run_in_dir(
-        dir.path(),
-        &["install", "test-plugin@test-marketplace"],
-    );
+    let output = run_in_dir(dir.path(), &["install", "test-plugin@test-marketplace"]);
     assert!(
         output.status.success(),
         "install failed: {}",

@@ -8,13 +8,16 @@ pub fn get_binary() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_kiro-market"))
 }
 
-/// Run `kiro-market` in the given directory with `XDG_DATA_HOME` overridden to
-/// isolate the cache from the real user data directory.
+/// Run `kiro-market` in the given directory with the cache isolated from the
+/// real user data directory.
+///
+/// Uses `KIRO_MARKET_DATA_DIR` which is respected by `CacheDir::default_location()`
+/// on all platforms (the `dirs` crate ignores `XDG_DATA_HOME` on macOS/Windows).
 pub fn run_in_dir(dir: &Path, args: &[&str]) -> Output {
     Command::new(get_binary())
         .args(args)
         .current_dir(dir)
-        .env("XDG_DATA_HOME", dir.join(".data"))
+        .env("KIRO_MARKET_DATA_DIR", dir.join(".data"))
         .output()
         .expect("Failed to execute kiro-market")
 }

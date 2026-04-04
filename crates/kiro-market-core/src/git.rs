@@ -121,8 +121,7 @@ pub fn clone_repo(url: &str, dest: &Path, git_ref: Option<&str>) -> Result<(), G
             ));
         }
 
-        let output = run_git(&["checkout", refname], dest)
-            .map_err(|e| map_err(Box::new(e)))?;
+        let output = run_git(&["checkout", refname], dest).map_err(|e| map_err(Box::new(e)))?;
 
         if !output.status.success() {
             let detail = git_error_detail(&output);
@@ -297,7 +296,13 @@ mod tests {
         run(&["checkout", "-b", "feature-branch"]);
         std::fs::write(origin_dir.path().join("feature.txt"), "feature work").expect("write");
         run(&["add", "feature.txt"]);
-        run(&["-c", "commit.gpgsign=false", "commit", "-m", "feature commit"]);
+        run(&[
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-m",
+            "feature commit",
+        ]);
 
         // Clone with git_ref pointing to the branch.
         let clone_dir = tempfile::tempdir().expect("tempdir");
@@ -501,7 +506,13 @@ mod tests {
         std::fs::write(origin_dir.path().join("second.txt"), "second").expect("write");
         run(&["add", "second.txt"], origin_dir.path());
         run(
-            &["-c", "commit.gpgsign=false", "commit", "-m", "second commit"],
+            &[
+                "-c",
+                "commit.gpgsign=false",
+                "commit",
+                "-m",
+                "second commit",
+            ],
             origin_dir.path(),
         );
 
