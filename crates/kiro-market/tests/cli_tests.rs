@@ -165,3 +165,59 @@ fn workflow_add_marketplace_and_list_plugins() {
         "expected 'test-plugin' in search output:\n{out}"
     );
 }
+
+#[test]
+fn workflow_install_skill_and_verify_on_disk() {
+    let dir = TempDir::new().expect("temp dir");
+
+    // Create and add a local marketplace.
+    let marketplace_dir = dir.path().join("origin-marketplace");
+    std::fs::create_dir_all(&marketplace_dir).expect("create marketplace dir");
+    common::fixtures::create_marketplace_repo(&marketplace_dir);
+
+    let source = marketplace_dir.to_str().expect("valid utf-8");
+    let output = run_in_dir(dir.path(), &["marketplace", "add", source]);
+    assert!(
+        output.status.success(),
+        "marketplace add failed: {}",
+        stderr(&output)
+    );
+
+    // Install a skill from the marketplace.
+    let output = run_in_dir(
+        dir.path(),
+        &["install", "test-plugin@test-marketplace"],
+    );
+    assert!(
+        output.status.success(),
+        "install failed: {}",
+        stderr(&output)
+    );
+
+    // Verify the skill file was written to disk.
+    let skill_path = dir.path().join(".kiro/skills/test-skill/SKILL.md");
+    assert!(
+        skill_path.exists(),
+        "SKILL.md should exist at {}",
+        skill_path.display()
+    );
+
+    let content = std::fs::read_to_string(&skill_path).expect("read SKILL.md");
+    assert!(
+        content.contains("Test Skill"),
+        "SKILL.md should contain skill content:\n{content}"
+    );
+
+    // List installed skills — should show the installed skill.
+    let output = run_in_dir(dir.path(), &["list"]);
+    assert!(
+        output.status.success(),
+        "list failed: {}",
+        stderr(&output)
+    );
+    let out = stdout(&output);
+    assert!(
+        out.contains("test-skill"),
+        "expected 'test-skill' in list output:\n{out}"
+    );
+}
