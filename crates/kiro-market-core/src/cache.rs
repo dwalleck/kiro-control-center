@@ -53,6 +53,7 @@ impl MarketplaceSource {
                 url: source.to_owned(),
             }
         } else if Path::new(source).is_absolute()
+            || source.starts_with('/')
             || source.starts_with("./")
             || source.starts_with("../")
             || source.starts_with('~')

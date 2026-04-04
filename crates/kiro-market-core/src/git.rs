@@ -29,9 +29,10 @@ fn run_git(args: &[&str], dir: &Path) -> Result<std::process::Output, GitError> 
         .current_dir(dir)
         .env("GIT_TERMINAL_PROMPT", "0");
 
-    // Only set SSH timeout when no custom GIT_SSH_COMMAND is configured,
-    // to avoid breaking non-OpenSSH helpers (e.g. plink/TortoisePlink).
-    if std::env::var_os("GIT_SSH_COMMAND").is_none() {
+    // Only set SSH timeout when no custom SSH configuration exists.
+    // GIT_SSH_COMMAND takes precedence over GIT_SSH in git's resolution;
+    // setting it when GIT_SSH points to plink would silently override it.
+    if std::env::var_os("GIT_SSH_COMMAND").is_none() && std::env::var_os("GIT_SSH").is_none() {
         cmd.env(
             "GIT_SSH_COMMAND",
             format!("ssh -o ConnectTimeout={SSH_CONNECT_TIMEOUT_SECS}"),
