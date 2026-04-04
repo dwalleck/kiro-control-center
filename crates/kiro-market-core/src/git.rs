@@ -24,7 +24,8 @@ const SSH_CONNECT_TIMEOUT_SECS: u32 = 30;
 /// indefinite hangs when SSH port 22 is firewalled. Detects a missing
 /// `git` binary and returns [`GitError::GitNotFound`].
 fn run_git(args: &[&str], dir: &Path) -> Result<std::process::Output, GitError> {
-    let ssh_cmd = format!("ssh -o ConnectTimeout={SSH_CONNECT_TIMEOUT_SECS}");
+    let base_ssh = std::env::var("GIT_SSH_COMMAND").unwrap_or_else(|_| "ssh".to_owned());
+    let ssh_cmd = format!("{base_ssh} -o ConnectTimeout={SSH_CONNECT_TIMEOUT_SECS}");
 
     Command::new("git")
         .args(args)
@@ -38,6 +39,22 @@ fn run_git(args: &[&str], dir: &Path) -> Result<std::process::Output, GitError> 
                 source: Box::new(e),
             },
         })
+}
+
+/// Extract a useful error message from a failed git command.
+///
+/// Prefers stderr, falls back to stdout, and ultimately includes the exit
+/// code if both are empty.
+fn git_error_detail(output: &std::process::Output) -> String {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if !stderr.trim().is_empty() {
+        return stderr.trim().to_owned();
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    if !stdout.trim().is_empty() {
+        return stdout.trim().to_owned();
+    }
+    format!("git exited with {}", output.status)
 }
 
 /// Which transport protocol to use when cloning from a shorthand host
@@ -104,11 +121,12 @@ pub fn clone_repo(url: &str, dest: &Path, git_ref: Option<&str>) -> Result<(), G
             ));
         }
 
-        let output = run_git(&["checkout", refname], dest)?;
+        let output = run_git(&["checkout", refname], dest)
+            .map_err(|e| map_err(Box::new(e)))?;
 
         if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
-            return Err(map_err(stderr.trim().to_owned().into()));
+            let detail = git_error_detail(&output);
+            return Err(map_err(detail.into()));
         }
     }
 
@@ -125,6 +143,13 @@ pub fn clone_repo(url: &str, dest: &Path, git_ref: Option<&str>) -> Result<(), G
 /// Returns [`GitError::ShaMismatch`] if the actual commit SHA does not match.
 /// Returns [`GitError::OpenFailed`] if the repository cannot be read.
 pub fn verify_sha(path: &Path, expected_sha: &str) -> Result<(), GitError> {
+    if expected_sha.is_empty() {
+        return Err(GitError::ShaMismatch {
+            expected: "(empty)".to_owned(),
+            actual: "(not checked)".to_owned(),
+        });
+    }
+
     let repo = gix::open(path).map_err(|e| GitError::OpenFailed {
         path: path.to_path_buf(),
         source: Box::new(e),
@@ -166,13 +191,16 @@ pub fn pull_repo(path: &Path) -> Result<(), GitError> {
         source: Box::new(e),
     })?;
 
-    let output = run_git(&["pull", "--ff-only"], path)?;
+    let output = run_git(&["pull", "--ff-only"], path).map_err(|e| GitError::PullFailed {
+        path: path.to_path_buf(),
+        source: Box::new(e),
+    })?;
 
     if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
+        let detail = git_error_detail(&output);
         return Err(GitError::PullFailed {
             path: path.to_path_buf(),
-            source: stderr.trim().to_owned().into(),
+            source: detail.into(),
         });
     }
 
@@ -303,6 +331,24 @@ mod tests {
     }
 
     #[test]
+    fn clone_repo_with_dash_prefixed_ref_returns_error() {
+        let origin_dir = tempfile::tempdir().expect("tempdir");
+        create_local_repo(origin_dir.path());
+
+        let clone_dir = tempfile::tempdir().expect("tempdir");
+        let dest = clone_dir.path().join("cloned");
+        let url = format!("file://{}", origin_dir.path().display());
+
+        let err = clone_repo(&url, &dest, Some("--orphan=malicious"))
+            .expect_err("should reject dash-prefixed ref");
+
+        assert!(
+            matches!(err, GitError::CloneFailed { .. }),
+            "expected CloneFailed, got {err:?}"
+        );
+    }
+
+    #[test]
     fn github_repo_to_url_https() {
         assert_eq!(
             github_repo_to_url("owner/repo", GitProtocol::Https),
@@ -372,6 +418,19 @@ mod tests {
         create_local_repo(dir.path());
 
         let err = verify_sha(dir.path(), "0000000deadbeef").expect_err("should reject wrong SHA");
+
+        assert!(
+            matches!(err, GitError::ShaMismatch { .. }),
+            "expected ShaMismatch, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn verify_sha_rejects_empty_expected() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        create_local_repo(dir.path());
+
+        let err = verify_sha(dir.path(), "").expect_err("should reject empty SHA");
 
         assert!(
             matches!(err, GitError::ShaMismatch { .. }),
