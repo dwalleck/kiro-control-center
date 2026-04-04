@@ -259,42 +259,6 @@ pub fn github_repo_to_url(repo: &str, protocol: GitProtocol) -> String {
     }
 }
 
-// ---------------------------------------------------------------------------
-// Deprecated free-function wrappers (removed in Task 8)
-// ---------------------------------------------------------------------------
-
-/// Deprecated: use [`GixCliBackend`] directly or `MarketplaceService`.
-///
-/// # Errors
-///
-/// Returns [`GitError::CloneFailed`] if the clone or checkout fails.
-pub fn clone_repo(url: &str, dest: &Path, git_ref: Option<&str>) -> Result<(), GitError> {
-    let opts = CloneOptions {
-        git_ref: git_ref.map(ToOwned::to_owned),
-    };
-    GixCliBackend::default().clone_repo(url, dest, &opts)
-}
-
-/// Deprecated: use [`GixCliBackend`] directly or `MarketplaceService`.
-///
-/// # Errors
-///
-/// Returns [`GitError::OpenFailed`] if the path is not a valid repository,
-/// or [`GitError::PullFailed`] if the pull fails.
-pub fn pull_repo(path: &Path) -> Result<(), GitError> {
-    GixCliBackend::default().pull_repo(path)
-}
-
-/// Deprecated: use [`GixCliBackend`] directly or `MarketplaceService`.
-///
-/// # Errors
-///
-/// Returns [`GitError::ShaMismatch`] if the SHA does not match.
-/// Returns [`GitError::OpenFailed`] if the repository cannot be read.
-pub fn verify_sha(path: &Path, expected_sha: &str) -> Result<(), GitError> {
-    GixCliBackend::default().verify_sha(path, expected_sha)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -340,7 +304,10 @@ mod tests {
         let dest = clone_dir.path().join("cloned");
 
         let url = path_to_file_url(origin_dir.path());
-        clone_repo(&url, &dest, None).expect("clone should succeed");
+        let git = GixCliBackend::default();
+        let opts = CloneOptions::default();
+        git.clone_repo(&url, &dest, &opts)
+            .expect("clone should succeed");
 
         let content = std::fs::read_to_string(dest.join("hello.txt")).expect("read hello.txt");
         assert_eq!(content, "Hello, world!");
@@ -351,7 +318,9 @@ mod tests {
         let dest_dir = tempfile::tempdir().expect("tempdir");
         let dest = dest_dir.path().join("bad-clone");
 
-        let err = match clone_repo("file:///nonexistent/repo", &dest, None) {
+        let git = GixCliBackend::default();
+        let opts = CloneOptions::default();
+        let err = match git.clone_repo("file:///nonexistent/repo", &dest, &opts) {
             Err(e) => e,
             Ok(()) => panic!("clone should fail for nonexistent URL"),
         };
@@ -400,7 +369,12 @@ mod tests {
         let dest = clone_dir.path().join("cloned");
         let url = path_to_file_url(origin_dir.path());
 
-        clone_repo(&url, &dest, Some("feature-branch")).expect("clone with ref should succeed");
+        let git = GixCliBackend::default();
+        let opts = CloneOptions {
+            git_ref: Some("feature-branch".to_owned()),
+        };
+        git.clone_repo(&url, &dest, &opts)
+            .expect("clone with ref should succeed");
 
         assert!(
             dest.join("feature.txt").exists(),
@@ -417,7 +391,12 @@ mod tests {
         let dest = clone_dir.path().join("cloned");
         let url = path_to_file_url(origin_dir.path());
 
-        let err = clone_repo(&url, &dest, Some("nonexistent-branch"))
+        let git = GixCliBackend::default();
+        let opts = CloneOptions {
+            git_ref: Some("nonexistent-branch".to_owned()),
+        };
+        let err = git
+            .clone_repo(&url, &dest, &opts)
             .expect_err("should fail for nonexistent ref");
 
         assert!(
@@ -435,7 +414,12 @@ mod tests {
         let dest = clone_dir.path().join("cloned");
         let url = path_to_file_url(origin_dir.path());
 
-        let err = clone_repo(&url, &dest, Some("--orphan=malicious"))
+        let git = GixCliBackend::default();
+        let opts = CloneOptions {
+            git_ref: Some("--orphan=malicious".to_owned()),
+        };
+        let err = git
+            .clone_repo(&url, &dest, &opts)
             .expect_err("should reject dash-prefixed ref");
 
         assert!(
@@ -493,7 +477,9 @@ mod tests {
         let repo = gix::open(dir.path()).expect("open repo");
         let head_sha = repo.head_id().expect("head_id").to_string();
 
-        verify_sha(dir.path(), &head_sha).expect("full SHA should match");
+        let git = GixCliBackend::default();
+        git.verify_sha(dir.path(), &head_sha)
+            .expect("full SHA should match");
     }
 
     #[test]
@@ -505,7 +491,9 @@ mod tests {
         let head_sha = repo.head_id().expect("head_id").to_string();
         let prefix = &head_sha[..7];
 
-        verify_sha(dir.path(), prefix).expect("7-char prefix should match");
+        let git = GixCliBackend::default();
+        git.verify_sha(dir.path(), prefix)
+            .expect("7-char prefix should match");
     }
 
     #[test]
@@ -513,7 +501,10 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         create_local_repo(dir.path());
 
-        let err = verify_sha(dir.path(), "0000000deadbeef").expect_err("should reject wrong SHA");
+        let git = GixCliBackend::default();
+        let err = git
+            .verify_sha(dir.path(), "0000000deadbeef")
+            .expect_err("should reject wrong SHA");
 
         assert!(
             matches!(err, GitError::ShaMismatch { .. }),
@@ -526,7 +517,10 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         create_local_repo(dir.path());
 
-        let err = verify_sha(dir.path(), "").expect_err("should reject empty SHA");
+        let git = GixCliBackend::default();
+        let err = git
+            .verify_sha(dir.path(), "")
+            .expect_err("should reject empty SHA");
 
         assert!(
             matches!(err, GitError::ShaMismatch { .. }),
@@ -544,8 +538,10 @@ mod tests {
 
         // Append extra characters to the actual SHA so it can never be a valid prefix.
         let too_long = format!("{head_sha}extra");
-        let err =
-            verify_sha(dir.path(), &too_long).expect_err("should reject overly long expected SHA");
+        let git = GixCliBackend::default();
+        let err = git
+            .verify_sha(dir.path(), &too_long)
+            .expect_err("should reject overly long expected SHA");
 
         assert!(
             matches!(err, GitError::ShaMismatch { .. }),
@@ -557,7 +553,10 @@ mod tests {
     fn pull_repo_on_non_repo_returns_error() {
         let dir = tempfile::tempdir().expect("tempdir");
 
-        let err = pull_repo(dir.path()).expect_err("should fail on non-repo");
+        let git = GixCliBackend::default();
+        let err = git
+            .pull_repo(dir.path())
+            .expect_err("should fail on non-repo");
 
         assert!(
             matches!(err, GitError::OpenFailed { .. }),
@@ -575,7 +574,10 @@ mod tests {
         let clone_dir = tempfile::tempdir().expect("tempdir");
         let dest = clone_dir.path().join("cloned");
         let url = path_to_file_url(origin_dir.path());
-        clone_repo(&url, &dest, None).expect("clone should succeed");
+        let git = GixCliBackend::default();
+        let opts = CloneOptions::default();
+        git.clone_repo(&url, &dest, &opts)
+            .expect("clone should succeed");
 
         // Add a second commit to the origin.
         let run = |args: &[&str], dir: &Path| {
@@ -607,8 +609,8 @@ mod tests {
             origin_dir.path(),
         );
 
-        // Pull into the clone — the new file should appear.
-        pull_repo(&dest).expect("pull should succeed");
+        // Pull into the clone -- the new file should appear.
+        git.pull_repo(&dest).expect("pull should succeed");
 
         assert!(
             dest.join("second.txt").exists(),

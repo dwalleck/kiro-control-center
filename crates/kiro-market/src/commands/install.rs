@@ -8,8 +8,7 @@ use chrono::Utc;
 use colored::Colorize;
 use kiro_market_core::cache::CacheDir;
 use kiro_market_core::error::{Error as CoreError, SkillError};
-use kiro_market_core::git;
-use kiro_market_core::git::GitProtocol;
+use kiro_market_core::git::{self, CloneOptions, GitBackend, GitProtocol, GixCliBackend};
 use kiro_market_core::marketplace::{PluginEntry, PluginSource, StructuredSource};
 use kiro_market_core::plugin::{PluginManifest, discover_skill_dirs};
 use kiro_market_core::project::{InstalledSkillMeta, KiroProject};
@@ -389,12 +388,18 @@ fn resolve_structured_source(
 
     debug!(url = %url, dest = %dest.display(), "cloning plugin");
     print!("  Cloning {label}...");
-    git::clone_repo(&url, &dest, git_ref)
+    let backend = GixCliBackend::default();
+    let opts = CloneOptions {
+        git_ref: git_ref.map(ToOwned::to_owned),
+    };
+    backend
+        .clone_repo(&url, &dest, &opts)
         .with_context(|| format!("failed to clone plugin from '{label}'"))?;
     println!(" done");
 
     if let Some(expected) = sha {
-        git::verify_sha(&dest, expected)
+        backend
+            .verify_sha(&dest, expected)
             .with_context(|| format!("SHA verification failed for '{label}'"))?;
     }
 
