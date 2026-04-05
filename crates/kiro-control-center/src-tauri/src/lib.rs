@@ -25,6 +25,10 @@ fn create_builder() -> Builder<tauri::Wry> {
         commands::marketplaces::add_marketplace,
         commands::marketplaces::remove_marketplace,
         commands::marketplaces::update_marketplace,
+        commands::settings::get_settings,
+        commands::settings::save_scan_roots,
+        commands::settings::discover_projects,
+        commands::settings::set_active_project,
     ])
 }
 

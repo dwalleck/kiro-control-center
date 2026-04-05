@@ -114,6 +114,52 @@ async updateMarketplace(name: string | null) : Promise<Result<UpdateResult, Comm
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
 }
+},
+/**
+ * Load application settings.
+ */
+async getSettings() : Promise<Result<Settings, CommandError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("get_settings") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Save the list of scan root directories.
+ */
+async saveScanRoots(roots: string[]) : Promise<Result<null, CommandError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("save_scan_roots", { roots }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Discover Kiro projects by scanning configured root directories.
+ * 
+ * Scans each root 1-2 levels deep for directories containing `.kiro/`.
+ */
+async discoverProjects() : Promise<Result<DiscoveredProject[], CommandError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("discover_projects") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Set the active project and persist it.
+ */
+async setActiveProject(path: string) : Promise<Result<ProjectInfo, CommandError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("set_active_project", { path }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
 }
 }
 
@@ -135,6 +181,26 @@ async updateMarketplace(name: string | null) : Promise<Result<UpdateResult, Comm
  * display appropriate messages without string parsing.
  */
 export type CommandError = { message: string; error_type: ErrorType }
+/**
+ * A discovered Kiro project.
+ */
+export type DiscoveredProject = { 
+/**
+ * Absolute path to the project root.
+ */
+path: string; 
+/**
+ * Directory name (for display).
+ */
+name: string; 
+/**
+ * Whether `.kiro/` exists.
+ */
+kiro_initialized: boolean; 
+/**
+ * Number of installed skills (0 during discovery, loaded on demand).
+ */
+skill_count: number }
 /**
  * Machine-readable error classification for frontend conditional logic.
  * 
@@ -199,6 +265,18 @@ export type PluginInfo = { name: string; description: string | null; skill_count
  * Summary information about a Kiro project directory.
  */
 export type ProjectInfo = { path: string; kiro_initialized: boolean; installed_skill_count: number }
+/**
+ * Persisted application settings.
+ */
+export type Settings = { 
+/**
+ * Directories to scan for Kiro projects.
+ */
+scan_roots?: string[]; 
+/**
+ * Last active project path (restored on launch).
+ */
+last_project?: string | null }
 /**
  * Information about a single skill, including installation status.
  */
