@@ -234,3 +234,121 @@ fn scan_for_projects(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Set `KIRO_MARKET_CONFIG_DIR` to a temp directory for isolated tests.
+    ///
+    /// Note: env var mutation is not thread-safe, but cargo test runs
+    /// `#[test]` functions in the same module sequentially by default.
+    ///
+    /// In edition 2024 `set_var`/`remove_var` are unsafe; this crate is
+    /// edition 2021 so the calls are safe.  If the crate upgrades to 2024,
+    /// wrap the two calls in `unsafe {}`.
+    fn with_temp_config<F: FnOnce()>(dir: &tempfile::TempDir, f: F) {
+        std::env::set_var("KIRO_MARKET_CONFIG_DIR", dir.path());
+        f();
+        std::env::remove_var("KIRO_MARKET_CONFIG_DIR");
+    }
+
+    #[test]
+    fn load_settings_returns_defaults_when_no_file() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        with_temp_config(&dir, || {
+            let settings = load_settings();
+            assert!(settings.scan_roots.is_empty());
+            assert!(settings.last_project.is_none());
+        });
+    }
+
+    #[test]
+    fn save_and_load_settings_roundtrip() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        with_temp_config(&dir, || {
+            let mut settings = Settings::default();
+            settings.scan_roots = vec!["~/repos".into(), "~/work".into()];
+            settings.last_project = Some("/home/user/project".into());
+            save_settings(&settings).expect("save");
+
+            let loaded = load_settings();
+            assert_eq!(loaded.scan_roots, vec!["~/repos", "~/work"]);
+            assert_eq!(loaded.last_project.as_deref(), Some("/home/user/project"));
+        });
+    }
+
+    #[test]
+    fn shellexpand_tilde_expands_home() {
+        let expanded = shellexpand_tilde("~/repos");
+        assert!(
+            !expanded.starts_with('~'),
+            "tilde should be expanded: {expanded}"
+        );
+        assert!(expanded.ends_with("repos"));
+    }
+
+    #[test]
+    fn shellexpand_tilde_leaves_absolute_paths_alone() {
+        let path = "/absolute/path";
+        assert_eq!(shellexpand_tilde(path), path);
+    }
+
+    #[test]
+    fn scan_for_projects_finds_kiro_dirs() {
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        // Create two projects: one at depth 1, one at depth 2.
+        let proj1 = dir.path().join("project-a");
+        std::fs::create_dir_all(proj1.join(".kiro")).expect("create .kiro");
+
+        let org = dir.path().join("org");
+        let proj2 = org.join("project-b");
+        std::fs::create_dir_all(proj2.join(".kiro")).expect("create .kiro");
+
+        // Create a non-project directory (no .kiro).
+        std::fs::create_dir_all(dir.path().join("not-a-project")).expect("create dir");
+
+        let mut results = Vec::new();
+        scan_for_projects(dir.path(), 0, 2, &mut results);
+
+        assert_eq!(results.len(), 2, "should find 2 projects: {results:?}");
+
+        let names: Vec<&str> = results.iter().map(|p| p.name.as_str()).collect();
+        assert!(names.contains(&"project-a"), "missing project-a: {names:?}");
+        assert!(names.contains(&"project-b"), "missing project-b: {names:?}");
+    }
+
+    #[test]
+    fn scan_for_projects_respects_max_depth() {
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        // Create project at depth 3 (should NOT be found with max_depth=2).
+        let deep = dir.path().join("a").join("b").join("c");
+        std::fs::create_dir_all(deep.join(".kiro")).expect("create .kiro");
+
+        let mut results = Vec::new();
+        scan_for_projects(dir.path(), 0, 2, &mut results);
+
+        assert!(results.is_empty(), "should not find projects at depth 3");
+    }
+
+    #[test]
+    fn scan_for_projects_skips_hidden_and_build_dirs() {
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        // Create .kiro inside hidden, node_modules, and target dirs.
+        for name in &[".hidden", "node_modules", "target"] {
+            let d = dir.path().join(name).join("sneaky");
+            std::fs::create_dir_all(d.join(".kiro")).expect("create .kiro");
+        }
+
+        let mut results = Vec::new();
+        scan_for_projects(dir.path(), 0, 2, &mut results);
+
+        assert!(
+            results.is_empty(),
+            "should skip hidden/build dirs: {results:?}"
+        );
+    }
+}
