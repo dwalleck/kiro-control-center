@@ -7,8 +7,10 @@ pub mod cache;
 pub mod error;
 pub mod git;
 pub mod marketplace;
+pub mod platform;
 pub mod plugin;
 pub mod project;
+pub mod service;
 pub mod skill;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_utils;

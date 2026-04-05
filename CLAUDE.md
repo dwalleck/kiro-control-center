@@ -36,6 +36,21 @@ and installs SKILL.md files into Kiro CLI projects at `.kiro/skills/`.
 Multi-file Claude Code skills (SKILL.md + companion .md files) are merged into a
 single SKILL.md since Kiro doesn't support deferred loading of companion files.
 
+### Service Layer
+Marketplace operations (add/remove/update/list) live in `kiro-market-core::service::MarketplaceService`.
+CLI and Tauri handlers are thin wrappers that construct the service, call it, and format output.
+Domain logic is never duplicated between frontends.
+
+### Git Abstraction
+Git operations are abstracted behind the `GitBackend` trait (`kiro-market-core::git`).
+`GixCliBackend` implements the trait using `gix` for clone/open and the system `git` CLI
+for pull/checkout. The trait enables mock-based testing without filesystem git repos.
+
+### Platform Abstraction
+Local marketplace linking uses `kiro-market-core::platform` which provides
+`create_local_link`/`is_local_link`/`remove_local_link`. On Unix this uses symlinks,
+on Windows it uses directory junctions with copy fallback.
+
 ## Key Crate Dependencies
 - `gix` + system `git` CLI — git operations (gix for clone/open, system git for pull/checkout)
 - `clap` (derive) — CLI framework

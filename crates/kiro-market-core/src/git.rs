@@ -15,37 +15,106 @@ use tracing::debug;
 
 use crate::error::GitError;
 
+// ---------------------------------------------------------------------------
+// Git backend trait
+// ---------------------------------------------------------------------------
+
+/// Options for cloning a repository.
+///
+/// When `git_ref` is `None`, the implementation should use a shallow clone
+/// (depth 1) to reduce transfer size. When `git_ref` is `Some`, a full
+/// clone is performed followed by a checkout of the specified ref.
+#[derive(Clone, Debug, Default)]
+pub struct CloneOptions {
+    /// Branch, tag, or SHA to check out after cloning.
+    pub git_ref: Option<String>,
+}
+
+/// Trait abstracting git operations for testability and backend swapping.
+///
+/// Implementations must be `Send + Sync` to support sharing across async
+/// Tauri command handlers via `Arc` or `Box`.
+pub trait GitBackend: Send + Sync {
+    /// Clone a remote repository into `dest`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GitError::CloneFailed`] if the clone or checkout fails.
+    fn clone_repo(&self, url: &str, dest: &Path, opts: &CloneOptions) -> Result<(), GitError>;
+
+    /// Pull (fast-forward only) the default branch.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GitError::OpenFailed`] if the path is not a valid repository,
+    /// or [`GitError::PullFailed`] if the pull fails.
+    fn pull_repo(&self, path: &Path) -> Result<(), GitError>;
+
+    /// Verify the HEAD commit matches the expected SHA prefix.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`GitError::ShaMismatch`] if the SHA does not match.
+    /// Returns [`GitError::OpenFailed`] if the repository cannot be read.
+    fn verify_sha(&self, path: &Path, expected_sha: &str) -> Result<(), GitError>;
+}
+
+// ---------------------------------------------------------------------------
+// Gix + CLI backend
+// ---------------------------------------------------------------------------
+
+/// Git backend using `gix` for clone/open and the system `git` CLI for
+/// pull and ref checkout.
+///
+/// SSH connect-timeout protection is applied when no custom `GIT_SSH_COMMAND`
+/// or `GIT_SSH` is configured. `GIT_TERMINAL_PROMPT=0` prevents interactive
+/// prompts from hanging non-interactive contexts.
+#[derive(Debug)]
+pub struct GixCliBackend {
+    ssh_connect_timeout: u32,
+}
+
+impl Default for GixCliBackend {
+    fn default() -> Self {
+        Self {
+            ssh_connect_timeout: SSH_CONNECT_TIMEOUT_SECS,
+        }
+    }
+}
+
 /// Default SSH connect timeout in seconds applied via `GIT_SSH_COMMAND`.
 const SSH_CONNECT_TIMEOUT_SECS: u32 = 30;
 
-/// Run a `git` command with SSH connect-timeout protection.
-///
-/// Sets `GIT_SSH_COMMAND` with a 30-second `ConnectTimeout` to prevent
-/// indefinite hangs when SSH port 22 is firewalled. Detects a missing
-/// `git` binary and returns [`GitError::GitNotFound`].
-fn run_git(args: &[&str], dir: &Path) -> Result<std::process::Output, GitError> {
-    let mut cmd = Command::new("git");
-    cmd.args(args)
-        .current_dir(dir)
-        .env("GIT_TERMINAL_PROMPT", "0");
+impl GixCliBackend {
+    /// Run a `git` command with SSH connect-timeout protection.
+    ///
+    /// Sets `GIT_SSH_COMMAND` with a configurable `ConnectTimeout` to prevent
+    /// indefinite hangs when SSH port 22 is firewalled. Detects a missing
+    /// `git` binary and returns [`GitError::GitNotFound`].
+    fn run_git(&self, args: &[&str], dir: &Path) -> Result<std::process::Output, GitError> {
+        let mut cmd = Command::new("git");
+        cmd.args(args)
+            .current_dir(dir)
+            .env("GIT_TERMINAL_PROMPT", "0");
 
-    // Only set SSH timeout when no custom SSH configuration exists.
-    // GIT_SSH_COMMAND takes precedence over GIT_SSH in git's resolution;
-    // setting it when GIT_SSH points to plink would silently override it.
-    if std::env::var_os("GIT_SSH_COMMAND").is_none() && std::env::var_os("GIT_SSH").is_none() {
-        cmd.env(
-            "GIT_SSH_COMMAND",
-            format!("ssh -o ConnectTimeout={SSH_CONNECT_TIMEOUT_SECS}"),
-        );
+        // Only set SSH timeout when no custom SSH configuration exists.
+        // GIT_SSH_COMMAND takes precedence over GIT_SSH in git's resolution;
+        // setting it when GIT_SSH points to plink would silently override it.
+        if std::env::var_os("GIT_SSH_COMMAND").is_none() && std::env::var_os("GIT_SSH").is_none() {
+            cmd.env(
+                "GIT_SSH_COMMAND",
+                format!("ssh -o ConnectTimeout={}", self.ssh_connect_timeout),
+            );
+        }
+
+        cmd.output().map_err(|e| match e.kind() {
+            std::io::ErrorKind::NotFound => GitError::GitNotFound,
+            _ => GitError::GitCommandFailed {
+                dir: dir.to_path_buf(),
+                source: Box::new(e),
+            },
+        })
     }
-
-    cmd.output().map_err(|e| match e.kind() {
-        std::io::ErrorKind::NotFound => GitError::GitNotFound,
-        _ => GitError::GitCommandFailed {
-            dir: dir.to_path_buf(),
-            source: Box::new(e),
-        },
-    })
 }
 
 /// Extract a useful error message from a failed git command.
@@ -62,6 +131,108 @@ fn git_error_detail(output: &std::process::Output) -> String {
         return stdout.trim().to_owned();
     }
     format!("git exited with {}", output.status)
+}
+
+impl GitBackend for GixCliBackend {
+    fn clone_repo(&self, url: &str, dest: &Path, opts: &CloneOptions) -> Result<(), GitError> {
+        debug!(url, dest = %dest.display(), git_ref = opts.git_ref.as_deref(), "cloning repository");
+
+        let map_err = |e: Box<dyn std::error::Error + Send + Sync>| GitError::CloneFailed {
+            url: url.to_owned(),
+            source: e,
+        };
+
+        let mut prepare = gix::prepare_clone(url, dest).map_err(|e| map_err(Box::new(e)))?;
+
+        if opts.git_ref.is_none() {
+            let depth = NonZeroU32::MIN;
+            prepare = prepare.with_shallow(gix::remote::fetch::Shallow::DepthAtRemote(depth));
+        }
+
+        let (mut checkout, _outcome) = prepare
+            .fetch_then_checkout(Discard, &AtomicBool::new(false))
+            .map_err(|e| map_err(Box::new(e)))?;
+
+        let (_repo, _outcome) = checkout
+            .main_worktree(Discard, &AtomicBool::new(false))
+            .map_err(|e| map_err(Box::new(e)))?;
+
+        if let Some(refname) = opts.git_ref.as_deref() {
+            if refname.starts_with('-') {
+                return Err(map_err(
+                    format!("invalid git ref: '{refname}' must not start with '-'").into(),
+                ));
+            }
+
+            let output = self
+                .run_git(&["checkout", refname], dest)
+                .map_err(|e| map_err(Box::new(e)))?;
+
+            if !output.status.success() {
+                let detail = git_error_detail(&output);
+                return Err(map_err(detail.into()));
+            }
+        }
+
+        Ok(())
+    }
+
+    fn pull_repo(&self, path: &Path) -> Result<(), GitError> {
+        debug!(path = %path.display(), "pulling repository");
+
+        // Verify it's actually a git repo first (preserves the OpenFailed error).
+        let _repo = gix::open(path).map_err(|e| GitError::OpenFailed {
+            path: path.to_path_buf(),
+            source: Box::new(e),
+        })?;
+
+        let output =
+            self.run_git(&["pull", "--ff-only"], path)
+                .map_err(|e| GitError::PullFailed {
+                    path: path.to_path_buf(),
+                    source: Box::new(e),
+                })?;
+
+        if !output.status.success() {
+            let detail = git_error_detail(&output);
+            return Err(GitError::PullFailed {
+                path: path.to_path_buf(),
+                source: detail.into(),
+            });
+        }
+
+        Ok(())
+    }
+
+    fn verify_sha(&self, path: &Path, expected_sha: &str) -> Result<(), GitError> {
+        if expected_sha.is_empty() {
+            return Err(GitError::ShaMismatch {
+                expected: "(empty)".to_owned(),
+                actual: "(not checked)".to_owned(),
+            });
+        }
+
+        let repo = gix::open(path).map_err(|e| GitError::OpenFailed {
+            path: path.to_path_buf(),
+            source: Box::new(e),
+        })?;
+
+        let head_id = repo.head_id().map_err(|e| GitError::OpenFailed {
+            path: path.to_path_buf(),
+            source: Box::new(e),
+        })?;
+
+        let actual_sha = head_id.to_string();
+
+        if actual_sha.starts_with(expected_sha) {
+            Ok(())
+        } else {
+            Err(GitError::ShaMismatch {
+                expected: expected_sha.to_owned(),
+                actual: actual_sha,
+            })
+        }
+    }
 }
 
 /// Which transport protocol to use when cloning from a shorthand host
@@ -86,131 +257,6 @@ pub fn github_repo_to_url(repo: &str, protocol: GitProtocol) -> String {
         GitProtocol::Https => format!("https://github.com/{repo}.git"),
         GitProtocol::Ssh => format!("git@github.com:{repo}.git"),
     }
-}
-
-/// Clone a remote Git repository into `dest`.
-///
-/// Uses `gix` for the clone operation. When `git_ref` is `None`, a shallow
-/// clone (depth 1) is used to reduce transfer size. When `git_ref` is
-/// provided, a full clone is performed followed by a `git checkout` of the
-/// specified branch, tag, or SHA (requires the `git` CLI in `$PATH`).
-///
-/// # Errors
-///
-/// Returns [`GitError::CloneFailed`] if the clone or checkout fails.
-pub fn clone_repo(url: &str, dest: &Path, git_ref: Option<&str>) -> Result<(), GitError> {
-    debug!(url, dest = %dest.display(), git_ref, "cloning repository");
-
-    let map_err = |e: Box<dyn std::error::Error + Send + Sync>| GitError::CloneFailed {
-        url: url.to_owned(),
-        source: e,
-    };
-
-    let mut prepare = gix::prepare_clone(url, dest).map_err(|e| map_err(Box::new(e)))?;
-
-    if git_ref.is_none() {
-        let depth = NonZeroU32::MIN;
-        prepare = prepare.with_shallow(gix::remote::fetch::Shallow::DepthAtRemote(depth));
-    }
-
-    let (mut checkout, _outcome) = prepare
-        .fetch_then_checkout(Discard, &AtomicBool::new(false))
-        .map_err(|e| map_err(Box::new(e)))?;
-
-    let (_repo, _outcome) = checkout
-        .main_worktree(Discard, &AtomicBool::new(false))
-        .map_err(|e| map_err(Box::new(e)))?;
-
-    if let Some(refname) = git_ref {
-        if refname.starts_with('-') {
-            return Err(map_err(
-                format!("invalid git ref: '{refname}' must not start with '-'").into(),
-            ));
-        }
-
-        let output = run_git(&["checkout", refname], dest).map_err(|e| map_err(Box::new(e)))?;
-
-        if !output.status.success() {
-            let detail = git_error_detail(&output);
-            return Err(map_err(detail.into()));
-        }
-    }
-
-    Ok(())
-}
-
-/// Verify the current HEAD of a repository matches the expected SHA prefix.
-///
-/// Both full and abbreviated SHAs are supported: the check passes if the
-/// actual commit SHA starts with the expected string.
-///
-/// # Errors
-///
-/// Returns [`GitError::ShaMismatch`] if the actual commit SHA does not match.
-/// Returns [`GitError::OpenFailed`] if the repository cannot be read.
-pub fn verify_sha(path: &Path, expected_sha: &str) -> Result<(), GitError> {
-    if expected_sha.is_empty() {
-        return Err(GitError::ShaMismatch {
-            expected: "(empty)".to_owned(),
-            actual: "(not checked)".to_owned(),
-        });
-    }
-
-    let repo = gix::open(path).map_err(|e| GitError::OpenFailed {
-        path: path.to_path_buf(),
-        source: Box::new(e),
-    })?;
-
-    let head_id = repo.head_id().map_err(|e| GitError::OpenFailed {
-        path: path.to_path_buf(),
-        source: Box::new(e),
-    })?;
-
-    let actual_sha = head_id.to_string();
-
-    if actual_sha.starts_with(expected_sha) {
-        Ok(())
-    } else {
-        Err(GitError::ShaMismatch {
-            expected: expected_sha.to_owned(),
-            actual: actual_sha,
-        })
-    }
-}
-
-/// Pull the default branch using `git pull --ff-only`.
-///
-/// Opens the repository at `path` with `gix` to verify it is valid,
-/// then runs `git pull --ff-only` to fetch and fast-forward the local
-/// branch.
-///
-/// # Errors
-///
-/// Returns [`GitError::OpenFailed`] if the path is not a valid repository,
-/// or [`GitError::PullFailed`] if the pull fails.
-pub fn pull_repo(path: &Path) -> Result<(), GitError> {
-    debug!(path = %path.display(), "pulling repository");
-
-    // Verify it's actually a git repo first (preserves the OpenFailed error).
-    let _repo = gix::open(path).map_err(|e| GitError::OpenFailed {
-        path: path.to_path_buf(),
-        source: Box::new(e),
-    })?;
-
-    let output = run_git(&["pull", "--ff-only"], path).map_err(|e| GitError::PullFailed {
-        path: path.to_path_buf(),
-        source: Box::new(e),
-    })?;
-
-    if !output.status.success() {
-        let detail = git_error_detail(&output);
-        return Err(GitError::PullFailed {
-            path: path.to_path_buf(),
-            source: detail.into(),
-        });
-    }
-
-    Ok(())
 }
 
 #[cfg(test)]
@@ -258,7 +304,10 @@ mod tests {
         let dest = clone_dir.path().join("cloned");
 
         let url = path_to_file_url(origin_dir.path());
-        clone_repo(&url, &dest, None).expect("clone should succeed");
+        let git = GixCliBackend::default();
+        let opts = CloneOptions::default();
+        git.clone_repo(&url, &dest, &opts)
+            .expect("clone should succeed");
 
         let content = std::fs::read_to_string(dest.join("hello.txt")).expect("read hello.txt");
         assert_eq!(content, "Hello, world!");
@@ -269,7 +318,9 @@ mod tests {
         let dest_dir = tempfile::tempdir().expect("tempdir");
         let dest = dest_dir.path().join("bad-clone");
 
-        let err = match clone_repo("file:///nonexistent/repo", &dest, None) {
+        let git = GixCliBackend::default();
+        let opts = CloneOptions::default();
+        let err = match git.clone_repo("file:///nonexistent/repo", &dest, &opts) {
             Err(e) => e,
             Ok(()) => panic!("clone should fail for nonexistent URL"),
         };
@@ -318,7 +369,12 @@ mod tests {
         let dest = clone_dir.path().join("cloned");
         let url = path_to_file_url(origin_dir.path());
 
-        clone_repo(&url, &dest, Some("feature-branch")).expect("clone with ref should succeed");
+        let git = GixCliBackend::default();
+        let opts = CloneOptions {
+            git_ref: Some("feature-branch".to_owned()),
+        };
+        git.clone_repo(&url, &dest, &opts)
+            .expect("clone with ref should succeed");
 
         assert!(
             dest.join("feature.txt").exists(),
@@ -335,7 +391,12 @@ mod tests {
         let dest = clone_dir.path().join("cloned");
         let url = path_to_file_url(origin_dir.path());
 
-        let err = clone_repo(&url, &dest, Some("nonexistent-branch"))
+        let git = GixCliBackend::default();
+        let opts = CloneOptions {
+            git_ref: Some("nonexistent-branch".to_owned()),
+        };
+        let err = git
+            .clone_repo(&url, &dest, &opts)
             .expect_err("should fail for nonexistent ref");
 
         assert!(
@@ -353,7 +414,12 @@ mod tests {
         let dest = clone_dir.path().join("cloned");
         let url = path_to_file_url(origin_dir.path());
 
-        let err = clone_repo(&url, &dest, Some("--orphan=malicious"))
+        let git = GixCliBackend::default();
+        let opts = CloneOptions {
+            git_ref: Some("--orphan=malicious".to_owned()),
+        };
+        let err = git
+            .clone_repo(&url, &dest, &opts)
             .expect_err("should reject dash-prefixed ref");
 
         assert!(
@@ -411,7 +477,9 @@ mod tests {
         let repo = gix::open(dir.path()).expect("open repo");
         let head_sha = repo.head_id().expect("head_id").to_string();
 
-        verify_sha(dir.path(), &head_sha).expect("full SHA should match");
+        let git = GixCliBackend::default();
+        git.verify_sha(dir.path(), &head_sha)
+            .expect("full SHA should match");
     }
 
     #[test]
@@ -423,7 +491,9 @@ mod tests {
         let head_sha = repo.head_id().expect("head_id").to_string();
         let prefix = &head_sha[..7];
 
-        verify_sha(dir.path(), prefix).expect("7-char prefix should match");
+        let git = GixCliBackend::default();
+        git.verify_sha(dir.path(), prefix)
+            .expect("7-char prefix should match");
     }
 
     #[test]
@@ -431,7 +501,10 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         create_local_repo(dir.path());
 
-        let err = verify_sha(dir.path(), "0000000deadbeef").expect_err("should reject wrong SHA");
+        let git = GixCliBackend::default();
+        let err = git
+            .verify_sha(dir.path(), "0000000deadbeef")
+            .expect_err("should reject wrong SHA");
 
         assert!(
             matches!(err, GitError::ShaMismatch { .. }),
@@ -444,7 +517,10 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         create_local_repo(dir.path());
 
-        let err = verify_sha(dir.path(), "").expect_err("should reject empty SHA");
+        let git = GixCliBackend::default();
+        let err = git
+            .verify_sha(dir.path(), "")
+            .expect_err("should reject empty SHA");
 
         assert!(
             matches!(err, GitError::ShaMismatch { .. }),
@@ -462,8 +538,10 @@ mod tests {
 
         // Append extra characters to the actual SHA so it can never be a valid prefix.
         let too_long = format!("{head_sha}extra");
-        let err =
-            verify_sha(dir.path(), &too_long).expect_err("should reject overly long expected SHA");
+        let git = GixCliBackend::default();
+        let err = git
+            .verify_sha(dir.path(), &too_long)
+            .expect_err("should reject overly long expected SHA");
 
         assert!(
             matches!(err, GitError::ShaMismatch { .. }),
@@ -475,7 +553,10 @@ mod tests {
     fn pull_repo_on_non_repo_returns_error() {
         let dir = tempfile::tempdir().expect("tempdir");
 
-        let err = pull_repo(dir.path()).expect_err("should fail on non-repo");
+        let git = GixCliBackend::default();
+        let err = git
+            .pull_repo(dir.path())
+            .expect_err("should fail on non-repo");
 
         assert!(
             matches!(err, GitError::OpenFailed { .. }),
@@ -493,7 +574,10 @@ mod tests {
         let clone_dir = tempfile::tempdir().expect("tempdir");
         let dest = clone_dir.path().join("cloned");
         let url = path_to_file_url(origin_dir.path());
-        clone_repo(&url, &dest, None).expect("clone should succeed");
+        let git = GixCliBackend::default();
+        let opts = CloneOptions::default();
+        git.clone_repo(&url, &dest, &opts)
+            .expect("clone should succeed");
 
         // Add a second commit to the origin.
         let run = |args: &[&str], dir: &Path| {
@@ -525,8 +609,8 @@ mod tests {
             origin_dir.path(),
         );
 
-        // Pull into the clone — the new file should appear.
-        pull_repo(&dest).expect("pull should succeed");
+        // Pull into the clone -- the new file should appear.
+        git.pull_repo(&dest).expect("pull should succeed");
 
         assert!(
             dest.join("second.txt").exists(),
