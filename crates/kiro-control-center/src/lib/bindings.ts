@@ -84,14 +84,6 @@ async removeSkill(name: string, projectPath: string) : Promise<Result<null, Comm
 },
 /**
  * Add a new marketplace source.
- * 
- * Mirrors the CLI `marketplace add` flow:
- * 1. Detect source type (GitHub shorthand, git URL, local path).
- * 2. Clone or symlink into a temp directory inside the cache.
- * 3. Read the marketplace manifest to discover the canonical name.
- * 4. Validate the name, rename to its final location.
- * 5. Register in `known_marketplaces.json`.
- * 6. Return the name and discovered plugins.
  */
 async addMarketplace(source: string, protocol: GitProtocol | null) : Promise<Result<MarketplaceAddResult, CommandError>> {
     try {
@@ -114,10 +106,6 @@ async removeMarketplace(name: string) : Promise<Result<null, CommandError>> {
 },
 /**
  * Update marketplace clone(s) from remote.
- * 
- * If `name` is provided, only that marketplace is updated. Otherwise all
- * registered marketplaces are updated. Symlinked (local) marketplaces are
- * skipped since they always reflect the latest state on disk.
  */
 async updateMarketplace(name: string | null) : Promise<Result<UpdateResult, CommandError>> {
     try {
@@ -187,7 +175,7 @@ export type InstalledSkillInfo = { name: string; marketplace: string; plugin: st
  */
 installed_at: string }
 /**
- * Result of adding a new marketplace, including the discovered plugins.
+ * Result of adding a new marketplace.
  */
 export type MarketplaceAddResult = { name: string; plugins: PluginBasicInfo[] }
 /**
