@@ -44,9 +44,25 @@ In the `tauri::Builder::default()` chain, add the dialog plugin:
         .invoke_handler(builder.invoke_handler())
 ```
 
-**Step 4: Add dialog permission in `tauri.conf.json`**
+**Step 4: Add dialog permission in capabilities file**
 
-Add to the `"app"` section (or create `"permissions"` in the appropriate capabilities file — check Tauri 2 docs for exact location).
+The file `src-tauri/capabilities/default.json` already exists with `core:default` and `opener:default`. Add `"dialog:default"` to the permissions array:
+
+```json
+{
+  "$schema": "../gen/schemas/desktop-schema.json",
+  "identifier": "default",
+  "description": "Capability for the main window",
+  "windows": ["main"],
+  "permissions": [
+    "core:default",
+    "opener:default",
+    "dialog:default"
+  ]
+}
+```
+
+**Note:** This is a Tauri 2 capabilities file, NOT `tauri.conf.json`. Tauri 2 uses `src-tauri/capabilities/*.json` for permission management. Without this, the dialog plugin will fail at runtime with a permission denied error.
 
 **Step 5: Verify it compiles**
 
@@ -116,7 +132,13 @@ pub struct DiscoveredProject {
 // ---------------------------------------------------------------------------
 
 /// Path to the settings file.
+///
+/// Respects `KIRO_MARKET_CONFIG_DIR` env var for test isolation (the `dirs`
+/// crate ignores `XDG_CONFIG_HOME` on macOS/Windows).
 fn settings_path() -> Option<PathBuf> {
+    if let Ok(dir) = std::env::var("KIRO_MARKET_CONFIG_DIR") {
+        return Some(PathBuf::from(dir).join("settings.json"));
+    }
     dirs::config_dir().map(|d| d.join("kiro-market").join("settings.json"))
 }
 
@@ -266,17 +288,14 @@ fn scan_for_projects(
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| dir.to_string_lossy().into_owned());
 
-        let project = KiroProject::new(dir.to_path_buf());
-        let skill_count = project
-            .load_installed()
-            .map(|i| i.skills.len() as u32)
-            .unwrap_or(0);
-
+        // Skip reading installed-skills.json during scan for performance.
+        // With 50+ projects, reading a JSON file per project would be slow.
+        // skill_count is loaded on demand when the user selects a project.
         results.push(DiscoveredProject {
             path: dir.to_string_lossy().into_owned(),
             name,
             kiro_initialized: true,
-            skill_count,
+            skill_count: 0,
         });
         // Don't recurse into .kiro projects (they won't contain sub-projects).
         return;
@@ -398,13 +417,38 @@ Add a `#[cfg(test)] mod tests` at the bottom of `settings.rs`:
 mod tests {
     use super::*;
 
+    /// Set KIRO_MARKET_CONFIG_DIR to a temp directory for isolated tests.
+    fn with_temp_config<F: FnOnce()>(dir: &tempfile::TempDir, f: F) {
+        // Note: env var mutation is not thread-safe, but test runner
+        // runs these sequentially by default.
+        unsafe { std::env::set_var("KIRO_MARKET_CONFIG_DIR", dir.path()); }
+        f();
+        unsafe { std::env::remove_var("KIRO_MARKET_CONFIG_DIR"); }
+    }
+
     #[test]
     fn load_settings_returns_defaults_when_no_file() {
-        // Uses the real config path — if no file exists, returns defaults.
-        let settings = load_settings();
-        // We can't assert much about scan_roots (user might have a file),
-        // but the function should not panic.
-        assert!(settings.scan_roots.len() >= 0);
+        let dir = tempfile::tempdir().expect("tempdir");
+        with_temp_config(&dir, || {
+            let settings = load_settings();
+            assert!(settings.scan_roots.is_empty());
+            assert!(settings.last_project.is_none());
+        });
+    }
+
+    #[test]
+    fn save_and_load_settings_roundtrip() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        with_temp_config(&dir, || {
+            let mut settings = Settings::default();
+            settings.scan_roots = vec!["~/repos".into(), "~/work".into()];
+            settings.last_project = Some("/home/user/project".into());
+            save_settings(&settings).expect("save");
+
+            let loaded = load_settings();
+            assert_eq!(loaded.scan_roots, vec!["~/repos", "~/work"]);
+            assert_eq!(loaded.last_project.as_deref(), Some("/home/user/project"));
+        });
     }
 
     #[test]
@@ -505,98 +549,113 @@ import { commands } from "$lib/bindings";
 import type { ProjectInfo, Settings, DiscoveredProject } from "$lib/bindings";
 
 // ---------------------------------------------------------------------------
-// Reactive state
+// Reactive state (exported as $state object — Svelte 5 Pattern A)
+//
+// Components read properties directly: `store.projectPath`, `store.loading`.
+// Property access on the $state proxy is reactive — no getters needed.
+// See: https://svelte.dev/docs/svelte/$state#Exporting-state
 // ---------------------------------------------------------------------------
 
-let projectPath: string | null = $state(null);
-let projectInfo: ProjectInfo | null = $state(null);
-let projectError: string | null = $state(null);
-let settings: Settings = $state({ scan_roots: [], last_project: null });
-let discoveredProjects: DiscoveredProject[] = $state([]);
-let loading: boolean = $state(true);
+export const store = $state({
+  projectPath: null as string | null,
+  projectInfo: null as ProjectInfo | null,
+  projectError: null as string | null,
+  settings: { scan_roots: [], last_project: null } as Settings,
+  discoveredProjects: [] as DiscoveredProject[],
+  loading: true,
+});
 
 // ---------------------------------------------------------------------------
-// Actions
+// Actions (mutate the store object's properties)
 // ---------------------------------------------------------------------------
 
 export async function initialize() {
-  loading = true;
-  projectError = null;
+  store.loading = true;
+  store.projectError = null;
 
   // Load settings.
   const settingsResult = await commands.getSettings();
   if (settingsResult.status === "ok") {
-    settings = settingsResult.data;
+    store.settings = settingsResult.data;
   }
 
   // Discover projects.
   await refreshProjects();
 
-  // Restore last project if it still exists.
-  if (settings.last_project) {
-    const found = discoveredProjects.find(
-      (p) => p.path === settings.last_project
+  // Restore last project if it still exists on disk.
+  if (store.settings.last_project) {
+    const found = store.discoveredProjects.find(
+      (p) => p.path === store.settings.last_project
     );
     if (found) {
-      await selectProject(settings.last_project);
+      await selectProject(store.settings.last_project);
     }
   }
 
-  loading = false;
+  store.loading = false;
 }
 
 export async function selectProject(path: string) {
-  projectError = null;
+  store.projectError = null;
   const result = await commands.setActiveProject(path);
   if (result.status === "ok") {
-    projectPath = result.data.path;
-    projectInfo = result.data;
+    store.projectPath = result.data.path;
+    store.projectInfo = result.data;
   } else {
-    projectError = result.error.message;
+    store.projectError = result.error.message;
   }
 }
 
 export async function refreshProjects() {
   const result = await commands.discoverProjects();
   if (result.status === "ok") {
-    discoveredProjects = result.data;
+    store.discoveredProjects = result.data;
   }
 }
 
 export async function addScanRoot(root: string) {
-  const roots = [...settings.scan_roots, root];
+  const roots = [...store.settings.scan_roots, root];
   const result = await commands.saveScanRoots(roots);
   if (result.status === "ok") {
-    settings.scan_roots = roots;
+    store.settings = { ...store.settings, scan_roots: roots };
     await refreshProjects();
   }
 }
 
 export async function removeScanRoot(root: string) {
-  const roots = settings.scan_roots.filter((r) => r !== root);
+  const roots = store.settings.scan_roots.filter((r: string) => r !== root);
   const result = await commands.saveScanRoots(roots);
   if (result.status === "ok") {
-    settings.scan_roots = roots;
+    store.settings = { ...store.settings, scan_roots: roots };
     await refreshProjects();
   }
 }
 
 export function clearProject() {
-  projectPath = null;
-  projectInfo = null;
+  store.projectPath = null;
+  store.projectInfo = null;
 }
+```
 
-// ---------------------------------------------------------------------------
-// Getters (read-only access to state)
-// ---------------------------------------------------------------------------
+**Reactivity note:** Components import `store` and read properties directly in templates:
+```svelte
+<script>
+  import { store, selectProject } from "$lib/stores/project.svelte";
+</script>
 
-export function getProjectPath() { return projectPath; }
-export function getProjectInfo() { return projectInfo; }
-export function getProjectError() { return projectError; }
-export function getSettings() { return settings; }
-export function getDiscoveredProjects() { return discoveredProjects; }
-export function isLoading() { return loading; }
-export function hasActiveProject() { return projectPath !== null; }
+<!-- These are reactive — property access on the $state proxy is tracked -->
+{#if store.projectPath}
+  <p>Active: {store.projectPath}</p>
+{:else}
+  <p>No project selected</p>
+{/if}
+```
+
+Do NOT capture store properties in local `let` variables (they become snapshots). Use `$derived` if a local reactive binding is needed:
+```svelte
+<script>
+  let hasProject = $derived(store.projectPath !== null);
+</script>
 ```
 
 **Step 2: Commit**
@@ -616,16 +675,77 @@ This is the full-page landing screen shown when no project is active.
 
 **Step 1: Create the component**
 
-Create `src/lib/components/ProjectPicker.svelte`. The component should:
+Create `src/lib/components/ProjectPicker.svelte`:
 
-- Show a list of discovered projects with name, path, and skill count
-- Each project is a clickable card that calls `selectProject(path)`
-- "Add Directory" button that opens the OS folder picker via `@tauri-apps/plugin-dialog`
-- "Open Other..." button that opens the OS folder picker for a one-off project
-- If no roots are configured, show a friendly onboarding message
-- Use the same Tailwind styling as existing components (dark mode support)
+```svelte
+<script lang="ts">
+  import { open } from "@tauri-apps/plugin-dialog";
+  import { store, selectProject, addScanRoot, refreshProjects } from "$lib/stores/project.svelte";
 
-This is a Svelte 5 component — use `$props`, `$state`, `$effect`. Import the dialog plugin with `import { open } from "@tauri-apps/plugin-dialog"` for the folder picker.
+  async function handleAddDirectory() {
+    const selected = await open({ directory: true, title: "Select a directory to scan for projects" });
+    if (selected === null) return; // User cancelled
+    await addScanRoot(selected);
+  }
+
+  async function handleOpenOther() {
+    const selected = await open({ directory: true, title: "Select a Kiro project" });
+    if (selected === null) return; // User cancelled
+    await selectProject(selected);
+  }
+</script>
+
+<div class="flex items-center justify-center h-full bg-gray-100 dark:bg-gray-950">
+  <div class="max-w-2xl w-full mx-auto p-8">
+    <h1 class="text-2xl font-bold text-gray-900 dark:text-gray-100 mb-2">Kiro Control Center</h1>
+    <p class="text-gray-500 dark:text-gray-400 mb-8">Select a project to manage its skills.</p>
+
+    {#if store.discoveredProjects.length > 0}
+      <div class="space-y-2 mb-6">
+        {#each store.discoveredProjects as project (project.path)}
+          <button
+            class="w-full text-left px-4 py-3 rounded-lg border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-900 hover:border-blue-400 dark:hover:border-blue-500 transition-colors"
+            onclick={() => selectProject(project.path)}
+          >
+            <div class="font-medium text-gray-900 dark:text-gray-100">{project.name}</div>
+            <div class="text-sm text-gray-500 dark:text-gray-400 truncate">{project.path}</div>
+          </button>
+        {/each}
+      </div>
+    {:else if store.settings.scan_roots.length > 0}
+      <p class="text-gray-500 dark:text-gray-400 mb-6">No projects found in your configured directories.</p>
+    {/if}
+
+    <div class="flex gap-3">
+      <button
+        class="px-4 py-2 rounded-lg bg-blue-600 text-white hover:bg-blue-700 transition-colors text-sm font-medium"
+        onclick={handleAddDirectory}
+      >
+        Add Directory to Scan
+      </button>
+      <button
+        class="px-4 py-2 rounded-lg border border-gray-300 dark:border-gray-600 text-gray-700 dark:text-gray-300 hover:bg-gray-50 dark:hover:bg-gray-800 transition-colors text-sm font-medium"
+        onclick={handleOpenOther}
+      >
+        Open Other...
+      </button>
+    </div>
+
+    {#if store.settings.scan_roots.length > 0}
+      <div class="mt-8 text-xs text-gray-400 dark:text-gray-500">
+        Scanning: {store.settings.scan_roots.join(", ")}
+      </div>
+    {/if}
+  </div>
+</div>
+```
+
+**Key design decisions:**
+- Projects shown as a list of clickable rows (not cards or grid — simpler, works at any count)
+- "Add Directory" is primary (blue), "Open Other" is secondary (outlined)
+- Dialog `open()` returns `null` on cancel — guarded with early return
+- Discovered projects read from `store.discoveredProjects` (reactive via $state proxy)
+- Scan roots shown as a small footer for context
 
 **Step 2: Commit**
 
@@ -644,15 +764,104 @@ This is the dropdown in the header for quick project switching.
 
 **Step 1: Create the component**
 
-The component should:
+Create `src/lib/components/ProjectDropdown.svelte`:
 
-- Show the current project name as a clickable button
-- On click, show a dropdown with discovered projects
-- Each project shows name and path (truncated)
-- "Open Other..." option at the bottom → opens OS folder picker
-- "Manage Directories..." option → emits an event to open settings
-- Clicking outside closes the dropdown
-- Use the same Tailwind styling as existing header elements
+```svelte
+<script lang="ts">
+  import { open } from "@tauri-apps/plugin-dialog";
+  import { store, selectProject, clearProject } from "$lib/stores/project.svelte";
+
+  let { onManageRoots }: { onManageRoots: () => void } = $props();
+
+  let isOpen = $state(false);
+
+  function toggle() {
+    isOpen = !isOpen;
+  }
+
+  function close() {
+    isOpen = false;
+  }
+
+  async function handleSelectProject(path: string) {
+    close();
+    await selectProject(path);
+  }
+
+  async function handleOpenOther() {
+    close();
+    const selected = await open({ directory: true, title: "Select a Kiro project" });
+    if (selected === null) return;
+    await selectProject(selected);
+  }
+
+  function handleManageRoots() {
+    close();
+    onManageRoots();
+  }
+</script>
+
+<!-- Click-outside handler -->
+{#if isOpen}
+  <!-- svelte-ignore a11y_no_static_element_interactions -->
+  <div class="fixed inset-0 z-40" onclick={close} onkeydown={() => {}}></div>
+{/if}
+
+<div class="relative">
+  <button
+    class="flex items-center gap-2 text-sm text-gray-700 dark:text-gray-300 hover:text-gray-900 dark:hover:text-gray-100 transition-colors"
+    onclick={toggle}
+  >
+    <span class="truncate max-w-xs font-medium">
+      {store.projectInfo?.path ?? "No project"}
+    </span>
+    <svg class="w-4 h-4 opacity-50" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+      <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M19 9l-7 7-7-7" />
+    </svg>
+  </button>
+
+  {#if isOpen}
+    <div class="absolute right-0 top-full mt-1 w-80 bg-white dark:bg-gray-800 rounded-lg shadow-lg border border-gray-200 dark:border-gray-700 z-50 overflow-hidden">
+      {#if store.discoveredProjects.length > 0}
+        <div class="max-h-64 overflow-y-auto py-1">
+          {#each store.discoveredProjects as project (project.path)}
+            <button
+              class="w-full text-left px-4 py-2 hover:bg-gray-100 dark:hover:bg-gray-700 transition-colors
+                {project.path === store.projectPath ? 'bg-blue-50 dark:bg-blue-900/20' : ''}"
+              onclick={() => handleSelectProject(project.path)}
+            >
+              <div class="text-sm font-medium text-gray-900 dark:text-gray-100">{project.name}</div>
+              <div class="text-xs text-gray-500 dark:text-gray-400 truncate">{project.path}</div>
+            </button>
+          {/each}
+        </div>
+      {/if}
+
+      <div class="border-t border-gray-200 dark:border-gray-700 py-1">
+        <button
+          class="w-full text-left px-4 py-2 text-sm text-gray-600 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-gray-700"
+          onclick={handleOpenOther}
+        >
+          Open Other...
+        </button>
+        <button
+          class="w-full text-left px-4 py-2 text-sm text-gray-600 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-gray-700"
+          onclick={handleManageRoots}
+        >
+          Manage Directories...
+        </button>
+      </div>
+    </div>
+  {/if}
+</div>
+```
+
+**Key design decisions:**
+- Click-outside uses a full-screen invisible overlay (`fixed inset-0 z-40`)
+- Active project highlighted with blue background
+- `onManageRoots` callback passed as `$props` (Svelte 5 pattern, not events)
+- Dropdown max-height with scroll for many projects
+- Dialog `open()` cancel guarded with null check
 
 **Step 2: Commit**
 
@@ -671,16 +880,89 @@ A small panel/modal for managing scan root directories.
 
 **Step 1: Create the component**
 
-The component should:
+Create `src/lib/components/ScanRootsPanel.svelte`:
 
-- List current scan roots with a remove button next to each
-- "Add Directory" button that opens the OS folder picker
-- Simple, compact design — this is a settings panel, not a main view
+```svelte
+<script lang="ts">
+  import { open } from "@tauri-apps/plugin-dialog";
+  import { store, addScanRoot, removeScanRoot } from "$lib/stores/project.svelte";
+
+  let { onClose }: { onClose: () => void } = $props();
+
+  async function handleAddRoot() {
+    const selected = await open({ directory: true, title: "Select a directory to scan" });
+    if (selected === null) return;
+    await addScanRoot(selected);
+  }
+</script>
+
+<!-- Modal backdrop -->
+<!-- svelte-ignore a11y_no_static_element_interactions -->
+<div class="fixed inset-0 z-50 flex items-center justify-center bg-black/50" onclick={onClose} onkeydown={() => {}}>
+  <!-- svelte-ignore a11y_no_static_element_interactions -->
+  <div
+    class="bg-white dark:bg-gray-800 rounded-lg shadow-xl w-full max-w-md mx-4 overflow-hidden"
+    onclick={(e) => e.stopPropagation()}
+    onkeydown={() => {}}
+  >
+    <div class="flex items-center justify-between px-4 py-3 border-b border-gray-200 dark:border-gray-700">
+      <h2 class="text-sm font-semibold text-gray-900 dark:text-gray-100">Scan Directories</h2>
+      <button
+        class="text-gray-400 hover:text-gray-600 dark:hover:text-gray-300"
+        onclick={onClose}
+      >
+        <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12" />
+        </svg>
+      </button>
+    </div>
+
+    <div class="p-4">
+      {#if store.settings.scan_roots.length > 0}
+        <ul class="space-y-2 mb-4">
+          {#each store.settings.scan_roots as root (root)}
+            <li class="flex items-center justify-between px-3 py-2 bg-gray-50 dark:bg-gray-700/50 rounded text-sm">
+              <span class="truncate text-gray-700 dark:text-gray-300">{root}</span>
+              <button
+                class="ml-2 text-gray-400 hover:text-red-500 flex-shrink-0"
+                onclick={() => removeScanRoot(root)}
+              >
+                <svg class="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M6 18L18 6M6 6l12 12" />
+                </svg>
+              </button>
+            </li>
+          {/each}
+        </ul>
+      {:else}
+        <p class="text-sm text-gray-500 dark:text-gray-400 mb-4">
+          No directories configured. Add a directory to discover Kiro projects.
+        </p>
+      {/if}
+
+      <button
+        class="w-full px-4 py-2 rounded-lg border border-dashed border-gray-300 dark:border-gray-600 text-sm text-gray-600 dark:text-gray-400 hover:border-blue-400 hover:text-blue-500 transition-colors"
+        onclick={handleAddRoot}
+      >
+        + Add Directory
+      </button>
+    </div>
+  </div>
+</div>
+```
+
+**Key design decisions:**
+- Modal with backdrop (not inline panel) — keeps the main view uncluttered
+- `onClose` callback via `$props` — parent controls visibility
+- Backdrop click closes modal (`onclick={onClose}` + `stopPropagation` on inner div)
+- Each root has an X button for removal
+- "Add Directory" uses dashed border style to indicate an action area
+- Dialog `open()` cancel guarded with null check
 
 **Step 2: Commit**
 
 ```
-feat: add ScanRootsPanel for managing scan directories
+feat: add ScanRootsPanel modal for managing scan directories
 ```
 
 ---
@@ -694,20 +976,72 @@ This is where it all comes together. The page conditionally shows the landing sc
 
 **Step 1: Rewrite +page.svelte**
 
-Replace the current content with:
+Replace the entire file with:
 
-- Import the project store
-- On mount, call `initialize()`
-- If loading → show loading spinner
-- If no active project → show `ProjectPicker`
-- If active project → show header with `ProjectDropdown` + tabs + content
-- The `projectPath` prop passed to tab components comes from the store
+```svelte
+<script lang="ts">
+  import { store, initialize } from "$lib/stores/project.svelte";
+  import TabBar from "$lib/components/TabBar.svelte";
+  import BrowseTab from "$lib/components/BrowseTab.svelte";
+  import InstalledTab from "$lib/components/InstalledTab.svelte";
+  import MarketplacesTab from "$lib/components/MarketplacesTab.svelte";
+  import ProjectPicker from "$lib/components/ProjectPicker.svelte";
+  import ProjectDropdown from "$lib/components/ProjectDropdown.svelte";
+  import ScanRootsPanel from "$lib/components/ScanRootsPanel.svelte";
 
-Key changes:
-- Remove hardcoded `projectPath = "."`
-- Remove inline `loadProjectInfo()` — the store handles this
-- Add conditional rendering: `{#if hasActiveProject()} ... {:else} <ProjectPicker /> {/if}`
-- Header now uses `ProjectDropdown` instead of the static path display
+  const tabs = ["Browse", "Installed", "Marketplaces"];
+  let activeTab: string = $state("Browse");
+  let showManageRoots = $state(false);
+
+  // Initialize on mount — loads settings, discovers projects, restores last project.
+  $effect(() => {
+    initialize();
+  });
+</script>
+
+{#if store.loading}
+  <!-- Loading state -->
+  <div class="flex items-center justify-center h-screen bg-gray-100 dark:bg-gray-950">
+    <p class="text-gray-500 dark:text-gray-400">Loading...</p>
+  </div>
+{:else if store.projectPath}
+  <!-- Active project — normal app experience -->
+  <div class="flex flex-col h-screen bg-gray-100 dark:bg-gray-950 text-gray-900 dark:text-gray-100">
+    <header class="flex items-center justify-between px-6 py-3 bg-white dark:bg-gray-900 border-b border-gray-200 dark:border-gray-700 shadow-sm">
+      <h1 class="text-lg font-semibold">Kiro Control Center</h1>
+      <ProjectDropdown onManageRoots={() => (showManageRoots = true)} />
+    </header>
+
+    <TabBar {tabs} {activeTab} onTabChange={(tab) => (activeTab = tab)} />
+
+    <main class="flex-1 overflow-hidden">
+      {#if activeTab === "Browse"}
+        <BrowseTab projectPath={store.projectPath} />
+      {:else if activeTab === "Installed"}
+        <InstalledTab projectPath={store.projectPath} />
+      {:else if activeTab === "Marketplaces"}
+        <MarketplacesTab />
+      {/if}
+    </main>
+  </div>
+{:else}
+  <!-- No active project — show picker -->
+  <ProjectPicker />
+{/if}
+
+{#if showManageRoots}
+  <ScanRootsPanel onClose={() => (showManageRoots = false)} />
+{/if}
+```
+
+**Key changes from the old +page.svelte:**
+- `projectPath = "."` hardcode removed — state comes from the store
+- `loadProjectInfo()` removed — `initialize()` handles everything
+- Conditional rendering: loading → active project → picker
+- Header uses `ProjectDropdown` instead of static path display
+- `ScanRootsPanel` shown as a modal overlay when triggered from the dropdown
+- `store.projectPath` passed directly to tab components (reactive via $state proxy)
+- `store.projectPath` is `string | null` — the `{:else if store.projectPath}` block guarantees it's non-null when passed to tabs
 
 **Step 2: Test manually**
 
