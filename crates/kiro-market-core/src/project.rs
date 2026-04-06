@@ -6,7 +6,7 @@
 
 use std::collections::HashMap;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -48,6 +48,47 @@ const INSTALLED_SKILLS_FILE: &str = "installed-skills.json";
 
 /// Name of the skill definition file inside each skill directory.
 const SKILL_MD: &str = "SKILL.md";
+
+/// Recursively copy a directory tree from `src` to `dest`.
+///
+/// Creates `dest` and all intermediate directories. Files are copied
+/// preserving the relative directory structure. Symlinks are followed
+/// (the target content is copied, not the link itself).
+///
+/// # Errors
+///
+/// Returns an I/O error if any directory creation or file copy fails.
+/// The error includes the path that caused the failure.
+fn copy_dir_recursive(src: &Path, dest: &Path) -> std::io::Result<()> {
+    fs::create_dir_all(dest)?;
+    for entry in fs::read_dir(src)? {
+        let entry = entry?;
+        let target = dest.join(entry.file_name());
+        // Use fs::metadata (follows symlinks) instead of entry.file_type()
+        // (which does not follow symlinks on all platforms).
+        let metadata = fs::metadata(entry.path()).map_err(|e| {
+            std::io::Error::new(
+                e.kind(),
+                format!("failed to read metadata for {}: {e}", entry.path().display()),
+            )
+        })?;
+        if metadata.is_dir() {
+            copy_dir_recursive(&entry.path(), &target)?;
+        } else {
+            fs::copy(&entry.path(), &target).map_err(|e| {
+                std::io::Error::new(
+                    e.kind(),
+                    format!(
+                        "failed to copy {} to {}: {e}",
+                        entry.path().display(),
+                        target.display()
+                    ),
+                )
+            })?;
+        }
+    }
+    Ok(())
+}
 
 /// Manages skill installation within a Kiro project directory.
 ///
@@ -198,6 +239,54 @@ impl KiroProject {
         Ok(())
     }
 
+    /// Install a skill by copying an entire source directory into the project.
+    ///
+    /// Recursively copies `source_dir` to `.kiro/skills/<name>/`, preserving
+    /// companion files (e.g. `references/`) for Kiro's lazy loading. The copy
+    /// is atomic: files are staged in a temp directory, then renamed into place
+    /// so a crash cannot leave a partially installed skill.
+    ///
+    /// # Errors
+    ///
+    /// - [`SkillError::AlreadyInstalled`] if a skill with this name already exists.
+    /// - I/O or JSON serialisation errors.
+    pub fn install_skill_from_dir(
+        &self,
+        name: &str,
+        source_dir: &Path,
+        meta: InstalledSkillMeta,
+    ) -> crate::error::Result<()> {
+        validation::validate_name(name)?;
+        let dir = self.skill_dir(name);
+
+        if dir.exists() {
+            return Err(SkillError::AlreadyInstalled {
+                name: name.to_owned(),
+            }
+            .into());
+        }
+
+        self.write_skill_dir(name, source_dir, meta)
+    }
+
+    /// Install a skill by copying a source directory, overwriting any existing installation.
+    ///
+    /// The copy is atomic: new content is staged in a temp directory first, then
+    /// the old directory is removed and the temp is renamed into place.
+    ///
+    /// # Errors
+    ///
+    /// I/O or JSON serialisation errors.
+    pub fn install_skill_from_dir_force(
+        &self,
+        name: &str,
+        source_dir: &Path,
+        meta: InstalledSkillMeta,
+    ) -> crate::error::Result<()> {
+        validation::validate_name(name)?;
+        self.write_skill_dir(name, source_dir, meta)
+    }
+
     // -- internal helpers --------------------------------------------------
 
     /// Write SKILL.md and update tracking for a skill installation.
@@ -216,6 +305,53 @@ impl KiroProject {
         self.write_tracking(&installed)?;
 
         debug!(name, "skill installed");
+        Ok(())
+    }
+
+    /// Copy a source skill directory atomically and update tracking.
+    ///
+    /// Copies to a staging directory (`_installing-<name>`) first, then
+    /// renames into the final location. For force installs, the old directory
+    /// is removed after the staging copy succeeds but before the rename.
+    fn write_skill_dir(
+        &self,
+        name: &str,
+        source_dir: &Path,
+        meta: InstalledSkillMeta,
+    ) -> crate::error::Result<()> {
+        let dir = self.skill_dir(name);
+        let staging_dir = self.skills_dir().join(format!("_installing-{name}"));
+
+        // Clean up any leftover staging dir from a previous crash.
+        if staging_dir.exists() {
+            debug!(
+                path = %staging_dir.display(),
+                "removing leftover staging directory"
+            );
+            fs::remove_dir_all(&staging_dir)?;
+        }
+
+        // Ensure the skills parent directory exists.
+        fs::create_dir_all(self.skills_dir())?;
+
+        // Stage the copy into the temp directory.
+        copy_dir_recursive(source_dir, &staging_dir)?;
+
+        // For force installs, remove the old directory now that the new
+        // content is safely staged.
+        if dir.exists() {
+            debug!(name, "removing existing skill directory for force install");
+            fs::remove_dir_all(&dir)?;
+        }
+
+        // Atomic rename from staging to final location.
+        fs::rename(&staging_dir, &dir)?;
+
+        let mut installed = self.load_installed()?;
+        installed.skills.insert(name.to_owned(), meta);
+        self.write_tracking(&installed)?;
+
+        debug!(name, "skill installed from directory");
         Ok(())
     }
 
@@ -473,5 +609,212 @@ mod tests {
             !skill_md.with_extension("tmp").exists(),
             "SKILL.md.tmp should be gone after atomic rename"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // install_skill_from_dir
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn install_skill_from_dir_copies_skill_and_references() {
+        let (_dir, project) = temp_project();
+        let src = tempfile::tempdir().expect("tempdir");
+
+        fs::write(
+            src.path().join("SKILL.md"),
+            "---\nname: with-refs\ndescription: Has references\n---\nSee `references/api.md`.\n",
+        )
+        .expect("write");
+        fs::create_dir_all(src.path().join("references")).expect("mkdir");
+        fs::write(
+            src.path().join("references").join("api.md"),
+            "# API Reference\nDetails here.",
+        )
+        .expect("write");
+
+        project
+            .install_skill_from_dir("with-refs", src.path(), sample_meta())
+            .expect("install should succeed");
+
+        let skill_md = project.skill_dir("with-refs").join("SKILL.md");
+        let content = fs::read_to_string(&skill_md).expect("read");
+        assert!(content.contains("See `references/api.md`."));
+
+        let ref_file = project
+            .skill_dir("with-refs")
+            .join("references")
+            .join("api.md");
+        assert!(ref_file.exists(), "reference file should be copied");
+        let ref_content = fs::read_to_string(&ref_file).expect("read");
+        assert_eq!(ref_content, "# API Reference\nDetails here.");
+
+        let installed = project.load_installed().expect("load");
+        assert!(installed.skills.contains_key("with-refs"));
+
+        // No temp dir should remain.
+        let skills_dir = project.skills_dir();
+        let leftover: Vec<_> = fs::read_dir(&skills_dir)
+            .expect("read skills dir")
+            .filter_map(Result::ok)
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with("_installing-")
+            })
+            .collect();
+        assert!(leftover.is_empty(), "temp dir should be cleaned up");
+    }
+
+    #[test]
+    fn install_skill_from_dir_rejects_duplicate() {
+        let (_dir, project) = temp_project();
+        let src = tempfile::tempdir().expect("tempdir");
+        fs::write(
+            src.path().join("SKILL.md"),
+            "---\nname: dup\ndescription: Dup\n---\n",
+        )
+        .expect("write");
+
+        project
+            .install_skill_from_dir("dup", src.path(), sample_meta())
+            .expect("first install");
+
+        let err = project
+            .install_skill_from_dir("dup", src.path(), sample_meta())
+            .expect_err("second install should fail");
+        assert!(err.to_string().contains("already installed"));
+    }
+
+    #[test]
+    fn install_skill_from_dir_force_overwrites() {
+        let (_dir, project) = temp_project();
+        let src1 = tempfile::tempdir().expect("tempdir");
+        let src2 = tempfile::tempdir().expect("tempdir");
+
+        fs::write(
+            src1.path().join("SKILL.md"),
+            "---\nname: s\ndescription: v1\n---\nOriginal.\n",
+        )
+        .expect("write");
+        fs::write(
+            src2.path().join("SKILL.md"),
+            "---\nname: s\ndescription: v2\n---\nUpdated.\n",
+        )
+        .expect("write");
+        fs::create_dir_all(src2.path().join("references")).expect("mkdir");
+        fs::write(src2.path().join("references").join("new.md"), "new ref").expect("write");
+
+        project
+            .install_skill_from_dir("s", src1.path(), sample_meta())
+            .expect("first install");
+
+        project
+            .install_skill_from_dir_force("s", src2.path(), sample_meta())
+            .expect("force install");
+
+        let content =
+            fs::read_to_string(project.skill_dir("s").join("SKILL.md")).expect("read");
+        assert!(content.contains("Updated."));
+
+        assert!(project
+            .skill_dir("s")
+            .join("references")
+            .join("new.md")
+            .exists());
+    }
+
+    #[test]
+    fn install_skill_from_dir_rejects_path_traversal() {
+        let (_dir, project) = temp_project();
+        let src = tempfile::tempdir().expect("tempdir");
+        fs::write(
+            src.path().join("SKILL.md"),
+            "---\nname: evil\ndescription: Evil\n---\n",
+        )
+        .expect("write");
+
+        let err = project
+            .install_skill_from_dir("../escape", src.path(), sample_meta())
+            .expect_err("should reject path traversal");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("invalid name"),
+            "expected 'invalid name', got: {msg}"
+        );
+    }
+
+    #[test]
+    fn install_skill_from_dir_works_with_skill_only_no_references() {
+        let (_dir, project) = temp_project();
+        let src = tempfile::tempdir().expect("tempdir");
+        fs::write(
+            src.path().join("SKILL.md"),
+            "---\nname: simple\ndescription: Simple\n---\nBody.\n",
+        )
+        .expect("write");
+
+        project
+            .install_skill_from_dir("simple", src.path(), sample_meta())
+            .expect("install should succeed");
+
+        let skill_md = project.skill_dir("simple").join("SKILL.md");
+        assert!(skill_md.exists());
+        assert!(!project.skill_dir("simple").join("references").exists());
+    }
+
+    // -----------------------------------------------------------------------
+    // copy_dir_recursive
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn copy_dir_recursive_copies_nested_structure() {
+        let src = tempfile::tempdir().expect("tempdir");
+        let dest = tempfile::tempdir().expect("tempdir");
+        let dest_path = dest.path().join("output");
+
+        fs::write(src.path().join("SKILL.md"), "skill content").expect("write");
+        fs::create_dir_all(src.path().join("references")).expect("mkdir");
+        fs::write(
+            src.path().join("references").join("guide.md"),
+            "guide content",
+        )
+        .expect("write");
+
+        copy_dir_recursive(src.path(), &dest_path).expect("copy should succeed");
+
+        assert_eq!(
+            fs::read_to_string(dest_path.join("SKILL.md")).expect("read"),
+            "skill content"
+        );
+        assert_eq!(
+            fs::read_to_string(dest_path.join("references").join("guide.md")).expect("read"),
+            "guide content"
+        );
+    }
+
+    #[test]
+    fn copy_dir_recursive_handles_empty_directory() {
+        let src = tempfile::tempdir().expect("tempdir");
+        let dest = tempfile::tempdir().expect("tempdir");
+        let dest_path = dest.path().join("output");
+
+        fs::write(src.path().join("SKILL.md"), "just skill").expect("write");
+
+        copy_dir_recursive(src.path(), &dest_path).expect("copy should succeed");
+
+        assert_eq!(
+            fs::read_to_string(dest_path.join("SKILL.md")).expect("read"),
+            "just skill"
+        );
+    }
+
+    #[test]
+    fn copy_dir_recursive_errors_on_nonexistent_source() {
+        let dest = tempfile::tempdir().expect("tempdir");
+        let dest_path = dest.path().join("output");
+        let fake_src = dest.path().join("does-not-exist");
+
+        let err = copy_dir_recursive(&fake_src, &dest_path).expect_err("should fail");
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
     }
 }
