@@ -1,7 +1,7 @@
 //! Path and name validation utilities.
 //!
 //! These functions guard against path traversal attacks where untrusted input
-//! (marketplace manifests, plugin.json, SKILL.md frontmatter, companion links)
+//! (marketplace manifests, plugin.json, SKILL.md frontmatter)
 //! could escape intended directories via `..` segments or path separators.
 
 use std::path::Path;

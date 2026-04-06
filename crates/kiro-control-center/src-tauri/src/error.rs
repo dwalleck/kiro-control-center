@@ -49,7 +49,6 @@ impl From<CoreError> for CommandError {
             CoreError::Skill(SkillError::AlreadyInstalled { .. }) => ErrorType::AlreadyExists,
             CoreError::Skill(SkillError::NotInstalled { .. }) => ErrorType::NotFound,
             CoreError::Skill(SkillError::SkillMdNotFound { .. }) => ErrorType::NotFound,
-            CoreError::Skill(SkillError::MergeFailed { .. }) => ErrorType::IoError,
             CoreError::Skill(_) => ErrorType::Unknown,
             CoreError::Validation(_) => ErrorType::Validation,
             CoreError::Git(_) => ErrorType::GitError,
@@ -126,14 +125,6 @@ mod tests {
     #[case::skill_md_not_found(
         CoreError::Skill(SkillError::SkillMdNotFound { path: PathBuf::from("skills/SKILL.md") }),
         ErrorType::NotFound
-    )]
-    #[case::skill_merge_failed(
-        CoreError::Skill(SkillError::MergeFailed {
-            skill: "go-lint".into(),
-            path: PathBuf::from(".kiro/skills"),
-            reason: "conflict".into(),
-        }),
-        ErrorType::IoError
     )]
     #[case::validation_invalid_name(
         CoreError::Validation(ValidationError::InvalidName {
