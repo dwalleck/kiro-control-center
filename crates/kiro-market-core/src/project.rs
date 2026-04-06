@@ -46,9 +46,6 @@ pub struct InstalledSkills {
 /// Name of the tracking file inside `.kiro/`.
 const INSTALLED_SKILLS_FILE: &str = "installed-skills.json";
 
-/// Name of the skill definition file inside each skill directory.
-const SKILL_MD: &str = "SKILL.md";
-
 /// Recursively copy a directory tree from `src` to `dest`.
 ///
 /// Creates `dest` and all intermediate directories. Files are copied
@@ -158,57 +155,6 @@ impl KiroProject {
         }
     }
 
-    /// Install a skill into the project.
-    ///
-    /// Creates `.kiro/skills/<name>/SKILL.md` with the provided `content`
-    /// and records the installation in the tracking file.
-    ///
-    /// # Errors
-    ///
-    /// - [`SkillError::AlreadyInstalled`] if a skill with this name already
-    ///   exists.
-    /// - I/O or JSON serialisation errors.
-    pub fn install_skill(
-        &self,
-        name: &str,
-        content: &str,
-        meta: InstalledSkillMeta,
-    ) -> crate::error::Result<()> {
-        validation::validate_name(name)?;
-        let dir = self.skill_dir(name);
-
-        if dir.exists() {
-            return Err(SkillError::AlreadyInstalled {
-                name: name.to_owned(),
-            }
-            .into());
-        }
-
-        self.write_skill(name, content, meta)
-    }
-
-    /// Install a skill, overwriting any existing installation.
-    ///
-    /// # Errors
-    ///
-    /// I/O or JSON serialisation errors.
-    pub fn install_skill_force(
-        &self,
-        name: &str,
-        content: &str,
-        meta: InstalledSkillMeta,
-    ) -> crate::error::Result<()> {
-        validation::validate_name(name)?;
-        let dir = self.skill_dir(name);
-
-        if dir.exists() {
-            debug!(name, "removing existing skill directory for force install");
-            fs::remove_dir_all(&dir)?;
-        }
-
-        self.write_skill(name, content, meta)
-    }
-
     /// Remove an installed skill.
     ///
     /// Deletes the skill directory and removes the entry from the tracking
@@ -288,25 +234,6 @@ impl KiroProject {
     }
 
     // -- internal helpers --------------------------------------------------
-
-    /// Write SKILL.md and update tracking for a skill installation.
-    fn write_skill(
-        &self,
-        name: &str,
-        content: &str,
-        meta: InstalledSkillMeta,
-    ) -> crate::error::Result<()> {
-        let dir = self.skill_dir(name);
-        fs::create_dir_all(&dir)?;
-        crate::cache::atomic_write(&dir.join(SKILL_MD), content.as_bytes())?;
-
-        let mut installed = self.load_installed()?;
-        installed.skills.insert(name.to_owned(), meta);
-        self.write_tracking(&installed)?;
-
-        debug!(name, "skill installed");
-        Ok(())
-    }
 
     /// Copy a source skill directory atomically and update tracking.
     ///
@@ -392,71 +319,17 @@ mod tests {
     }
 
     #[test]
-    fn install_skill_creates_directory_and_file() {
-        let (_dir, project) = temp_project();
-        let content = "---\nname: rust-check\ndescription: Rust checks\n---\nBody.\n";
-
-        project
-            .install_skill("rust-check", content, sample_meta())
-            .expect("install should succeed");
-
-        let skill_md = project.skill_dir("rust-check").join("SKILL.md");
-        assert!(skill_md.exists(), "SKILL.md should exist");
-
-        let written = fs::read_to_string(&skill_md).expect("read SKILL.md");
-        assert_eq!(written, content);
-
-        let installed = project.load_installed().expect("load");
-        assert!(installed.skills.contains_key("rust-check"));
-        assert_eq!(installed.skills["rust-check"].plugin, "test-plugin");
-    }
-
-    #[test]
-    fn install_skill_rejects_duplicate_without_force() {
-        let (_dir, project) = temp_project();
-        let content = "---\nname: dup\ndescription: Dup\n---\n";
-
-        project
-            .install_skill("dup", content, sample_meta())
-            .expect("first install should succeed");
-
-        let err = project
-            .install_skill("dup", content, sample_meta())
-            .expect_err("second install should fail");
-
-        let msg = err.to_string();
-        assert!(
-            msg.contains("already installed"),
-            "expected 'already installed', got: {msg}"
-        );
-    }
-
-    #[test]
-    fn install_skill_force_overwrites_existing() {
-        let (_dir, project) = temp_project();
-        let original = "---\nname: skill\ndescription: v1\n---\nOriginal.\n";
-        let updated = "---\nname: skill\ndescription: v2\n---\nUpdated.\n";
-
-        project
-            .install_skill("skill", original, sample_meta())
-            .expect("first install");
-
-        project
-            .install_skill_force("skill", updated, sample_meta())
-            .expect("force install should succeed");
-
-        let written =
-            fs::read_to_string(project.skill_dir("skill").join("SKILL.md")).expect("read");
-        assert_eq!(written, updated);
-    }
-
-    #[test]
     fn remove_skill_deletes_directory_and_tracking() {
         let (_dir, project) = temp_project();
-        let content = "---\nname: removable\ndescription: Goes away\n---\n";
+        let src = tempfile::tempdir().expect("tempdir");
+        fs::write(
+            src.path().join("SKILL.md"),
+            "---\nname: removable\ndescription: Goes away\n---\n",
+        )
+        .expect("write");
 
         project
-            .install_skill("removable", content, sample_meta())
+            .install_skill_from_dir("removable", src.path(), sample_meta())
             .expect("install");
 
         project
@@ -497,51 +370,6 @@ mod tests {
     }
 
     #[test]
-    fn install_skill_rejects_path_traversal() {
-        let (_dir, project) = temp_project();
-        let content = "---\nname: evil\ndescription: Evil\n---\n";
-
-        let err = project
-            .install_skill("../escape", content, sample_meta())
-            .expect_err("should reject path traversal");
-        let msg = err.to_string();
-        assert!(
-            msg.contains("invalid name"),
-            "expected 'invalid name', got: {msg}"
-        );
-    }
-
-    #[test]
-    fn install_skill_rejects_slash_in_name() {
-        let (_dir, project) = temp_project();
-        let content = "---\nname: evil\ndescription: Evil\n---\n";
-
-        let err = project
-            .install_skill("sub/dir", content, sample_meta())
-            .expect_err("should reject path separator");
-        let msg = err.to_string();
-        assert!(
-            msg.contains("path separator"),
-            "expected 'path separator', got: {msg}"
-        );
-    }
-
-    #[test]
-    fn install_skill_force_rejects_path_traversal() {
-        let (_dir, project) = temp_project();
-        let content = "---\nname: evil\ndescription: Evil\n---\n";
-
-        let err = project
-            .install_skill_force("../escape", content, sample_meta())
-            .expect_err("should reject path traversal");
-        let msg = err.to_string();
-        assert!(
-            msg.contains("invalid name"),
-            "expected 'invalid name', got: {msg}"
-        );
-    }
-
-    #[test]
     fn remove_skill_rejects_path_traversal() {
         let (_dir, project) = temp_project();
 
@@ -558,10 +386,15 @@ mod tests {
     #[test]
     fn load_installed_returns_installed_skills() {
         let (_dir, project) = temp_project();
-        let content = "---\nname: listed\ndescription: Listed\n---\n";
+        let src = tempfile::tempdir().expect("tempdir");
+        fs::write(
+            src.path().join("SKILL.md"),
+            "---\nname: listed\ndescription: Listed\n---\n",
+        )
+        .expect("write");
 
         project
-            .install_skill("listed", content, sample_meta())
+            .install_skill_from_dir("listed", src.path(), sample_meta())
             .expect("install");
 
         let installed = project.load_installed().expect("load");
@@ -571,10 +404,15 @@ mod tests {
     #[test]
     fn tracking_file_contains_valid_json_after_install() {
         let (_dir, project) = temp_project();
-        let content = "---\nname: atomic-check\ndescription: Checks atomic\n---\n";
+        let src = tempfile::tempdir().expect("tempdir");
+        fs::write(
+            src.path().join("SKILL.md"),
+            "---\nname: atomic-check\ndescription: Checks atomic\n---\n",
+        )
+        .expect("write");
 
         project
-            .install_skill("atomic-check", content, sample_meta())
+            .install_skill_from_dir("atomic-check", src.path(), sample_meta())
             .expect("install");
 
         let raw = fs::read(project.tracking_path()).expect("read tracking file");
@@ -582,32 +420,9 @@ mod tests {
             serde_json::from_slice(&raw).expect("tracking file should be valid JSON");
         assert!(parsed.skills.contains_key("atomic-check"));
 
-        // The temp file should not remain.
         assert!(
             !project.tracking_path().with_extension("tmp").exists(),
             ".tmp file should be gone after atomic rename"
-        );
-    }
-
-    #[test]
-    fn skill_md_written_atomically_no_tmp_leftover() {
-        let (_dir, project) = temp_project();
-        let content = "---\nname: atomic-skill\ndescription: Atomic write\n---\nBody.\n";
-
-        project
-            .install_skill("atomic-skill", content, sample_meta())
-            .expect("install");
-
-        let skill_md = project.skill_dir("atomic-skill").join("SKILL.md");
-        assert!(skill_md.exists(), "SKILL.md should exist");
-
-        let written = fs::read_to_string(&skill_md).expect("read SKILL.md");
-        assert_eq!(written, content, "content should match exactly");
-
-        // The atomic write temp file should not remain.
-        assert!(
-            !skill_md.with_extension("tmp").exists(),
-            "SKILL.md.tmp should be gone after atomic rename"
         );
     }
 
