@@ -1,13 +1,9 @@
-//! Parsing and merging of `SKILL.md` files.
+//! Parsing of `SKILL.md` files.
 //!
 //! A skill file uses YAML frontmatter delimited by `---` fences, followed by
 //! free-form Markdown content. This module extracts and validates the
-//! frontmatter, records where the body begins, and supports merging companion
-//! `.md` files into a single output.
+//! frontmatter and records where the body begins.
 
-use std::path::Path;
-
-use pulldown_cmark::{Event, Parser, Tag};
 use serde::Deserialize;
 use thiserror::Error;
 
@@ -90,76 +86,6 @@ pub fn parse_frontmatter(content: &str) -> Result<(SkillFrontmatter, usize), Par
     Ok((frontmatter, body_offset))
 }
 
-/// Extract relative `.md` link destinations from Markdown content.
-///
-/// Only links whose `dest_url`:
-/// - ends with `.md`
-/// - does **not** start with `http://`, `https://`, or `/`
-///
-/// are returned. This identifies companion files that live alongside a
-/// `SKILL.md` and can be merged into it.
-#[must_use]
-pub fn extract_relative_md_links(markdown: &str) -> Vec<String> {
-    let parser = Parser::new(markdown);
-    let mut links = Vec::new();
-
-    for event in parser {
-        if let Event::Start(Tag::Link { dest_url, .. }) = event {
-            let url: &str = &dest_url;
-            let has_md_ext = Path::new(url)
-                .extension()
-                .is_some_and(|ext| ext.eq_ignore_ascii_case("md"));
-
-            if has_md_ext
-                && !url.starts_with("http://")
-                && !url.starts_with("https://")
-                && !url.starts_with('/')
-                && !url.contains("..")
-            {
-                links.push(url.to_owned());
-            }
-        }
-    }
-
-    links
-}
-
-/// Merge companion files into a `SKILL.md` document.
-///
-/// For each relative `.md` link found in `skill_content` that has a matching
-/// entry in `companions` (keyed by relative path), the companion file content
-/// is appended after a separator comment.
-///
-/// If `companions` is empty the original content is returned unchanged.
-///
-/// # Errors
-///
-/// Returns [`ParseError`] if the frontmatter in `skill_content` is invalid.
-pub fn merge_skill(skill_content: &str, companions: &[(&str, &str)]) -> Result<String, ParseError> {
-    if companions.is_empty() {
-        return Ok(skill_content.to_owned());
-    }
-
-    // Validate frontmatter so we fail fast on malformed input.
-    let (_fm, body_offset) = parse_frontmatter(skill_content)?;
-    let body = &skill_content[body_offset..];
-
-    let referenced_links = extract_relative_md_links(body);
-
-    let mut merged = skill_content.to_owned();
-
-    for link in &referenced_links {
-        if let Some(&(_path, content)) = companions.iter().find(|(p, _)| *p == link.as_str()) {
-            merged.push_str("\n\n---\n<!-- Merged from ");
-            merged.push_str(link);
-            merged.push_str(" -->\n");
-            merged.push_str(content);
-        }
-    }
-
-    Ok(merged)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -219,108 +145,4 @@ mod tests {
         );
     }
 
-    // -----------------------------------------------------------------------
-    // extract_relative_md_links
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn extract_relative_md_links_from_mixed_content() {
-        let markdown = r"
-Check [external](https://example.com/docs.md) and [image](logo.png).
-Also see [type mapping](references/type-mapping.md) and
-[error guide](references/error-guide.md).
-And a [root link](/absolute/path.md).
-";
-        let links = extract_relative_md_links(markdown);
-        assert_eq!(
-            links,
-            vec!["references/type-mapping.md", "references/error-guide.md",]
-        );
-    }
-
-    #[test]
-    fn extract_relative_md_links_rejects_parent_traversal() {
-        let markdown = r"
-See [escape](../secret.md) and [nested](sub/../../other.md).
-But [safe](companion.md) is fine.
-";
-        let links = extract_relative_md_links(markdown);
-        assert_eq!(links, vec!["companion.md"]);
-    }
-
-    #[test]
-    fn extract_relative_md_links_returns_empty_for_plain_text() {
-        let markdown = "No links here, just plain text with a .md mention.";
-        let links = extract_relative_md_links(markdown);
-        assert!(links.is_empty());
-    }
-
-    // -----------------------------------------------------------------------
-    // merge_skill
-    // -----------------------------------------------------------------------
-
-    #[test]
-    fn merge_skill_with_one_companion() {
-        let skill = "\
----
-name: test-skill
-description: A test
----
-See [ref](companion.md) for details.
-";
-        let companion_content = "# Companion\nExtra details here.";
-        let companions = [("companion.md", companion_content)];
-
-        let merged = merge_skill(skill, &companions).expect("should merge");
-
-        assert!(merged.starts_with(skill));
-        assert!(merged.contains("<!-- Merged from companion.md -->"));
-        assert!(merged.contains(companion_content));
-    }
-
-    #[test]
-    fn merge_skill_with_no_companions_returns_original() {
-        let skill = "\
----
-name: standalone
-description: No companions
----
-Just the body.
-";
-        let merged = merge_skill(skill, &[]).expect("should succeed");
-        assert_eq!(merged, skill);
-    }
-
-    #[test]
-    fn merge_skill_with_multiple_companions() {
-        let skill = "\
----
-name: multi
-description: Multiple refs
----
-Read [types](references/types.md) and [errors](references/errors.md).
-";
-        let companions = [
-            ("references/types.md", "# Types\nType info."),
-            ("references/errors.md", "# Errors\nError info."),
-        ];
-
-        let merged = merge_skill(skill, &companions).expect("should merge");
-
-        assert!(merged.contains("<!-- Merged from references/types.md -->"));
-        assert!(merged.contains("# Types\nType info."));
-        assert!(merged.contains("<!-- Merged from references/errors.md -->"));
-        assert!(merged.contains("# Errors\nError info."));
-
-        let types_pos = merged
-            .find("<!-- Merged from references/types.md -->")
-            .expect("types marker");
-        let errors_pos = merged
-            .find("<!-- Merged from references/errors.md -->")
-            .expect("errors marker");
-        assert!(
-            types_pos < errors_pos,
-            "types should appear before errors (document order)"
-        );
-    }
 }
