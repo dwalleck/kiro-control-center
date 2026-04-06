@@ -56,7 +56,7 @@ where
 {
     let lock_path = lock_path_for(path);
 
-    if let Some(parent) = lock_path.parent() {
+    if let Some(parent) = lock_path.parent().filter(|p| !p.as_os_str().is_empty()) {
         fs::create_dir_all(parent)?;
     }
 
@@ -88,7 +88,7 @@ where
 
         if first_attempt {
             tracing::debug!(path = %lock_path.display(), "waiting for file lock");
-            eprintln!("Waiting for lock on {}...", path.display());
+            tracing::warn!(path = %path.display(), "waiting for lock, another process may be running");
             first_attempt = false;
         }
 
