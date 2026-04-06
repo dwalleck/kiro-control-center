@@ -12,7 +12,7 @@ use kiro_market_core::error::{Error as CoreError, SkillError};
 use kiro_market_core::marketplace::{Marketplace, PluginEntry, PluginSource, StructuredSource};
 use kiro_market_core::plugin::{discover_skill_dirs, PluginManifest};
 use kiro_market_core::project::{InstalledSkillMeta, KiroProject};
-use kiro_market_core::skill::{extract_relative_md_links, merge_skill, parse_frontmatter};
+use kiro_market_core::skill::parse_frontmatter;
 
 use crate::error::{CommandError, ErrorType};
 
@@ -299,7 +299,7 @@ pub async fn install_skills(
             }
         };
 
-        let (frontmatter, body_offset) = match parse_frontmatter(&content) {
+        let (frontmatter, _body_offset) = match parse_frontmatter(&content) {
             Ok(r) => r,
             Err(e) => {
                 warn!(
@@ -317,17 +317,6 @@ pub async fn install_skills(
 
         processed_skills.insert(frontmatter.name.clone());
 
-        let merged_content = match prepare_merged_content(&content, body_offset, skill_dir) {
-            Ok(c) => c,
-            Err(e) => {
-                result.failed.push(FailedSkill {
-                    name: frontmatter.name,
-                    error: e,
-                });
-                continue;
-            }
-        };
-
         let meta = InstalledSkillMeta {
             marketplace: marketplace.clone(),
             plugin: plugin.clone(),
@@ -336,9 +325,9 @@ pub async fn install_skills(
         };
 
         let install_outcome = if force {
-            project.install_skill_force(&frontmatter.name, &merged_content, meta)
+            project.install_skill_from_dir_force(&frontmatter.name, skill_dir, meta)
         } else {
-            project.install_skill(&frontmatter.name, &merged_content, meta)
+            project.install_skill_from_dir(&frontmatter.name, skill_dir, meta)
         };
 
         match install_outcome {
@@ -606,42 +595,6 @@ fn count_plugin_skills(entry: &PluginEntry, marketplace_path: &Path) -> usize {
         }
         PluginSource::Structured(_) => 0,
     }
-}
-
-/// Read companion files and merge them into a single SKILL.md document.
-///
-/// Kiro doesn't support deferred loading of companion markdown files, so
-/// multi-file Claude Code skills must be merged into one file before
-/// installation. Returns an error string on failure.
-fn prepare_merged_content(
-    skill_content: &str,
-    body_offset: usize,
-    skill_dir: &Path,
-) -> Result<String, String> {
-    let body = &skill_content[body_offset..];
-    let relative_links = extract_relative_md_links(body);
-
-    let mut companions: Vec<(String, String)> = Vec::new();
-    for link in &relative_links {
-        let companion_path = skill_dir.join(link);
-        match fs::read_to_string(&companion_path) {
-            Ok(content) => companions.push((link.clone(), content)),
-            Err(e) => {
-                return Err(format!(
-                    "companion file '{}' referenced by SKILL.md could not be read: {e}",
-                    companion_path.display()
-                ));
-            }
-        }
-    }
-
-    let companion_refs: Vec<(&str, &str)> = companions
-        .iter()
-        .map(|(path, content)| (path.as_str(), content.as_str()))
-        .collect();
-
-    merge_skill(skill_content, &companion_refs)
-        .map_err(|e| format!("failed to merge skill content: {e}"))
 }
 
 #[cfg(test)]
