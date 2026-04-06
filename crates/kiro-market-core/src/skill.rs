@@ -144,5 +144,4 @@ mod tests {
             "expected InvalidYaml, got {err:?}"
         );
     }
-
 }

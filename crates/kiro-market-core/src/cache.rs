@@ -243,14 +243,17 @@ impl CacheDir {
     /// - I/O or JSON serialisation errors.
     pub fn add_known_marketplace(&self, entry: KnownMarketplace) -> crate::error::Result<()> {
         validation::validate_name(&entry.name)?;
-        let mut entries = self.load_known_marketplaces()?;
 
-        if entries.iter().any(|e| e.name == entry.name) {
-            return Err(MarketplaceError::AlreadyRegistered { name: entry.name }.into());
-        }
+        crate::file_lock::with_file_lock(&self.registry_path(), move || {
+            let mut entries = self.load_known_marketplaces()?;
 
-        entries.push(entry);
-        self.write_registry(&entries)
+            if entries.iter().any(|e| e.name == entry.name) {
+                return Err(MarketplaceError::AlreadyRegistered { name: entry.name }.into());
+            }
+
+            entries.push(entry);
+            self.write_registry(&entries)
+        })
     }
 
     /// Remove a marketplace from the registry by name, persisting to disk.
@@ -261,18 +264,20 @@ impl CacheDir {
     ///   exists.
     /// - I/O or JSON serialisation errors.
     pub fn remove_known_marketplace(&self, name: &str) -> crate::error::Result<()> {
-        let mut entries = self.load_known_marketplaces()?;
-        let before_len = entries.len();
-        entries.retain(|e| e.name != name);
+        crate::file_lock::with_file_lock(&self.registry_path(), || {
+            let mut entries = self.load_known_marketplaces()?;
+            let before_len = entries.len();
+            entries.retain(|e| e.name != name);
 
-        if entries.len() == before_len {
-            return Err(MarketplaceError::NotFound {
-                name: name.to_owned(),
+            if entries.len() == before_len {
+                return Err(MarketplaceError::NotFound {
+                    name: name.to_owned(),
+                }
+                .into());
             }
-            .into());
-        }
 
-        self.write_registry(&entries)
+            self.write_registry(&entries)
+        })
     }
 
     /// Serialise and write the registry to disk atomically.

@@ -5,6 +5,7 @@
 
 pub mod cache;
 pub mod error;
+pub mod file_lock;
 pub mod git;
 pub mod marketplace;
 pub mod platform;
