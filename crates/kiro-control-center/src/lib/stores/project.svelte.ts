@@ -33,29 +33,35 @@ export async function initialize() {
   store.loading = true;
   store.projectError = null;
 
-  // Load settings.
-  const settingsResult = await commands.getSettings();
-  if (settingsResult.status === "ok") {
-    store.settings = settingsResult.data;
-  } else {
-    console.error("Failed to load settings:", settingsResult.error.message);
-    store.projectError = `Could not load settings: ${settingsResult.error.message}`;
-  }
-
-  // Discover projects.
-  await refreshProjects();
-
-  // Restore last project if it still exists on disk.
-  if (store.settings.last_project) {
-    const found = store.discoveredProjects.find(
-      (p) => p.path === store.settings.last_project,
-    );
-    if (found) {
-      await selectProject(store.settings.last_project);
+  try {
+    // Load settings.
+    const settingsResult = await commands.getSettings();
+    if (settingsResult.status === "ok") {
+      store.settings = settingsResult.data;
+    } else {
+      console.error("Failed to load settings:", settingsResult.error.message);
+      store.projectError = `Could not load settings: ${settingsResult.error.message}`;
+      return; // Don't continue with dependent operations.
     }
-  }
 
-  store.loading = false;
+    // Discover projects.
+    await refreshProjects();
+
+    // Restore last project if it still exists on disk.
+    if (store.settings.last_project) {
+      const found = store.discoveredProjects.find(
+        (p) => p.path === store.settings.last_project,
+      );
+      if (found) {
+        await selectProject(store.settings.last_project);
+      }
+    }
+  } catch (e) {
+    console.error("Initialization failed unexpectedly:", e);
+    store.projectError = "Failed to initialize. Please restart the application.";
+  } finally {
+    store.loading = false;
+  }
 }
 
 export async function selectProject(path: string) {
@@ -65,6 +71,9 @@ export async function selectProject(path: string) {
     store.projectPath = result.data.path;
     store.projectInfo = result.data;
   } else {
+    // Clear stale project state so the UI doesn't show the old project.
+    store.projectPath = null;
+    store.projectInfo = null;
     store.projectError = result.error.message;
   }
 }

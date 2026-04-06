@@ -213,8 +213,8 @@ fn scan_for_projects(
             |n| n.to_string_lossy().into_owned(),
         );
 
-        // Skip reading installed-skills.json during scan for performance.
-        // skill_count is loaded on demand when the user selects a project.
+        // Discovery collects only path and name; full project details
+        // are loaded when the user selects a project.
         results.push(DiscoveredProject {
             path: dir.to_string_lossy().into_owned(),
             name,
@@ -238,10 +238,7 @@ fn scan_for_projects(
             // Skip hidden directories (covers .git, .cache, etc.) and common build dirs.
             let name = entry.file_name();
             let name_str = name.to_string_lossy();
-            if name_str.starts_with('.')
-                || name_str == "node_modules"
-                || name_str == "target"
-            {
+            if name_str.starts_with('.') || name_str == "node_modules" || name_str == "target" {
                 continue;
             }
             scan_for_projects(&path, current_depth + 1, max_depth, results);
@@ -255,12 +252,15 @@ mod tests {
 
     /// Set `KIRO_MARKET_CONFIG_DIR` to a temp directory for isolated tests.
     ///
-    /// Note: env var mutation is not thread-safe, but cargo test runs
-    /// `#[test]` functions in the same module sequentially by default.
+    /// **Not thread-safe**: env var mutation is process-global. Tests that
+    /// use this helper must run with `--test-threads=1` to avoid races.
+    /// Each test uses its own `TempDir` so values don't collide in the
+    /// filesystem, but concurrent `set_var` + `load_settings` calls can
+    /// interleave. The CI workflow should use `--test-threads=1` for this
+    /// crate.
     ///
     /// In edition 2024 `set_var`/`remove_var` are unsafe; this crate is
-    /// edition 2021 so the calls are safe.  If the crate upgrades to 2024,
-    /// wrap the two calls in `unsafe {}`.
+    /// edition 2021 so the calls compile without `unsafe`.
     fn with_temp_config<F: FnOnce()>(dir: &tempfile::TempDir, f: F) {
         std::env::set_var("KIRO_MARKET_CONFIG_DIR", dir.path());
         f();
@@ -364,5 +364,61 @@ mod tests {
             results.is_empty(),
             "should skip hidden/build dirs: {results:?}"
         );
+    }
+
+    #[test]
+    fn load_settings_returns_defaults_on_corrupt_json() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        with_temp_config(&dir, || {
+            // Write garbage to the settings file.
+            let path = settings_path().expect("settings path");
+            if let Some(parent) = path.parent() {
+                std::fs::create_dir_all(parent).expect("create dir");
+            }
+            std::fs::write(&path, "not valid json {{{").expect("write garbage");
+
+            let settings = load_settings();
+            assert!(
+                settings.scan_roots.is_empty(),
+                "corrupt file should fall back to defaults"
+            );
+            assert!(settings.last_project.is_none());
+        });
+    }
+
+    #[test]
+    fn save_scan_roots_preserves_last_project() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        with_temp_config(&dir, || {
+            // Save settings with both fields populated.
+            let mut settings = Settings::default();
+            settings.scan_roots = vec!["~/old-root".into()];
+            settings.last_project = Some("/home/user/my-project".into());
+            save_settings(&settings).expect("save initial");
+
+            // Now update only scan_roots (simulating save_scan_roots).
+            let mut loaded = load_settings();
+            loaded.scan_roots = vec!["~/new-root".into()];
+            save_settings(&loaded).expect("save updated roots");
+
+            // Verify last_project survived the update.
+            let final_settings = load_settings();
+            assert_eq!(final_settings.scan_roots, vec!["~/new-root"]);
+            assert_eq!(
+                final_settings.last_project.as_deref(),
+                Some("/home/user/my-project"),
+                "last_project should survive scan_roots update"
+            );
+        });
+    }
+
+    #[test]
+    fn shellexpand_tilde_expands_bare_tilde() {
+        let expanded = shellexpand_tilde("~");
+        assert!(
+            !expanded.contains('~'),
+            "bare ~ should be expanded: {expanded}"
+        );
+        assert!(!expanded.is_empty(), "expanded home should not be empty");
     }
 }

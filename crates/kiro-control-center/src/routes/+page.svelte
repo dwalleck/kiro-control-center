@@ -16,7 +16,11 @@
   // Initialize once on mount. Uses onMount (not $effect) because initialize()
   // is a one-shot async function that should not re-trigger on state changes.
   onMount(() => {
-    initialize();
+    initialize().catch((e) => {
+      console.error("Initialization failed:", e);
+      store.projectError = "Application failed to initialize. Please restart.";
+      store.loading = false;
+    });
   });
 </script>
 
@@ -45,6 +49,18 @@
   </div>
 {:else}
   <ProjectPicker />
+{/if}
+
+{#if store.projectError}
+  <div class="fixed bottom-4 right-4 z-50 max-w-md px-4 py-3 rounded-lg bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 shadow-lg">
+    <p class="text-sm text-red-700 dark:text-red-400">{store.projectError}</p>
+    <button
+      class="mt-1 text-xs text-red-500 hover:text-red-700 dark:hover:text-red-300"
+      onclick={() => (store.projectError = null)}
+    >
+      Dismiss
+    </button>
+  </div>
 {/if}
 
 {#if showManageRoots}
