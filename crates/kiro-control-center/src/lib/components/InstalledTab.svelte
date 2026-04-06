@@ -108,51 +108,51 @@
 
 <div class="flex flex-col h-full">
   <!-- Search bar -->
-  <div class="p-4 border-b border-gray-200 dark:border-gray-700">
+  <div class="p-4 border-b border-kiro-muted">
     <input
       type="text"
       placeholder="Filter by name, plugin, or marketplace..."
       bind:value={filterText}
-      class="w-full px-3 py-2 text-sm rounded-md border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-800 text-gray-900 dark:text-gray-100 placeholder-gray-400 dark:placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+      class="w-full px-3 py-2 text-sm rounded-md border border-kiro-muted bg-kiro-overlay text-kiro-text placeholder-kiro-subtle focus:outline-none focus:ring-2 focus:ring-kiro-accent-500 focus:border-transparent"
     />
   </div>
 
   <!-- Error display -->
   {#if error}
-    <div class="mx-4 mt-3 px-4 py-3 rounded-md bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800">
-      <p class="text-sm text-red-700 dark:text-red-400">{error}</p>
+    <div class="mx-4 mt-3 px-4 py-3 rounded-md bg-kiro-error/10 border border-kiro-error/30">
+      <p class="text-sm text-kiro-error">{error}</p>
     </div>
   {/if}
 
   <!-- Success message -->
   {#if successMessage}
-    <div class="mx-4 mt-3 px-4 py-3 rounded-md bg-green-50 dark:bg-green-900/20 border border-green-200 dark:border-green-800">
-      <p class="text-sm text-green-700 dark:text-green-400">{successMessage}</p>
+    <div class="mx-4 mt-3 px-4 py-3 rounded-md bg-kiro-success/10 border border-kiro-success/30">
+      <p class="text-sm text-kiro-success">{successMessage}</p>
     </div>
   {/if}
 
   <!-- Table -->
   <div class="flex-1 overflow-y-auto">
     {#if loading}
-      <div class="flex items-center justify-center h-full text-gray-400 dark:text-gray-500">
+      <div class="flex items-center justify-center h-full text-kiro-subtle">
         <p class="text-sm">Loading installed skills...</p>
       </div>
     {:else if filteredSkills.length === 0}
-      <div class="flex items-center justify-center h-full text-gray-400 dark:text-gray-500">
+      <div class="flex items-center justify-center h-full text-kiro-subtle">
         <p class="text-sm">
           {filterText ? "No installed skills match the filter" : "No skills installed"}
         </p>
       </div>
     {:else}
       <table class="w-full text-sm text-left">
-        <thead class="text-xs text-gray-500 dark:text-gray-400 uppercase bg-gray-50 dark:bg-gray-900 sticky top-0">
+        <thead class="text-xs text-kiro-subtle uppercase bg-kiro-surface sticky top-0">
           <tr>
             <th class="px-4 py-3 w-10">
               <input
                 type="checkbox"
                 checked={selectedSkills.size === filteredSkills.length && filteredSkills.length > 0}
                 onchange={toggleAll}
-                class="h-4 w-4 rounded border-gray-300 text-blue-600 focus:ring-blue-500"
+                class="h-4 w-4 rounded border-kiro-muted text-kiro-accent-500 focus:ring-kiro-accent-500"
               />
             </th>
             <th class="px-4 py-3">Name</th>
@@ -165,22 +165,22 @@
         <tbody>
           {#each filteredSkills as skill (skill.name)}
             <tr
-              class="border-b border-gray-100 dark:border-gray-800 hover:bg-gray-50 dark:hover:bg-gray-800/50 transition-colors duration-100
-                {selectedSkills.has(skill.name) ? 'bg-blue-50 dark:bg-blue-900/10' : ''}"
+              class="border-b border-kiro-muted/50 hover:bg-kiro-overlay transition-colors duration-100
+                {selectedSkills.has(skill.name) ? 'bg-kiro-accent-900/10' : ''}"
             >
               <td class="px-4 py-3">
                 <input
                   type="checkbox"
                   checked={selectedSkills.has(skill.name)}
                   onchange={() => toggleSkill(skill.name)}
-                  class="h-4 w-4 rounded border-gray-300 text-blue-600 focus:ring-blue-500"
+                  class="h-4 w-4 rounded border-kiro-muted text-kiro-accent-500 focus:ring-kiro-accent-500"
                 />
               </td>
-              <td class="px-4 py-3 font-medium text-gray-900 dark:text-gray-100">{skill.name}</td>
-              <td class="px-4 py-3 text-gray-600 dark:text-gray-400">{skill.plugin}</td>
-              <td class="px-4 py-3 text-gray-600 dark:text-gray-400">{skill.marketplace}</td>
-              <td class="px-4 py-3 text-gray-600 dark:text-gray-400">{skill.version ?? "---"}</td>
-              <td class="px-4 py-3 text-gray-600 dark:text-gray-400">{formatDate(skill.installed_at)}</td>
+              <td class="px-4 py-3 font-medium text-kiro-text">{skill.name}</td>
+              <td class="px-4 py-3 text-kiro-text-secondary">{skill.plugin}</td>
+              <td class="px-4 py-3 text-kiro-text-secondary">{skill.marketplace}</td>
+              <td class="px-4 py-3 text-kiro-text-secondary">{skill.version ?? "---"}</td>
+              <td class="px-4 py-3 text-kiro-text-secondary">{formatDate(skill.installed_at)}</td>
             </tr>
           {/each}
         </tbody>
@@ -189,15 +189,15 @@
   </div>
 
   <!-- Bottom bar -->
-  <div class="p-4 border-t border-gray-200 dark:border-gray-700 bg-gray-50 dark:bg-gray-900 flex items-center justify-between">
-    <span class="text-sm text-gray-500 dark:text-gray-400">
+  <div class="p-4 border-t border-kiro-muted bg-kiro-surface flex items-center justify-between">
+    <span class="text-sm text-kiro-subtle">
       {skills.length} skill{skills.length === 1 ? "" : "s"} installed
     </span>
     <button
       class="px-4 py-2 text-sm font-medium rounded-md text-white transition-colors duration-150
         {selectedCount > 0 && !removing
-          ? 'bg-red-600 hover:bg-red-700 dark:bg-red-500 dark:hover:bg-red-600'
-          : 'bg-gray-300 dark:bg-gray-700 cursor-not-allowed'}"
+          ? 'bg-kiro-error hover:bg-kiro-error-hover'
+          : 'bg-kiro-muted text-kiro-subtle cursor-not-allowed'}"
       disabled={selectedCount === 0 || removing}
       onclick={removeSelected}
     >

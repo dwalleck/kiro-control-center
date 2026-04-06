@@ -1,5 +1,82 @@
 @import "tailwindcss";
 
+/*
+ * CRITICAL: @theme inline is required for var() references.
+ * Without it, Tailwind generates utility classes referencing --color-kiro-*,
+ * which then resolve var(--kiro-*) at the wrong cascade level.
+ * With inline, utilities embed var(--kiro-*) directly.
+ *
+ * All color values use OKLCH for native compatibility with
+ * Tailwind v4's opacity modifier system (e.g., bg-kiro-error/10).
+ */
+
+/* Surface, text, and semantic colors — auto-swap via CSS custom properties */
+@theme inline {
+  --color-kiro-base: var(--kiro-base);
+  --color-kiro-surface: var(--kiro-surface);
+  --color-kiro-overlay: var(--kiro-overlay);
+  --color-kiro-muted: var(--kiro-muted);
+  --color-kiro-subtle: var(--kiro-subtle);
+  --color-kiro-text: var(--kiro-text);
+  --color-kiro-text-secondary: var(--kiro-text-secondary);
+  --color-kiro-success: var(--kiro-success);
+  --color-kiro-error: var(--kiro-error);
+  --color-kiro-error-hover: var(--kiro-error-hover);
+  --color-kiro-warning: var(--kiro-warning);
+  --color-kiro-info: var(--kiro-info);
+}
+
+/* Accent scale — static purple, same in both modes. No var() references,
+   so a regular @theme block is correct here. */
+@theme {
+  --color-kiro-accent-50: oklch(96.33% 0.0206 301.01);
+  --color-kiro-accent-100: oklch(90.91% 0.0536 303.22);
+  --color-kiro-accent-200: oklch(83.09% 0.1019 302.28);
+  --color-kiro-accent-300: oklch(70.14% 0.1831 299.07);
+  --color-kiro-accent-400: oklch(62.76% 0.2304 297.02);
+  --color-kiro-accent-500: oklch(58.87% 0.2534 294.98);
+  --color-kiro-accent-600: oklch(49.95% 0.2130 295.09);
+  --color-kiro-accent-700: oklch(42.40% 0.1802 295.51);
+  --color-kiro-accent-800: oklch(34.63% 0.1446 296.00);
+  --color-kiro-accent-900: oklch(26.77% 0.1065 297.06);
+}
+
+/* Dark-first: dark values are the default */
+:root {
+  color-scheme: dark;
+  --kiro-base: oklch(20.69% 0.0144 304.56);
+  --kiro-surface: oklch(23.88% 0.0162 307.66);
+  --kiro-overlay: oklch(26.90% 0.0191 303.28);
+  --kiro-muted: oklch(32.22% 0.0291 301.89);
+  --kiro-subtle: oklch(39.82% 0.0360 300.00);
+  --kiro-text: oklch(100% 0 0);
+  --kiro-text-secondary: oklch(65.73% 0.0182 300.94);
+  --kiro-success: oklch(90.81% 0.1542 156.00);
+  --kiro-error: oklch(74.45% 0.1550 21.49);
+  --kiro-error-hover: oklch(67.41% 0.1547 22.08);
+  --kiro-warning: oklch(88.39% 0.0880 69.59);
+  --kiro-info: oklch(81.12% 0.0948 245.43);
+}
+
+/* Light mode override */
+@media (prefers-color-scheme: light) {
+  :root {
+    color-scheme: light;
+    --kiro-base: oklch(95.98% 0.0042 300.72);
+    --kiro-surface: oklch(93.40% 0.0071 303.81);
+    --kiro-overlay: oklch(89.14% 0.0071 303.83);
+    --kiro-muted: oklch(82.82% 0.0115 302.85);
+    --kiro-subtle: oklch(75.35% 0.0159 298.34);
+    --kiro-text: oklch(31.73% 0.0259 304.41);
+    --kiro-text-secondary: oklch(45% 0.0182 300.94);
+    --kiro-success: oklch(52.97% 0.0963 155.38);
+    --kiro-error: oklch(47.08% 0.1367 23.99);
+    --kiro-error-hover: oklch(41.46% 0.1191 23.89);
+    --kiro-warning: oklch(67.07% 0.1392 63.52);
+    --kiro-info: oklch(50.99% 0.1053 247.85);
+  }
+}
+
 html,
 body {
   height: 100%;
@@ -8,10 +85,4 @@ body {
   font-family: Inter, system-ui, -apple-system, sans-serif;
   -webkit-font-smoothing: antialiased;
   -moz-osx-font-smoothing: grayscale;
-}
-
-@media (prefers-color-scheme: dark) {
-  html {
-    color-scheme: dark;
-  }
 }

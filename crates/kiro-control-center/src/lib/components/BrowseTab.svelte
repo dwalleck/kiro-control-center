@@ -132,47 +132,47 @@
 
 <div class="flex h-full">
   <!-- Sidebar -->
-  <div class="w-64 flex-shrink-0 border-r border-gray-200 dark:border-gray-700 bg-gray-50 dark:bg-gray-900 overflow-y-auto">
+  <div class="w-64 flex-shrink-0 border-r border-kiro-muted bg-kiro-surface overflow-y-auto">
     <div class="p-3">
-      <h3 class="text-xs font-semibold text-gray-500 dark:text-gray-400 uppercase tracking-wider mb-2">
+      <h3 class="text-xs font-semibold text-kiro-subtle uppercase tracking-wider mb-2">
         Marketplaces
       </h3>
       {#if loadingMarketplaces}
-        <p class="text-sm text-gray-400 dark:text-gray-500 px-2">Loading...</p>
+        <p class="text-sm text-kiro-subtle px-2">Loading...</p>
       {:else if marketplaces.length === 0}
-        <p class="text-sm text-gray-400 dark:text-gray-500 px-2">No marketplaces found</p>
+        <p class="text-sm text-kiro-subtle px-2">No marketplaces found</p>
       {:else}
         {#each marketplaces as mp (mp.name)}
           <div class="mb-1">
             <button
               class="w-full text-left px-3 py-2 text-sm rounded-md transition-colors duration-100
                 {expandedMarketplace === mp.name
-                  ? 'bg-gray-200 dark:bg-gray-700 text-gray-900 dark:text-gray-100'
-                  : 'text-gray-700 dark:text-gray-300 hover:bg-gray-100 dark:hover:bg-gray-800'}"
+                  ? 'bg-kiro-muted text-kiro-text'
+                  : 'text-kiro-text-secondary hover:bg-kiro-overlay'}"
               onclick={() => toggleMarketplace(mp.name)}
             >
               <span class="flex items-center justify-between">
                 <span class="truncate font-medium">{mp.name}</span>
-                <span class="text-xs text-gray-400">{mp.plugin_count}</span>
+                <span class="text-xs text-kiro-subtle">{mp.plugin_count}</span>
               </span>
             </button>
 
             {#if expandedMarketplace === mp.name}
               <div class="ml-3 mt-1 space-y-0.5">
                 {#if loadingPlugins === mp.name}
-                  <p class="text-xs text-gray-400 px-3 py-1">Loading plugins...</p>
+                  <p class="text-xs text-kiro-subtle px-3 py-1">Loading plugins...</p>
                 {:else if pluginsByMarketplace[mp.name]}
                   {#each pluginsByMarketplace[mp.name] as plugin (plugin.name)}
                     <button
                       class="w-full text-left px-3 py-1.5 text-sm rounded-md transition-colors duration-100
                         {selectedMarketplace === mp.name && selectedPlugin === plugin.name
-                          ? 'bg-blue-100 dark:bg-blue-900/30 text-blue-700 dark:text-blue-300'
-                          : 'text-gray-600 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-gray-800'}"
+                          ? 'bg-kiro-accent-900/30 text-kiro-accent-300'
+                          : 'text-kiro-text-secondary hover:bg-kiro-overlay'}"
                       onclick={() => selectPlugin(mp.name, plugin.name)}
                     >
                       <span class="flex items-center justify-between">
                         <span class="truncate">{plugin.name}</span>
-                        <span class="text-xs text-gray-400">{plugin.skill_count}</span>
+                        <span class="text-xs text-kiro-subtle">{plugin.skill_count}</span>
                       </span>
                     </button>
                   {/each}
@@ -188,41 +188,41 @@
   <!-- Main area -->
   <div class="flex-1 flex flex-col min-w-0">
     <!-- Search bar -->
-    <div class="p-4 border-b border-gray-200 dark:border-gray-700">
+    <div class="p-4 border-b border-kiro-muted">
       <input
         type="text"
         placeholder="Filter skills by name or description..."
         bind:value={filterText}
-        class="w-full px-3 py-2 text-sm rounded-md border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-800 text-gray-900 dark:text-gray-100 placeholder-gray-400 dark:placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent"
+        class="w-full px-3 py-2 text-sm rounded-md border border-kiro-muted bg-kiro-overlay text-kiro-text placeholder-kiro-subtle focus:outline-none focus:ring-2 focus:ring-kiro-accent-500 focus:border-transparent"
       />
     </div>
 
     <!-- Error display -->
     {#if error}
-      <div class="mx-4 mt-3 px-4 py-3 rounded-md bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800">
-        <p class="text-sm text-red-700 dark:text-red-400">{error}</p>
+      <div class="mx-4 mt-3 px-4 py-3 rounded-md bg-kiro-error/10 border border-kiro-error/30">
+        <p class="text-sm text-kiro-error">{error}</p>
       </div>
     {/if}
 
     <!-- Install success message -->
     {#if installMessage}
-      <div class="mx-4 mt-3 px-4 py-3 rounded-md bg-green-50 dark:bg-green-900/20 border border-green-200 dark:border-green-800">
-        <p class="text-sm text-green-700 dark:text-green-400">{installMessage}</p>
+      <div class="mx-4 mt-3 px-4 py-3 rounded-md bg-kiro-success/10 border border-kiro-success/30">
+        <p class="text-sm text-kiro-success">{installMessage}</p>
       </div>
     {/if}
 
     <!-- Skills content -->
     <div class="flex-1 overflow-y-auto p-4">
       {#if !selectedPlugin}
-        <div class="flex items-center justify-center h-full text-gray-400 dark:text-gray-500">
+        <div class="flex items-center justify-center h-full text-kiro-subtle">
           <p class="text-sm">Select a plugin from the sidebar to browse skills</p>
         </div>
       {:else if loadingSkills}
-        <div class="flex items-center justify-center h-full text-gray-400 dark:text-gray-500">
+        <div class="flex items-center justify-center h-full text-kiro-subtle">
           <p class="text-sm">Loading skills...</p>
         </div>
       {:else if filteredSkills.length === 0}
-        <div class="flex items-center justify-center h-full text-gray-400 dark:text-gray-500">
+        <div class="flex items-center justify-center h-full text-kiro-subtle">
           <p class="text-sm">
             {filterText ? "No skills match the filter" : "No skills available"}
           </p>
@@ -242,20 +242,20 @@
 
     <!-- Bottom bar -->
     {#if selectedPlugin}
-      <div class="p-4 border-t border-gray-200 dark:border-gray-700 bg-gray-50 dark:bg-gray-900 flex items-center justify-between">
-        <label class="flex items-center gap-2 text-sm text-gray-600 dark:text-gray-400">
+      <div class="p-4 border-t border-kiro-muted bg-kiro-surface flex items-center justify-between">
+        <label class="flex items-center gap-2 text-sm text-kiro-text-secondary">
           <input
             type="checkbox"
             bind:checked={forceInstall}
-            class="h-4 w-4 rounded border-gray-300 text-blue-600 focus:ring-blue-500"
+            class="h-4 w-4 rounded border-kiro-muted text-kiro-accent-500 focus:ring-kiro-accent-500"
           />
           Force reinstall
         </label>
         <button
           class="px-4 py-2 text-sm font-medium rounded-md text-white transition-colors duration-150
             {selectedCount > 0 && !installing
-              ? 'bg-blue-600 hover:bg-blue-700 dark:bg-blue-500 dark:hover:bg-blue-600'
-              : 'bg-gray-300 dark:bg-gray-700 cursor-not-allowed'}"
+              ? 'bg-kiro-accent-600 hover:bg-kiro-accent-700'
+              : 'bg-kiro-muted text-kiro-subtle cursor-not-allowed'}"
           disabled={selectedCount === 0 || installing}
           onclick={installSelected}
         >

@@ -36,21 +36,17 @@ pub struct DiscoveredProject {
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Path to the settings file.
+/// Resolve the platform config directory for kiro-market settings.
 ///
-/// Respects `KIRO_MARKET_CONFIG_DIR` env var for test isolation.
-fn settings_path() -> Option<PathBuf> {
-    if let Ok(dir) = std::env::var("KIRO_MARKET_CONFIG_DIR") {
-        return Some(PathBuf::from(dir).join("settings.json"));
-    }
-    dirs::config_dir().map(|d| d.join("kiro-market").join("settings.json"))
+/// Returns `None` only when the OS has no config directory (rare).
+fn default_config_dir() -> Option<PathBuf> {
+    dirs::config_dir().map(|d| d.join("kiro-market"))
 }
 
-/// Load settings from disk, returning defaults if the file doesn't exist.
-fn load_settings() -> Settings {
-    let Some(path) = settings_path() else {
-        return Settings::default();
-    };
+/// Load settings from `config_dir/settings.json`, returning defaults if
+/// the file doesn't exist or is corrupt.
+fn load_settings_from(config_dir: &Path) -> Settings {
+    let path = config_dir.join("settings.json");
     match fs::read(&path) {
         Ok(bytes) => match serde_json::from_slice(&bytes) {
             Ok(settings) => settings,
@@ -71,22 +67,15 @@ fn load_settings() -> Settings {
     }
 }
 
-/// Save settings to disk.
-fn save_settings(settings: &Settings) -> Result<(), CommandError> {
-    let path = settings_path().ok_or_else(|| {
+/// Save settings to `config_dir/settings.json`.
+fn save_settings_to(config_dir: &Path, settings: &Settings) -> Result<(), CommandError> {
+    let path = config_dir.join("settings.json");
+    fs::create_dir_all(config_dir).map_err(|e| {
         CommandError::new(
-            "could not determine config directory",
+            format!("failed to create config directory: {e}"),
             crate::error::ErrorType::IoError,
         )
     })?;
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|e| {
-            CommandError::new(
-                format!("failed to create config directory: {e}"),
-                crate::error::ErrorType::IoError,
-            )
-        })?;
-    }
     let json = serde_json::to_string_pretty(settings).map_err(|e| {
         CommandError::new(
             format!("failed to serialize settings: {e}"),
@@ -101,6 +90,25 @@ fn save_settings(settings: &Settings) -> Result<(), CommandError> {
     })?;
     debug!(path = %path.display(), "settings saved");
     Ok(())
+}
+
+/// Convenience: load from the default config directory.
+fn load_settings() -> Settings {
+    let Some(dir) = default_config_dir() else {
+        return Settings::default();
+    };
+    load_settings_from(&dir)
+}
+
+/// Convenience: save to the default config directory.
+fn save_settings(settings: &Settings) -> Result<(), CommandError> {
+    let dir = default_config_dir().ok_or_else(|| {
+        CommandError::new(
+            "could not determine config directory",
+            crate::error::ErrorType::IoError,
+        )
+    })?;
+    save_settings_to(&dir, settings)
 }
 
 // ---------------------------------------------------------------------------
@@ -250,46 +258,25 @@ fn scan_for_projects(
 mod tests {
     use super::*;
 
-    /// Set `KIRO_MARKET_CONFIG_DIR` to a temp directory for isolated tests.
-    ///
-    /// **Not thread-safe**: env var mutation is process-global. Tests that
-    /// use this helper must run with `--test-threads=1` to avoid races.
-    /// Each test uses its own `TempDir` so values don't collide in the
-    /// filesystem, but concurrent `set_var` + `load_settings` calls can
-    /// interleave. The CI workflow should use `--test-threads=1` for this
-    /// crate.
-    ///
-    /// In edition 2024 `set_var`/`remove_var` are unsafe; this crate is
-    /// edition 2021 so the calls compile without `unsafe`.
-    fn with_temp_config<F: FnOnce()>(dir: &tempfile::TempDir, f: F) {
-        std::env::set_var("KIRO_MARKET_CONFIG_DIR", dir.path());
-        f();
-        std::env::remove_var("KIRO_MARKET_CONFIG_DIR");
-    }
-
     #[test]
     fn load_settings_returns_defaults_when_no_file() {
         let dir = tempfile::tempdir().expect("tempdir");
-        with_temp_config(&dir, || {
-            let settings = load_settings();
-            assert!(settings.scan_roots.is_empty());
-            assert!(settings.last_project.is_none());
-        });
+        let settings = load_settings_from(dir.path());
+        assert!(settings.scan_roots.is_empty());
+        assert!(settings.last_project.is_none());
     }
 
     #[test]
     fn save_and_load_settings_roundtrip() {
         let dir = tempfile::tempdir().expect("tempdir");
-        with_temp_config(&dir, || {
-            let mut settings = Settings::default();
-            settings.scan_roots = vec!["~/repos".into(), "~/work".into()];
-            settings.last_project = Some("/home/user/project".into());
-            save_settings(&settings).expect("save");
+        let mut settings = Settings::default();
+        settings.scan_roots = vec!["~/repos".into(), "~/work".into()];
+        settings.last_project = Some("/home/user/project".into());
+        save_settings_to(dir.path(), &settings).expect("save");
 
-            let loaded = load_settings();
-            assert_eq!(loaded.scan_roots, vec!["~/repos", "~/work"]);
-            assert_eq!(loaded.last_project.as_deref(), Some("/home/user/project"));
-        });
+        let loaded = load_settings_from(dir.path());
+        assert_eq!(loaded.scan_roots, vec!["~/repos", "~/work"]);
+        assert_eq!(loaded.last_project.as_deref(), Some("/home/user/project"));
     }
 
     #[test]
@@ -369,47 +356,40 @@ mod tests {
     #[test]
     fn load_settings_returns_defaults_on_corrupt_json() {
         let dir = tempfile::tempdir().expect("tempdir");
-        with_temp_config(&dir, || {
-            // Write garbage to the settings file.
-            let path = settings_path().expect("settings path");
-            if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent).expect("create dir");
-            }
-            std::fs::write(&path, "not valid json {{{").expect("write garbage");
+        let path = dir.path().join("settings.json");
+        std::fs::write(&path, "not valid json {{{").expect("write garbage");
 
-            let settings = load_settings();
-            assert!(
-                settings.scan_roots.is_empty(),
-                "corrupt file should fall back to defaults"
-            );
-            assert!(settings.last_project.is_none());
-        });
+        let settings = load_settings_from(dir.path());
+        assert!(
+            settings.scan_roots.is_empty(),
+            "corrupt file should fall back to defaults"
+        );
+        assert!(settings.last_project.is_none());
     }
 
     #[test]
     fn save_scan_roots_preserves_last_project() {
         let dir = tempfile::tempdir().expect("tempdir");
-        with_temp_config(&dir, || {
-            // Save settings with both fields populated.
-            let mut settings = Settings::default();
-            settings.scan_roots = vec!["~/old-root".into()];
-            settings.last_project = Some("/home/user/my-project".into());
-            save_settings(&settings).expect("save initial");
 
-            // Now update only scan_roots (simulating save_scan_roots).
-            let mut loaded = load_settings();
-            loaded.scan_roots = vec!["~/new-root".into()];
-            save_settings(&loaded).expect("save updated roots");
+        // Save settings with both fields populated.
+        let mut settings = Settings::default();
+        settings.scan_roots = vec!["~/old-root".into()];
+        settings.last_project = Some("/home/user/my-project".into());
+        save_settings_to(dir.path(), &settings).expect("save initial");
 
-            // Verify last_project survived the update.
-            let final_settings = load_settings();
-            assert_eq!(final_settings.scan_roots, vec!["~/new-root"]);
-            assert_eq!(
-                final_settings.last_project.as_deref(),
-                Some("/home/user/my-project"),
-                "last_project should survive scan_roots update"
-            );
-        });
+        // Now update only scan_roots (simulating save_scan_roots).
+        let mut loaded = load_settings_from(dir.path());
+        loaded.scan_roots = vec!["~/new-root".into()];
+        save_settings_to(dir.path(), &loaded).expect("save updated roots");
+
+        // Verify last_project survived the update.
+        let final_settings = load_settings_from(dir.path());
+        assert_eq!(final_settings.scan_roots, vec!["~/new-root"]);
+        assert_eq!(
+            final_settings.last_project.as_deref(),
+            Some("/home/user/my-project"),
+            "last_project should survive scan_roots update"
+        );
     }
 
     #[test]

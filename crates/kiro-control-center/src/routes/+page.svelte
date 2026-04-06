@@ -25,12 +25,12 @@
 </script>
 
 {#if store.loading}
-  <div class="flex items-center justify-center h-screen bg-gray-100 dark:bg-gray-950">
-    <p class="text-gray-500 dark:text-gray-400">Loading...</p>
+  <div class="flex items-center justify-center h-screen bg-kiro-base">
+    <p class="text-kiro-subtle">Loading...</p>
   </div>
 {:else if store.projectPath}
-  <div class="flex flex-col h-screen bg-gray-100 dark:bg-gray-950 text-gray-900 dark:text-gray-100">
-    <header class="flex items-center justify-between px-6 py-3 bg-white dark:bg-gray-900 border-b border-gray-200 dark:border-gray-700 shadow-sm">
+  <div class="flex flex-col h-screen bg-kiro-base text-kiro-text">
+    <header class="flex items-center justify-between px-6 py-3 bg-kiro-surface border-b border-kiro-muted shadow-sm">
       <h1 class="text-lg font-semibold">Kiro Control Center</h1>
       <ProjectDropdown onManageRoots={() => (showManageRoots = true)} />
     </header>
@@ -52,10 +52,10 @@
 {/if}
 
 {#if store.projectError}
-  <div class="fixed bottom-4 right-4 z-50 max-w-md px-4 py-3 rounded-lg bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 shadow-lg">
-    <p class="text-sm text-red-700 dark:text-red-400">{store.projectError}</p>
+  <div class="fixed bottom-4 right-4 z-50 max-w-md px-4 py-3 rounded-lg bg-kiro-error/10 border border-kiro-error/30 shadow-lg">
+    <p class="text-sm text-kiro-error">{store.projectError}</p>
     <button
-      class="mt-1 text-xs text-red-500 hover:text-red-700 dark:hover:text-red-300"
+      class="mt-1 text-xs text-kiro-error/70 hover:text-kiro-error"
       onclick={() => (store.projectError = null)}
     >
       Dismiss
