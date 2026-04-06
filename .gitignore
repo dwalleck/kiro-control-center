@@ -1,1 +1,4 @@
 /target
+
+# Advisory lock files created by kiro-market during concurrent operations
+*.json.lock
