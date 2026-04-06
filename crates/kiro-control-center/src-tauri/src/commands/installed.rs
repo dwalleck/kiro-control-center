@@ -82,9 +82,15 @@ mod tests {
             version: Some("1.0.0".into()),
             installed_at: Utc::now(),
         };
+        let skill_src = tempfile::tempdir().expect("skill src");
+        std::fs::write(
+            skill_src.path().join("SKILL.md"),
+            "# Test Skill\nBody content",
+        )
+        .expect("write SKILL.md");
         project
-            .install_skill(name, "# Test Skill\nBody content", meta)
-            .expect("install_skill");
+            .install_skill_from_dir(name, skill_src.path(), meta)
+            .expect("install_skill_from_dir");
         let path = dir.path().to_str().expect("valid utf-8").to_owned();
         (dir, path)
     }
@@ -102,9 +108,12 @@ mod tests {
                 version: Some("1.0.0".into()),
                 installed_at: Utc::now(),
             };
+            let skill_src = tempfile::tempdir().expect("skill src");
+            std::fs::write(skill_src.path().join("SKILL.md"), "# Skill\nBody")
+                .expect("write SKILL.md");
             project
-                .install_skill(name, "# Skill\nBody", meta)
-                .expect("install_skill");
+                .install_skill_from_dir(name, skill_src.path(), meta)
+                .expect("install_skill_from_dir");
         }
 
         let result = list_installed_skills(path).await.expect("should succeed");

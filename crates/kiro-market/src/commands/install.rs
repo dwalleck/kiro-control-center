@@ -12,7 +12,7 @@ use kiro_market_core::git::{self, CloneOptions, GitBackend, GitProtocol, GixCliB
 use kiro_market_core::marketplace::{PluginEntry, PluginSource, StructuredSource};
 use kiro_market_core::plugin::{PluginManifest, discover_skill_dirs};
 use kiro_market_core::project::{InstalledSkillMeta, KiroProject};
-use kiro_market_core::skill::{extract_relative_md_links, merge_skill, parse_frontmatter};
+use kiro_market_core::skill::parse_frontmatter;
 use tracing::{debug, warn};
 
 use crate::cli;
@@ -26,8 +26,8 @@ struct InstallStats {
 
 /// Run the install command.
 ///
-/// Resolves `plugin_ref` to a plugin, discovers skills, merges companions,
-/// and installs into the current Kiro project.
+/// Resolves `plugin_ref` to a plugin, discovers skills, copies skill
+/// directories, and installs into the current Kiro project.
 pub fn run(plugin_ref: &str, skill_filter: Option<&str>, force: bool) -> Result<()> {
     let (plugin_name, marketplace_name) = cli::parse_plugin_ref(plugin_ref).with_context(|| {
         format!("invalid plugin reference '{plugin_ref}': expected plugin@marketplace")
@@ -187,7 +187,7 @@ fn process_skill(
         }
     };
 
-    let (frontmatter, body_offset) = match parse_frontmatter(&skill_content) {
+    let (frontmatter, _body_offset) = match parse_frontmatter(&skill_content) {
         Ok(result) => result,
         Err(e) => {
             eprintln!(
@@ -208,38 +208,6 @@ fn process_skill(
         return SkillResult::Filtered;
     }
 
-    // Extract relative md links and read companion files.
-    let body = &skill_content[body_offset..];
-    let relative_links = extract_relative_md_links(body);
-
-    let companions: Vec<(String, String)> = relative_links
-        .iter()
-        .filter_map(|link| {
-            let companion_path = skill_dir.join(link);
-            match fs::read_to_string(&companion_path) {
-                Ok(content) => Some((link.clone(), content)),
-                Err(e) => {
-                    debug!(link, error = %e, "companion file not found, skipping");
-                    None
-                }
-            }
-        })
-        .collect();
-
-    let companion_refs: Vec<(&str, &str)> = companions
-        .iter()
-        .map(|(path, content)| (path.as_str(), content.as_str()))
-        .collect();
-
-    let Ok(merged_content) = merge_skill(&skill_content, &companion_refs) else {
-        eprintln!(
-            "  {} Failed to merge skill '{}'",
-            "✗".red().bold(),
-            frontmatter.name
-        );
-        return SkillResult::Failed;
-    };
-
     let meta = InstalledSkillMeta {
         marketplace: marketplace_name.to_owned(),
         plugin: plugin_name.to_owned(),
@@ -248,9 +216,9 @@ fn process_skill(
     };
 
     let install_result = if force {
-        project.install_skill_force(&frontmatter.name, &merged_content, meta)
+        project.install_skill_from_dir_force(&frontmatter.name, skill_dir, meta)
     } else {
-        project.install_skill(&frontmatter.name, &merged_content, meta)
+        project.install_skill_from_dir(&frontmatter.name, skill_dir, meta)
     };
 
     match install_result {

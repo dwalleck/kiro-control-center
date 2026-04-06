@@ -77,14 +77,6 @@ pub enum SkillError {
     /// No `SKILL.md` was found for the skill.
     #[error("SKILL.md not found at {path}")]
     SkillMdNotFound { path: PathBuf },
-
-    /// Merging the skill into the target project failed.
-    #[error("failed to merge skill `{skill}` into {path}: {reason}")]
-    MergeFailed {
-        skill: String,
-        path: PathBuf,
-        reason: String,
-    },
 }
 
 // ---------------------------------------------------------------------------
@@ -255,14 +247,6 @@ mod tests {
     #[case::skill_md_not_found(
         SkillError::SkillMdNotFound { path: PathBuf::from("skills/rust/SKILL.md") },
         "SKILL.md not found at skills/rust/SKILL.md"
-    )]
-    #[case::skill_merge_failed(
-        SkillError::MergeFailed {
-            skill: "go-lint".into(),
-            path: PathBuf::from(".kiro/skills"),
-            reason: "conflict".into(),
-        },
-        "failed to merge skill `go-lint` into .kiro/skills: conflict"
     )]
     fn skill_error_display(#[case] err: SkillError, #[case] expected: &str) {
         assert_eq!(err.to_string(), expected);
