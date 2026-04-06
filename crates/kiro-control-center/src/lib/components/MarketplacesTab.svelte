@@ -87,13 +87,13 @@
   function sourceTypeBadgeClass(sourceType: string): string {
     switch (sourceType) {
       case "github":
-        return "bg-blue-100 text-blue-800 dark:bg-blue-900/30 dark:text-blue-400";
+        return "bg-kiro-info/15 text-kiro-info";
       case "git":
-        return "bg-purple-100 text-purple-800 dark:bg-purple-900/30 dark:text-purple-400";
+        return "bg-kiro-accent-900/30 text-kiro-accent-300";
       case "local":
-        return "bg-yellow-100 text-yellow-800 dark:bg-yellow-900/30 dark:text-yellow-400";
+        return "bg-kiro-warning/15 text-kiro-warning";
       default:
-        return "bg-gray-100 text-gray-800 dark:bg-gray-700 dark:text-gray-300";
+        return "bg-kiro-muted text-kiro-text-secondary";
     }
   }
 
@@ -104,8 +104,8 @@
 
 <div class="flex flex-col h-full">
   <!-- Add marketplace section -->
-  <div class="p-4 border-b border-gray-200 dark:border-gray-700">
-    <h3 class="text-sm font-medium text-gray-700 dark:text-gray-300 mb-2">Add marketplace</h3>
+  <div class="p-4 border-b border-kiro-muted">
+    <h3 class="text-sm font-medium text-kiro-text-secondary mb-2">Add marketplace</h3>
     <form
       class="flex gap-2"
       onsubmit={(e: Event) => { e.preventDefault(); addMarketplace(); }}
@@ -115,12 +115,12 @@
         placeholder="owner/repo, git URL, or local path"
         bind:value={newSource}
         disabled={adding}
-        class="flex-1 px-3 py-2 text-sm rounded-md border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-800 text-gray-900 dark:text-gray-100 placeholder-gray-400 dark:placeholder-gray-500 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent disabled:opacity-50"
+        class="flex-1 px-3 py-2 text-sm rounded-md border border-kiro-muted bg-kiro-overlay text-kiro-text placeholder-kiro-subtle focus:outline-none focus:ring-2 focus:ring-kiro-accent-500 focus:border-transparent disabled:opacity-50"
       />
       <select
         bind:value={protocol}
         disabled={adding}
-        class="px-3 py-2 text-sm rounded-md border border-gray-300 dark:border-gray-600 bg-white dark:bg-gray-800 text-gray-900 dark:text-gray-100 focus:outline-none focus:ring-2 focus:ring-blue-500 focus:border-transparent disabled:opacity-50"
+        class="px-3 py-2 text-sm rounded-md border border-kiro-muted bg-kiro-overlay text-kiro-text focus:outline-none focus:ring-2 focus:ring-kiro-accent-500 focus:border-transparent disabled:opacity-50"
       >
         <option value="https">HTTPS</option>
         <option value="ssh">SSH</option>
@@ -130,8 +130,8 @@
         disabled={adding || !newSource.trim()}
         class="px-4 py-2 text-sm font-medium rounded-md text-white transition-colors duration-150
           {!adding && newSource.trim()
-            ? 'bg-blue-600 hover:bg-blue-700 dark:bg-blue-500 dark:hover:bg-blue-600'
-            : 'bg-gray-300 dark:bg-gray-700 cursor-not-allowed'}"
+            ? 'bg-kiro-accent-600 hover:bg-kiro-accent-700'
+            : 'bg-kiro-muted text-kiro-subtle cursor-not-allowed'}"
       >
         {adding ? "Adding..." : "Add"}
       </button>
@@ -140,41 +140,41 @@
 
   <!-- Error display -->
   {#if error}
-    <div class="mx-4 mt-3 px-4 py-3 rounded-md bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800">
-      <p class="text-sm text-red-700 dark:text-red-400">{error}</p>
+    <div class="mx-4 mt-3 px-4 py-3 rounded-md bg-kiro-error/10 border border-kiro-error/30">
+      <p class="text-sm text-kiro-error">{error}</p>
     </div>
   {/if}
 
   <!-- Success message -->
   {#if successMessage}
-    <div class="mx-4 mt-3 px-4 py-3 rounded-md bg-green-50 dark:bg-green-900/20 border border-green-200 dark:border-green-800">
-      <p class="text-sm text-green-700 dark:text-green-400">{successMessage}</p>
+    <div class="mx-4 mt-3 px-4 py-3 rounded-md bg-kiro-success/10 border border-kiro-success/30">
+      <p class="text-sm text-kiro-success">{successMessage}</p>
     </div>
   {/if}
 
   <!-- Marketplace list -->
   <div class="flex-1 overflow-y-auto p-4">
     {#if loading}
-      <div class="flex items-center justify-center h-full text-gray-400 dark:text-gray-500">
+      <div class="flex items-center justify-center h-full text-kiro-subtle">
         <p class="text-sm">Loading marketplaces...</p>
       </div>
     {:else if marketplaces.length === 0}
-      <div class="flex items-center justify-center h-full text-gray-400 dark:text-gray-500">
+      <div class="flex items-center justify-center h-full text-kiro-subtle">
         <p class="text-sm">No marketplaces registered. Add one above to get started.</p>
       </div>
     {:else}
       <div class="space-y-3">
         {#each marketplaces as mp (mp.name)}
-          <div class="flex items-center justify-between p-4 rounded-lg border border-gray-200 dark:border-gray-700 bg-white dark:bg-gray-800">
+          <div class="flex items-center justify-between p-4 rounded-lg border border-kiro-muted bg-kiro-overlay">
             <div class="flex items-center gap-3 min-w-0">
               <div class="min-w-0">
                 <div class="flex items-center gap-2">
-                  <span class="font-semibold text-gray-900 dark:text-gray-100 truncate">{mp.name}</span>
+                  <span class="font-semibold text-kiro-text truncate">{mp.name}</span>
                   <span class="inline-flex items-center px-2 py-0.5 text-xs font-medium rounded-full {sourceTypeBadgeClass(mp.source_type)}">
                     {mp.source_type}
                   </span>
                 </div>
-                <p class="mt-0.5 text-sm text-gray-500 dark:text-gray-400">
+                <p class="mt-0.5 text-sm text-kiro-subtle">
                   {mp.plugin_count} plugin{mp.plugin_count === 1 ? "" : "s"}
                 </p>
               </div>
@@ -183,8 +183,8 @@
               <button
                 class="px-3 py-1.5 text-xs font-medium rounded-md transition-colors duration-150
                   {updatingName === mp.name
-                    ? 'bg-gray-200 dark:bg-gray-700 text-gray-400 cursor-not-allowed'
-                    : 'bg-gray-100 dark:bg-gray-700 text-gray-700 dark:text-gray-300 hover:bg-gray-200 dark:hover:bg-gray-600'}"
+                    ? 'bg-kiro-muted text-kiro-subtle cursor-not-allowed'
+                    : 'bg-kiro-muted text-kiro-text-secondary hover:bg-kiro-muted'}"
                 disabled={updatingName === mp.name}
                 onclick={() => updateMarketplace(mp.name)}
               >
@@ -193,8 +193,8 @@
               <button
                 class="px-3 py-1.5 text-xs font-medium rounded-md transition-colors duration-150
                   {removingName === mp.name
-                    ? 'bg-gray-200 dark:bg-gray-700 text-gray-400 cursor-not-allowed'
-                    : 'bg-red-50 dark:bg-red-900/20 text-red-600 dark:text-red-400 hover:bg-red-100 dark:hover:bg-red-900/40'}"
+                    ? 'bg-kiro-muted text-kiro-subtle cursor-not-allowed'
+                    : 'bg-kiro-error/10 text-kiro-error hover:bg-kiro-error/20'}"
                 disabled={removingName === mp.name}
                 onclick={() => removeMarketplace(mp.name)}
               >
