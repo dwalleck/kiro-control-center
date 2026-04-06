@@ -1,64 +1,68 @@
 <script lang="ts">
-  import { commands } from "$lib/bindings";
-  import type { ProjectInfo } from "$lib/bindings";
+  import { onMount } from "svelte";
+  import { store, initialize } from "$lib/stores/project.svelte";
   import TabBar from "$lib/components/TabBar.svelte";
   import BrowseTab from "$lib/components/BrowseTab.svelte";
   import InstalledTab from "$lib/components/InstalledTab.svelte";
   import MarketplacesTab from "$lib/components/MarketplacesTab.svelte";
+  import ProjectPicker from "$lib/components/ProjectPicker.svelte";
+  import ProjectDropdown from "$lib/components/ProjectDropdown.svelte";
+  import ScanRootsPanel from "$lib/components/ScanRootsPanel.svelte";
 
   const tabs = ["Browse", "Installed", "Marketplaces"];
   let activeTab: string = $state("Browse");
+  let showManageRoots = $state(false);
 
-  let projectPath: string = $state(".");
-  let projectInfo: ProjectInfo | null = $state(null);
-  let projectError: string | null = $state(null);
-
-  async function loadProjectInfo() {
-    const result = await commands.getProjectInfo(projectPath);
-    if (result.status === "ok") {
-      projectInfo = result.data;
-      projectPath = result.data.path;
-    } else {
-      projectError = result.error.message;
-    }
-  }
-
-  $effect(() => {
-    loadProjectInfo();
+  // Initialize once on mount. Uses onMount (not $effect) because initialize()
+  // is a one-shot async function that should not re-trigger on state changes.
+  onMount(() => {
+    initialize().catch((e) => {
+      console.error("Initialization failed:", e);
+      store.projectError = "Application failed to initialize. Please restart.";
+      store.loading = false;
+    });
   });
 </script>
 
-<div class="flex flex-col h-screen bg-gray-100 dark:bg-gray-950 text-gray-900 dark:text-gray-100">
-  <!-- Header -->
-  <header class="flex items-center justify-between px-6 py-3 bg-white dark:bg-gray-900 border-b border-gray-200 dark:border-gray-700 shadow-sm">
-    <h1 class="text-lg font-semibold">Kiro Control Center</h1>
-    <div class="flex items-center gap-3 text-sm text-gray-500 dark:text-gray-400">
-      {#if projectInfo}
-        <span class="truncate max-w-md" title={projectInfo.path}>{projectInfo.path}</span>
-        {#if !projectInfo.kiro_initialized}
-          <span class="inline-flex items-center px-2 py-0.5 text-xs font-medium rounded-full bg-yellow-100 text-yellow-800 dark:bg-yellow-900/30 dark:text-yellow-400">
-            Not initialized
-          </span>
-        {/if}
-      {:else if projectError}
-        <span class="text-red-500 dark:text-red-400 text-xs">{projectError}</span>
-      {:else}
-        <span>Loading...</span>
+{#if store.loading}
+  <div class="flex items-center justify-center h-screen bg-gray-100 dark:bg-gray-950">
+    <p class="text-gray-500 dark:text-gray-400">Loading...</p>
+  </div>
+{:else if store.projectPath}
+  <div class="flex flex-col h-screen bg-gray-100 dark:bg-gray-950 text-gray-900 dark:text-gray-100">
+    <header class="flex items-center justify-between px-6 py-3 bg-white dark:bg-gray-900 border-b border-gray-200 dark:border-gray-700 shadow-sm">
+      <h1 class="text-lg font-semibold">Kiro Control Center</h1>
+      <ProjectDropdown onManageRoots={() => (showManageRoots = true)} />
+    </header>
+
+    <TabBar {tabs} {activeTab} onTabChange={(tab) => (activeTab = tab)} />
+
+    <main class="flex-1 overflow-hidden">
+      {#if activeTab === "Browse"}
+        <BrowseTab projectPath={store.projectPath} />
+      {:else if activeTab === "Installed"}
+        <InstalledTab projectPath={store.projectPath} />
+      {:else if activeTab === "Marketplaces"}
+        <MarketplacesTab />
       {/if}
-    </div>
-  </header>
+    </main>
+  </div>
+{:else}
+  <ProjectPicker />
+{/if}
 
-  <!-- Tabs -->
-  <TabBar {tabs} {activeTab} onTabChange={(tab) => (activeTab = tab)} />
+{#if store.projectError}
+  <div class="fixed bottom-4 right-4 z-50 max-w-md px-4 py-3 rounded-lg bg-red-50 dark:bg-red-900/20 border border-red-200 dark:border-red-800 shadow-lg">
+    <p class="text-sm text-red-700 dark:text-red-400">{store.projectError}</p>
+    <button
+      class="mt-1 text-xs text-red-500 hover:text-red-700 dark:hover:text-red-300"
+      onclick={() => (store.projectError = null)}
+    >
+      Dismiss
+    </button>
+  </div>
+{/if}
 
-  <!-- Content -->
-  <main class="flex-1 overflow-hidden">
-    {#if activeTab === "Browse"}
-      <BrowseTab {projectPath} />
-    {:else if activeTab === "Installed"}
-      <InstalledTab {projectPath} />
-    {:else if activeTab === "Marketplaces"}
-      <MarketplacesTab />
-    {/if}
-  </main>
-</div>
+{#if showManageRoots}
+  <ScanRootsPanel onClose={() => (showManageRoots = false)} />
+{/if}

@@ -25,6 +25,10 @@ fn create_builder() -> Builder<tauri::Wry> {
         commands::marketplaces::add_marketplace,
         commands::marketplaces::remove_marketplace,
         commands::marketplaces::update_marketplace,
+        commands::settings::get_settings,
+        commands::settings::save_scan_roots,
+        commands::settings::discover_projects,
+        commands::settings::set_active_project,
     ])
 }
 
@@ -42,6 +46,7 @@ pub fn run() {
 
     tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .plugin(tauri_plugin_dialog::init())
         .invoke_handler(builder.invoke_handler())
         .setup(move |app| {
             builder.mount_events(app);
