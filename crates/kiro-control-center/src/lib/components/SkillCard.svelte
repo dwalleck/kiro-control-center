@@ -6,6 +6,16 @@
     selected: boolean;
     onToggle: () => void;
   } = $props();
+
+  let expanded = $state(false);
+  let overflows = $state(false);
+  let descEl: HTMLParagraphElement | undefined = $state();
+
+  $effect(() => {
+    if (descEl) {
+      overflows = descEl.scrollHeight > descEl.clientHeight;
+    }
+  });
 </script>
 
 <button
@@ -35,6 +45,23 @@
         </span>
       {/if}
     </div>
-    <p class="mt-1 text-sm text-kiro-text-secondary truncate">{skill.description}</p>
+    <p
+      bind:this={descEl}
+      class="mt-1 text-sm text-kiro-text-secondary"
+      class:line-clamp-3={!expanded}
+    >
+      {skill.description}
+    </p>
+    {#if overflows || expanded}
+      <span
+        role="button"
+        tabindex="0"
+        class="mt-1 inline-block text-xs text-kiro-accent-400 hover:text-kiro-accent-300 cursor-pointer"
+        onclick={(e) => { e.stopPropagation(); expanded = !expanded; }}
+        onkeydown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.stopPropagation(); e.preventDefault(); expanded = !expanded; } }}
+      >
+        {expanded ? "Show less" : "Show more"}
+      </span>
+    {/if}
   </div>
 </button>
