@@ -134,16 +134,24 @@ impl KiroProject {
         meta: InstalledSkillMeta,
     ) -> crate::error::Result<()> {
         validation::validate_name(name)?;
-        let dir = self.skill_dir(name);
 
-        if dir.exists() {
-            return Err(SkillError::AlreadyInstalled {
-                name: name.to_owned(),
+        crate::file_lock::with_file_lock(&self.tracking_path(), || {
+            let dir = self.skill_dir(name);
+
+            if dir.exists() {
+                return Err(SkillError::AlreadyInstalled {
+                    name: name.to_owned(),
+                }
+                .into());
             }
-            .into());
-        }
 
-        self.write_skill(name, content, meta)
+            fs::create_dir_all(&dir)?;
+            crate::cache::atomic_write(&dir.join(SKILL_MD), content.as_bytes())?;
+
+            let mut installed = self.load_installed()?;
+            installed.skills.insert(name.to_owned(), meta);
+            self.write_tracking(&installed)
+        })
     }
 
     /// Install a skill, overwriting any existing installation.
@@ -158,14 +166,22 @@ impl KiroProject {
         meta: InstalledSkillMeta,
     ) -> crate::error::Result<()> {
         validation::validate_name(name)?;
-        let dir = self.skill_dir(name);
 
-        if dir.exists() {
-            debug!(name, "removing existing skill directory for force install");
-            fs::remove_dir_all(&dir)?;
-        }
+        crate::file_lock::with_file_lock(&self.tracking_path(), || {
+            let dir = self.skill_dir(name);
 
-        self.write_skill(name, content, meta)
+            if dir.exists() {
+                debug!(name, "removing existing skill directory for force install");
+                fs::remove_dir_all(&dir)?;
+            }
+
+            fs::create_dir_all(&dir)?;
+            crate::cache::atomic_write(&dir.join(SKILL_MD), content.as_bytes())?;
+
+            let mut installed = self.load_installed()?;
+            installed.skills.insert(name.to_owned(), meta);
+            self.write_tracking(&installed)
+        })
     }
 
     /// Remove an installed skill.
@@ -179,45 +195,29 @@ impl KiroProject {
     /// - I/O or JSON serialisation errors.
     pub fn remove_skill(&self, name: &str) -> crate::error::Result<()> {
         validation::validate_name(name)?;
-        let dir = self.skill_dir(name);
 
-        if !dir.exists() {
-            return Err(SkillError::NotInstalled {
-                name: name.to_owned(),
+        crate::file_lock::with_file_lock(&self.tracking_path(), || {
+            let dir = self.skill_dir(name);
+
+            if !dir.exists() {
+                return Err(SkillError::NotInstalled {
+                    name: name.to_owned(),
+                }
+                .into());
             }
-            .into());
-        }
 
-        fs::remove_dir_all(&dir)?;
+            fs::remove_dir_all(&dir)?;
 
-        let mut installed = self.load_installed()?;
-        installed.skills.remove(name);
-        self.write_tracking(&installed)?;
+            let mut installed = self.load_installed()?;
+            installed.skills.remove(name);
+            self.write_tracking(&installed)
+        })?;
 
         debug!(name, "skill removed");
         Ok(())
     }
 
     // -- internal helpers --------------------------------------------------
-
-    /// Write SKILL.md and update tracking for a skill installation.
-    fn write_skill(
-        &self,
-        name: &str,
-        content: &str,
-        meta: InstalledSkillMeta,
-    ) -> crate::error::Result<()> {
-        let dir = self.skill_dir(name);
-        fs::create_dir_all(&dir)?;
-        crate::cache::atomic_write(&dir.join(SKILL_MD), content.as_bytes())?;
-
-        let mut installed = self.load_installed()?;
-        installed.skills.insert(name.to_owned(), meta);
-        self.write_tracking(&installed)?;
-
-        debug!(name, "skill installed");
-        Ok(())
-    }
 
     /// Persist the tracking file to disk atomically.
     ///
