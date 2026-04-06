@@ -49,8 +49,9 @@ const INSTALLED_SKILLS_FILE: &str = "installed-skills.json";
 /// Recursively copy a directory tree from `src` to `dest`.
 ///
 /// Creates `dest` and all intermediate directories. Files are copied
-/// preserving the relative directory structure. Symlinks are followed
-/// (the target content is copied, not the link itself).
+/// preserving the relative directory structure. **Symlinks are skipped**
+/// to prevent path traversal attacks where a malicious skill package
+/// could include symlinks pointing to sensitive host files.
 ///
 /// # Errors
 ///
@@ -61,14 +62,22 @@ fn copy_dir_recursive(src: &Path, dest: &Path) -> std::io::Result<()> {
     for entry in fs::read_dir(src)? {
         let entry = entry?;
         let target = dest.join(entry.file_name());
-        // Use fs::metadata (follows symlinks) so that symlinks are
-        // transparently treated as the file/directory they point to.
-        let metadata = fs::metadata(entry.path()).map_err(|e| {
+        // Use symlink_metadata (does NOT follow symlinks) so we can
+        // detect and skip symlinks. Skill source directories are
+        // untrusted input — a symlink could point to sensitive files.
+        let metadata = fs::symlink_metadata(entry.path()).map_err(|e| {
             std::io::Error::new(
                 e.kind(),
                 format!("failed to read metadata for {}: {e}", entry.path().display()),
             )
         })?;
+        if metadata.is_symlink() {
+            debug!(
+                path = %entry.path().display(),
+                "skipping symlink in skill directory"
+            );
+            continue;
+        }
         if metadata.is_dir() {
             copy_dir_recursive(&entry.path(), &target)?;
         } else {
@@ -754,5 +763,29 @@ mod tests {
 
         let err = copy_dir_recursive(&fake_src, &dest_path).expect_err("should fail");
         assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn copy_dir_recursive_skips_symlinks() {
+        use std::os::unix::fs as unix_fs;
+
+        let src = tempfile::tempdir().expect("tempdir");
+        let dest = tempfile::tempdir().expect("tempdir");
+        let dest_path = dest.path().join("output");
+
+        fs::write(src.path().join("SKILL.md"), "skill content").expect("write");
+        // Create a symlink that points to a sensitive file.
+        unix_fs::symlink("/etc/passwd", src.path().join("evil-link")).expect("symlink");
+
+        copy_dir_recursive(src.path(), &dest_path).expect("copy should succeed");
+
+        // The regular file should be copied.
+        assert!(dest_path.join("SKILL.md").exists());
+        // The symlink should NOT be copied.
+        assert!(
+            !dest_path.join("evil-link").exists(),
+            "symlinks should be skipped during copy"
+        );
     }
 }
