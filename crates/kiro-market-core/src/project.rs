@@ -75,7 +75,7 @@ fn copy_dir_recursive(src: &Path, dest: &Path) -> std::io::Result<()> {
         if metadata.is_dir() {
             copy_dir_recursive(&entry.path(), &target)?;
         } else {
-            fs::copy(&entry.path(), &target).map_err(|e| {
+            fs::copy(entry.path(), &target).map_err(|e| {
                 std::io::Error::new(
                     e.kind(),
                     format!(
