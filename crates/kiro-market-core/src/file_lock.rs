@@ -186,10 +186,10 @@ mod tests {
                     barrier.wait();
                     for _ in 0..increments_per_thread {
                         let result: Result<(), io::Error> = with_file_lock(&target, || {
-                            let val: u64 =
-                                fs::read_to_string(&counter_path)?.trim().parse().map_err(
-                                    |e| io::Error::new(io::ErrorKind::InvalidData, e),
-                                )?;
+                            let val: u64 = fs::read_to_string(&counter_path)?
+                                .trim()
+                                .parse()
+                                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
                             fs::write(&counter_path, (val + 1).to_string())?;
                             Ok(())
                         });

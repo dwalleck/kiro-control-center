@@ -68,7 +68,10 @@ fn copy_dir_recursive(src: &Path, dest: &Path) -> std::io::Result<()> {
         let metadata = fs::symlink_metadata(entry.path()).map_err(|e| {
             std::io::Error::new(
                 e.kind(),
-                format!("failed to read metadata for {}: {e}", entry.path().display()),
+                format!(
+                    "failed to read metadata for {}: {e}",
+                    entry.path().display()
+                ),
             )
         })?;
         if metadata.is_symlink() {
@@ -307,14 +310,12 @@ impl KiroProject {
         // concurrent processes from clobbering each other's writes.
         // If this fails, roll back the rename to keep the filesystem
         // and tracking file consistent.
-        let tracking_result =
-            crate::file_lock::with_file_lock(&self.tracking_path(), || {
-                self.load_installed()
-                    .and_then(|mut installed| {
-                        installed.skills.insert(name.to_owned(), meta);
-                        self.write_tracking(&installed)
-                    })
-            });
+        let tracking_result = crate::file_lock::with_file_lock(&self.tracking_path(), || {
+            self.load_installed().and_then(|mut installed| {
+                installed.skills.insert(name.to_owned(), meta);
+                self.write_tracking(&installed)
+            })
+        });
 
         if let Err(e) = tracking_result {
             debug!(
@@ -525,11 +526,7 @@ mod tests {
         let leftover: Vec<_> = fs::read_dir(&skills_dir)
             .expect("read skills dir")
             .filter_map(Result::ok)
-            .filter(|e| {
-                e.file_name()
-                    .to_string_lossy()
-                    .starts_with("_installing-")
-            })
+            .filter(|e| e.file_name().to_string_lossy().starts_with("_installing-"))
             .collect();
         assert!(leftover.is_empty(), "temp dir should be cleaned up");
     }
@@ -581,15 +578,16 @@ mod tests {
             .install_skill_from_dir_force("s", src2.path(), sample_meta())
             .expect("force install");
 
-        let content =
-            fs::read_to_string(project.skill_dir("s").join("SKILL.md")).expect("read");
+        let content = fs::read_to_string(project.skill_dir("s").join("SKILL.md")).expect("read");
         assert!(content.contains("Updated."));
 
-        assert!(project
-            .skill_dir("s")
-            .join("references")
-            .join("new.md")
-            .exists());
+        assert!(
+            project
+                .skill_dir("s")
+                .join("references")
+                .join("new.md")
+                .exists()
+        );
     }
 
     #[test]
@@ -696,7 +694,13 @@ mod tests {
         project
             .install_skill_from_dir("s", src1.path(), sample_meta())
             .expect("first install");
-        assert!(project.skill_dir("s").join("references").join("old.md").exists());
+        assert!(
+            project
+                .skill_dir("s")
+                .join("references")
+                .join("old.md")
+                .exists()
+        );
 
         // v2: SKILL.md only, no references/
         fs::write(
