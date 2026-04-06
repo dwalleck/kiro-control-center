@@ -184,7 +184,7 @@
                 class="px-3 py-1.5 text-xs font-medium rounded-md transition-colors duration-150
                   {updatingName === mp.name
                     ? 'bg-kiro-muted text-kiro-subtle cursor-not-allowed'
-                    : 'bg-kiro-muted text-kiro-text-secondary hover:bg-kiro-muted'}"
+                    : 'bg-kiro-muted text-kiro-text-secondary hover:bg-kiro-subtle'}"
                 disabled={updatingName === mp.name}
                 onclick={() => updateMarketplace(mp.name)}
               >

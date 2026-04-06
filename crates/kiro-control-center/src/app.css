@@ -68,7 +68,7 @@
     --kiro-muted: oklch(82.82% 0.0115 302.85);
     --kiro-subtle: oklch(75.35% 0.0159 298.34);
     --kiro-text: oklch(31.73% 0.0259 304.41);
-    --kiro-text-secondary: oklch(65.73% 0.0182 300.94);
+    --kiro-text-secondary: oklch(45% 0.0182 300.94);
     --kiro-success: oklch(52.97% 0.0963 155.38);
     --kiro-error: oklch(47.08% 0.1367 23.99);
     --kiro-error-hover: oklch(41.46% 0.1191 23.89);
