@@ -23,17 +23,13 @@ pub struct Settings {
     pub last_project: Option<String>,
 }
 
-/// A discovered Kiro project.
+/// A discovered Kiro project found during directory scanning.
 #[derive(Clone, Debug, Serialize, specta::Type)]
 pub struct DiscoveredProject {
     /// Absolute path to the project root.
     pub path: String,
     /// Directory name (for display).
     pub name: String,
-    /// Whether `.kiro/` exists.
-    pub kiro_initialized: bool,
-    /// Number of installed skills (0 during discovery, loaded on demand).
-    pub skill_count: u32,
 }
 
 // ---------------------------------------------------------------------------
@@ -42,8 +38,7 @@ pub struct DiscoveredProject {
 
 /// Path to the settings file.
 ///
-/// Respects `KIRO_MARKET_CONFIG_DIR` env var for test isolation (the `dirs`
-/// crate ignores `XDG_CONFIG_HOME` on macOS/Windows).
+/// Respects `KIRO_MARKET_CONFIG_DIR` env var for test isolation.
 fn settings_path() -> Option<PathBuf> {
     if let Ok(dir) = std::env::var("KIRO_MARKET_CONFIG_DIR") {
         return Some(PathBuf::from(dir).join("settings.json"));
@@ -57,7 +52,17 @@ fn load_settings() -> Settings {
         return Settings::default();
     };
     match fs::read(&path) {
-        Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_default(),
+        Ok(bytes) => match serde_json::from_slice(&bytes) {
+            Ok(settings) => settings,
+            Err(e) => {
+                warn!(
+                    path = %path.display(),
+                    error = %e,
+                    "settings file is corrupt or incompatible, using defaults"
+                );
+                Settings::default()
+            }
+        },
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Settings::default(),
         Err(e) => {
             warn!(path = %path.display(), error = %e, "failed to read settings");
@@ -122,7 +127,7 @@ pub async fn save_scan_roots(roots: Vec<String>) -> Result<(), CommandError> {
 
 /// Discover Kiro projects by scanning configured root directories.
 ///
-/// Scans each root 1-2 levels deep for directories containing `.kiro/`.
+/// Scans each root up to 2 levels deep for directories containing `.kiro/`.
 #[tauri::command]
 #[specta::specta]
 #[allow(clippy::unused_async)] // Tauri commands must be async
@@ -139,8 +144,10 @@ pub async fn discover_projects() -> Result<Vec<DiscoveredProject>, CommandError>
         scan_for_projects(&root_path, 0, 2, &mut projects);
     }
 
-    projects.sort_by(|a, b| a.name.cmp(&b.name));
+    // Dedup by path (requires sorting by path first), then sort by name for display.
+    projects.sort_by(|a, b| a.path.cmp(&b.path));
     projects.dedup_by(|a, b| a.path == b.path);
+    projects.sort_by(|a, b| a.name.cmp(&b.name));
     Ok(projects)
 }
 
@@ -171,12 +178,18 @@ pub async fn set_active_project(
 // Scanning helpers
 // ---------------------------------------------------------------------------
 
-/// Expand `~` to the home directory.
+/// Expand `~/` prefix to the home directory. A bare `~` is also expanded.
 fn shellexpand_tilde(path: &str) -> String {
+    if path == "~" {
+        if let Some(home) = dirs::home_dir() {
+            return home.to_string_lossy().into_owned();
+        }
+    }
     if let Some(rest) = path.strip_prefix("~/") {
         if let Some(home) = dirs::home_dir() {
             return home.join(rest).to_string_lossy().into_owned();
         }
+        warn!(path = %path, "could not expand '~' — HOME directory not available");
     }
     path.to_owned()
 }
@@ -205,28 +218,29 @@ fn scan_for_projects(
         results.push(DiscoveredProject {
             path: dir.to_string_lossy().into_owned(),
             name,
-            kiro_initialized: true,
-            skill_count: 0,
         });
         // Don't recurse into .kiro projects.
         return;
     }
 
     // Recurse into subdirectories.
-    let Ok(entries) = fs::read_dir(dir) else {
-        return;
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) => {
+            debug!(dir = %dir.display(), error = %e, "could not read directory, skipping");
+            return;
+        }
     };
     for entry in entries {
         let Ok(entry) = entry else { continue };
         let path = entry.path();
         if path.is_dir() {
-            // Skip hidden directories and common non-project dirs.
+            // Skip hidden directories (covers .git, .cache, etc.) and common build dirs.
             let name = entry.file_name();
             let name_str = name.to_string_lossy();
             if name_str.starts_with('.')
                 || name_str == "node_modules"
                 || name_str == "target"
-                || name_str == ".git"
             {
                 continue;
             }

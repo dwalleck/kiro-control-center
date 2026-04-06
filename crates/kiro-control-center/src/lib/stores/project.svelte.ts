@@ -2,11 +2,18 @@ import { commands } from "$lib/bindings";
 import type { ProjectInfo, Settings, DiscoveredProject } from "$lib/bindings";
 
 // ---------------------------------------------------------------------------
-// Reactive state (exported as $state object — Svelte 5 Pattern A)
+// Reactive state (exported as a const $state object — Svelte 5 module pattern)
 //
-// Components read properties directly: `store.projectPath`, `store.loading`.
-// Property access on the $state proxy is reactive — no getters needed.
-// See: https://svelte.dev/docs/svelte/$state#Exporting-state
+// We export a const object rather than reassignable $state variables because
+// the Svelte compiler only transforms $state references within the declaring
+// file. Importing a reassignable $state variable from another module yields
+// the raw signal object, not the reactive value.
+//
+// By exporting a const object, property mutations (e.g. store.loading = true)
+// go through the deep state proxy and trigger reactive updates in any
+// component that reads those properties.
+//
+// See: https://svelte.dev/docs/svelte/$state ("Passing state across modules")
 // ---------------------------------------------------------------------------
 
 export const store = $state({
@@ -30,6 +37,9 @@ export async function initialize() {
   const settingsResult = await commands.getSettings();
   if (settingsResult.status === "ok") {
     store.settings = settingsResult.data;
+  } else {
+    console.error("Failed to load settings:", settingsResult.error.message);
+    store.projectError = `Could not load settings: ${settingsResult.error.message}`;
   }
 
   // Discover projects.
@@ -63,15 +73,23 @@ export async function refreshProjects() {
   const result = await commands.discoverProjects();
   if (result.status === "ok") {
     store.discoveredProjects = result.data;
+  } else {
+    console.error("Failed to discover projects:", result.error.message);
+    store.projectError = `Could not scan for projects: ${result.error.message}`;
   }
 }
 
 export async function addScanRoot(root: string) {
-  const roots = [...(store.settings.scan_roots ?? []), root];
+  const existing = store.settings.scan_roots ?? [];
+  if (existing.includes(root)) return; // Already added
+  const roots = [...existing, root];
   const result = await commands.saveScanRoots(roots);
   if (result.status === "ok") {
     store.settings = { ...store.settings, scan_roots: roots };
     await refreshProjects();
+  } else {
+    console.error("Failed to save scan roots:", result.error.message);
+    store.projectError = `Could not save settings: ${result.error.message}`;
   }
 }
 
@@ -83,6 +101,9 @@ export async function removeScanRoot(root: string) {
   if (result.status === "ok") {
     store.settings = { ...store.settings, scan_roots: roots };
     await refreshProjects();
+  } else {
+    console.error("Failed to save scan roots:", result.error.message);
+    store.projectError = `Could not save settings: ${result.error.message}`;
   }
 }
 

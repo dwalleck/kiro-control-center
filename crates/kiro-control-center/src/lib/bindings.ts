@@ -140,7 +140,7 @@ async saveScanRoots(roots: string[]) : Promise<Result<null, CommandError>> {
 /**
  * Discover Kiro projects by scanning configured root directories.
  * 
- * Scans each root 1-2 levels deep for directories containing `.kiro/`.
+ * Scans each root up to 2 levels deep for directories containing `.kiro/`.
  */
 async discoverProjects() : Promise<Result<DiscoveredProject[], CommandError>> {
     try {
@@ -182,7 +182,7 @@ async setActiveProject(path: string) : Promise<Result<ProjectInfo, CommandError>
  */
 export type CommandError = { message: string; error_type: ErrorType }
 /**
- * A discovered Kiro project.
+ * A discovered Kiro project found during directory scanning.
  */
 export type DiscoveredProject = { 
 /**
@@ -192,15 +192,7 @@ path: string;
 /**
  * Directory name (for display).
  */
-name: string; 
-/**
- * Whether `.kiro/` exists.
- */
-kiro_initialized: boolean; 
-/**
- * Number of installed skills (0 during discovery, loaded on demand).
- */
-skill_count: number }
+name: string }
 /**
  * Machine-readable error classification for frontend conditional logic.
  * 

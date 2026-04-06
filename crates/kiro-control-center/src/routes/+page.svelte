@@ -1,4 +1,5 @@
 <script lang="ts">
+  import { onMount } from "svelte";
   import { store, initialize } from "$lib/stores/project.svelte";
   import TabBar from "$lib/components/TabBar.svelte";
   import BrowseTab from "$lib/components/BrowseTab.svelte";
@@ -12,8 +13,9 @@
   let activeTab: string = $state("Browse");
   let showManageRoots = $state(false);
 
-  // Initialize on mount — loads settings, discovers projects, restores last project.
-  $effect(() => {
+  // Initialize once on mount. Uses onMount (not $effect) because initialize()
+  // is a one-shot async function that should not re-trigger on state changes.
+  onMount(() => {
     initialize();
   });
 </script>
