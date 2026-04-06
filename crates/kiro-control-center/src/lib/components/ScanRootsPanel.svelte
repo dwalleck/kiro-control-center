@@ -13,17 +13,17 @@
 
 <div class="fixed inset-0 z-50 flex items-center justify-center bg-black/50" onclick={onClose} role="none">
   <div
-    class="bg-white dark:bg-gray-800 rounded-lg shadow-xl w-full max-w-md mx-4 overflow-hidden"
+    class="bg-kiro-overlay rounded-lg shadow-xl w-full max-w-md mx-4 overflow-hidden"
     onclick={(e) => e.stopPropagation()}
     onkeydown={(e) => { if (e.key === 'Escape') onClose(); }}
     role="dialog"
     aria-label="Manage scan directories"
     tabindex="0"
   >
-    <div class="flex items-center justify-between px-4 py-3 border-b border-gray-200 dark:border-gray-700">
-      <h2 class="text-sm font-semibold text-gray-900 dark:text-gray-100">Scan Directories</h2>
+    <div class="flex items-center justify-between px-4 py-3 border-b border-kiro-muted">
+      <h2 class="text-sm font-semibold text-kiro-text">Scan Directories</h2>
       <button
-        class="text-gray-400 hover:text-gray-600 dark:hover:text-gray-300"
+        class="text-kiro-subtle hover:text-kiro-text-secondary"
         onclick={onClose}
         aria-label="Close dialog"
       >
@@ -37,10 +37,10 @@
       {#if (store.settings.scan_roots ?? []).length > 0}
         <ul class="space-y-2 mb-4">
           {#each store.settings.scan_roots ?? [] as root (root)}
-            <li class="flex items-center justify-between px-3 py-2 bg-gray-50 dark:bg-gray-700/50 rounded text-sm">
-              <span class="truncate text-gray-700 dark:text-gray-300">{root}</span>
+            <li class="flex items-center justify-between px-3 py-2 bg-kiro-overlay rounded text-sm">
+              <span class="truncate text-kiro-text-secondary">{root}</span>
               <button
-                class="ml-2 text-gray-400 hover:text-red-500 flex-shrink-0"
+                class="ml-2 text-kiro-subtle hover:text-kiro-error flex-shrink-0"
                 onclick={() => removeScanRoot(root)}
                 aria-label="Remove {root}"
               >
@@ -52,13 +52,13 @@
           {/each}
         </ul>
       {:else}
-        <p class="text-sm text-gray-500 dark:text-gray-400 mb-4">
+        <p class="text-sm text-kiro-subtle mb-4">
           No directories configured. Add a directory to discover Kiro projects.
         </p>
       {/if}
 
       <button
-        class="w-full px-4 py-2 rounded-lg border border-dashed border-gray-300 dark:border-gray-600 text-sm text-gray-600 dark:text-gray-400 hover:border-blue-400 hover:text-blue-500 transition-colors"
+        class="w-full px-4 py-2 rounded-lg border border-dashed border-kiro-muted text-sm text-kiro-text-secondary hover:border-kiro-accent-400 hover:text-kiro-accent-400 transition-colors"
         onclick={handleAddRoot}
       >
         + Add Directory

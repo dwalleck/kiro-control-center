@@ -38,7 +38,7 @@
 
 <div class="relative">
   <button
-    class="flex items-center gap-2 text-sm text-gray-700 dark:text-gray-300 hover:text-gray-900 dark:hover:text-gray-100 transition-colors"
+    class="flex items-center gap-2 text-sm text-kiro-text-secondary hover:text-kiro-text transition-colors"
     onclick={toggle}
   >
     <span class="truncate max-w-xs font-medium">
@@ -50,31 +50,31 @@
   </button>
 
   {#if isOpen}
-    <div class="absolute right-0 top-full mt-1 w-80 bg-white dark:bg-gray-800 rounded-lg shadow-lg border border-gray-200 dark:border-gray-700 z-50 overflow-hidden">
+    <div class="absolute right-0 top-full mt-1 w-80 bg-kiro-overlay rounded-lg shadow-lg border border-kiro-muted z-50 overflow-hidden">
       {#if store.discoveredProjects.length > 0}
         <div class="max-h-64 overflow-y-auto py-1">
           {#each store.discoveredProjects as project (project.path)}
             <button
-              class="w-full text-left px-4 py-2 hover:bg-gray-100 dark:hover:bg-gray-700 transition-colors
-                {project.path === store.projectPath ? 'bg-blue-50 dark:bg-blue-900/20' : ''}"
+              class="w-full text-left px-4 py-2 hover:bg-kiro-muted transition-colors
+                {project.path === store.projectPath ? 'bg-kiro-accent-900/20' : ''}"
               onclick={() => handleSelectProject(project.path)}
             >
-              <div class="text-sm font-medium text-gray-900 dark:text-gray-100">{project.name}</div>
-              <div class="text-xs text-gray-500 dark:text-gray-400 truncate">{project.path}</div>
+              <div class="text-sm font-medium text-kiro-text">{project.name}</div>
+              <div class="text-xs text-kiro-subtle truncate">{project.path}</div>
             </button>
           {/each}
         </div>
       {/if}
 
-      <div class="border-t border-gray-200 dark:border-gray-700 py-1">
+      <div class="border-t border-kiro-muted py-1">
         <button
-          class="w-full text-left px-4 py-2 text-sm text-gray-600 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-gray-700"
+          class="w-full text-left px-4 py-2 text-sm text-kiro-text-secondary hover:bg-kiro-muted"
           onclick={handleOpenOther}
         >
           Open Other...
         </button>
         <button
-          class="w-full text-left px-4 py-2 text-sm text-gray-600 dark:text-gray-400 hover:bg-gray-100 dark:hover:bg-gray-700"
+          class="w-full text-left px-4 py-2 text-sm text-kiro-text-secondary hover:bg-kiro-muted"
           onclick={handleManageRoots}
         >
           Manage Directories...
