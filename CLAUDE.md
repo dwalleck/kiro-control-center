@@ -31,10 +31,10 @@ cargo clippy --workspace -- -D warnings
 
 ## Architecture
 The tool reads Claude Code `marketplace.json` catalogs, discovers plugins and skills,
-and installs SKILL.md files into Kiro CLI projects at `.kiro/skills/`.
+and installs them into Kiro CLI projects at `.kiro/skills/`.
 
-Multi-file Claude Code skills (SKILL.md + companion .md files) are merged into a
-single SKILL.md since Kiro doesn't support deferred loading of companion files.
+Skill directories are copied wholesale (SKILL.md + `references/` companion files)
+so that Kiro's native lazy loading can resolve companion files on demand.
 
 ### Service Layer
 Marketplace operations (add/remove/update/list) live in `kiro-market-core::service::MarketplaceService`.
@@ -54,7 +54,6 @@ on Windows it uses directory junctions with copy fallback.
 ## Key Crate Dependencies
 - `gix` + system `git` CLI — git operations (gix for clone/open, system git for pull/checkout)
 - `clap` (derive) — CLI framework
-- `pulldown-cmark` — markdown parsing for skill merging
 - `serde` / `serde_json` / `serde_yaml` — JSON and YAML parsing
 - `colored` — terminal output
 - `dirs` — XDG path resolution

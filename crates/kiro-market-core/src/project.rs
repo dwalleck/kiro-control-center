@@ -61,8 +61,8 @@ fn copy_dir_recursive(src: &Path, dest: &Path) -> std::io::Result<()> {
     for entry in fs::read_dir(src)? {
         let entry = entry?;
         let target = dest.join(entry.file_name());
-        // Use fs::metadata (follows symlinks) instead of entry.file_type()
-        // (which does not follow symlinks on all platforms).
+        // Use fs::metadata (follows symlinks) so that symlinks are
+        // transparently treated as the file/directory they point to.
         let metadata = fs::metadata(entry.path()).map_err(|e| {
             std::io::Error::new(
                 e.kind(),
@@ -98,6 +98,8 @@ fn copy_dir_recursive(src: &Path, dest: &Path) -> std::io::Result<()> {
 ///     skills/
 ///       <skill-name>/
 ///         SKILL.md
+///         references/    (optional companion files)
+///           *.md
 /// ```
 #[derive(Debug, Clone)]
 pub struct KiroProject {
@@ -188,9 +190,10 @@ impl KiroProject {
     /// Install a skill by copying an entire source directory into the project.
     ///
     /// Recursively copies `source_dir` to `.kiro/skills/<name>/`, preserving
-    /// companion files (e.g. `references/`) for Kiro's lazy loading. The copy
-    /// is atomic: files are staged in a temp directory, then renamed into place
-    /// so a crash cannot leave a partially installed skill.
+    /// companion files (e.g. `references/`) for Kiro's lazy loading. Files
+    /// are staged in a temp directory, then renamed into place so a crash
+    /// during the copy phase cannot leave a partially installed skill
+    /// directory. The tracking file is updated separately after the rename.
     ///
     /// # Errors
     ///
@@ -217,8 +220,9 @@ impl KiroProject {
 
     /// Install a skill by copying a source directory, overwriting any existing installation.
     ///
-    /// The copy is atomic: new content is staged in a temp directory first, then
-    /// the old directory is removed and the temp is renamed into place.
+    /// New content is staged in a temp directory first, then the old directory
+    /// is removed and the temp is renamed into place. The tracking file is
+    /// updated separately after the rename.
     ///
     /// # Errors
     ///
@@ -235,11 +239,14 @@ impl KiroProject {
 
     // -- internal helpers --------------------------------------------------
 
-    /// Copy a source skill directory atomically and update tracking.
+    /// Copy a source skill directory and update tracking.
     ///
     /// Copies to a staging directory (`_installing-<name>`) first, then
-    /// renames into the final location. For force installs, the old directory
-    /// is removed after the staging copy succeeds but before the rename.
+    /// renames into the final location so a crash during the copy phase
+    /// cannot leave a partially installed skill directory. The tracking
+    /// file is updated separately after the rename. For force installs,
+    /// the old directory is removed after staging succeeds but before
+    /// the rename.
     fn write_skill_dir(
         &self,
         name: &str,
@@ -262,7 +269,17 @@ impl KiroProject {
         fs::create_dir_all(self.skills_dir())?;
 
         // Stage the copy into the temp directory.
-        copy_dir_recursive(source_dir, &staging_dir)?;
+        if let Err(e) = copy_dir_recursive(source_dir, &staging_dir) {
+            // Clean up the partial staging directory.
+            if let Err(cleanup_err) = fs::remove_dir_all(&staging_dir) {
+                debug!(
+                    path = %staging_dir.display(),
+                    error = %cleanup_err,
+                    "failed to clean up partial staging directory"
+                );
+            }
+            return Err(e.into());
+        }
 
         // For force installs, remove the old directory now that the new
         // content is safely staged.
@@ -271,12 +288,33 @@ impl KiroProject {
             fs::remove_dir_all(&dir)?;
         }
 
-        // Atomic rename from staging to final location.
+        // Rename staging to final location.
         fs::rename(&staging_dir, &dir)?;
 
-        let mut installed = self.load_installed()?;
-        installed.skills.insert(name.to_owned(), meta);
-        self.write_tracking(&installed)?;
+        // Update the tracking file. If this fails, roll back the rename
+        // to keep the filesystem and tracking file consistent.
+        let tracking_result = self
+            .load_installed()
+            .and_then(|mut installed| {
+                installed.skills.insert(name.to_owned(), meta);
+                self.write_tracking(&installed)
+            });
+
+        if let Err(e) = tracking_result {
+            debug!(
+                name,
+                error = %e,
+                "tracking update failed after rename, rolling back"
+            );
+            if let Err(rollback_err) = fs::remove_dir_all(&dir) {
+                debug!(
+                    path = %dir.display(),
+                    error = %rollback_err,
+                    "failed to roll back skill directory after tracking failure"
+                );
+            }
+            return Err(e);
+        }
 
         debug!(name, "skill installed from directory");
         Ok(())
@@ -575,6 +613,91 @@ mod tests {
         let skill_md = project.skill_dir("simple").join("SKILL.md");
         assert!(skill_md.exists());
         assert!(!project.skill_dir("simple").join("references").exists());
+    }
+
+    #[test]
+    fn install_skill_from_dir_force_rejects_path_traversal() {
+        let (_dir, project) = temp_project();
+        let src = tempfile::tempdir().expect("tempdir");
+        fs::write(
+            src.path().join("SKILL.md"),
+            "---\nname: evil\ndescription: Evil\n---\n",
+        )
+        .expect("write");
+
+        let err = project
+            .install_skill_from_dir_force("../escape", src.path(), sample_meta())
+            .expect_err("should reject path traversal");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("invalid name"),
+            "expected 'invalid name', got: {msg}"
+        );
+    }
+
+    #[test]
+    fn install_skill_from_dir_recovers_from_leftover_staging_dir() {
+        let (_dir, project) = temp_project();
+
+        // Simulate a previous crash that left a staging directory behind.
+        let staging_dir = project.skills_dir().join("_installing-recovered");
+        fs::create_dir_all(&staging_dir).expect("create staging dir");
+        fs::write(staging_dir.join("SKILL.md"), "stale content").expect("write stale");
+
+        // A fresh install of the same skill should clean up and succeed.
+        let src = tempfile::tempdir().expect("tempdir");
+        fs::write(
+            src.path().join("SKILL.md"),
+            "---\nname: recovered\ndescription: Fresh\n---\nFresh content.\n",
+        )
+        .expect("write");
+
+        project
+            .install_skill_from_dir("recovered", src.path(), sample_meta())
+            .expect("install should succeed despite leftover staging dir");
+
+        let content =
+            fs::read_to_string(project.skill_dir("recovered").join("SKILL.md")).expect("read");
+        assert!(content.contains("Fresh content."));
+        assert!(!staging_dir.exists(), "staging dir should be cleaned up");
+    }
+
+    #[test]
+    fn install_skill_from_dir_force_removes_stale_files_from_old_version() {
+        let (_dir, project) = temp_project();
+        let src1 = tempfile::tempdir().expect("tempdir");
+        let src2 = tempfile::tempdir().expect("tempdir");
+
+        // v1: SKILL.md + references/old.md
+        fs::write(
+            src1.path().join("SKILL.md"),
+            "---\nname: s\ndescription: v1\n---\n",
+        )
+        .expect("write");
+        fs::create_dir_all(src1.path().join("references")).expect("mkdir");
+        fs::write(src1.path().join("references").join("old.md"), "old ref").expect("write");
+
+        project
+            .install_skill_from_dir("s", src1.path(), sample_meta())
+            .expect("first install");
+        assert!(project.skill_dir("s").join("references").join("old.md").exists());
+
+        // v2: SKILL.md only, no references/
+        fs::write(
+            src2.path().join("SKILL.md"),
+            "---\nname: s\ndescription: v2\n---\n",
+        )
+        .expect("write");
+
+        project
+            .install_skill_from_dir_force("s", src2.path(), sample_meta())
+            .expect("force install");
+
+        // Old reference file should be gone — full directory replacement.
+        assert!(
+            !project.skill_dir("s").join("references").exists(),
+            "stale references/ dir from v1 should be gone after force install"
+        );
     }
 
     // -----------------------------------------------------------------------
