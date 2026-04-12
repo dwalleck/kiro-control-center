@@ -47,7 +47,9 @@
           </svg>
         </button>
       </div>
-      <ProjectDropdown onManageRoots={() => (showManageRoots = true)} />
+      {#if !showSettings}
+        <ProjectDropdown onManageRoots={() => (showManageRoots = true)} />
+      {/if}
     </header>
 
     {#if showSettings}
