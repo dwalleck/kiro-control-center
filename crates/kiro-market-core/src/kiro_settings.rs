@@ -60,7 +60,8 @@ pub enum SettingType {
 
 impl SettingType {
     /// Returns the wire-format type name used in [`SettingEntry::value_type`].
-    fn type_name(&self) -> &'static str {
+    #[must_use]
+    pub fn type_name(&self) -> &'static str {
         match self {
             Self::Bool => "bool",
             Self::String => "string",
@@ -76,6 +77,20 @@ impl SettingType {
         match self {
             Self::Enum(opts) => opts.iter().map(|s| (*s).to_owned()).collect(),
             _ => vec![],
+        }
+    }
+
+    /// Check if a JSON value is compatible with this setting type.
+    #[must_use]
+    pub fn is_compatible_value(&self, value: &JsonValue) -> bool {
+        match self {
+            Self::Bool => value.is_boolean(),
+            Self::String | Self::Char => value.is_string(),
+            Self::Number => value.is_number(),
+            Self::StringArray => value
+                .as_array()
+                .is_some_and(|arr| arr.iter().all(JsonValue::is_string)),
+            Self::Enum(opts) => value.as_str().is_some_and(|s| opts.contains(&s)),
         }
     }
 }
@@ -277,6 +292,8 @@ pub fn registry() -> Vec<SettingDef> {
         // ----------------------------------------------------------------
         // Knowledge Base
         // ----------------------------------------------------------------
+        // Key lives under the chat namespace in the upstream CLI but
+        // logically belongs to knowledge configuration.
         SettingDef {
             key: "chat.enableKnowledge",
             label: "Enable Knowledge",
@@ -504,7 +521,10 @@ pub fn get_nested<'a>(value: &'a JsonValue, path: &str) -> Option<&'a JsonValue>
 ///
 /// # Panics
 ///
-/// Panics if `path` is an empty string (i.e. contains no `.`-separated segments).
+/// The internal `expect` calls are defensive assertions that cannot be reached
+/// in practice: `str::split('.')` always produces at least one element, so
+/// `split_last` never returns `None`, and the object-mutation invariants are
+/// upheld by the preceding `if !current.is_object()` guards.
 pub fn set_nested(value: &mut JsonValue, path: &str, val: JsonValue) {
     let segments: Vec<&str> = path.split('.').collect();
     let (last, parents) = segments.split_last().expect("path must not be empty");
@@ -569,6 +589,12 @@ fn remove_nested_impl(value: &mut JsonValue, segments: &[&str]) -> bool {
 /// `current_value` is `None` when the key is absent from `json` (meaning the
 /// setting is at its default). `default_value` is `None` when no default is
 /// known for that setting.
+///
+/// # Panics
+///
+/// Cannot panic in practice: `SettingCategory` derives `Serialize` and always
+/// serializes to a `snake_case` JSON string, so both `expect` calls on the
+/// serialization result are unreachable.
 #[must_use]
 pub fn resolve_settings(json: &JsonValue) -> Vec<SettingEntry> {
     registry()
@@ -577,9 +603,10 @@ pub fn resolve_settings(json: &JsonValue) -> Vec<SettingEntry> {
             let current_value = get_nested(json, def.key).cloned();
 
             let category_str = serde_json::to_value(def.category)
-                .ok()
-                .and_then(|v| v.as_str().map(std::borrow::ToOwned::to_owned))
-                .unwrap_or_default();
+                .expect("SettingCategory serialization is infallible")
+                .as_str()
+                .expect("SettingCategory serializes to a JSON string")
+                .to_owned();
 
             SettingEntry {
                 key: def.key.to_owned(),
@@ -603,38 +630,63 @@ pub fn resolve_settings(json: &JsonValue) -> Vec<SettingEntry> {
 /// Path to the CLI settings file relative to the Kiro home directory.
 const SETTINGS_FILE: &str = "settings/cli.json";
 
+/// Errors from loading the Kiro CLI settings file.
+#[derive(Debug)]
+pub enum LoadSettingsError {
+    /// The file does not exist — use empty defaults.
+    NotFound,
+    /// An I/O error occurred reading the file.
+    Io(std::io::Error),
+    /// The file exists but contains invalid JSON.
+    InvalidJson(serde_json::Error),
+}
+
+impl std::fmt::Display for LoadSettingsError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::NotFound => write!(f, "settings file not found"),
+            Self::Io(e) => write!(f, "failed to read settings file: {e}"),
+            Self::InvalidJson(e) => write!(f, "settings file contains invalid JSON: {e}"),
+        }
+    }
+}
+
 /// Load `settings/cli.json` from the given Kiro home directory.
 ///
-/// Returns an empty JSON object (`{}`) if the file does not exist or if its
-/// contents cannot be parsed as JSON.
-#[must_use]
-pub fn load_kiro_settings_from(kiro_dir: &Path) -> JsonValue {
+/// Returns `Err(LoadSettingsError::NotFound)` if the file does not exist,
+/// `Err(LoadSettingsError::InvalidJson)` if the file contains invalid JSON,
+/// or `Err(LoadSettingsError::Io)` for other I/O errors.
+///
+/// # Errors
+///
+/// Returns a [`LoadSettingsError`] if the file cannot be read or parsed.
+pub fn load_kiro_settings_from(kiro_dir: &Path) -> Result<JsonValue, LoadSettingsError> {
     let path = kiro_dir.join(SETTINGS_FILE);
     debug!(path = %path.display(), "loading Kiro settings");
 
     match std::fs::read_to_string(&path) {
         Ok(contents) => match serde_json::from_str::<JsonValue>(&contents) {
-            Ok(json) => json,
+            Ok(json) => Ok(json),
             Err(e) => {
                 warn!(
                     path = %path.display(),
                     error = %e,
-                    "settings file contains invalid JSON, using empty config"
+                    "settings file contains invalid JSON"
                 );
-                serde_json::json!({})
+                Err(LoadSettingsError::InvalidJson(e))
             }
         },
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
-            debug!(path = %path.display(), "settings file not found, using empty config");
-            serde_json::json!({})
+            debug!(path = %path.display(), "settings file not found");
+            Err(LoadSettingsError::NotFound)
         }
         Err(e) => {
             warn!(
                 path = %path.display(),
                 error = %e,
-                "could not read settings file, using empty config"
+                "could not read settings file"
             );
-            serde_json::json!({})
+            Err(LoadSettingsError::Io(e))
         }
     }
 }
@@ -797,7 +849,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Task 2 — JSON path helpers
+    // JSON path helpers
     // -----------------------------------------------------------------------
 
     #[test]
@@ -820,6 +872,15 @@ mod tests {
         let v = serde_json::json!({"chat": {}});
         assert_eq!(get_nested(&v, "chat.defaultModel"), None);
         assert_eq!(get_nested(&v, "nonexistent"), None);
+    }
+
+    #[test]
+    fn get_nested_finds_three_segment_path() {
+        let json: JsonValue = serde_json::json!({"chat": {"greeting": {"enabled": true}}});
+        assert_eq!(
+            get_nested(&json, "chat.greeting.enabled"),
+            Some(&JsonValue::Bool(true))
+        );
     }
 
     #[test]
@@ -847,6 +908,30 @@ mod tests {
     }
 
     #[test]
+    fn set_nested_creates_three_segment_path() {
+        let mut json: JsonValue = serde_json::json!({});
+        set_nested(&mut json, "chat.greeting.enabled", JsonValue::Bool(true));
+        assert_eq!(
+            json,
+            serde_json::json!({"chat": {"greeting": {"enabled": true}}})
+        );
+    }
+
+    #[test]
+    fn set_nested_replaces_non_object_intermediate() {
+        let mut json: JsonValue = serde_json::json!({"chat": "not-an-object"});
+        set_nested(
+            &mut json,
+            "chat.defaultModel",
+            JsonValue::String("opus".into()),
+        );
+        assert_eq!(
+            get_nested(&json, "chat.defaultModel"),
+            Some(&JsonValue::String("opus".into()))
+        );
+    }
+
+    #[test]
     fn remove_nested_deletes_key() {
         let mut v =
             serde_json::json!({"chat": {"defaultModel": "claude-sonnet-4-5", "temperature": 0.7}});
@@ -865,6 +950,13 @@ mod tests {
         remove_nested(&mut v, "chat.defaultModel");
         // chat object should have been pruned since it became empty
         assert_eq!(get_nested(&v, "chat"), None);
+    }
+
+    #[test]
+    fn remove_nested_cleans_all_empty_ancestors() {
+        let mut json: JsonValue = serde_json::json!({"chat": {"greeting": {"enabled": true}}});
+        remove_nested(&mut json, "chat.greeting.enabled");
+        assert_eq!(json, serde_json::json!({}));
     }
 
     #[test]
@@ -936,14 +1028,14 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // Task 3 — Kiro settings file I/O
+    // Kiro settings file I/O
     // -----------------------------------------------------------------------
 
     #[test]
     fn load_kiro_settings_returns_empty_when_no_file() {
         let dir = TempDir::new().unwrap();
         let result = load_kiro_settings_from(dir.path());
-        assert_eq!(result, serde_json::json!({}));
+        assert!(matches!(result, Err(LoadSettingsError::NotFound)));
     }
 
     #[test]
@@ -958,7 +1050,7 @@ mod tests {
 
         save_kiro_settings_to(dir.path(), &settings).expect("save should succeed");
 
-        let loaded = load_kiro_settings_from(dir.path());
+        let loaded = load_kiro_settings_from(dir.path()).unwrap();
         assert_eq!(loaded, settings);
     }
 
@@ -971,7 +1063,7 @@ mod tests {
 
         save_kiro_settings_to(&nested, &settings).expect("save should create parent dirs");
 
-        let loaded = load_kiro_settings_from(&nested);
+        let loaded = load_kiro_settings_from(&nested).unwrap();
         assert_eq!(loaded, settings);
     }
 
@@ -983,7 +1075,7 @@ mod tests {
         std::fs::write(settings_dir.join("cli.json"), b"{ this is not valid json }").unwrap();
 
         let result = load_kiro_settings_from(dir.path());
-        assert_eq!(result, serde_json::json!({}));
+        assert!(matches!(result, Err(LoadSettingsError::InvalidJson(_))));
     }
 
     #[test]
@@ -995,7 +1087,7 @@ mod tests {
         });
 
         save_kiro_settings_to(dir.path(), &settings).unwrap();
-        let loaded = load_kiro_settings_from(dir.path());
+        let loaded = load_kiro_settings_from(dir.path()).unwrap();
 
         assert_eq!(
             loaded["unknownFutureKey"]["nestedValue"],
@@ -1005,5 +1097,19 @@ mod tests {
             loaded["chat"]["defaultModel"],
             serde_json::json!("claude-sonnet-4-5")
         );
+    }
+
+    #[test]
+    fn is_compatible_value_validates_types() {
+        assert!(SettingType::Bool.is_compatible_value(&JsonValue::Bool(true)));
+        assert!(!SettingType::Bool.is_compatible_value(&JsonValue::String("yes".into())));
+        assert!(SettingType::Number.is_compatible_value(&serde_json::json!(42)));
+        assert!(!SettingType::Number.is_compatible_value(&JsonValue::Bool(true)));
+        assert!(SettingType::String.is_compatible_value(&JsonValue::String("hello".into())));
+        assert!(SettingType::StringArray.is_compatible_value(&serde_json::json!(["a", "b"])));
+        assert!(!SettingType::StringArray.is_compatible_value(&serde_json::json!([1, 2])));
+        let enum_type = SettingType::Enum(vec!["a", "b"]);
+        assert!(enum_type.is_compatible_value(&JsonValue::String("a".into())));
+        assert!(!enum_type.is_compatible_value(&JsonValue::String("c".into())));
     }
 }

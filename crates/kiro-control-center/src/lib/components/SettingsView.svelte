@@ -68,13 +68,20 @@
   }
 
   onMount(async () => {
-    const result = await commands.getKiroSettings();
-    if (result.status === "ok") {
-      allEntries = result.data;
-    } else {
-      loadError = result.error.message;
+    try {
+      const result = await commands.getKiroSettings();
+      if (result.status === "ok") {
+        allEntries = result.data;
+      } else {
+        loadError = result.error.message;
+      }
+    } catch (e) {
+      loadError = e instanceof Error
+        ? `Failed to load settings: ${e.message}`
+        : "Failed to load settings due to an unexpected error.";
+    } finally {
+      loading = false;
     }
-    loading = false;
   });
 </script>
 

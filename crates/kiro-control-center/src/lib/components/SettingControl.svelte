@@ -15,27 +15,43 @@
   let error: string | null = $state(null);
 
   async function handleSet(value: JsonValue) {
+    if (saving) return;
     saving = true;
     error = null;
-    const result = await commands.setKiroSetting(entry.key, value);
-    if (result.status === "ok") {
-      onUpdate(result.data);
-    } else {
-      error = result.error.message;
+    try {
+      const result = await commands.setKiroSetting(entry.key, value);
+      if (result.status === "ok") {
+        onUpdate(result.data);
+      } else {
+        error = result.error.message;
+      }
+    } catch (e) {
+      error = e instanceof Error
+        ? `Failed to save: ${e.message}`
+        : "Failed to save setting.";
+    } finally {
+      saving = false;
     }
-    saving = false;
   }
 
   async function handleReset() {
+    if (saving) return;
     saving = true;
     error = null;
-    const result = await commands.resetKiroSetting(entry.key);
-    if (result.status === "ok") {
-      onUpdate({ ...entry, current_value: null });
-    } else {
-      error = result.error.message;
+    try {
+      const result = await commands.resetKiroSetting(entry.key);
+      if (result.status === "ok") {
+        onUpdate({ ...entry, current_value: null });
+      } else {
+        error = result.error.message;
+      }
+    } catch (e) {
+      error = e instanceof Error
+        ? `Failed to reset: ${e.message}`
+        : "Failed to reset setting.";
+    } finally {
+      saving = false;
     }
-    saving = false;
   }
 
   function handleStringChange(e: Event) {
@@ -45,10 +61,16 @@
 
   function handleNumberChange(e: Event) {
     const target = e.target as HTMLInputElement;
-    const num = Number(target.value);
-    if (!Number.isNaN(num) && target.value !== "") {
-      handleSet(num);
+    if (target.value === "") {
+      handleReset();
+      return;
     }
+    const num = Number(target.value);
+    if (Number.isNaN(num)) {
+      error = "Invalid number";
+      return;
+    }
+    handleSet(num);
   }
 
   function handleCharChange(e: Event) {
@@ -130,7 +152,8 @@
     {:else if entry.value_type === "number"}
       <input
         type="number"
-        value={typeof displayValue === "number" ? displayValue : 0}
+        value={typeof displayValue === "number" ? displayValue : ""}
+        placeholder={entry.default_value !== null ? String(entry.default_value) : "not set"}
         onchange={handleNumberChange}
         class="w-24 px-2.5 py-1.5 text-sm rounded-md border border-kiro-muted bg-kiro-overlay text-kiro-text focus:outline-none focus:ring-2 focus:ring-kiro-accent-500 focus:border-transparent"
       />
