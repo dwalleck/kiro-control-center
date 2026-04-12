@@ -56,7 +56,6 @@ pub enum SettingType {
 
 impl SettingType {
     /// Returns the wire-format type name used in [`SettingEntry::value_type`].
-    #[allow(dead_code)]
     fn type_name(&self) -> &'static str {
         match self {
             Self::Bool => "bool",
@@ -69,7 +68,6 @@ impl SettingType {
     }
 
     /// Returns enum options if this is an `Enum` variant, otherwise `None`.
-    #[allow(dead_code)]
     fn enum_options(&self) -> Option<Vec<String>> {
         match self {
             Self::Enum(opts) => Some(opts.iter().map(|s| (*s).to_owned()).collect()),
@@ -489,12 +487,132 @@ pub fn registry() -> Vec<SettingDef> {
 }
 
 // ---------------------------------------------------------------------------
-// Tests — Task 1
+// JSON path helpers
+// ---------------------------------------------------------------------------
+
+/// Traverse a nested JSON object following a dotted key path.
+///
+/// Returns `None` if any segment of the path is absent or if an intermediate
+/// value is not an object.
+///
+/// # Examples
+/// ```
+/// # use serde_json::json;
+/// # use kiro_market_core::kiro_settings::get_nested;
+/// let v = json!({"chat": {"defaultModel": "claude-sonnet-4-5"}});
+/// assert_eq!(get_nested(&v, "chat.defaultModel"), Some(&json!("claude-sonnet-4-5")));
+/// assert_eq!(get_nested(&v, "chat.missing"), None);
+/// ```
+#[must_use]
+pub fn get_nested<'a>(value: &'a JsonValue, path: &str) -> Option<&'a JsonValue> {
+    let mut current = value;
+    for segment in path.split('.') {
+        current = current.as_object()?.get(segment)?;
+    }
+    Some(current)
+}
+
+/// Write a value at a dotted key path, creating intermediate objects as needed.
+///
+/// If any intermediate node already exists but is not an object it is replaced
+/// with an empty object before descending.
+///
+/// # Panics
+///
+/// Panics if `path` is an empty string (i.e. contains no `.`-separated segments).
+pub fn set_nested(value: &mut JsonValue, path: &str, val: JsonValue) {
+    let segments: Vec<&str> = path.split('.').collect();
+    let (last, parents) = segments.split_last().expect("path must not be empty");
+
+    let mut current = value;
+    for &segment in parents {
+        if !current.is_object() {
+            *current = serde_json::json!({});
+        }
+        let obj = current.as_object_mut().expect("ensured above");
+        if !obj.contains_key(segment) {
+            obj.insert(segment.to_owned(), serde_json::json!({}));
+        }
+        current = obj.get_mut(segment).expect("just inserted");
+    }
+
+    if !current.is_object() {
+        *current = serde_json::json!({});
+    }
+    current
+        .as_object_mut()
+        .expect("ensured above")
+        .insert((*last).to_owned(), val);
+}
+
+/// Remove the value at a dotted key path, cleaning up empty parent objects.
+///
+/// If the path does not exist this is a no-op.
+pub fn remove_nested(value: &mut JsonValue, path: &str) {
+    let segments: Vec<&str> = path.split('.').collect();
+    remove_nested_impl(value, &segments);
+}
+
+/// Recursive implementation for [`remove_nested`].
+///
+/// Returns `true` if the caller should remove the current object from its
+/// parent (i.e., the object became empty after the removal).
+fn remove_nested_impl(value: &mut JsonValue, segments: &[&str]) -> bool {
+    let Some((&first, rest)) = segments.split_first() else {
+        return false;
+    };
+
+    let Some(obj) = value.as_object_mut() else {
+        return false;
+    };
+
+    if rest.is_empty() {
+        obj.remove(first);
+    } else if let Some(child) = obj.get_mut(first) {
+        let should_remove = remove_nested_impl(child, rest);
+        if should_remove {
+            obj.remove(first);
+        }
+    }
+
+    obj.is_empty()
+}
+
+/// Resolve all registry settings against a loaded JSON config, returning a
+/// [`SettingEntry`] for each definition.
+///
+/// Settings absent from `json` fall back to their `default` values.
+#[must_use]
+pub fn resolve_settings(json: &JsonValue) -> Vec<SettingEntry> {
+    registry()
+        .into_iter()
+        .map(|def| {
+            let current_value = get_nested(json, def.key)
+                .cloned()
+                .unwrap_or_else(|| def.default.clone());
+
+            SettingEntry {
+                key: def.key.to_owned(),
+                label: def.label.to_owned(),
+                description: def.description.to_owned(),
+                category: def.category,
+                category_label: def.category.label().to_owned(),
+                value_type: def.value_type.type_name().to_owned(),
+                enum_options: def.value_type.enum_options(),
+                default_value: def.default,
+                current_value,
+            }
+        })
+        .collect()
+}
+
+// ---------------------------------------------------------------------------
+// Tests
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashSet;
+    use std::collections::{HashMap, HashSet};
 
     use super::*;
 
@@ -605,6 +723,135 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // Task 2 — JSON path helpers
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn get_nested_finds_top_level_key() {
+        let v = serde_json::json!({"foo": 42});
+        assert_eq!(get_nested(&v, "foo"), Some(&serde_json::json!(42)));
+    }
+
+    #[test]
+    fn get_nested_finds_dotted_path() {
+        let v = serde_json::json!({"chat": {"defaultModel": "claude-sonnet-4-5"}});
+        assert_eq!(
+            get_nested(&v, "chat.defaultModel"),
+            Some(&serde_json::json!("claude-sonnet-4-5"))
+        );
+    }
+
+    #[test]
+    fn get_nested_returns_none_for_missing() {
+        let v = serde_json::json!({"chat": {}});
+        assert_eq!(get_nested(&v, "chat.defaultModel"), None);
+        assert_eq!(get_nested(&v, "nonexistent"), None);
+    }
+
+    #[test]
+    fn set_nested_creates_intermediate_objects() {
+        let mut v = serde_json::json!({});
+        set_nested(
+            &mut v,
+            "chat.defaultModel",
+            serde_json::json!("claude-opus-4"),
+        );
+        assert_eq!(
+            get_nested(&v, "chat.defaultModel"),
+            Some(&serde_json::json!("claude-opus-4"))
+        );
+    }
+
+    #[test]
+    fn set_nested_overwrites_existing() {
+        let mut v = serde_json::json!({"chat": {"defaultModel": "old"}});
+        set_nested(&mut v, "chat.defaultModel", serde_json::json!("new"));
+        assert_eq!(
+            get_nested(&v, "chat.defaultModel"),
+            Some(&serde_json::json!("new"))
+        );
+    }
+
+    #[test]
+    fn remove_nested_deletes_key() {
+        let mut v =
+            serde_json::json!({"chat": {"defaultModel": "claude-sonnet-4-5", "temperature": 0.7}});
+        remove_nested(&mut v, "chat.defaultModel");
+        assert_eq!(get_nested(&v, "chat.defaultModel"), None);
+        // sibling should still exist
+        assert_eq!(
+            get_nested(&v, "chat.temperature"),
+            Some(&serde_json::json!(0.7))
+        );
+    }
+
+    #[test]
+    fn remove_nested_cleans_empty_parents() {
+        let mut v = serde_json::json!({"chat": {"defaultModel": "claude-sonnet-4-5"}});
+        remove_nested(&mut v, "chat.defaultModel");
+        // chat object should have been pruned since it became empty
+        assert_eq!(get_nested(&v, "chat"), None);
+    }
+
+    #[test]
+    fn remove_nested_noop_for_missing() {
+        let mut v = serde_json::json!({"chat": {}});
+        // should not panic
+        remove_nested(&mut v, "chat.doesNotExist");
+        remove_nested(&mut v, "completely.missing.path");
+    }
+
+    #[test]
+    fn resolve_settings_uses_defaults_when_no_file() {
+        let empty = serde_json::json!({});
+        let entries = resolve_settings(&empty);
+
+        assert!(!entries.is_empty());
+
+        for entry in &entries {
+            assert_eq!(
+                entry.current_value, entry.default_value,
+                "key '{}' should use default when config is empty",
+                entry.key
+            );
+        }
+    }
+
+    #[test]
+    fn resolve_settings_picks_up_user_values() {
+        let config = serde_json::json!({
+            "chat": {
+                "defaultModel": "claude-opus-4"
+            }
+        });
+        let entries = resolve_settings(&config);
+
+        let model_entry = entries
+            .iter()
+            .find(|e| e.key == "chat.defaultModel")
+            .expect("chat.defaultModel must be in registry");
+
+        assert_eq!(
+            model_entry.current_value,
+            serde_json::json!("claude-opus-4")
+        );
+    }
+
+    #[test]
+    fn resolve_settings_includes_category_label() {
+        let entries = resolve_settings(&serde_json::json!({}));
+        let mut labels_by_category: HashMap<String, String> = HashMap::new();
+        for entry in &entries {
+            labels_by_category
+                .entry(format!("{:?}", entry.category))
+                .or_insert_with(|| entry.category_label.clone());
+        }
+        for label in labels_by_category.values() {
+            assert!(!label.is_empty(), "category_label must not be empty");
         }
     }
 }
