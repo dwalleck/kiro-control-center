@@ -47,6 +47,10 @@ pub async fn get_kiro_settings() -> Result<Vec<SettingEntry>, CommandError>
 #[allow(clippy::unused_async)]
 pub async fn set_kiro_setting(key: String, value: JsonValue) -> Result<SettingEntry, CommandError>
 {
+    if key.is_empty() {
+        return Err(CommandError::new("setting key must not be empty", ErrorType::Validation));
+    }
+
     let reg = registry();
     if !reg.iter().any(|def| def.key == key)
     {

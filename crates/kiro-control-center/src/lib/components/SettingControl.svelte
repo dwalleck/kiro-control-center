@@ -11,19 +11,31 @@
   let isModified = $derived(entry.current_value !== null);
 
   let chipInput = $state("");
+  let saving = $state(false);
+  let error: string | null = $state(null);
 
   async function handleSet(value: JsonValue) {
+    saving = true;
+    error = null;
     const result = await commands.setKiroSetting(entry.key, value);
     if (result.status === "ok") {
       onUpdate(result.data);
+    } else {
+      error = result.error.message;
     }
+    saving = false;
   }
 
   async function handleReset() {
+    saving = true;
+    error = null;
     const result = await commands.resetKiroSetting(entry.key);
     if (result.status === "ok") {
       onUpdate({ ...entry, current_value: null });
+    } else {
+      error = result.error.message;
     }
+    saving = false;
   }
 
   function handleStringChange(e: Event) {
@@ -33,7 +45,10 @@
 
   function handleNumberChange(e: Event) {
     const target = e.target as HTMLInputElement;
-    handleSet(Number(target.value));
+    const num = Number(target.value);
+    if (!Number.isNaN(num) && target.value !== "") {
+      handleSet(num);
+    }
   }
 
   function handleCharChange(e: Event) {
@@ -80,6 +95,9 @@
     </div>
     <p class="mt-0.5 text-sm text-kiro-text-secondary">{entry.description}</p>
     <p class="mt-0.5 font-mono text-[10px] text-kiro-subtle">{entry.key}</p>
+    {#if error}
+      <p class="mt-1 text-xs text-kiro-error">{error}</p>
+    {/if}
   </div>
 
   <!-- Right: editor + reset -->
@@ -160,6 +178,7 @@
           <button
             type="button"
             onclick={handleAddChip}
+            aria-label="Add item to {entry.label}"
             class="px-2 py-1 text-xs rounded-md bg-kiro-overlay border border-kiro-muted text-kiro-text-secondary hover:bg-kiro-muted transition-colors"
           >
             +
