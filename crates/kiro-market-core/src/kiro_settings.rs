@@ -77,7 +77,8 @@ impl SettingType {
     pub fn is_compatible_value(&self, value: &JsonValue) -> bool {
         match self {
             Self::Bool => value.is_boolean(),
-            Self::String | Self::Char => value.is_string(),
+            Self::String => value.is_string(),
+            Self::Char => value.as_str().is_some_and(|s| s.chars().count() == 1),
             Self::Number => value.is_number(),
             Self::StringArray => value
                 .as_array()
@@ -159,343 +160,348 @@ pub struct SettingEntry {
 
 /// Returns the complete list of known Kiro CLI settings definitions.
 ///
-/// The returned `Vec` is ordered: categories are grouped and within each
-/// category settings appear in a logical sequence.
+/// The returned slice is ordered: categories are grouped and within each
+/// category settings appear in a logical sequence. The registry is initialized
+/// once and reused on subsequent calls.
 #[must_use]
 #[allow(clippy::too_many_lines)]
-pub fn registry() -> Vec<SettingDef> {
-    vec![
-        // ----------------------------------------------------------------
-        // Telemetry & Privacy
-        // ----------------------------------------------------------------
-        SettingDef {
-            key: "telemetry.enabled",
-            label: "Enable Telemetry",
-            description: "Enable or disable telemetry collection",
-            category: SettingCategory::Telemetry,
-            value_type: SettingType::Bool,
-            default: Some(JsonValue::Bool(true)),
-        },
-        SettingDef {
-            key: "telemetryClientId",
-            label: "Telemetry Client ID",
-            description: "Client identifier for telemetry",
-            category: SettingCategory::Telemetry,
-            value_type: SettingType::String,
-            default: None,
-        },
-        // ----------------------------------------------------------------
-        // Chat Interface
-        // ----------------------------------------------------------------
-        SettingDef {
-            key: "chat.defaultModel",
-            label: "Default Model",
-            description: "Default AI model for conversations",
-            category: SettingCategory::Chat,
-            value_type: SettingType::String,
-            default: None,
-        },
-        SettingDef {
-            key: "chat.defaultAgent",
-            label: "Default Agent",
-            description: "Default agent configuration",
-            category: SettingCategory::Chat,
-            value_type: SettingType::String,
-            default: None,
-        },
-        SettingDef {
-            key: "chat.diffTool",
-            label: "Diff Tool",
-            description: "External diff tool for viewing code changes",
-            category: SettingCategory::Chat,
-            value_type: SettingType::String,
-            default: None,
-        },
-        SettingDef {
-            key: "chat.greeting.enabled",
-            label: "Show Greeting",
-            description: "Show greeting message on chat start",
-            category: SettingCategory::Chat,
-            value_type: SettingType::Bool,
-            default: Some(JsonValue::Bool(true)),
-        },
-        SettingDef {
-            key: "chat.editMode",
-            label: "Edit Mode",
-            description: "Enable edit mode for chat interface",
-            category: SettingCategory::Chat,
-            value_type: SettingType::Bool,
-            default: None,
-        },
-        SettingDef {
-            key: "chat.enableNotifications",
-            label: "Enable Notifications",
-            description: "Enable desktop notifications",
-            category: SettingCategory::Chat,
-            value_type: SettingType::Bool,
-            default: None,
-        },
-        SettingDef {
-            key: "chat.disableMarkdownRendering",
-            label: "Disable Markdown Rendering",
-            description: "Disable markdown formatting in chat",
-            category: SettingCategory::Chat,
-            value_type: SettingType::Bool,
-            default: Some(JsonValue::Bool(false)),
-        },
-        SettingDef {
-            key: "chat.disableAutoCompaction",
-            label: "Disable Auto Compaction",
-            description: "Disable automatic conversation summarization",
-            category: SettingCategory::Chat,
-            value_type: SettingType::Bool,
-            default: Some(JsonValue::Bool(false)),
-        },
-        SettingDef {
-            key: "chat.enablePromptHints",
-            label: "Enable Prompt Hints",
-            description: "Show startup hints with tips and shortcuts",
-            category: SettingCategory::Chat,
-            value_type: SettingType::Bool,
-            default: Some(JsonValue::Bool(true)),
-        },
-        SettingDef {
-            key: "chat.enableHistoryHints",
-            label: "Enable History Hints",
-            description: "Show conversation history hints",
-            category: SettingCategory::Chat,
-            value_type: SettingType::Bool,
-            default: None,
-        },
-        SettingDef {
-            key: "chat.uiMode",
-            label: "UI Mode",
-            description: "UI variant to use",
-            category: SettingCategory::Chat,
-            value_type: SettingType::String,
-            default: None,
-        },
-        SettingDef {
-            key: "chat.enableContextUsageIndicator",
-            label: "Enable Context Usage Indicator",
-            description: "Show context usage percentage in prompt",
-            category: SettingCategory::Chat,
-            value_type: SettingType::Bool,
-            default: None,
-        },
-        SettingDef {
-            key: "compaction.excludeMessages",
-            label: "Compaction Exclude Messages",
-            description: "Minimum message pairs to retain during compaction",
-            category: SettingCategory::Chat,
-            value_type: SettingType::Number,
-            default: None,
-        },
-        SettingDef {
-            key: "compaction.excludeContextWindowPercent",
-            label: "Compaction Exclude Context Window Percent",
-            description: "Minimum percentage of context window to retain during compaction",
-            category: SettingCategory::Chat,
-            value_type: SettingType::Number,
-            default: None,
-        },
-        // ----------------------------------------------------------------
-        // Knowledge Base
-        // ----------------------------------------------------------------
-        // Key lives under the chat namespace in the upstream CLI but
-        // logically belongs to knowledge configuration.
-        SettingDef {
-            key: "chat.enableKnowledge",
-            label: "Enable Knowledge",
-            description: "Enable knowledge base functionality",
-            category: SettingCategory::Knowledge,
-            value_type: SettingType::Bool,
-            default: None,
-        },
-        SettingDef {
-            key: "knowledge.defaultIncludePatterns",
-            label: "Default Include Patterns",
-            description: "Default file patterns to include in knowledge indexing",
-            category: SettingCategory::Knowledge,
-            value_type: SettingType::StringArray,
-            default: None,
-        },
-        SettingDef {
-            key: "knowledge.defaultExcludePatterns",
-            label: "Default Exclude Patterns",
-            description: "Default file patterns to exclude from knowledge indexing",
-            category: SettingCategory::Knowledge,
-            value_type: SettingType::StringArray,
-            default: None,
-        },
-        SettingDef {
-            key: "knowledge.maxFiles",
-            label: "Max Files",
-            description: "Maximum number of files for knowledge indexing",
-            category: SettingCategory::Knowledge,
-            value_type: SettingType::Number,
-            default: None,
-        },
-        SettingDef {
-            key: "knowledge.chunkSize",
-            label: "Chunk Size",
-            description: "Text chunk size for knowledge processing",
-            category: SettingCategory::Knowledge,
-            value_type: SettingType::Number,
-            default: None,
-        },
-        SettingDef {
-            key: "knowledge.chunkOverlap",
-            label: "Chunk Overlap",
-            description: "Overlap between text chunks in knowledge processing",
-            category: SettingCategory::Knowledge,
-            value_type: SettingType::Number,
-            default: None,
-        },
-        SettingDef {
-            key: "knowledge.indexType",
-            label: "Index Type",
-            description: "Type of knowledge index to use",
-            category: SettingCategory::Knowledge,
-            value_type: SettingType::String,
-            default: None,
-        },
-        // ----------------------------------------------------------------
-        // Key Bindings
-        // ----------------------------------------------------------------
-        SettingDef {
-            key: "chat.skimCommandKey",
-            label: "Skim Command Key",
-            description: "Key for fuzzy search command",
-            category: SettingCategory::KeyBindings,
-            value_type: SettingType::Char,
-            default: None,
-        },
-        SettingDef {
-            key: "chat.autocompletionKey",
-            label: "Autocompletion Key",
-            description: "Key for autocompletion hint acceptance",
-            category: SettingCategory::KeyBindings,
-            value_type: SettingType::Char,
-            default: None,
-        },
-        SettingDef {
-            key: "chat.tangentModeKey",
-            label: "Tangent Mode Key",
-            description: "Key for tangent mode toggle",
-            category: SettingCategory::KeyBindings,
-            value_type: SettingType::Char,
-            default: None,
-        },
-        SettingDef {
-            key: "chat.delegateModeKey",
-            label: "Delegate Mode Key",
-            description: "Key for delegate command",
-            category: SettingCategory::KeyBindings,
-            value_type: SettingType::Char,
-            default: None,
-        },
-        // ----------------------------------------------------------------
-        // Feature Toggles
-        // ----------------------------------------------------------------
-        SettingDef {
-            key: "chat.enableThinking",
-            label: "Enable Thinking",
-            description: "Enable thinking tool for complex reasoning",
-            category: SettingCategory::Features,
-            value_type: SettingType::Bool,
-            default: None,
-        },
-        SettingDef {
-            key: "chat.enableTangentMode",
-            label: "Enable Tangent Mode",
-            description: "Enable tangent mode feature",
-            category: SettingCategory::Features,
-            value_type: SettingType::Bool,
-            default: None,
-        },
-        SettingDef {
-            key: "introspect.tangentMode",
-            label: "Introspect Tangent Mode",
-            description: "Auto-enter tangent mode for introspect",
-            category: SettingCategory::Features,
-            value_type: SettingType::Bool,
-            default: None,
-        },
-        SettingDef {
-            key: "chat.enableTodoList",
-            label: "Enable Todo List",
-            description: "Enable todo list feature",
-            category: SettingCategory::Features,
-            value_type: SettingType::Bool,
-            default: None,
-        },
-        SettingDef {
-            key: "chat.enableCheckpoint",
-            label: "Enable Checkpoint",
-            description: "Enable checkpoint feature",
-            category: SettingCategory::Features,
-            value_type: SettingType::Bool,
-            default: None,
-        },
-        SettingDef {
-            key: "chat.enableDelegate",
-            label: "Enable Delegate",
-            description: "Enable delegate tool",
-            category: SettingCategory::Features,
-            value_type: SettingType::Bool,
-            default: None,
-        },
-        // ----------------------------------------------------------------
-        // API & Service
-        // ----------------------------------------------------------------
-        SettingDef {
-            key: "api.timeout",
-            label: "API Timeout",
-            description: "API request timeout in seconds",
-            category: SettingCategory::Api,
-            value_type: SettingType::Number,
-            default: None,
-        },
-        // ----------------------------------------------------------------
-        // MCP
-        // ----------------------------------------------------------------
-        SettingDef {
-            key: "mcp.initTimeout",
-            label: "MCP Init Timeout",
-            description: "MCP server initialization timeout in milliseconds",
-            category: SettingCategory::Mcp,
-            value_type: SettingType::Number,
-            default: None,
-        },
-        SettingDef {
-            key: "mcp.noInteractiveTimeout",
-            label: "MCP Non-Interactive Timeout",
-            description: "Non-interactive MCP timeout in milliseconds",
-            category: SettingCategory::Mcp,
-            value_type: SettingType::Number,
-            default: None,
-        },
-        SettingDef {
-            key: "mcp.loadedBefore",
-            label: "MCP Loaded Before",
-            description: "Track previously loaded MCP servers",
-            category: SettingCategory::Mcp,
-            value_type: SettingType::Bool,
-            default: None,
-        },
-        // ----------------------------------------------------------------
-        // Environment Variables
-        // ----------------------------------------------------------------
-        SettingDef {
-            key: "KIRO_LOG_NO_COLOR",
-            label: "Disable Log Color",
-            description: "Set to disable colored log output",
-            category: SettingCategory::Environment,
-            value_type: SettingType::Bool,
-            default: Some(JsonValue::Bool(false)),
-        },
-    ]
+pub fn registry() -> &'static [SettingDef] {
+    use std::sync::OnceLock;
+    static REGISTRY: OnceLock<Vec<SettingDef>> = OnceLock::new();
+    REGISTRY.get_or_init(|| {
+        vec![
+            // ----------------------------------------------------------------
+            // Telemetry & Privacy
+            // ----------------------------------------------------------------
+            SettingDef {
+                key: "telemetry.enabled",
+                label: "Enable Telemetry",
+                description: "Enable or disable telemetry collection",
+                category: SettingCategory::Telemetry,
+                value_type: SettingType::Bool,
+                default: Some(JsonValue::Bool(true)),
+            },
+            SettingDef {
+                key: "telemetryClientId",
+                label: "Telemetry Client ID",
+                description: "Client identifier for telemetry",
+                category: SettingCategory::Telemetry,
+                value_type: SettingType::String,
+                default: None,
+            },
+            // ----------------------------------------------------------------
+            // Chat Interface
+            // ----------------------------------------------------------------
+            SettingDef {
+                key: "chat.defaultModel",
+                label: "Default Model",
+                description: "Default AI model for conversations",
+                category: SettingCategory::Chat,
+                value_type: SettingType::String,
+                default: None,
+            },
+            SettingDef {
+                key: "chat.defaultAgent",
+                label: "Default Agent",
+                description: "Default agent configuration",
+                category: SettingCategory::Chat,
+                value_type: SettingType::String,
+                default: None,
+            },
+            SettingDef {
+                key: "chat.diffTool",
+                label: "Diff Tool",
+                description: "External diff tool for viewing code changes",
+                category: SettingCategory::Chat,
+                value_type: SettingType::String,
+                default: None,
+            },
+            SettingDef {
+                key: "chat.greeting.enabled",
+                label: "Show Greeting",
+                description: "Show greeting message on chat start",
+                category: SettingCategory::Chat,
+                value_type: SettingType::Bool,
+                default: Some(JsonValue::Bool(true)),
+            },
+            SettingDef {
+                key: "chat.editMode",
+                label: "Edit Mode",
+                description: "Enable edit mode for chat interface",
+                category: SettingCategory::Chat,
+                value_type: SettingType::Bool,
+                default: None,
+            },
+            SettingDef {
+                key: "chat.enableNotifications",
+                label: "Enable Notifications",
+                description: "Enable desktop notifications",
+                category: SettingCategory::Chat,
+                value_type: SettingType::Bool,
+                default: None,
+            },
+            SettingDef {
+                key: "chat.disableMarkdownRendering",
+                label: "Disable Markdown Rendering",
+                description: "Disable markdown formatting in chat",
+                category: SettingCategory::Chat,
+                value_type: SettingType::Bool,
+                default: Some(JsonValue::Bool(false)),
+            },
+            SettingDef {
+                key: "chat.disableAutoCompaction",
+                label: "Disable Auto Compaction",
+                description: "Disable automatic conversation summarization",
+                category: SettingCategory::Chat,
+                value_type: SettingType::Bool,
+                default: Some(JsonValue::Bool(false)),
+            },
+            SettingDef {
+                key: "chat.enablePromptHints",
+                label: "Enable Prompt Hints",
+                description: "Show startup hints with tips and shortcuts",
+                category: SettingCategory::Chat,
+                value_type: SettingType::Bool,
+                default: Some(JsonValue::Bool(true)),
+            },
+            SettingDef {
+                key: "chat.enableHistoryHints",
+                label: "Enable History Hints",
+                description: "Show conversation history hints",
+                category: SettingCategory::Chat,
+                value_type: SettingType::Bool,
+                default: None,
+            },
+            SettingDef {
+                key: "chat.uiMode",
+                label: "UI Mode",
+                description: "UI variant to use",
+                category: SettingCategory::Chat,
+                value_type: SettingType::String,
+                default: None,
+            },
+            SettingDef {
+                key: "chat.enableContextUsageIndicator",
+                label: "Enable Context Usage Indicator",
+                description: "Show context usage percentage in prompt",
+                category: SettingCategory::Chat,
+                value_type: SettingType::Bool,
+                default: None,
+            },
+            SettingDef {
+                key: "compaction.excludeMessages",
+                label: "Compaction Exclude Messages",
+                description: "Minimum message pairs to retain during compaction",
+                category: SettingCategory::Chat,
+                value_type: SettingType::Number,
+                default: None,
+            },
+            SettingDef {
+                key: "compaction.excludeContextWindowPercent",
+                label: "Compaction Exclude Context Window Percent",
+                description: "Minimum percentage of context window to retain during compaction",
+                category: SettingCategory::Chat,
+                value_type: SettingType::Number,
+                default: None,
+            },
+            // ----------------------------------------------------------------
+            // Knowledge Base
+            // ----------------------------------------------------------------
+            // Key lives under the chat namespace in the upstream CLI but
+            // logically belongs to knowledge configuration.
+            SettingDef {
+                key: "chat.enableKnowledge",
+                label: "Enable Knowledge",
+                description: "Enable knowledge base functionality",
+                category: SettingCategory::Knowledge,
+                value_type: SettingType::Bool,
+                default: None,
+            },
+            SettingDef {
+                key: "knowledge.defaultIncludePatterns",
+                label: "Default Include Patterns",
+                description: "Default file patterns to include in knowledge indexing",
+                category: SettingCategory::Knowledge,
+                value_type: SettingType::StringArray,
+                default: None,
+            },
+            SettingDef {
+                key: "knowledge.defaultExcludePatterns",
+                label: "Default Exclude Patterns",
+                description: "Default file patterns to exclude from knowledge indexing",
+                category: SettingCategory::Knowledge,
+                value_type: SettingType::StringArray,
+                default: None,
+            },
+            SettingDef {
+                key: "knowledge.maxFiles",
+                label: "Max Files",
+                description: "Maximum number of files for knowledge indexing",
+                category: SettingCategory::Knowledge,
+                value_type: SettingType::Number,
+                default: None,
+            },
+            SettingDef {
+                key: "knowledge.chunkSize",
+                label: "Chunk Size",
+                description: "Text chunk size for knowledge processing",
+                category: SettingCategory::Knowledge,
+                value_type: SettingType::Number,
+                default: None,
+            },
+            SettingDef {
+                key: "knowledge.chunkOverlap",
+                label: "Chunk Overlap",
+                description: "Overlap between text chunks in knowledge processing",
+                category: SettingCategory::Knowledge,
+                value_type: SettingType::Number,
+                default: None,
+            },
+            SettingDef {
+                key: "knowledge.indexType",
+                label: "Index Type",
+                description: "Type of knowledge index to use",
+                category: SettingCategory::Knowledge,
+                value_type: SettingType::String,
+                default: None,
+            },
+            // ----------------------------------------------------------------
+            // Key Bindings
+            // ----------------------------------------------------------------
+            SettingDef {
+                key: "chat.skimCommandKey",
+                label: "Skim Command Key",
+                description: "Key for fuzzy search command",
+                category: SettingCategory::KeyBindings,
+                value_type: SettingType::Char,
+                default: None,
+            },
+            SettingDef {
+                key: "chat.autocompletionKey",
+                label: "Autocompletion Key",
+                description: "Key for autocompletion hint acceptance",
+                category: SettingCategory::KeyBindings,
+                value_type: SettingType::Char,
+                default: None,
+            },
+            SettingDef {
+                key: "chat.tangentModeKey",
+                label: "Tangent Mode Key",
+                description: "Key for tangent mode toggle",
+                category: SettingCategory::KeyBindings,
+                value_type: SettingType::Char,
+                default: None,
+            },
+            SettingDef {
+                key: "chat.delegateModeKey",
+                label: "Delegate Mode Key",
+                description: "Key for delegate command",
+                category: SettingCategory::KeyBindings,
+                value_type: SettingType::Char,
+                default: None,
+            },
+            // ----------------------------------------------------------------
+            // Feature Toggles
+            // ----------------------------------------------------------------
+            SettingDef {
+                key: "chat.enableThinking",
+                label: "Enable Thinking",
+                description: "Enable thinking tool for complex reasoning",
+                category: SettingCategory::Features,
+                value_type: SettingType::Bool,
+                default: None,
+            },
+            SettingDef {
+                key: "chat.enableTangentMode",
+                label: "Enable Tangent Mode",
+                description: "Enable tangent mode feature",
+                category: SettingCategory::Features,
+                value_type: SettingType::Bool,
+                default: None,
+            },
+            SettingDef {
+                key: "introspect.tangentMode",
+                label: "Introspect Tangent Mode",
+                description: "Auto-enter tangent mode for introspect",
+                category: SettingCategory::Features,
+                value_type: SettingType::Bool,
+                default: None,
+            },
+            SettingDef {
+                key: "chat.enableTodoList",
+                label: "Enable Todo List",
+                description: "Enable todo list feature",
+                category: SettingCategory::Features,
+                value_type: SettingType::Bool,
+                default: None,
+            },
+            SettingDef {
+                key: "chat.enableCheckpoint",
+                label: "Enable Checkpoint",
+                description: "Enable checkpoint feature",
+                category: SettingCategory::Features,
+                value_type: SettingType::Bool,
+                default: None,
+            },
+            SettingDef {
+                key: "chat.enableDelegate",
+                label: "Enable Delegate",
+                description: "Enable delegate tool",
+                category: SettingCategory::Features,
+                value_type: SettingType::Bool,
+                default: None,
+            },
+            // ----------------------------------------------------------------
+            // API & Service
+            // ----------------------------------------------------------------
+            SettingDef {
+                key: "api.timeout",
+                label: "API Timeout",
+                description: "API request timeout in seconds",
+                category: SettingCategory::Api,
+                value_type: SettingType::Number,
+                default: None,
+            },
+            // ----------------------------------------------------------------
+            // MCP
+            // ----------------------------------------------------------------
+            SettingDef {
+                key: "mcp.initTimeout",
+                label: "MCP Init Timeout",
+                description: "MCP server initialization timeout in milliseconds",
+                category: SettingCategory::Mcp,
+                value_type: SettingType::Number,
+                default: None,
+            },
+            SettingDef {
+                key: "mcp.noInteractiveTimeout",
+                label: "MCP Non-Interactive Timeout",
+                description: "Non-interactive MCP timeout in milliseconds",
+                category: SettingCategory::Mcp,
+                value_type: SettingType::Number,
+                default: None,
+            },
+            SettingDef {
+                key: "mcp.loadedBefore",
+                label: "MCP Loaded Before",
+                description: "Track previously loaded MCP servers",
+                category: SettingCategory::Mcp,
+                value_type: SettingType::Bool,
+                default: None,
+            },
+            // ----------------------------------------------------------------
+            // Environment Variables
+            // ----------------------------------------------------------------
+            SettingDef {
+                key: "KIRO_LOG_NO_COLOR",
+                label: "Disable Log Color",
+                description: "Set to disable colored log output",
+                category: SettingCategory::Environment,
+                value_type: SettingType::Bool,
+                default: Some(JsonValue::Bool(false)),
+            },
+        ]
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -602,7 +608,7 @@ fn remove_nested_impl(value: &mut JsonValue, segments: &[&str]) -> bool {
 #[must_use]
 pub fn resolve_settings(json: &JsonValue) -> Vec<SettingEntry> {
     registry()
-        .into_iter()
+        .iter()
         .map(|def| {
             let current_value = get_nested(json, def.key).cloned();
 
@@ -624,7 +630,7 @@ pub fn resolve_settings(json: &JsonValue) -> Vec<SettingEntry> {
                 category: def.category,
                 category_label: def.category.label().to_owned(),
                 value_type,
-                default_value: def.default,
+                default_value: def.default.clone(),
                 current_value,
             }
         })
@@ -710,7 +716,7 @@ pub fn save_kiro_settings_to(kiro_dir: &Path, json: &JsonValue) -> io::Result<()
     let contents = serde_json::to_string_pretty(json)
         .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
 
-    std::fs::write(&path, contents)?;
+    crate::cache::atomic_write(&path, contents.as_bytes())?;
     Ok(())
 }
 
@@ -730,6 +736,7 @@ pub fn default_kiro_dir() -> Option<PathBuf> {
 mod tests {
     use std::collections::{HashMap, HashSet};
 
+    use rstest::rstest;
     use tempfile::TempDir;
 
     use super::*;
@@ -738,7 +745,7 @@ mod tests {
     fn registry_keys_are_unique() {
         let reg = registry();
         let mut seen = HashSet::new();
-        for def in &reg {
+        for def in reg {
             assert!(seen.insert(def.key), "duplicate registry key: {}", def.key);
         }
     }
@@ -1100,17 +1107,30 @@ mod tests {
         );
     }
 
-    #[test]
-    fn is_compatible_value_validates_types() {
-        assert!(SettingType::Bool.is_compatible_value(&JsonValue::Bool(true)));
-        assert!(!SettingType::Bool.is_compatible_value(&JsonValue::String("yes".into())));
-        assert!(SettingType::Number.is_compatible_value(&serde_json::json!(42)));
-        assert!(!SettingType::Number.is_compatible_value(&JsonValue::Bool(true)));
-        assert!(SettingType::String.is_compatible_value(&JsonValue::String("hello".into())));
-        assert!(SettingType::StringArray.is_compatible_value(&serde_json::json!(["a", "b"])));
-        assert!(!SettingType::StringArray.is_compatible_value(&serde_json::json!([1, 2])));
-        let enum_type = SettingType::Enum(vec!["a", "b"]);
-        assert!(enum_type.is_compatible_value(&JsonValue::String("a".into())));
-        assert!(!enum_type.is_compatible_value(&JsonValue::String("c".into())));
+    #[rstest]
+    #[case::bool_accepts_bool(SettingType::Bool, serde_json::json!(true), true)]
+    #[case::bool_rejects_string(SettingType::Bool, serde_json::json!("yes"), false)]
+    #[case::number_accepts_number(SettingType::Number, serde_json::json!(42), true)]
+    #[case::number_rejects_bool(SettingType::Number, serde_json::json!(true), false)]
+    #[case::string_accepts_string(SettingType::String, serde_json::json!("hello"), true)]
+    #[case::string_rejects_number(SettingType::String, serde_json::json!(42), false)]
+    #[case::char_accepts_single_char(SettingType::Char, serde_json::json!("x"), true)]
+    #[case::char_rejects_multi_char(SettingType::Char, serde_json::json!("abc"), false)]
+    #[case::char_rejects_empty(SettingType::Char, serde_json::json!(""), false)]
+    #[case::string_array_accepts_array(SettingType::StringArray, serde_json::json!(["a", "b"]), true)]
+    #[case::string_array_rejects_int_array(SettingType::StringArray, serde_json::json!([1, 2]), false)]
+    #[case::string_array_accepts_empty(SettingType::StringArray, serde_json::json!([]), true)]
+    #[case::enum_accepts_valid(SettingType::Enum(vec!["a", "b"]), serde_json::json!("a"), true)]
+    #[case::enum_rejects_invalid(SettingType::Enum(vec!["a", "b"]), serde_json::json!("c"), false)]
+    fn is_compatible_value_validates_types(
+        #[case] setting_type: SettingType,
+        #[case] value: JsonValue,
+        #[case] expected: bool,
+    ) {
+        assert_eq!(
+            setting_type.is_compatible_value(&value),
+            expected,
+            "is_compatible_value({setting_type:?}, {value}) should be {expected}"
+        );
     }
 }

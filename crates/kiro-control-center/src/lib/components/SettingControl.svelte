@@ -75,7 +75,12 @@
 
   function handleCharChange(e: Event) {
     const target = e.target as HTMLInputElement;
-    handleSet(target.value.slice(0, 1));
+    const char = target.value.slice(0, 1);
+    if (char === "") {
+      handleReset();
+      return;
+    }
+    handleSet(char);
   }
 
   function handleSelectChange(e: Event) {
