@@ -292,10 +292,6 @@ export type PluginInfo = { name: string; description: string | null; skill_count
  */
 export type ProjectInfo = { path: string; kiro_initialized: boolean; installed_skill_count: number }
 /**
- * Top-level category for a Kiro CLI setting.
- */
-export type SettingCategory = "telemetry" | "chat" | "knowledge" | "key_bindings" | "features" | "api" | "mcp" | "environment"
-/**
  * A fully-resolved setting entry suitable for serialisation to a frontend.
  */
 export type SettingEntry = { 
@@ -312,9 +308,9 @@ label: string;
  */
 description: string; 
 /**
- * Machine-readable category identifier.
+ * Machine-readable category identifier (serialized `snake_case` string).
  */
-category: SettingCategory; 
+category: string; 
 /**
  * Human-readable category label.
  */
@@ -324,17 +320,17 @@ category_label: string;
  */
 value_type: string; 
 /**
- * For `Enum` settings: the allowed values.  `None` for all other types.
+ * For `Enum` settings: the allowed values. Empty vec for all other types.
  */
-enum_options: string[] | null; 
+enum_options: string[]; 
 /**
- * Default value as a JSON value.
+ * Default value as a JSON value. `None` when no default is known.
  */
-default_value: JsonValue; 
+default_value: JsonValue | null; 
 /**
- * Current value as stored in the user's settings file.
+ * Current value from the user's settings file. `None` means key absent (using default).
  */
-current_value: JsonValue }
+current_value: JsonValue | null }
 /**
  * Persisted application settings.
  */
