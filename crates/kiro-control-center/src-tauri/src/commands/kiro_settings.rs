@@ -113,9 +113,11 @@ pub async fn set_kiro_setting(
     let dir = kiro_dir()?;
 
     // Serialize load-modify-save to prevent lost updates from rapid changes.
-    let _guard = SETTINGS_WRITE_LOCK
-        .lock()
-        .expect("settings write lock poisoned");
+    let _guard = SETTINGS_WRITE_LOCK.lock().unwrap_or_else(|poisoned| {
+        // A prior panic poisoned the lock. Recover rather than cascade panics —
+        // a lost-update is preferable to permanently bricking settings writes.
+        poisoned.into_inner()
+    });
 
     let mut json = load_settings(&dir)?;
     set_nested(&mut json, &key, value);
@@ -141,9 +143,11 @@ pub async fn reset_kiro_setting(key: String) -> Result<(), CommandError> {
     let dir = kiro_dir()?;
 
     // Serialize load-modify-save to prevent lost updates from rapid changes.
-    let _guard = SETTINGS_WRITE_LOCK
-        .lock()
-        .expect("settings write lock poisoned");
+    let _guard = SETTINGS_WRITE_LOCK.lock().unwrap_or_else(|poisoned| {
+        // A prior panic poisoned the lock. Recover rather than cascade panics —
+        // a lost-update is preferable to permanently bricking settings writes.
+        poisoned.into_inner()
+    });
 
     let mut json = load_settings(&dir)?;
     remove_nested(&mut json, &key);
