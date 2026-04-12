@@ -124,7 +124,7 @@
 
   <!-- Right: editor + reset -->
   <div class="flex items-center gap-2 flex-shrink-0">
-    {#if entry.value_type === "bool"}
+    {#if entry.value_type.kind === "bool"}
       <!-- Toggle switch -->
       <button
         type="button"
@@ -141,7 +141,7 @@
         ></span>
       </button>
 
-    {:else if entry.value_type === "string"}
+    {:else if entry.value_type.kind === "string"}
       <input
         type="text"
         value={typeof displayValue === "string" ? displayValue : ""}
@@ -149,7 +149,7 @@
         class="w-48 px-2.5 py-1.5 text-sm rounded-md border border-kiro-muted bg-kiro-overlay text-kiro-text placeholder-kiro-subtle focus:outline-none focus:ring-2 focus:ring-kiro-accent-500 focus:border-transparent"
       />
 
-    {:else if entry.value_type === "number"}
+    {:else if entry.value_type.kind === "number"}
       <input
         type="number"
         value={typeof displayValue === "number" ? displayValue : ""}
@@ -158,7 +158,7 @@
         class="w-24 px-2.5 py-1.5 text-sm rounded-md border border-kiro-muted bg-kiro-overlay text-kiro-text focus:outline-none focus:ring-2 focus:ring-kiro-accent-500 focus:border-transparent"
       />
 
-    {:else if entry.value_type === "char"}
+    {:else if entry.value_type.kind === "char"}
       <input
         type="text"
         maxlength={1}
@@ -167,7 +167,7 @@
         class="w-12 px-2.5 py-1.5 text-sm text-center rounded-md border border-kiro-muted bg-kiro-overlay text-kiro-text focus:outline-none focus:ring-2 focus:ring-kiro-accent-500 focus:border-transparent"
       />
 
-    {:else if entry.value_type === "string_array"}
+    {:else if entry.value_type.kind === "string_array"}
       <div class="flex flex-col gap-2 w-64">
         <!-- Chips -->
         {#if Array.isArray(displayValue) && displayValue.length > 0}
@@ -209,19 +209,19 @@
         </div>
       </div>
 
-    {:else if entry.value_type === "enum"}
+    {:else if entry.value_type.kind === "enum"}
       <select
         value={typeof displayValue === "string" ? displayValue : ""}
         onchange={handleSelectChange}
         class="w-40 px-2.5 py-1.5 text-sm rounded-md border border-kiro-muted bg-kiro-overlay text-kiro-text focus:outline-none focus:ring-2 focus:ring-kiro-accent-500 focus:border-transparent"
       >
-        {#each entry.enum_options as option (option)}
+        {#each entry.value_type.options as option (option)}
           <option value={option}>{option}</option>
         {/each}
       </select>
 
     {:else}
-      <span class="text-sm text-kiro-subtle italic">Unsupported type: {entry.value_type}</span>
+      <span class="text-sm text-kiro-subtle italic">Unsupported type</span>
     {/if}
 
     <!-- Reset button (always rendered to reserve space, invisible when unmodified) -->

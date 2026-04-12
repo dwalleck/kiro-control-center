@@ -59,7 +59,7 @@ pub enum SettingType {
 }
 
 impl SettingType {
-    /// Returns the wire-format type name used in [`SettingEntry::value_type`].
+    /// Returns the wire-format type name used in error messages.
     #[must_use]
     pub fn type_name(&self) -> &'static str {
         match self {
@@ -69,14 +69,6 @@ impl SettingType {
             Self::Char => "char",
             Self::StringArray => "string_array",
             Self::Enum(_) => "enum",
-        }
-    }
-
-    /// Returns enum options if this is an `Enum` variant, otherwise an empty vec.
-    fn enum_options(&self) -> Vec<std::string::String> {
-        match self {
-            Self::Enum(opts) => opts.iter().map(|s| (*s).to_owned()).collect(),
-            _ => vec![],
         }
     }
 
@@ -93,6 +85,26 @@ impl SettingType {
             Self::Enum(opts) => value.as_str().is_some_and(|s| opts.contains(&s)),
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Setting value info (frontend-facing discriminated union)
+// ---------------------------------------------------------------------------
+
+/// Describes the value type and any type-specific metadata for a setting entry.
+///
+/// Serialized as an internally-tagged enum so the frontend can use a
+/// discriminated union: `entry.value_type.kind === "bool"`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SettingValueInfo {
+    Bool,
+    String,
+    Number,
+    Char,
+    StringArray,
+    Enum { options: Vec<std::string::String> },
 }
 
 // ---------------------------------------------------------------------------
@@ -129,14 +141,12 @@ pub struct SettingEntry {
     pub label: std::string::String,
     /// Longer description.
     pub description: std::string::String,
-    /// Machine-readable category identifier (serialized `snake_case` string).
-    pub category: std::string::String,
+    /// Typed category identifier.
+    pub category: SettingCategory,
     /// Human-readable category label.
     pub category_label: std::string::String,
-    /// Wire-format type name (`"bool"`, `"string"`, `"enum"`, …).
-    pub value_type: std::string::String,
-    /// For `Enum` settings: the allowed values. Empty vec for all other types.
-    pub enum_options: Vec<std::string::String>,
+    /// Value type and type-specific metadata (discriminated union on the frontend).
+    pub value_type: SettingValueInfo,
     /// Default value as a JSON value. `None` when no default is known.
     pub default_value: Option<JsonValue>,
     /// Current value from the user's settings file. `None` means key absent (using default).
@@ -589,12 +599,6 @@ fn remove_nested_impl(value: &mut JsonValue, segments: &[&str]) -> bool {
 /// `current_value` is `None` when the key is absent from `json` (meaning the
 /// setting is at its default). `default_value` is `None` when no default is
 /// known for that setting.
-///
-/// # Panics
-///
-/// Cannot panic in practice: `SettingCategory` derives `Serialize` and always
-/// serializes to a `snake_case` JSON string, so both `expect` calls on the
-/// serialization result are unreachable.
 #[must_use]
 pub fn resolve_settings(json: &JsonValue) -> Vec<SettingEntry> {
     registry()
@@ -602,20 +606,24 @@ pub fn resolve_settings(json: &JsonValue) -> Vec<SettingEntry> {
         .map(|def| {
             let current_value = get_nested(json, def.key).cloned();
 
-            let category_str = serde_json::to_value(def.category)
-                .expect("SettingCategory serialization is infallible")
-                .as_str()
-                .expect("SettingCategory serializes to a JSON string")
-                .to_owned();
+            let value_type = match &def.value_type {
+                SettingType::Bool => SettingValueInfo::Bool,
+                SettingType::String => SettingValueInfo::String,
+                SettingType::Number => SettingValueInfo::Number,
+                SettingType::Char => SettingValueInfo::Char,
+                SettingType::StringArray => SettingValueInfo::StringArray,
+                SettingType::Enum(opts) => SettingValueInfo::Enum {
+                    options: opts.iter().map(|&s| s.to_owned()).collect(),
+                },
+            };
 
             SettingEntry {
                 key: def.key.to_owned(),
                 label: def.label.to_owned(),
                 description: def.description.to_owned(),
-                category: category_str,
+                category: def.category,
                 category_label: def.category.label().to_owned(),
-                value_type: def.value_type.type_name().to_owned(),
-                enum_options: def.value_type.enum_options(),
+                value_type,
                 default_value: def.default,
                 current_value,
             }
@@ -631,24 +639,17 @@ pub fn resolve_settings(json: &JsonValue) -> Vec<SettingEntry> {
 const SETTINGS_FILE: &str = "settings/cli.json";
 
 /// Errors from loading the Kiro CLI settings file.
-#[derive(Debug)]
+#[derive(Debug, thiserror::Error)]
 pub enum LoadSettingsError {
     /// The file does not exist — use empty defaults.
+    #[error("settings file not found")]
     NotFound,
     /// An I/O error occurred reading the file.
-    Io(std::io::Error),
+    #[error("failed to read settings file: {0}")]
+    Io(#[from] std::io::Error),
     /// The file exists but contains invalid JSON.
-    InvalidJson(serde_json::Error),
-}
-
-impl std::fmt::Display for LoadSettingsError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::NotFound => write!(f, "settings file not found"),
-            Self::Io(e) => write!(f, "failed to read settings file: {e}"),
-            Self::InvalidJson(e) => write!(f, "settings file contains invalid JSON: {e}"),
-        }
-    }
+    #[error("settings file contains invalid JSON: {0}")]
+    InvalidJson(#[from] serde_json::Error),
 }
 
 /// Load `settings/cli.json` from the given Kiro home directory.
@@ -1016,10 +1017,10 @@ mod tests {
             "expected 'Telemetry & Privacy' category label to appear in resolved entries"
         );
 
-        let mut labels_by_category: HashMap<String, String> = HashMap::new();
+        let mut labels_by_category: HashMap<SettingCategory, String> = HashMap::new();
         for entry in &entries {
             labels_by_category
-                .entry(entry.category.clone())
+                .entry(entry.category)
                 .or_insert_with(|| entry.category_label.clone());
         }
         for label in labels_by_category.values() {
