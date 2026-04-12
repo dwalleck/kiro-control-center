@@ -31,14 +31,14 @@ impl SettingCategory {
     #[must_use]
     pub fn label(self) -> &'static str {
         match self {
-            Self::Telemetry => "Telemetry",
-            Self::Chat => "Chat",
-            Self::Knowledge => "Knowledge",
+            Self::Telemetry => "Telemetry & Privacy",
+            Self::Chat => "Chat Interface",
+            Self::Knowledge => "Knowledge Base",
             Self::KeyBindings => "Key Bindings",
-            Self::Features => "Features",
-            Self::Api => "API",
+            Self::Features => "Feature Toggles",
+            Self::Api => "API & Service",
             Self::Mcp => "MCP",
-            Self::Environment => "Environment",
+            Self::Environment => "Environment Variables",
         }
     }
 }
@@ -71,11 +71,11 @@ impl SettingType {
         }
     }
 
-    /// Returns enum options if this is an `Enum` variant, otherwise `None`.
-    fn enum_options(&self) -> Option<Vec<String>> {
+    /// Returns enum options if this is an `Enum` variant, otherwise an empty vec.
+    fn enum_options(&self) -> Vec<std::string::String> {
         match self {
-            Self::Enum(opts) => Some(opts.iter().map(|s| (*s).to_owned()).collect()),
-            _ => None,
+            Self::Enum(opts) => opts.iter().map(|s| (*s).to_owned()).collect(),
+            _ => vec![],
         }
     }
 }
@@ -96,8 +96,8 @@ pub struct SettingDef {
     pub category: SettingCategory,
     /// What kind of value this setting holds.
     pub value_type: SettingType,
-    /// Default value as a JSON value.
-    pub default: JsonValue,
+    /// Default value as a JSON value. `None` when the default is unknown.
+    pub default: Option<JsonValue>,
 }
 
 // ---------------------------------------------------------------------------
@@ -109,23 +109,23 @@ pub struct SettingDef {
 #[cfg_attr(feature = "specta", derive(specta::Type))]
 pub struct SettingEntry {
     /// Dotted JSON key path.
-    pub key: String,
+    pub key: std::string::String,
     /// Short human-readable label.
-    pub label: String,
+    pub label: std::string::String,
     /// Longer description.
-    pub description: String,
-    /// Machine-readable category identifier.
-    pub category: SettingCategory,
+    pub description: std::string::String,
+    /// Machine-readable category identifier (serialized `snake_case` string).
+    pub category: std::string::String,
     /// Human-readable category label.
-    pub category_label: String,
+    pub category_label: std::string::String,
     /// Wire-format type name (`"bool"`, `"string"`, `"enum"`, …).
-    pub value_type: String,
-    /// For `Enum` settings: the allowed values.  `None` for all other types.
-    pub enum_options: Option<Vec<String>>,
-    /// Default value as a JSON value.
-    pub default_value: JsonValue,
-    /// Current value as stored in the user's settings file.
-    pub current_value: JsonValue,
+    pub value_type: std::string::String,
+    /// For `Enum` settings: the allowed values. Empty vec for all other types.
+    pub enum_options: Vec<std::string::String>,
+    /// Default value as a JSON value. `None` when no default is known.
+    pub default_value: Option<JsonValue>,
+    /// Current value from the user's settings file. `None` means key absent (using default).
+    pub current_value: Option<JsonValue>,
 }
 
 // ---------------------------------------------------------------------------
@@ -141,351 +141,332 @@ pub struct SettingEntry {
 pub fn registry() -> Vec<SettingDef> {
     vec![
         // ----------------------------------------------------------------
-        // Telemetry
+        // Telemetry & Privacy
         // ----------------------------------------------------------------
         SettingDef {
             key: "telemetry.enabled",
             label: "Enable Telemetry",
-            description: "Send anonymous usage data to help improve Kiro.",
+            description: "Enable or disable telemetry collection",
             category: SettingCategory::Telemetry,
             value_type: SettingType::Bool,
-            default: JsonValue::Bool(true),
+            default: Some(JsonValue::Bool(true)),
         },
         SettingDef {
-            key: "telemetry.shareCodeSnippets",
-            label: "Share Code Snippets",
-            description: "Allow telemetry to include short code snippets for context.",
+            key: "telemetryClientId",
+            label: "Telemetry Client ID",
+            description: "Client identifier for telemetry",
             category: SettingCategory::Telemetry,
-            value_type: SettingType::Bool,
-            default: JsonValue::Bool(false),
+            value_type: SettingType::String,
+            default: None,
         },
         // ----------------------------------------------------------------
-        // Chat
+        // Chat Interface
         // ----------------------------------------------------------------
         SettingDef {
             key: "chat.defaultModel",
             label: "Default Model",
-            description: "The AI model used by default for chat sessions.",
+            description: "Default AI model for conversations",
             category: SettingCategory::Chat,
-            value_type: SettingType::Enum(vec![
-                "claude-opus-4-5",
-                "claude-sonnet-4-5",
-                "claude-haiku-4-5",
-                "claude-opus-4",
-                "claude-sonnet-4",
-                "claude-haiku-3",
-            ]),
-            default: JsonValue::String("claude-sonnet-4-5".to_owned()),
+            value_type: SettingType::String,
+            default: None,
         },
         SettingDef {
-            key: "chat.temperature",
-            label: "Temperature",
-            description: "Sampling temperature for model responses (0.0\u{2013}1.0).",
+            key: "chat.defaultAgent",
+            label: "Default Agent",
+            description: "Default agent configuration",
             category: SettingCategory::Chat,
-            value_type: SettingType::Number,
-            default: serde_json::json!(0.7),
+            value_type: SettingType::String,
+            default: None,
         },
         SettingDef {
-            key: "chat.maxTokens",
-            label: "Max Tokens",
-            description: "Maximum number of tokens the model may generate per response.",
+            key: "chat.diffTool",
+            label: "Diff Tool",
+            description: "External diff tool for viewing code changes",
             category: SettingCategory::Chat,
-            value_type: SettingType::Number,
-            default: serde_json::json!(8096),
+            value_type: SettingType::String,
+            default: None,
         },
         SettingDef {
-            key: "chat.streamResponses",
-            label: "Stream Responses",
-            description: "Stream model output token-by-token as it is generated.",
+            key: "chat.greeting.enabled",
+            label: "Show Greeting",
+            description: "Show greeting message on chat start",
             category: SettingCategory::Chat,
             value_type: SettingType::Bool,
-            default: JsonValue::Bool(true),
+            default: Some(JsonValue::Bool(true)),
         },
         SettingDef {
-            key: "chat.autoSave",
-            label: "Auto-Save Conversations",
-            description: "Automatically persist chat sessions to disk.",
+            key: "chat.editMode",
+            label: "Edit Mode",
+            description: "Enable edit mode for chat interface",
             category: SettingCategory::Chat,
             value_type: SettingType::Bool,
-            default: JsonValue::Bool(true),
+            default: None,
         },
         SettingDef {
-            key: "chat.contextWindow",
-            label: "Context Window",
-            description: "Number of previous messages included in each request.",
+            key: "chat.enableNotifications",
+            label: "Enable Notifications",
+            description: "Enable desktop notifications",
+            category: SettingCategory::Chat,
+            value_type: SettingType::Bool,
+            default: None,
+        },
+        SettingDef {
+            key: "chat.disableMarkdownRendering",
+            label: "Disable Markdown Rendering",
+            description: "Disable markdown formatting in chat",
+            category: SettingCategory::Chat,
+            value_type: SettingType::Bool,
+            default: Some(JsonValue::Bool(false)),
+        },
+        SettingDef {
+            key: "chat.disableAutoCompaction",
+            label: "Disable Auto Compaction",
+            description: "Disable automatic conversation summarization",
+            category: SettingCategory::Chat,
+            value_type: SettingType::Bool,
+            default: Some(JsonValue::Bool(false)),
+        },
+        SettingDef {
+            key: "chat.enablePromptHints",
+            label: "Enable Prompt Hints",
+            description: "Show startup hints with tips and shortcuts",
+            category: SettingCategory::Chat,
+            value_type: SettingType::Bool,
+            default: Some(JsonValue::Bool(true)),
+        },
+        SettingDef {
+            key: "chat.enableHistoryHints",
+            label: "Enable History Hints",
+            description: "Show conversation history hints",
+            category: SettingCategory::Chat,
+            value_type: SettingType::Bool,
+            default: None,
+        },
+        SettingDef {
+            key: "chat.uiMode",
+            label: "UI Mode",
+            description: "UI variant to use",
+            category: SettingCategory::Chat,
+            value_type: SettingType::String,
+            default: None,
+        },
+        SettingDef {
+            key: "chat.enableContextUsageIndicator",
+            label: "Enable Context Usage Indicator",
+            description: "Show context usage percentage in prompt",
+            category: SettingCategory::Chat,
+            value_type: SettingType::Bool,
+            default: None,
+        },
+        SettingDef {
+            key: "compaction.excludeMessages",
+            label: "Compaction Exclude Messages",
+            description: "Minimum message pairs to retain during compaction",
             category: SettingCategory::Chat,
             value_type: SettingType::Number,
-            default: serde_json::json!(20),
+            default: None,
+        },
+        SettingDef {
+            key: "compaction.excludeContextWindowPercent",
+            label: "Compaction Exclude Context Window Percent",
+            description: "Minimum percentage of context window to retain during compaction",
+            category: SettingCategory::Chat,
+            value_type: SettingType::Number,
+            default: None,
         },
         // ----------------------------------------------------------------
-        // Knowledge
+        // Knowledge Base
         // ----------------------------------------------------------------
         SettingDef {
-            key: "knowledge.indexOnStartup",
-            label: "Index on Startup",
-            description: "Re-index the project knowledge base when Kiro starts.",
+            key: "chat.enableKnowledge",
+            label: "Enable Knowledge",
+            description: "Enable knowledge base functionality",
             category: SettingCategory::Knowledge,
             value_type: SettingType::Bool,
-            default: JsonValue::Bool(true),
+            default: None,
         },
         SettingDef {
-            key: "knowledge.excludePatterns",
-            label: "Exclude Patterns",
-            description: "Glob patterns for files and directories excluded from indexing.",
+            key: "knowledge.defaultIncludePatterns",
+            label: "Default Include Patterns",
+            description: "Default file patterns to include in knowledge indexing",
             category: SettingCategory::Knowledge,
             value_type: SettingType::StringArray,
-            default: serde_json::json!(["node_modules", ".git", "target", "dist"]),
+            default: None,
         },
         SettingDef {
-            key: "knowledge.maxFileSize",
-            label: "Max File Size (KB)",
-            description: "Files larger than this limit (in kilobytes) are skipped during indexing.",
+            key: "knowledge.defaultExcludePatterns",
+            label: "Default Exclude Patterns",
+            description: "Default file patterns to exclude from knowledge indexing",
+            category: SettingCategory::Knowledge,
+            value_type: SettingType::StringArray,
+            default: None,
+        },
+        SettingDef {
+            key: "knowledge.maxFiles",
+            label: "Max Files",
+            description: "Maximum number of files for knowledge indexing",
             category: SettingCategory::Knowledge,
             value_type: SettingType::Number,
-            default: serde_json::json!(512),
+            default: None,
         },
         SettingDef {
             key: "knowledge.chunkSize",
             label: "Chunk Size",
-            description: "Token chunk size used when splitting documents for embedding.",
+            description: "Text chunk size for knowledge processing",
             category: SettingCategory::Knowledge,
             value_type: SettingType::Number,
-            default: serde_json::json!(1000),
+            default: None,
         },
         SettingDef {
-            key: "knowledge.embeddingModel",
-            label: "Embedding Model",
-            description: "Model used to generate document embeddings for semantic search.",
+            key: "knowledge.chunkOverlap",
+            label: "Chunk Overlap",
+            description: "Overlap between text chunks in knowledge processing",
             category: SettingCategory::Knowledge,
-            value_type: SettingType::Enum(vec![
-                "amazon.titan-embed-text-v2:0",
-                "cohere.embed-english-v3",
-                "cohere.embed-multilingual-v3",
-            ]),
-            default: JsonValue::String("amazon.titan-embed-text-v2:0".to_owned()),
+            value_type: SettingType::Number,
+            default: None,
+        },
+        SettingDef {
+            key: "knowledge.indexType",
+            label: "Index Type",
+            description: "Type of knowledge index to use",
+            category: SettingCategory::Knowledge,
+            value_type: SettingType::String,
+            default: None,
         },
         // ----------------------------------------------------------------
         // Key Bindings
         // ----------------------------------------------------------------
         SettingDef {
-            key: "keyBindings.submitChat",
-            label: "Submit Chat",
-            description: "Key combination to submit the current chat message.",
+            key: "chat.skimCommandKey",
+            label: "Skim Command Key",
+            description: "Key for fuzzy search command",
             category: SettingCategory::KeyBindings,
-            value_type: SettingType::String,
-            default: JsonValue::String("Enter".to_owned()),
+            value_type: SettingType::Char,
+            default: None,
         },
         SettingDef {
-            key: "keyBindings.newLine",
-            label: "New Line",
-            description: "Key combination to insert a newline without submitting.",
+            key: "chat.autocompletionKey",
+            label: "Autocompletion Key",
+            description: "Key for autocompletion hint acceptance",
             category: SettingCategory::KeyBindings,
-            value_type: SettingType::String,
-            default: JsonValue::String("Shift+Enter".to_owned()),
+            value_type: SettingType::Char,
+            default: None,
         },
         SettingDef {
-            key: "keyBindings.clearChat",
-            label: "Clear Chat",
-            description: "Key combination to clear the current chat session.",
+            key: "chat.tangentModeKey",
+            label: "Tangent Mode Key",
+            description: "Key for tangent mode toggle",
             category: SettingCategory::KeyBindings,
-            value_type: SettingType::String,
-            default: JsonValue::String("Ctrl+L".to_owned()),
+            value_type: SettingType::Char,
+            default: None,
         },
         SettingDef {
-            key: "keyBindings.focusChat",
-            label: "Focus Chat Input",
-            description: "Key combination to move focus to the chat input box.",
+            key: "chat.delegateModeKey",
+            label: "Delegate Mode Key",
+            description: "Key for delegate command",
             category: SettingCategory::KeyBindings,
-            value_type: SettingType::String,
-            default: JsonValue::String("Ctrl+I".to_owned()),
-        },
-        SettingDef {
-            key: "keyBindings.toggleSidebar",
-            label: "Toggle Sidebar",
-            description: "Key combination to show or hide the sidebar.",
-            category: SettingCategory::KeyBindings,
-            value_type: SettingType::String,
-            default: JsonValue::String("Ctrl+B".to_owned()),
+            value_type: SettingType::Char,
+            default: None,
         },
         // ----------------------------------------------------------------
-        // Features
+        // Feature Toggles
         // ----------------------------------------------------------------
         SettingDef {
-            key: "features.agentMode",
-            label: "Agent Mode",
-            description: "Enable autonomous agent mode for multi-step task execution.",
+            key: "chat.enableThinking",
+            label: "Enable Thinking",
+            description: "Enable thinking tool for complex reasoning",
             category: SettingCategory::Features,
             value_type: SettingType::Bool,
-            default: JsonValue::Bool(true),
+            default: None,
         },
         SettingDef {
-            key: "features.codeActions",
-            label: "Code Actions",
-            description: "Show inline AI-powered code actions inside the editor.",
+            key: "chat.enableTangentMode",
+            label: "Enable Tangent Mode",
+            description: "Enable tangent mode feature",
             category: SettingCategory::Features,
             value_type: SettingType::Bool,
-            default: JsonValue::Bool(true),
+            default: None,
         },
         SettingDef {
-            key: "features.inlineCompletions",
-            label: "Inline Completions",
-            description: "Provide ghost-text completions as you type.",
+            key: "introspect.tangentMode",
+            label: "Introspect Tangent Mode",
+            description: "Auto-enter tangent mode for introspect",
             category: SettingCategory::Features,
             value_type: SettingType::Bool,
-            default: JsonValue::Bool(true),
+            default: None,
         },
         SettingDef {
-            key: "features.diagnosticsIntegration",
-            label: "Diagnostics Integration",
-            description: "Surface compiler/linter diagnostics inside the AI chat.",
+            key: "chat.enableTodoList",
+            label: "Enable Todo List",
+            description: "Enable todo list feature",
             category: SettingCategory::Features,
             value_type: SettingType::Bool,
-            default: JsonValue::Bool(true),
+            default: None,
         },
         SettingDef {
-            key: "features.experimentalTools",
-            label: "Experimental Tools",
-            description: "Enable tools that are still in beta and may change.",
+            key: "chat.enableCheckpoint",
+            label: "Enable Checkpoint",
+            description: "Enable checkpoint feature",
             category: SettingCategory::Features,
             value_type: SettingType::Bool,
-            default: JsonValue::Bool(false),
+            default: None,
+        },
+        SettingDef {
+            key: "chat.enableDelegate",
+            label: "Enable Delegate",
+            description: "Enable delegate tool",
+            category: SettingCategory::Features,
+            value_type: SettingType::Bool,
+            default: None,
         },
         // ----------------------------------------------------------------
-        // API
+        // API & Service
         // ----------------------------------------------------------------
-        SettingDef {
-            key: "api.provider",
-            label: "API Provider",
-            description: "Which API backend Kiro uses to call the AI model.",
-            category: SettingCategory::Api,
-            value_type: SettingType::Enum(vec!["anthropic", "bedrock", "vertex"]),
-            default: JsonValue::String("anthropic".to_owned()),
-        },
-        SettingDef {
-            key: "api.region",
-            label: "AWS Region",
-            description: "AWS region for Bedrock or Vertex API calls.",
-            category: SettingCategory::Api,
-            value_type: SettingType::String,
-            default: JsonValue::String("us-east-1".to_owned()),
-        },
         SettingDef {
             key: "api.timeout",
-            label: "Request Timeout (s)",
-            description: "Number of seconds before an API request times out.",
+            label: "API Timeout",
+            description: "API request timeout in seconds",
             category: SettingCategory::Api,
             value_type: SettingType::Number,
-            default: serde_json::json!(60),
-        },
-        SettingDef {
-            key: "api.retries",
-            label: "Max Retries",
-            description: "How many times to retry a failed API request.",
-            category: SettingCategory::Api,
-            value_type: SettingType::Number,
-            default: serde_json::json!(3),
-        },
-        SettingDef {
-            key: "api.proxyUrl",
-            label: "Proxy URL",
-            description: "HTTP/HTTPS proxy URL for outbound API requests.",
-            category: SettingCategory::Api,
-            value_type: SettingType::String,
-            default: JsonValue::String(String::new()),
+            default: None,
         },
         // ----------------------------------------------------------------
         // MCP
         // ----------------------------------------------------------------
         SettingDef {
-            key: "mcp.enabled",
-            label: "Enable MCP",
-            description: "Enable the Model Context Protocol server integration.",
-            category: SettingCategory::Mcp,
-            value_type: SettingType::Bool,
-            default: JsonValue::Bool(true),
-        },
-        SettingDef {
-            key: "mcp.autoStart",
-            label: "Auto-Start Servers",
-            description: "Automatically start configured MCP servers when Kiro launches.",
-            category: SettingCategory::Mcp,
-            value_type: SettingType::Bool,
-            default: JsonValue::Bool(true),
-        },
-        SettingDef {
-            key: "mcp.serverTimeout",
-            label: "Server Timeout (s)",
-            description: "Seconds to wait for an MCP server to become ready.",
+            key: "mcp.initTimeout",
+            label: "MCP Init Timeout",
+            description: "MCP server initialization timeout in milliseconds",
             category: SettingCategory::Mcp,
             value_type: SettingType::Number,
-            default: serde_json::json!(30),
+            default: None,
         },
         SettingDef {
-            key: "mcp.allowedHosts",
-            label: "Allowed Hosts",
-            description: "Hostnames or IP addresses that MCP servers may connect to.",
+            key: "mcp.noInteractiveTimeout",
+            label: "MCP Non-Interactive Timeout",
+            description: "Non-interactive MCP timeout in milliseconds",
             category: SettingCategory::Mcp,
-            value_type: SettingType::StringArray,
-            default: serde_json::json!([]),
-        },
-        SettingDef {
-            key: "mcp.logLevel",
-            label: "Log Level",
-            description: "Verbosity of MCP server logs.",
-            category: SettingCategory::Mcp,
-            value_type: SettingType::Enum(vec!["error", "warn", "info", "debug", "trace"]),
-            default: JsonValue::String("info".to_owned()),
-        },
-        // ----------------------------------------------------------------
-        // Environment
-        // ----------------------------------------------------------------
-        SettingDef {
-            key: "environment.shell",
-            label: "Shell",
-            description: "Shell executable used when running terminal commands.",
-            category: SettingCategory::Environment,
-            value_type: SettingType::String,
-            default: JsonValue::String(String::new()),
-        },
-        SettingDef {
-            key: "environment.workingDirectory",
-            label: "Working Directory",
-            description: "Default working directory for new chat sessions.",
-            category: SettingCategory::Environment,
-            value_type: SettingType::String,
-            default: JsonValue::String(String::new()),
-        },
-        SettingDef {
-            key: "environment.extraEnvVars",
-            label: "Extra Environment Variables",
-            description: "Additional environment variables injected into agent sub-processes.",
-            category: SettingCategory::Environment,
-            value_type: SettingType::StringArray,
-            default: serde_json::json!([]),
-        },
-        SettingDef {
-            key: "environment.theme",
-            label: "Theme",
-            description: "Color theme for the Kiro UI.",
-            category: SettingCategory::Environment,
-            value_type: SettingType::Enum(vec!["system", "light", "dark"]),
-            default: JsonValue::String("system".to_owned()),
-        },
-        SettingDef {
-            key: "environment.locale",
-            label: "Locale",
-            description: "BCP 47 locale tag used for formatting dates and numbers.",
-            category: SettingCategory::Environment,
-            value_type: SettingType::String,
-            default: JsonValue::String("en-US".to_owned()),
-        },
-        SettingDef {
-            key: "environment.fontSize",
-            label: "Font Size",
-            description: "Base font size (in pixels) for the Kiro UI.",
-            category: SettingCategory::Environment,
             value_type: SettingType::Number,
-            default: serde_json::json!(14),
+            default: None,
+        },
+        SettingDef {
+            key: "mcp.loadedBefore",
+            label: "MCP Loaded Before",
+            description: "Track previously loaded MCP servers",
+            category: SettingCategory::Mcp,
+            value_type: SettingType::Bool,
+            default: None,
+        },
+        // ----------------------------------------------------------------
+        // Environment Variables
+        // ----------------------------------------------------------------
+        SettingDef {
+            key: "KIRO_LOG_NO_COLOR",
+            label: "Disable Log Color",
+            description: "Set to disable colored log output",
+            category: SettingCategory::Environment,
+            value_type: SettingType::Bool,
+            default: Some(JsonValue::Bool(false)),
         },
     ]
 }
@@ -585,21 +566,26 @@ fn remove_nested_impl(value: &mut JsonValue, segments: &[&str]) -> bool {
 /// Resolve all registry settings against a loaded JSON config, returning a
 /// [`SettingEntry`] for each definition.
 ///
-/// Settings absent from `json` fall back to their `default` values.
+/// `current_value` is `None` when the key is absent from `json` (meaning the
+/// setting is at its default). `default_value` is `None` when no default is
+/// known for that setting.
 #[must_use]
 pub fn resolve_settings(json: &JsonValue) -> Vec<SettingEntry> {
     registry()
         .into_iter()
         .map(|def| {
-            let current_value = get_nested(json, def.key)
-                .cloned()
-                .unwrap_or_else(|| def.default.clone());
+            let current_value = get_nested(json, def.key).cloned();
+
+            let category_str = serde_json::to_value(def.category)
+                .ok()
+                .and_then(|v| v.as_str().map(std::borrow::ToOwned::to_owned))
+                .unwrap_or_default();
 
             SettingEntry {
                 key: def.key.to_owned(),
                 label: def.label.to_owned(),
                 description: def.description.to_owned(),
-                category: def.category,
+                category: category_str,
                 category_label: def.category.label().to_owned(),
                 value_type: def.value_type.type_name().to_owned(),
                 enum_options: def.value_type.enum_options(),
@@ -753,44 +739,49 @@ mod tests {
     #[test]
     fn registry_defaults_match_value_type() {
         for def in registry() {
+            // Settings with no known default skip type validation.
+            let Some(ref default) = def.default else {
+                continue;
+            };
+
             match &def.value_type {
                 SettingType::Bool => {
                     assert!(
-                        def.default.is_boolean(),
+                        default.is_boolean(),
                         "key '{}' is Bool but default is not boolean: {}",
                         def.key,
-                        def.default
+                        default
                     );
                 }
                 SettingType::Number => {
                     assert!(
-                        def.default.is_number(),
+                        default.is_number(),
                         "key '{}' is Number but default is not a number: {}",
                         def.key,
-                        def.default
+                        default
                     );
                 }
                 SettingType::String | SettingType::Char => {
                     assert!(
-                        def.default.is_string(),
+                        default.is_string(),
                         "key '{}' is String/Char but default is not a string: {}",
                         def.key,
-                        def.default
+                        default
                     );
                 }
                 SettingType::StringArray => {
                     assert!(
-                        def.default.is_array(),
+                        default.is_array(),
                         "key '{}' is StringArray but default is not an array: {}",
                         def.key,
-                        def.default
+                        default
                     );
                 }
                 SettingType::Enum(opts) => {
-                    let default_str = def.default.as_str().unwrap_or_else(|| {
+                    let default_str = default.as_str().unwrap_or_else(|| {
                         panic!(
                             "key '{}' is Enum but default is not a string: {}",
-                            def.key, def.default
+                            def.key, default
                         )
                     });
                     assert!(
@@ -892,9 +883,9 @@ mod tests {
         assert!(!entries.is_empty());
 
         for entry in &entries {
-            assert_eq!(
-                entry.current_value, entry.default_value,
-                "key '{}' should use default when config is empty",
+            assert!(
+                entry.current_value.is_none(),
+                "key '{}' current_value should be None when config is empty",
                 entry.key
             );
         }
@@ -916,17 +907,27 @@ mod tests {
 
         assert_eq!(
             model_entry.current_value,
-            serde_json::json!("claude-opus-4")
+            Some(serde_json::json!("claude-opus-4"))
         );
     }
 
     #[test]
     fn resolve_settings_includes_category_label() {
         let entries = resolve_settings(&serde_json::json!({}));
+
+        let has_telemetry_privacy = entries
+            .iter()
+            .any(|e| e.category_label == "Telemetry & Privacy");
+
+        assert!(
+            has_telemetry_privacy,
+            "expected 'Telemetry & Privacy' category label to appear in resolved entries"
+        );
+
         let mut labels_by_category: HashMap<String, String> = HashMap::new();
         for entry in &entries {
             labels_by_category
-                .entry(format!("{:?}", entry.category))
+                .entry(entry.category.clone())
                 .or_insert_with(|| entry.category_label.clone());
         }
         for label in labels_by_category.values() {
