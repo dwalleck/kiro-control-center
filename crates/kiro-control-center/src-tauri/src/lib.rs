@@ -29,6 +29,9 @@ fn create_builder() -> Builder<tauri::Wry> {
         commands::settings::save_scan_roots,
         commands::settings::discover_projects,
         commands::settings::set_active_project,
+        commands::kiro_settings::get_kiro_settings,
+        commands::kiro_settings::set_kiro_setting,
+        commands::kiro_settings::reset_kiro_setting,
     ])
 }
 

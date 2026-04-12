@@ -160,6 +160,39 @@ async setActiveProject(path: string) : Promise<Result<ProjectInfo, CommandError>
     if(e instanceof Error) throw e;
     else return { status: "error", error: e  as any };
 }
+},
+/**
+ * Load all Kiro CLI settings, merging the stored JSON with the registry defaults.
+ */
+async getKiroSettings() : Promise<Result<SettingEntry[], CommandError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("get_kiro_settings") };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Update a single Kiro CLI setting by key and return the updated entry.
+ */
+async setKiroSetting(key: string, value: JsonValue) : Promise<Result<SettingEntry, CommandError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("set_kiro_setting", { key, value }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
+},
+/**
+ * Remove a single Kiro CLI setting by key, reverting it to its default.
+ */
+async resetKiroSetting(key: string) : Promise<Result<null, CommandError>> {
+    try {
+    return { status: "ok", data: await TAURI_INVOKE("reset_kiro_setting", { key }) };
+} catch (e) {
+    if(e instanceof Error) throw e;
+    else return { status: "error", error: e  as any };
+}
 }
 }
 
@@ -232,6 +265,7 @@ export type InstalledSkillInfo = { name: string; marketplace: string; plugin: st
  * ISO 8601 timestamp of when the skill was installed.
  */
 installed_at: string }
+export type JsonValue = null | boolean | number | string | JsonValue[] | { [key in string]: JsonValue }
 /**
  * Result of adding a new marketplace.
  */
@@ -257,6 +291,50 @@ export type PluginInfo = { name: string; description: string | null; skill_count
  * Summary information about a Kiro project directory.
  */
 export type ProjectInfo = { path: string; kiro_initialized: boolean; installed_skill_count: number }
+/**
+ * Top-level category for a Kiro CLI setting.
+ */
+export type SettingCategory = "telemetry" | "chat" | "knowledge" | "key_bindings" | "features" | "api" | "mcp" | "environment"
+/**
+ * A fully-resolved setting entry suitable for serialisation to a frontend.
+ */
+export type SettingEntry = { 
+/**
+ * Dotted JSON key path.
+ */
+key: string; 
+/**
+ * Short human-readable label.
+ */
+label: string; 
+/**
+ * Longer description.
+ */
+description: string; 
+/**
+ * Machine-readable category identifier.
+ */
+category: SettingCategory; 
+/**
+ * Human-readable category label.
+ */
+category_label: string; 
+/**
+ * Wire-format type name (`"bool"`, `"string"`, `"enum"`, …).
+ */
+value_type: string; 
+/**
+ * For `Enum` settings: the allowed values.  `None` for all other types.
+ */
+enum_options: string[] | null; 
+/**
+ * Default value as a JSON value.
+ */
+default_value: JsonValue; 
+/**
+ * Current value as stored in the user's settings file.
+ */
+current_value: JsonValue }
 /**
  * Persisted application settings.
  */
