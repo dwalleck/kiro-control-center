@@ -7,6 +7,7 @@ pub mod cache;
 pub mod error;
 pub mod file_lock;
 pub mod git;
+pub mod kiro_settings;
 pub mod marketplace;
 pub mod platform;
 pub mod plugin;
