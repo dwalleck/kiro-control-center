@@ -1,7 +1,11 @@
-//! Kiro CLI settings registry types and definitions.
+//! Kiro CLI settings registry, JSON path helpers, and file I/O.
+
+use std::io;
+use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value as JsonValue;
+use tracing::{debug, warn};
 
 // ---------------------------------------------------------------------------
 // Setting category
@@ -607,12 +611,87 @@ pub fn resolve_settings(json: &JsonValue) -> Vec<SettingEntry> {
 }
 
 // ---------------------------------------------------------------------------
+// Kiro settings file I/O
+// ---------------------------------------------------------------------------
+
+/// Path to the CLI settings file relative to the Kiro home directory.
+const SETTINGS_FILE: &str = "settings/cli.json";
+
+/// Load `settings/cli.json` from the given Kiro home directory.
+///
+/// Returns an empty JSON object (`{}`) if the file does not exist or if its
+/// contents cannot be parsed as JSON.
+#[must_use]
+pub fn load_kiro_settings_from(kiro_dir: &Path) -> JsonValue {
+    let path = kiro_dir.join(SETTINGS_FILE);
+    debug!(path = %path.display(), "loading Kiro settings");
+
+    match std::fs::read_to_string(&path) {
+        Ok(contents) => match serde_json::from_str::<JsonValue>(&contents) {
+            Ok(json) => json,
+            Err(e) => {
+                warn!(
+                    path = %path.display(),
+                    error = %e,
+                    "settings file contains invalid JSON, using empty config"
+                );
+                serde_json::json!({})
+            }
+        },
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            debug!(path = %path.display(), "settings file not found, using empty config");
+            serde_json::json!({})
+        }
+        Err(e) => {
+            warn!(
+                path = %path.display(),
+                error = %e,
+                "could not read settings file, using empty config"
+            );
+            serde_json::json!({})
+        }
+    }
+}
+
+/// Save a JSON value to `settings/cli.json` inside the given Kiro home directory.
+///
+/// Creates the `settings/` subdirectory if it does not already exist.
+///
+/// # Errors
+///
+/// Returns an [`io::Error`] if directory creation or file write fails.
+pub fn save_kiro_settings_to(kiro_dir: &Path, json: &JsonValue) -> io::Result<()> {
+    let path = kiro_dir.join(SETTINGS_FILE);
+    debug!(path = %path.display(), "saving Kiro settings");
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+
+    let contents = serde_json::to_string_pretty(json)
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+
+    std::fs::write(&path, contents)?;
+    Ok(())
+}
+
+/// Resolve the default Kiro home directory (`~/.kiro`).
+///
+/// Returns `None` if the home directory cannot be determined.
+#[must_use]
+pub fn default_kiro_dir() -> Option<PathBuf> {
+    dirs::home_dir().map(|h| h.join(".kiro"))
+}
+
+// ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
 
 #[cfg(test)]
 mod tests {
     use std::collections::{HashMap, HashSet};
+
+    use tempfile::TempDir;
 
     use super::*;
 
@@ -853,5 +932,77 @@ mod tests {
         for label in labels_by_category.values() {
             assert!(!label.is_empty(), "category_label must not be empty");
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Task 3 — Kiro settings file I/O
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn load_kiro_settings_returns_empty_when_no_file() {
+        let dir = TempDir::new().unwrap();
+        let result = load_kiro_settings_from(dir.path());
+        assert_eq!(result, serde_json::json!({}));
+    }
+
+    #[test]
+    fn save_and_load_kiro_settings_roundtrip() {
+        let dir = TempDir::new().unwrap();
+        let settings = serde_json::json!({
+            "chat": {
+                "defaultModel": "claude-opus-4",
+                "temperature": 0.5
+            }
+        });
+
+        save_kiro_settings_to(dir.path(), &settings).expect("save should succeed");
+
+        let loaded = load_kiro_settings_from(dir.path());
+        assert_eq!(loaded, settings);
+    }
+
+    #[test]
+    fn save_kiro_settings_creates_parent_dirs() {
+        let dir = TempDir::new().unwrap();
+        // The settings subdirectory does not exist yet.
+        let nested = dir.path().join("does_not_exist_yet");
+        let settings = serde_json::json!({"key": "value"});
+
+        save_kiro_settings_to(&nested, &settings).expect("save should create parent dirs");
+
+        let loaded = load_kiro_settings_from(&nested);
+        assert_eq!(loaded, settings);
+    }
+
+    #[test]
+    fn load_kiro_settings_returns_empty_on_corrupt_json() {
+        let dir = TempDir::new().unwrap();
+        let settings_dir = dir.path().join("settings");
+        std::fs::create_dir_all(&settings_dir).unwrap();
+        std::fs::write(settings_dir.join("cli.json"), b"{ this is not valid json }").unwrap();
+
+        let result = load_kiro_settings_from(dir.path());
+        assert_eq!(result, serde_json::json!({}));
+    }
+
+    #[test]
+    fn save_kiro_settings_preserves_unknown_keys() {
+        let dir = TempDir::new().unwrap();
+        let settings = serde_json::json!({
+            "chat": {"defaultModel": "claude-sonnet-4-5"},
+            "unknownFutureKey": {"nestedValue": true}
+        });
+
+        save_kiro_settings_to(dir.path(), &settings).unwrap();
+        let loaded = load_kiro_settings_from(dir.path());
+
+        assert_eq!(
+            loaded["unknownFutureKey"]["nestedValue"],
+            serde_json::json!(true)
+        );
+        assert_eq!(
+            loaded["chat"]["defaultModel"],
+            serde_json::json!("claude-sonnet-4-5")
+        );
     }
 }
