@@ -120,15 +120,16 @@ impl MarketplaceService {
     ///
     /// 1. Detect source type (GitHub, git URL, local path).
     /// 2. Clone or link into a temp directory in the cache.
-    /// 3. Read the marketplace manifest to discover the canonical name.
-    /// 4. Validate the name, rename to final location.
-    /// 5. Register in `known_marketplaces.json`.
+    /// 3. Try to read `marketplace.json`; if missing, scan for `plugin.json` files.
+    /// 4. Merge manifest plugins with discovered plugins, deduplicating by path and name.
+    /// 5. Validate the name, rename to final location.
+    /// 6. Register in `known_marketplaces.json`.
     ///
     /// # Errors
     ///
-    /// Returns an error if the clone/link fails, the manifest is missing or
-    /// invalid, the marketplace name fails validation, or a marketplace with
-    /// the same name is already registered.
+    /// Returns an error if the clone/link fails, no plugins are found (neither
+    /// via manifest nor scan), the marketplace name fails validation, or a
+    /// marketplace with the same name is already registered.
     pub fn add(&self, source: &str, protocol: GitProtocol) -> Result<MarketplaceAddResult, Error> {
         let ms = MarketplaceSource::detect(source);
         self.cache.ensure_dirs()?;
@@ -136,7 +137,6 @@ impl MarketplaceService {
         let temp_name = format!("_pending_{}", std::process::id());
         let temp_dir = self.cache.marketplace_path(&temp_name);
 
-        // Clean up any leftover temp directory from a prior interrupted run.
         if temp_dir.exists()
             && let Err(e) = fs::remove_dir_all(&temp_dir)
         {
@@ -147,10 +147,8 @@ impl MarketplaceService {
             );
         }
 
-        // Guard auto-cleans temp_dir on any early return. Defuse after rename.
         let mut guard = TempDirGuard::new(temp_dir.clone());
 
-        // Clone or link based on source type.
         let link_result = self.clone_or_link(&ms, protocol, &temp_dir)?;
 
         if link_result == LinkResult::Copied {
@@ -160,23 +158,88 @@ impl MarketplaceService {
             );
         }
 
-        // Read marketplace manifest.
-        let manifest_path = temp_dir.join(crate::MARKETPLACE_MANIFEST_PATH);
-        let manifest = Self::read_manifest(&manifest_path)?;
+        // Try to read marketplace manifest (optional).
+        let manifest = Self::try_read_manifest(&temp_dir);
 
-        let name = manifest.name.clone();
+        // Scan for plugin.json files.
+        let discovered = crate::plugin::discover_plugins(&temp_dir, 3);
+
+        // Build the plugin list: manifest entries first, then discovered (deduplicated).
+        let (name, plugins) = if let Some(m) = manifest {
+            let manifest_name = m.name.clone();
+            let mut plugins: Vec<PluginBasicInfo> = m
+                .plugins
+                .iter()
+                .map(|p| PluginBasicInfo {
+                    name: p.name.clone(),
+                    description: p.description.clone(),
+                })
+                .collect();
+
+            // Collect marketplace-listed relative paths for dedup.
+            let listed_paths: Vec<PathBuf> = m
+                .plugins
+                .iter()
+                .filter_map(|p| match &p.source {
+                    crate::marketplace::PluginSource::RelativePath(rel) => {
+                        Some(PathBuf::from(rel.trim_start_matches("./")))
+                    }
+                    crate::marketplace::PluginSource::Structured(_) => None,
+                })
+                .collect();
+
+            // Collect listed names for dedup of structured sources.
+            let listed_names: Vec<&str> =
+                m.plugins.iter().map(|p| p.name.as_str()).collect();
+
+            // Add discovered plugins that aren't already listed.
+            for dp in &discovered {
+                let path_match = listed_paths.iter().any(|lp| lp == &dp.relative_path);
+                let name_match = listed_names.contains(&dp.name.as_str());
+                if !path_match && !name_match {
+                    plugins.push(PluginBasicInfo {
+                        name: dp.name.clone(),
+                        description: dp.description.clone(),
+                    });
+                }
+            }
+
+            (manifest_name, plugins)
+        } else {
+            if discovered.is_empty() {
+                return Err(MarketplaceError::NoPluginsFound {
+                    path: temp_dir.clone(),
+                }
+                .into());
+            }
+
+            let name = ms.fallback_name().ok_or_else(|| {
+                MarketplaceError::InvalidManifest {
+                    reason: "no marketplace.json found and could not derive a name from the source; use --name to specify one".into(),
+                }
+            })?;
+
+            let plugins = discovered
+                .iter()
+                .map(|dp| PluginBasicInfo {
+                    name: dp.name.clone(),
+                    description: dp.description.clone(),
+                })
+                .collect();
+
+            (name, plugins)
+        };
+
         validation::validate_name(&name)?;
 
-        // Rename temp dir to final location.
         let final_dir = self.cache.marketplace_path(&name);
         if final_dir.exists() {
             return Err(MarketplaceError::AlreadyRegistered { name: name.clone() }.into());
         }
 
         fs::rename(&temp_dir, &final_dir)?;
-        guard.defuse(); // Rename succeeded — don't clean up.
+        guard.defuse();
 
-        // Register in known_marketplaces.json.
         let entry = KnownMarketplace {
             name: name.clone(),
             source: ms,
@@ -184,15 +247,6 @@ impl MarketplaceService {
             added_at: chrono::Utc::now(),
         };
         self.cache.add_known_marketplace(entry)?;
-
-        let plugins = manifest
-            .plugins
-            .iter()
-            .map(|p| PluginBasicInfo {
-                name: p.name.clone(),
-                description: p.description.clone(),
-            })
-            .collect();
 
         debug!(marketplace = %name, "marketplace added");
 
@@ -341,28 +395,38 @@ impl MarketplaceService {
         }
     }
 
-    /// Read and parse the marketplace manifest. Does NOT do cleanup — the
-    /// caller (or its `TempDirGuard`) owns temp directory lifecycle.
-    fn read_manifest(manifest_path: &Path) -> Result<Marketplace, Error> {
-        let manifest_bytes = match fs::read(manifest_path) {
-            Ok(bytes) => bytes,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return Err(MarketplaceError::ManifestNotFound {
-                    path: manifest_path.to_path_buf(),
+    /// Try to read the marketplace manifest. Returns `None` if the file is
+    /// missing or malformed, logging appropriately in each case.
+    fn try_read_manifest(repo_dir: &Path) -> Option<Marketplace> {
+        let manifest_path = repo_dir.join(crate::MARKETPLACE_MANIFEST_PATH);
+        match fs::read(&manifest_path) {
+            Ok(bytes) => match Marketplace::from_json(&bytes) {
+                Ok(m) => Some(m),
+                Err(e) => {
+                    warn!(
+                        path = %manifest_path.display(),
+                        error = %e,
+                        "marketplace.json is malformed, falling back to plugin scan"
+                    );
+                    None
                 }
-                .into());
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                debug!(
+                    path = %manifest_path.display(),
+                    "no marketplace.json found, will discover plugins via scan"
+                );
+                None
             }
             Err(e) => {
-                // Permission denied, I/O error, etc. — propagate the real cause.
-                return Err(e.into());
+                warn!(
+                    path = %manifest_path.display(),
+                    error = %e,
+                    "failed to read marketplace.json, falling back to plugin scan"
+                );
+                None
             }
-        };
-
-        Marketplace::from_json(&manifest_bytes).map_err(|e| {
-            Error::from(MarketplaceError::InvalidManifest {
-                reason: e.to_string(),
-            })
-        })
+        }
     }
 }
 
@@ -620,5 +684,195 @@ mod tests {
 
         assert_eq!(result.updated.len(), 1);
         assert_eq!(result.updated[0], "mock-market");
+    }
+
+    // -----------------------------------------------------------------------
+    // Scan-and-merge tests
+    // -----------------------------------------------------------------------
+
+    /// Mock git backend that creates a repo with plugin.json files but no marketplace.json.
+    #[derive(Debug, Default)]
+    struct NoManifestGitBackend;
+
+    impl GitBackend for NoManifestGitBackend {
+        fn clone_repo(
+            &self,
+            _url: &str,
+            dest: &Path,
+            _opts: &CloneOptions,
+        ) -> Result<(), GitError> {
+            let plugin_a = dest.join("plugins/alpha");
+            fs::create_dir_all(&plugin_a).unwrap();
+            fs::write(
+                plugin_a.join("plugin.json"),
+                r#"{"name":"alpha","description":"Alpha plugin","skills":["./skills/"]}"#,
+            )
+            .unwrap();
+
+            let plugin_b = dest.join("plugins/beta");
+            fs::create_dir_all(&plugin_b).unwrap();
+            fs::write(
+                plugin_b.join("plugin.json"),
+                r#"{"name":"beta","skills":["./skills/"]}"#,
+            )
+            .unwrap();
+
+            Ok(())
+        }
+
+        fn pull_repo(&self, _path: &Path) -> Result<(), GitError> {
+            Ok(())
+        }
+
+        fn verify_sha(&self, _path: &Path, _expected: &str) -> Result<(), GitError> {
+            Ok(())
+        }
+    }
+
+    /// Mock that creates a repo with a marketplace.json AND an unlisted plugin.
+    #[derive(Debug, Default)]
+    struct MixedGitBackend;
+
+    impl GitBackend for MixedGitBackend {
+        fn clone_repo(
+            &self,
+            _url: &str,
+            dest: &Path,
+            _opts: &CloneOptions,
+        ) -> Result<(), GitError> {
+            let mp_dir = dest.join(".claude-plugin");
+            fs::create_dir_all(&mp_dir).unwrap();
+            fs::write(
+                mp_dir.join("marketplace.json"),
+                r#"{"name":"mixed-market","owner":{"name":"Test"},"plugins":[{"name":"listed","description":"A listed plugin","source":"./plugins/listed"}]}"#,
+            )
+            .unwrap();
+
+            let listed = dest.join("plugins/listed");
+            fs::create_dir_all(&listed).unwrap();
+            fs::write(
+                listed.join("plugin.json"),
+                r#"{"name":"listed","description":"A listed plugin","skills":["./skills/"]}"#,
+            )
+            .unwrap();
+
+            let unlisted = dest.join("plugins/unlisted");
+            fs::create_dir_all(&unlisted).unwrap();
+            fs::write(
+                unlisted.join("plugin.json"),
+                r#"{"name":"unlisted","description":"An unlisted plugin","skills":["./skills/"]}"#,
+            )
+            .unwrap();
+
+            Ok(())
+        }
+
+        fn pull_repo(&self, _path: &Path) -> Result<(), GitError> {
+            Ok(())
+        }
+
+        fn verify_sha(&self, _path: &Path, _expected: &str) -> Result<(), GitError> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn add_repo_without_manifest_discovers_plugins_via_scan() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cache = CacheDir::with_root(dir.path().to_path_buf());
+        cache.ensure_dirs().expect("ensure_dirs");
+        let svc = MarketplaceService::new(cache, NoManifestGitBackend);
+
+        let result = svc
+            .add("owner/skills", GitProtocol::Https)
+            .expect("add should succeed");
+
+        assert_eq!(result.name, "skills");
+        assert_eq!(result.plugins.len(), 2);
+
+        let names: Vec<&str> = result.plugins.iter().map(|p| p.name.as_str()).collect();
+        assert!(names.contains(&"alpha"), "should find alpha: {names:?}");
+        assert!(names.contains(&"beta"), "should find beta: {names:?}");
+    }
+
+    #[test]
+    fn add_repo_with_manifest_and_unlisted_plugins_merges_both() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cache = CacheDir::with_root(dir.path().to_path_buf());
+        cache.ensure_dirs().expect("ensure_dirs");
+        let svc = MarketplaceService::new(cache, MixedGitBackend);
+
+        let result = svc
+            .add("owner/repo", GitProtocol::Https)
+            .expect("add should succeed");
+
+        assert_eq!(result.name, "mixed-market");
+        assert_eq!(result.plugins.len(), 2);
+
+        let names: Vec<&str> = result.plugins.iter().map(|p| p.name.as_str()).collect();
+        assert!(names.contains(&"listed"), "should find listed: {names:?}");
+        assert!(
+            names.contains(&"unlisted"),
+            "should find unlisted: {names:?}"
+        );
+    }
+
+    #[test]
+    fn add_repo_with_manifest_deduplicates_listed_plugins() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cache = CacheDir::with_root(dir.path().to_path_buf());
+        cache.ensure_dirs().expect("ensure_dirs");
+        let svc = MarketplaceService::new(cache, MixedGitBackend);
+
+        let result = svc
+            .add("owner/repo", GitProtocol::Https)
+            .expect("add should succeed");
+
+        let listed_count = result
+            .plugins
+            .iter()
+            .filter(|p| p.name == "listed")
+            .count();
+        assert_eq!(listed_count, 1, "listed plugin should not be duplicated");
+    }
+
+    #[test]
+    fn add_empty_repo_returns_no_plugins_found_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cache = CacheDir::with_root(dir.path().to_path_buf());
+        cache.ensure_dirs().expect("ensure_dirs");
+
+        #[derive(Debug)]
+        struct EmptyRepoBackend;
+
+        impl GitBackend for EmptyRepoBackend {
+            fn clone_repo(
+                &self,
+                _url: &str,
+                dest: &Path,
+                _opts: &CloneOptions,
+            ) -> Result<(), GitError> {
+                fs::create_dir_all(dest).unwrap();
+                Ok(())
+            }
+
+            fn pull_repo(&self, _path: &Path) -> Result<(), GitError> {
+                Ok(())
+            }
+
+            fn verify_sha(&self, _path: &Path, _expected: &str) -> Result<(), GitError> {
+                Ok(())
+            }
+        }
+
+        let svc = MarketplaceService::new(cache, EmptyRepoBackend);
+        let err = svc
+            .add("owner/empty", GitProtocol::Https)
+            .expect_err("should fail");
+
+        assert!(
+            err.to_string().contains("no plugins found"),
+            "expected 'no plugins found' error, got: {err}"
+        );
     }
 }
