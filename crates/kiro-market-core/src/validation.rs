@@ -167,4 +167,13 @@ mod tests {
     fn validate_relative_path_accepts_current_dir_prefix() {
         assert!(validate_relative_path("./skills/tunit").is_ok());
     }
+
+    #[test]
+    fn validate_relative_path_rejects_backslash_absolute() {
+        let err = validate_relative_path("\\windows\\path").unwrap_err();
+        assert!(
+            matches!(err, ValidationError::InvalidRelativePath { .. }),
+            "expected InvalidRelativePath, got {err:?}"
+        );
+    }
 }

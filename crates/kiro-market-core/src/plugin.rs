@@ -614,6 +614,48 @@ mod tests {
     }
 
     #[test]
+    fn discover_plugins_relative_path_string_has_dot_slash_prefix() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+
+        create_plugin_json(&root.join("plugins/my-plugin"), "my-plugin", None);
+
+        let discovered = discover_plugins(root, 3);
+        assert_eq!(discovered.len(), 1);
+        assert_eq!(
+            discovered[0].as_relative_path_string(),
+            "./plugins/my-plugin"
+        );
+    }
+
+    #[test]
+    fn discover_plugins_max_depth_zero_returns_empty() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+
+        create_plugin_json(&root.join("my-plugin"), "my-plugin", None);
+
+        let discovered = discover_plugins(root, 0);
+        assert!(
+            discovered.is_empty(),
+            "max_depth 0 should not find plugins at depth 1"
+        );
+    }
+
+    #[test]
+    fn parse_missing_name_returns_error() {
+        let json = br#"{
+            "version": "1.0.0",
+            "description": "no name field"
+        }"#;
+
+        assert!(
+            PluginManifest::from_json(json).is_err(),
+            "missing `name` field should produce an error"
+        );
+    }
+
+    #[test]
     fn discover_plugins_skips_plugin_with_invalid_name() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let root = tmp.path();

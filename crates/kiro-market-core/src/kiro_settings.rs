@@ -1122,6 +1122,8 @@ mod tests {
     #[case::string_array_accepts_empty(SettingType::StringArray, serde_json::json!([]), true)]
     #[case::enum_accepts_valid(SettingType::Enum(vec!["a", "b"]), serde_json::json!("a"), true)]
     #[case::enum_rejects_invalid(SettingType::Enum(vec!["a", "b"]), serde_json::json!("c"), false)]
+    #[case::string_array_rejects_mixed(SettingType::StringArray, serde_json::json!([1, "a"]), false)]
+    #[case::enum_rejects_when_options_empty(SettingType::Enum(vec![]), serde_json::json!("any"), false)]
     fn is_compatible_value_validates_types(
         #[case] setting_type: SettingType,
         #[case] value: JsonValue,
@@ -1131,6 +1133,67 @@ mod tests {
             setting_type.is_compatible_value(&value),
             expected,
             "is_compatible_value({setting_type:?}, {value}) should be {expected}"
+        );
+    }
+
+    #[test]
+    fn resolve_settings_populates_value_type_and_default() {
+        let empty = serde_json::json!({});
+        let entries = resolve_settings(&empty);
+
+        let telemetry = entries
+            .iter()
+            .find(|e| e.key == "telemetry.enabled")
+            .expect("telemetry.enabled must be in registry");
+
+        assert!(
+            matches!(telemetry.value_type, SettingValueInfo::Bool),
+            "expected Bool value_type, got {:?}",
+            telemetry.value_type
+        );
+        assert_eq!(
+            telemetry.default_value,
+            Some(serde_json::json!(true)),
+            "telemetry.enabled should default to true"
+        );
+        assert!(
+            telemetry.current_value.is_none(),
+            "current_value should be None when resolved against empty JSON"
+        );
+    }
+
+    #[test]
+    fn set_nested_preserves_sibling_keys() {
+        let mut json = serde_json::json!({
+            "chat": {
+                "defaultModel": "claude-sonnet-4-5",
+                "temperature": 0.7
+            },
+            "mcp": {
+                "initTimeout": 5000
+            }
+        });
+
+        set_nested(
+            &mut json,
+            "chat.defaultModel",
+            serde_json::json!("claude-opus-4"),
+        );
+
+        assert_eq!(
+            get_nested(&json, "chat.defaultModel"),
+            Some(&serde_json::json!("claude-opus-4")),
+            "chat.defaultModel should be updated"
+        );
+        assert_eq!(
+            get_nested(&json, "chat.temperature"),
+            Some(&serde_json::json!(0.7)),
+            "chat.temperature should be unchanged"
+        );
+        assert_eq!(
+            get_nested(&json, "mcp.initTimeout"),
+            Some(&serde_json::json!(5000)),
+            "mcp.initTimeout should be unchanged"
         );
     }
 }

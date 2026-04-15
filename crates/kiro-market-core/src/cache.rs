@@ -699,6 +699,69 @@ mod tests {
     }
 
     #[test]
+    fn plugin_registry_roundtrip_preserves_source() {
+        let (_dir, cache) = temp_cache();
+        cache.ensure_dirs().expect("ensure_dirs");
+
+        let entries = vec![crate::marketplace::PluginEntry {
+            name: "dotnet".into(),
+            description: Some("Core .NET skills".into()),
+            source: crate::marketplace::PluginSource::RelativePath("./plugins/dotnet".into()),
+        }];
+
+        cache
+            .write_plugin_registry("source-test", &entries)
+            .expect("write should succeed");
+
+        let loaded = cache
+            .load_plugin_registry("source-test")
+            .expect("load should succeed")
+            .expect("registry should exist");
+
+        assert_eq!(loaded.len(), 1);
+        match &loaded[0].source {
+            crate::marketplace::PluginSource::RelativePath(p) => {
+                assert_eq!(p, "./plugins/dotnet");
+            }
+            other => panic!("expected RelativePath source, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn remove_known_marketplace_leaves_other_entries() {
+        let (_dir, cache) = temp_cache();
+        cache.ensure_dirs().expect("ensure_dirs");
+
+        for name in ["alpha", "beta", "gamma"] {
+            let entry = KnownMarketplace {
+                name: name.into(),
+                source: MarketplaceSource::GitHub {
+                    repo: format!("owner/{name}"),
+                },
+                protocol: None,
+                added_at: Utc::now(),
+            };
+            cache
+                .add_known_marketplace(entry)
+                .expect("add should succeed");
+        }
+
+        cache
+            .remove_known_marketplace("beta")
+            .expect("remove should succeed");
+
+        let remaining = cache
+            .load_known_marketplaces()
+            .expect("load should succeed");
+
+        assert_eq!(remaining.len(), 2);
+        assert!(
+            !remaining.iter().any(|e| e.name == "beta"),
+            "beta should have been removed"
+        );
+    }
+
+    #[test]
     fn known_marketplace_deserializes_without_protocol_field() {
         let json = r#"{
             "name": "legacy-market",
