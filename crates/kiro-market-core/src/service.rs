@@ -46,11 +46,12 @@ impl Drop for TempDirGuard {
     fn drop(&mut self) {
         if !self.defused
             && let Err(e) = fs::remove_dir_all(&self.path)
+            && e.kind() != std::io::ErrorKind::NotFound
         {
             warn!(
                 path = %self.path.display(),
                 error = %e,
-                "failed to clean up temp directory"
+                "failed to clean up temp directory — remove it manually"
             );
         }
     }
@@ -173,13 +174,20 @@ impl MarketplaceService {
 
         let name = if let Some(m) = &manifest {
             m.name.clone()
-        } else {
-            if discovered.is_empty() {
-                return Err(MarketplaceError::NoPluginsFound {
-                    path: temp_dir.clone(),
+        } else if discovered.is_empty() {
+            // Check if a manifest file exists but was malformed.
+            let manifest_path = temp_dir.join(crate::MARKETPLACE_MANIFEST_PATH);
+            if manifest_path.exists() {
+                return Err(MarketplaceError::InvalidManifest {
+                    reason: "marketplace.json exists but could not be parsed, and no plugin.json files were found via scan".into(),
                 }
                 .into());
             }
+            return Err(MarketplaceError::NoPluginsFound {
+                path: temp_dir.clone(),
+            }
+            .into());
+        } else {
             ms.fallback_name().ok_or_else(|| {
                 MarketplaceError::InvalidManifest {
                     reason: "no marketplace.json found and could not derive a name from the source; use --name to specify one".into(),
@@ -239,7 +247,7 @@ impl MarketplaceService {
             warn!(
                 marketplace = %name,
                 error = %e,
-                "failed to write plugin registry — browse may show incomplete plugins"
+                "failed to write plugin registry — run 'update {name}' to regenerate"
             );
         }
 
@@ -255,16 +263,26 @@ impl MarketplaceService {
     /// Returns an error if the marketplace is not registered or its cached
     /// data cannot be removed from disk.
     pub fn remove(&self, name: &str) -> Result<(), Error> {
-        self.cache.remove_known_marketplace(name)?;
-
         let mp_path = self.cache.marketplace_path(name);
+
+        // Verify it's registered before trying to delete.
+        let entries = self.cache.load_known_marketplaces()?;
+        if !entries.iter().any(|e| e.name == name) {
+            return Err(MarketplaceError::NotFound {
+                name: name.to_owned(),
+            }
+            .into());
+        }
+
+        // Delete the directory first — if this fails, the marketplace stays
+        // registered and the user can retry.
         if platform::is_local_link(&mp_path) {
             platform::remove_local_link(&mp_path)?;
         } else if mp_path.exists() {
             fs::remove_dir_all(&mp_path)?;
         }
 
-        // Clean up the plugin registry file.
+        // Clean up the plugin registry file (best-effort).
         let registry_path = self.cache.plugin_registry_path(name);
         if registry_path.exists()
             && let Err(e) = fs::remove_file(&registry_path)
@@ -275,6 +293,9 @@ impl MarketplaceService {
                 "failed to remove plugin registry file"
             );
         }
+
+        // Now unregister — directory is already gone.
+        self.cache.remove_known_marketplace(name)?;
 
         debug!(marketplace = %name, "marketplace removed");
         Ok(())
@@ -409,7 +430,17 @@ impl MarketplaceService {
     /// Called after `update()` pulls new content. Best-effort — a failure
     /// here does not block the update from succeeding.
     fn regenerate_plugin_registry(&self, name: &str, mp_path: &Path) {
-        let manifest = Self::try_read_manifest(mp_path).ok().flatten();
+        let manifest = match Self::try_read_manifest(mp_path) {
+            Ok(m) => m,
+            Err(e) => {
+                warn!(
+                    marketplace = %name,
+                    error = %e,
+                    "could not read manifest during registry regeneration"
+                );
+                None
+            }
+        };
         let discovered = crate::plugin::discover_plugins(mp_path, 3);
 
         let entries = Self::build_registry_entries(manifest.as_ref(), &discovered);
@@ -424,6 +455,9 @@ impl MarketplaceService {
     }
 
     /// Build a merged list of `PluginEntry` from manifest + discovered plugins.
+    ///
+    /// Uses [`plugin_entry_from_discovered`] to construct entries from
+    /// scanned `DiscoveredPlugin` values.
     fn build_registry_entries(
         manifest: Option<&Marketplace>,
         discovered: &[crate::plugin::DiscoveredPlugin],
@@ -453,13 +487,7 @@ impl MarketplaceService {
             for dp in discovered {
                 let dp_path = dp.relative_path_unix();
                 if !listed_paths.contains(&dp_path) && !listed_names.contains(&dp.name()) {
-                    entries.push(crate::marketplace::PluginEntry {
-                        name: dp.name().to_owned(),
-                        description: dp.description().map(String::from),
-                        source: crate::marketplace::PluginSource::RelativePath(
-                            dp.as_relative_path_string(),
-                        ),
-                    });
+                    entries.push(plugin_entry_from_discovered(dp));
                 }
             }
 
@@ -467,13 +495,7 @@ impl MarketplaceService {
         } else {
             discovered
                 .iter()
-                .map(|dp| crate::marketplace::PluginEntry {
-                    name: dp.name().to_owned(),
-                    description: dp.description().map(String::from),
-                    source: crate::marketplace::PluginSource::RelativePath(
-                        dp.as_relative_path_string(),
-                    ),
-                })
+                .map(plugin_entry_from_discovered)
                 .collect()
         }
     }
@@ -507,6 +529,17 @@ impl MarketplaceService {
             }
             Err(e) => Err(e.into()),
         }
+    }
+}
+
+/// Convert a [`DiscoveredPlugin`] into a [`PluginEntry`] with a relative-path source.
+fn plugin_entry_from_discovered(
+    dp: &crate::plugin::DiscoveredPlugin,
+) -> crate::marketplace::PluginEntry {
+    crate::marketplace::PluginEntry {
+        name: dp.name().to_owned(),
+        description: dp.description().map(String::from),
+        source: crate::marketplace::PluginSource::RelativePath(dp.as_relative_path_string()),
     }
 }
 

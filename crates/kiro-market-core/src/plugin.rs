@@ -100,7 +100,62 @@ pub fn discover_plugins(repo_root: &Path, max_depth: usize) -> Vec<DiscoveredPlu
     results
 }
 
-#[allow(clippy::too_many_lines)]
+/// Try to read and validate a `plugin.json` at the given directory.
+/// Returns `Some(DiscoveredPlugin)` if successful, `None` if the file
+/// doesn't exist, is malformed, or has an invalid name.
+fn try_read_plugin(dir: &Path, repo_root: &Path) -> Option<DiscoveredPlugin> {
+    let candidate = dir.join(PLUGIN_JSON);
+    if !candidate.is_file() {
+        return None;
+    }
+
+    let bytes = match fs::read(&candidate) {
+        Ok(b) => b,
+        Err(e) => {
+            warn!(
+                path = %candidate.display(),
+                error = %e,
+                "failed to read plugin.json, skipping"
+            );
+            return None;
+        }
+    };
+
+    let manifest = match PluginManifest::from_json(&bytes) {
+        Ok(m) => m,
+        Err(e) => {
+            warn!(
+                path = %candidate.display(),
+                error = %e,
+                "skipping malformed plugin.json"
+            );
+            return None;
+        }
+    };
+
+    if let Err(e) = crate::validation::validate_name(&manifest.name) {
+        warn!(
+            path = %candidate.display(),
+            name = %manifest.name,
+            error = %e,
+            "skipping plugin with invalid name"
+        );
+        return None;
+    }
+
+    let relative_path = dir.strip_prefix(repo_root).unwrap_or(dir).to_path_buf();
+    debug!(
+        name = %manifest.name,
+        path = %relative_path.display(),
+        "discovered plugin"
+    );
+    Some(DiscoveredPlugin {
+        name: manifest.name,
+        description: manifest.description,
+        relative_path,
+    })
+}
+
 fn scan_for_plugins(
     repo_root: &Path,
     dir: &Path,
@@ -113,53 +168,12 @@ fn scan_for_plugins(
     }
 
     // Check for plugin.json in this directory (skip the root itself).
-    if current_depth > 0 {
-        let candidate = dir.join(PLUGIN_JSON);
-        if candidate.is_file() {
-            match fs::read(&candidate) {
-                Ok(bytes) => match PluginManifest::from_json(&bytes) {
-                    Ok(manifest) => {
-                        if let Err(e) = crate::validation::validate_name(&manifest.name) {
-                            warn!(
-                                path = %candidate.display(),
-                                name = %manifest.name,
-                                error = %e,
-                                "skipping plugin with invalid name"
-                            );
-                            return;
-                        }
-                        let relative_path =
-                            dir.strip_prefix(repo_root).unwrap_or(dir).to_path_buf();
-                        debug!(
-                            name = %manifest.name,
-                            path = %relative_path.display(),
-                            "discovered plugin"
-                        );
-                        results.push(DiscoveredPlugin {
-                            name: manifest.name,
-                            description: manifest.description,
-                            relative_path,
-                        });
-                    }
-                    Err(e) => {
-                        warn!(
-                            path = %candidate.display(),
-                            error = %e,
-                            "skipping malformed plugin.json"
-                        );
-                    }
-                },
-                Err(e) => {
-                    warn!(
-                        path = %candidate.display(),
-                        error = %e,
-                        "failed to read plugin.json, skipping"
-                    );
-                }
-            }
-            // Don't recurse into a plugin directory — it won't contain nested plugins.
-            return;
+    if current_depth > 0 && dir.join(PLUGIN_JSON).is_file() {
+        if let Some(plugin) = try_read_plugin(dir, repo_root) {
+            results.push(plugin);
         }
+        // Don't recurse into a plugin directory — it won't contain nested plugins.
+        return;
     }
 
     // Recurse into subdirectories.

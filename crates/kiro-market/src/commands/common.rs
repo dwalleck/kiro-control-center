@@ -37,7 +37,10 @@ pub fn find_plugin_entry(
             }
         },
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            // Expected — manifest is optional.
+            debug!(
+                path = %manifest_path.display(),
+                "no marketplace.json found, falling back to plugin scan"
+            );
         }
         Err(e) => {
             warn!(
@@ -45,6 +48,11 @@ pub fn find_plugin_entry(
                 error = %e,
                 "failed to read marketplace.json, falling back to plugin scan"
             );
+            // Still fall through to scan -- the manifest may be optional.
+            // But propagate permission errors instead of silently scanning.
+            if e.kind() == std::io::ErrorKind::PermissionDenied {
+                anyhow::bail!("permission denied reading {}: {e}", manifest_path.display());
+            }
         }
     }
 

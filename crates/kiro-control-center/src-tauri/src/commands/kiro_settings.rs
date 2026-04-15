@@ -19,6 +19,24 @@ use crate::error::{CommandError, ErrorType};
 /// interactions (e.g. toggling multiple booleans quickly).
 static SETTINGS_WRITE_LOCK: Mutex<()> = Mutex::new(());
 
+/// Acquire the settings write lock, recovering from poisoning.
+fn acquire_settings_lock() -> std::sync::MutexGuard<'static, ()> {
+    SETTINGS_WRITE_LOCK.lock().unwrap_or_else(|poisoned| {
+        // A prior panic poisoned the lock. Recover rather than cascade
+        // panics — a lost-update is preferable to permanently bricking
+        // settings writes.
+        poisoned.into_inner()
+    })
+}
+
+/// Save the settings JSON to the Kiro directory, wrapping I/O errors
+/// into [`CommandError`].
+fn save_settings(dir: &std::path::Path, json: &serde_json::Value) -> Result<(), CommandError> {
+    save_kiro_settings_to(dir, json).map_err(|e| {
+        CommandError::new(format!("failed to save settings: {e}"), ErrorType::IoError)
+    })
+}
+
 /// Resolve the Kiro home directory (`~/.kiro`), returning a [`CommandError`]
 /// if the home directory cannot be determined.
 fn kiro_dir() -> Result<PathBuf, CommandError> {
@@ -113,17 +131,11 @@ pub async fn set_kiro_setting(
     let dir = kiro_dir()?;
 
     // Serialize load-modify-save to prevent lost updates from rapid changes.
-    let _guard = SETTINGS_WRITE_LOCK.lock().unwrap_or_else(|poisoned| {
-        // A prior panic poisoned the lock. Recover rather than cascade panics —
-        // a lost-update is preferable to permanently bricking settings writes.
-        poisoned.into_inner()
-    });
+    let _guard = acquire_settings_lock();
 
     let mut json = load_settings(&dir)?;
     set_nested(&mut json, &key, value);
-    save_kiro_settings_to(&dir, &json).map_err(|e| {
-        CommandError::new(format!("failed to save settings: {e}"), ErrorType::IoError)
-    })?;
+    save_settings(&dir, &json)?;
 
     let entry = resolve_settings(&json)
         .into_iter()
@@ -143,17 +155,11 @@ pub async fn reset_kiro_setting(key: String) -> Result<(), CommandError> {
     let dir = kiro_dir()?;
 
     // Serialize load-modify-save to prevent lost updates from rapid changes.
-    let _guard = SETTINGS_WRITE_LOCK.lock().unwrap_or_else(|poisoned| {
-        // A prior panic poisoned the lock. Recover rather than cascade panics —
-        // a lost-update is preferable to permanently bricking settings writes.
-        poisoned.into_inner()
-    });
+    let _guard = acquire_settings_lock();
 
     let mut json = load_settings(&dir)?;
     remove_nested(&mut json, &key);
-    save_kiro_settings_to(&dir, &json).map_err(|e| {
-        CommandError::new(format!("failed to save settings: {e}"), ErrorType::IoError)
-    })?;
+    save_settings(&dir, &json)?;
 
     Ok(())
 }

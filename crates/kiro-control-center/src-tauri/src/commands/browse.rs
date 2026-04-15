@@ -444,7 +444,8 @@ fn load_plugin_entries(
             warn!(
                 marketplace = marketplace_name,
                 error = %e,
-                "failed to load plugin registry, falling back to marketplace manifest"
+                "plugin registry is corrupt or unreadable — falling back to manifest; \
+                 run 'update' to regenerate"
             );
         }
     }
