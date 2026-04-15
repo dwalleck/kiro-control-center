@@ -32,6 +32,181 @@ impl PluginManifest {
     }
 }
 
+/// Name of the plugin manifest file.
+const PLUGIN_JSON: &str = "plugin.json";
+
+/// Directories to skip during recursive plugin scanning.
+const SKIP_DIRS: &[&str] = &["node_modules", "target", "__pycache__", ".venv", "vendor"];
+
+/// A plugin discovered by scanning a repository for `plugin.json` files.
+#[derive(Debug, Clone)]
+pub struct DiscoveredPlugin {
+    name: String,
+    description: Option<String>,
+    relative_path: PathBuf,
+}
+
+impl DiscoveredPlugin {
+    /// The plugin name from its `plugin.json`.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// The plugin description from its `plugin.json`.
+    #[must_use]
+    pub fn description(&self) -> Option<&str> {
+        self.description.as_deref()
+    }
+
+    /// Path to the plugin directory, relative to the repo root.
+    #[must_use]
+    pub fn relative_path(&self) -> &Path {
+        &self.relative_path
+    }
+
+    /// The relative path as a `./`-prefixed string, matching the
+    /// `PluginSource::RelativePath` convention used in `marketplace.json`.
+    #[must_use]
+    pub fn as_relative_path_string(&self) -> String {
+        format!("./{}", self.relative_path.display())
+    }
+}
+
+/// Scan a repository for `plugin.json` files up to `max_depth` levels deep.
+///
+/// Skips hidden directories (starting with `.`) and common noise directories
+/// (`node_modules`, `target`, etc.). Returns a list of discovered plugins with
+/// their names, descriptions, and relative paths.
+///
+/// Files that fail to read, parse, or have invalid plugin names are warned about and skipped.
+#[must_use]
+pub fn discover_plugins(repo_root: &Path, max_depth: usize) -> Vec<DiscoveredPlugin> {
+    let mut results = Vec::new();
+    scan_for_plugins(repo_root, repo_root, 0, max_depth, &mut results);
+    results
+}
+
+#[allow(clippy::too_many_lines)]
+fn scan_for_plugins(
+    repo_root: &Path,
+    dir: &Path,
+    current_depth: usize,
+    max_depth: usize,
+    results: &mut Vec<DiscoveredPlugin>,
+) {
+    if current_depth > max_depth {
+        return;
+    }
+
+    // Check for plugin.json in this directory (skip the root itself).
+    if current_depth > 0 {
+        let candidate = dir.join(PLUGIN_JSON);
+        if candidate.is_file() {
+            match fs::read(&candidate) {
+                Ok(bytes) => match PluginManifest::from_json(&bytes) {
+                    Ok(manifest) => {
+                        if let Err(e) = crate::validation::validate_name(&manifest.name) {
+                            warn!(
+                                path = %candidate.display(),
+                                name = %manifest.name,
+                                error = %e,
+                                "skipping plugin with invalid name"
+                            );
+                            return;
+                        }
+                        let relative_path =
+                            dir.strip_prefix(repo_root).unwrap_or(dir).to_path_buf();
+                        debug!(
+                            name = %manifest.name,
+                            path = %relative_path.display(),
+                            "discovered plugin"
+                        );
+                        results.push(DiscoveredPlugin {
+                            name: manifest.name,
+                            description: manifest.description,
+                            relative_path,
+                        });
+                    }
+                    Err(e) => {
+                        warn!(
+                            path = %candidate.display(),
+                            error = %e,
+                            "skipping malformed plugin.json"
+                        );
+                    }
+                },
+                Err(e) => {
+                    warn!(
+                        path = %candidate.display(),
+                        error = %e,
+                        "failed to read plugin.json, skipping"
+                    );
+                }
+            }
+            // Don't recurse into a plugin directory — it won't contain nested plugins.
+            return;
+        }
+    }
+
+    // Recurse into subdirectories.
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) => {
+            if current_depth == 0 {
+                warn!(
+                    path = %dir.display(),
+                    error = %e,
+                    "failed to read repo root during plugin scan"
+                );
+            } else {
+                debug!(
+                    path = %dir.display(),
+                    error = %e,
+                    "failed to read directory during plugin scan, skipping"
+                );
+            }
+            return;
+        }
+    };
+
+    for entry in entries {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(e) => {
+                warn!(error = %e, "failed to read directory entry, skipping");
+                continue;
+            }
+        };
+
+        let entry_path = entry.path();
+        if !entry_path.is_dir() {
+            continue;
+        }
+
+        // Skip hidden and noise directories.
+        let Some(dir_name) = entry.file_name().to_str().map(str::to_owned) else {
+            debug!(
+                path = %entry_path.display(),
+                "skipping directory with non-UTF-8 name"
+            );
+            continue;
+        };
+
+        if dir_name.starts_with('.') || SKIP_DIRS.contains(&dir_name.as_str()) {
+            continue;
+        }
+
+        scan_for_plugins(
+            repo_root,
+            &entry_path,
+            current_depth + 1,
+            max_depth,
+            results,
+        );
+    }
+}
+
 /// Name of the skill definition file.
 const SKILL_MD: &str = "SKILL.md";
 
@@ -268,5 +443,181 @@ mod tests {
             "only the valid skill should be returned, got {:?}",
             dirs[0]
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // discover_plugins
+    // -----------------------------------------------------------------------
+
+    /// Helper: create a minimal plugin.json in the given directory.
+    fn create_plugin_json(dir: &Path, name: &str, description: Option<&str>) {
+        fs::create_dir_all(dir).expect("create_dir_all");
+        let desc = description
+            .map(|d| format!(r#","description":"{d}""#))
+            .unwrap_or_default();
+        fs::write(
+            dir.join("plugin.json"),
+            format!(r#"{{"name":"{name}"{desc},"skills":["./skills/"]}}"#),
+        )
+        .expect("write plugin.json");
+    }
+
+    #[test]
+    fn discover_plugins_finds_plugin_json_at_depth_1() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+
+        create_plugin_json(&root.join("my-plugin"), "my-plugin", Some("A plugin"));
+
+        let discovered = discover_plugins(root, 3);
+        assert_eq!(discovered.len(), 1);
+        assert_eq!(discovered[0].name(), "my-plugin");
+        assert_eq!(discovered[0].description(), Some("A plugin"));
+    }
+
+    #[test]
+    fn discover_plugins_finds_plugin_json_at_depth_2() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+
+        create_plugin_json(
+            &root.join("plugins/dotnet-experimental"),
+            "dotnet-experimental",
+            Some("Experimental"),
+        );
+
+        let discovered = discover_plugins(root, 3);
+        assert_eq!(discovered.len(), 1);
+        assert_eq!(discovered[0].name(), "dotnet-experimental");
+    }
+
+    #[test]
+    fn discover_plugins_finds_multiple_plugins() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+
+        create_plugin_json(&root.join("plugins/alpha"), "alpha", None);
+        create_plugin_json(&root.join("plugins/beta"), "beta", None);
+
+        let mut discovered = discover_plugins(root, 3);
+        discovered.sort_by(|a, b| a.name().cmp(b.name()));
+        assert_eq!(discovered.len(), 2);
+        assert_eq!(discovered[0].name(), "alpha");
+        assert_eq!(discovered[1].name(), "beta");
+    }
+
+    #[test]
+    fn discover_plugins_respects_depth_limit() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+
+        create_plugin_json(&root.join("a/b/c/deep-plugin"), "deep-plugin", None);
+
+        let discovered = discover_plugins(root, 3);
+        assert!(discovered.is_empty(), "should not find plugin at depth 4");
+    }
+
+    #[test]
+    fn discover_plugins_skips_hidden_directories() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+
+        create_plugin_json(&root.join(".git/hooks"), "git-hooks", None);
+        create_plugin_json(&root.join(".claude-plugin"), "claude-internal", None);
+        create_plugin_json(&root.join("plugins/visible"), "visible", None);
+
+        let discovered = discover_plugins(root, 3);
+        assert_eq!(discovered.len(), 1);
+        assert_eq!(discovered[0].name(), "visible");
+    }
+
+    #[test]
+    fn discover_plugins_skips_noise_directories() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+
+        create_plugin_json(&root.join("node_modules/some-pkg"), "npm-thing", None);
+        create_plugin_json(&root.join("target/debug"), "build-artifact", None);
+        create_plugin_json(&root.join("plugins/real"), "real", None);
+
+        let discovered = discover_plugins(root, 3);
+        assert_eq!(discovered.len(), 1);
+        assert_eq!(discovered[0].name(), "real");
+    }
+
+    #[test]
+    fn discover_plugins_skips_malformed_plugin_json() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+
+        let bad_dir = root.join("plugins/bad");
+        fs::create_dir_all(&bad_dir).expect("mkdir");
+        fs::write(bad_dir.join("plugin.json"), "not json").expect("write");
+
+        create_plugin_json(&root.join("plugins/good"), "good", None);
+
+        let discovered = discover_plugins(root, 3);
+        assert_eq!(discovered.len(), 1);
+        assert_eq!(discovered[0].name(), "good");
+    }
+
+    #[test]
+    fn discover_plugins_returns_empty_for_no_plugins() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let discovered = discover_plugins(tmp.path(), 3);
+        assert!(discovered.is_empty());
+    }
+
+    #[test]
+    fn discover_plugins_includes_relative_path() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+
+        create_plugin_json(&root.join("plugins/my-plugin"), "my-plugin", None);
+
+        let discovered = discover_plugins(root, 3);
+        assert_eq!(discovered.len(), 1);
+        assert_eq!(
+            discovered[0].relative_path(),
+            Path::new("plugins/my-plugin")
+        );
+    }
+
+    #[test]
+    fn discover_plugins_finds_plugin_at_exact_max_depth() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+
+        // Depth 3 exactly — should be found with max_depth 3.
+        create_plugin_json(&root.join("a/b/at-limit"), "at-limit", None);
+
+        let discovered = discover_plugins(root, 3);
+        assert_eq!(
+            discovered.len(),
+            1,
+            "should find plugin at exactly max_depth"
+        );
+        assert_eq!(discovered[0].name(), "at-limit");
+    }
+
+    #[test]
+    fn discover_plugins_skips_plugin_with_invalid_name() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+
+        // Plugin with path traversal in name — should be skipped.
+        let bad_dir = root.join("plugins/bad");
+        fs::create_dir_all(&bad_dir).expect("mkdir");
+        fs::write(
+            bad_dir.join("plugin.json"),
+            r#"{"name":"../escape","skills":["./skills/"]}"#,
+        )
+        .expect("write");
+
+        create_plugin_json(&root.join("plugins/good"), "good", None);
+
+        let discovered = discover_plugins(root, 3);
+        assert_eq!(discovered.len(), 1);
+        assert_eq!(discovered[0].name(), "good");
     }
 }

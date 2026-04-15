@@ -22,8 +22,8 @@
   type="button"
   class="flex items-start gap-3 w-full text-left p-4 rounded-lg border transition-colors duration-150
     {selected
-      ? 'border-kiro-accent-500 bg-kiro-accent-900/20'
-      : 'border-kiro-muted bg-kiro-overlay hover:border-kiro-subtle'}
+      ? 'border-kiro-accent-500 border-l-kiro-accent-400 bg-kiro-accent-900/20'
+      : 'border-kiro-muted border-l-2 border-l-kiro-accent-800 bg-kiro-overlay hover:border-l-kiro-accent-500 hover:bg-kiro-accent-900/5'}
     {skill.installed ? 'opacity-60' : ''}"
   onclick={onToggle}
   disabled={skill.installed}
@@ -44,6 +44,9 @@
           Installed
         </span>
       {/if}
+      <span class="inline-flex items-center px-2 py-0.5 text-xs font-medium rounded-full bg-kiro-info/15 text-kiro-info">
+        {skill.plugin}
+      </span>
     </div>
     <p
       bind:this={descEl}
