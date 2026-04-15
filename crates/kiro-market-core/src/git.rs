@@ -121,8 +121,7 @@ impl GixCliBackend {
 
     /// Clone using the `gix` library (fast, in-process, no subprocess).
     fn clone_with_gix(&self, url: &str, dest: &Path, opts: &CloneOptions) -> Result<(), GitError> {
-        let mut prepare =
-            gix::prepare_clone(url, dest).map_err(|e| clone_failed(url, e))?;
+        let mut prepare = gix::prepare_clone(url, dest).map_err(|e| clone_failed(url, e))?;
 
         if opts.git_ref.is_none() {
             let depth = NonZeroU32::MIN;
@@ -255,20 +254,23 @@ impl GitBackend for GixCliBackend {
                     "gix clone failed, falling back to system git CLI"
                 );
                 // Clean up any partial gix clone before retrying.
+                // If cleanup fails, the CLI clone will fail on a non-empty
+                // directory, so we must bail out with both errors.
                 if dest.exists()
-                    && let Err(e) = std::fs::remove_dir_all(dest)
+                    && let Err(cleanup_err) = std::fs::remove_dir_all(dest)
                 {
                     warn!(
                         path = %dest.display(),
-                        error = %e,
+                        error = %cleanup_err,
                         "failed to clean up partial gix clone"
                     );
+                    return Err(clone_failed(
+                        url,
+                        format!("gix: {gix_err}; cleanup failed: {cleanup_err}"),
+                    ));
                 }
                 self.clone_with_cli(url, dest, opts).map_err(|cli_err| {
-                    clone_failed(
-                        url,
-                        format!("gix: {gix_err}; system git: {cli_err}"),
-                    )
+                    clone_failed(url, format!("gix: {gix_err}; system git: {cli_err}"))
                 })
             }
         }

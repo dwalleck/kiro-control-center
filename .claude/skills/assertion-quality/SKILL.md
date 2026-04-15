@@ -58,7 +58,7 @@ If the language is ambiguous, ask the user. If the test files contain a mix of l
 
 ## Universal Assertion Categories
 
-These 12 categories apply across all languages. Each language reference file maps framework-specific syntax to these categories.
+These 14 categories apply across all languages. Each language reference file maps framework-specific syntax to these categories.
 
 | # | Category | What it verifies |
 |---|----------|-----------------|
