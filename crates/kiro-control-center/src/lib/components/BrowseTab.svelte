@@ -138,7 +138,7 @@
         Marketplaces
       </h3>
       {#if loadingMarketplaces}
-        <p class="text-sm text-kiro-subtle px-2">Loading...</p>
+        <p class="text-sm text-kiro-subtle px-2 animate-pulse">Loading...</p>
       {:else if marketplaces.length === 0}
         <p class="text-sm text-kiro-subtle px-2">No marketplaces found</p>
       {:else}
@@ -152,7 +152,14 @@
               onclick={() => toggleMarketplace(mp.name)}
             >
               <span class="flex items-center justify-between">
-                <span class="truncate font-medium">{mp.name}</span>
+                <span class="flex items-center gap-2 truncate">
+                  <span class="w-2 h-2 rounded-full flex-shrink-0 {
+                    mp.source_type === 'github' ? 'bg-kiro-info' :
+                    mp.source_type === 'local' ? 'bg-kiro-warning' :
+                    'bg-kiro-accent-400'
+                  }"></span>
+                  <span class="truncate font-medium">{mp.name}</span>
+                </span>
                 <span class="text-xs text-kiro-subtle">{mp.plugin_count}</span>
               </span>
             </button>
@@ -214,15 +221,27 @@
     <!-- Skills content -->
     <div class="flex-1 overflow-y-auto p-4">
       {#if !selectedPlugin}
-        <div class="flex items-center justify-center h-full text-kiro-subtle">
+        <div class="flex flex-col items-center justify-center h-full text-kiro-subtle gap-3">
+          <svg class="w-10 h-10 text-kiro-accent-800" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5"
+              d="M20 7l-8-4-8 4m16 0l-8 4m8-4v10l-8 4m0-10L4 7m8 4v10M4 7v10l8 4" />
+          </svg>
           <p class="text-sm">Select a plugin from the sidebar to browse skills</p>
         </div>
       {:else if loadingSkills}
-        <div class="flex items-center justify-center h-full text-kiro-subtle">
+        <div class="flex flex-col items-center justify-center h-full text-kiro-subtle gap-3">
+          <svg class="w-8 h-8 text-kiro-accent-800 animate-pulse" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5"
+              d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+          </svg>
           <p class="text-sm">Loading skills...</p>
         </div>
       {:else if filteredSkills.length === 0}
-        <div class="flex items-center justify-center h-full text-kiro-subtle">
+        <div class="flex flex-col items-center justify-center h-full text-kiro-subtle gap-3">
+          <svg class="w-10 h-10 text-kiro-accent-800" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5"
+              d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" />
+          </svg>
           <p class="text-sm">
             {filterText ? "No skills match the filter" : "No skills available"}
           </p>

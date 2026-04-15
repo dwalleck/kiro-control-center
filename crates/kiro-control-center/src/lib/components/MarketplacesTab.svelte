@@ -155,17 +155,25 @@
   <!-- Marketplace list -->
   <div class="flex-1 overflow-y-auto p-4">
     {#if loading}
-      <div class="flex items-center justify-center h-full text-kiro-subtle">
+      <div class="flex flex-col items-center justify-center h-full text-kiro-subtle gap-3">
+        <svg class="w-8 h-8 text-kiro-accent-800 animate-pulse" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5"
+            d="M4 4v5h.582m15.356 2A8.001 8.001 0 004.582 9m0 0H9m11 11v-5h-.581m0 0a8.003 8.003 0 01-15.357-2m15.357 2H15" />
+        </svg>
         <p class="text-sm">Loading marketplaces...</p>
       </div>
     {:else if marketplaces.length === 0}
-      <div class="flex items-center justify-center h-full text-kiro-subtle">
+      <div class="flex flex-col items-center justify-center h-full text-kiro-subtle gap-3">
+        <svg class="w-10 h-10 text-kiro-accent-800" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+          <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5"
+            d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10" />
+        </svg>
         <p class="text-sm">No marketplaces registered. Add one above to get started.</p>
       </div>
     {:else}
       <div class="space-y-3">
         {#each marketplaces as mp (mp.name)}
-          <div class="flex items-center justify-between p-4 rounded-lg border border-kiro-muted bg-kiro-overlay">
+          <div class="flex items-center justify-between p-4 rounded-lg border border-kiro-muted border-l-2 border-l-kiro-accent-800 bg-kiro-overlay">
             <div class="flex items-center gap-3 min-w-0">
               <div class="min-w-0">
                 <div class="flex items-center gap-2">

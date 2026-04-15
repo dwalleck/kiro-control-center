@@ -32,7 +32,7 @@
   </div>
 {:else if store.projectPath}
   <div class="flex flex-col h-screen bg-kiro-base text-kiro-text">
-    <header class="flex items-center justify-between px-6 py-3 bg-kiro-surface border-b border-kiro-muted shadow-sm">
+    <header class="flex items-center justify-between px-6 py-3 bg-kiro-surface border-b-2 border-kiro-accent-700 shadow-sm">
       <div class="flex items-center gap-3">
         <h1 class="text-lg font-semibold">Kiro Control Center</h1>
         <button
