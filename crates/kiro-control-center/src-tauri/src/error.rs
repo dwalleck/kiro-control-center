@@ -45,6 +45,7 @@ impl From<CoreError> for CommandError {
             CoreError::Marketplace(MarketplaceError::AlreadyRegistered { .. }) => {
                 ErrorType::AlreadyExists
             }
+            CoreError::Marketplace(MarketplaceError::NoPluginsFound { .. }) => ErrorType::NotFound,
             CoreError::Marketplace(_) => ErrorType::ParseError,
             CoreError::Skill(SkillError::AlreadyInstalled { .. }) => ErrorType::AlreadyExists,
             CoreError::Skill(SkillError::NotInstalled { .. }) => ErrorType::NotFound,
@@ -105,6 +106,10 @@ mod tests {
     #[case::marketplace_already_registered(
         CoreError::Marketplace(MarketplaceError::AlreadyRegistered { name: "acme".into() }),
         ErrorType::AlreadyExists
+    )]
+    #[case::marketplace_no_plugins_found(
+        CoreError::Marketplace(MarketplaceError::NoPluginsFound { path: PathBuf::from("/tmp/repo") }),
+        ErrorType::NotFound
     )]
     #[case::marketplace_invalid_manifest(
         CoreError::Marketplace(MarketplaceError::InvalidManifest { reason: "bad json".into() }),

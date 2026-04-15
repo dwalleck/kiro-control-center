@@ -1,7 +1,7 @@
 //! Advisory file locking for concurrent marketplace operations.
 //!
 //! Uses [`fs4`] exclusive advisory locks to serialise read-modify-write cycles
-//! on shared JSON files (`installed-skills.json`, `marketplace-cache.json`, etc.).
+//! on shared JSON files (`installed-skills.json`, `known_marketplaces.json`, etc.).
 //!
 //! ## Windows caveat
 //!

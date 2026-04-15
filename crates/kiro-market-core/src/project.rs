@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::error::SkillError;
 use crate::validation;
@@ -181,7 +181,7 @@ impl KiroProject {
     pub fn remove_skill(&self, name: &str) -> crate::error::Result<()> {
         validation::validate_name(name)?;
 
-        crate::file_lock::with_file_lock(&self.tracking_path(), || {
+        crate::file_lock::with_file_lock(&self.tracking_path(), || -> crate::error::Result<()> {
             let dir = self.skill_dir(name);
 
             if !dir.exists() {
@@ -191,11 +191,43 @@ impl KiroProject {
                 .into());
             }
 
-            fs::remove_dir_all(&dir)?;
-
+            // Update tracking BEFORE deleting the directory so a crash
+            // between the two operations leaves the directory on disk
+            // (harmless) rather than a phantom tracking entry (confusing).
             let mut installed = self.load_installed()?;
-            installed.skills.remove(name);
-            self.write_tracking(&installed)
+            let saved_meta = installed.skills.remove(name);
+            self.write_tracking(&installed)?;
+
+            if let Err(e) = fs::remove_dir_all(&dir) {
+                // Directory delete failed after tracking was already updated.
+                // Re-insert the entry so the tracking file stays consistent.
+                warn!(
+                    name,
+                    error = %e,
+                    "failed to delete skill directory after tracking update; \
+                     restoring tracking entry"
+                );
+                if let Some(meta) = saved_meta {
+                    installed.skills.insert(name.to_owned(), meta);
+                    if let Err(restore_err) = self.write_tracking(&installed) {
+                        warn!(
+                            name,
+                            error = %restore_err,
+                            "failed to restore tracking entry — skill may be \
+                             untracked on disk"
+                        );
+                    }
+                } else {
+                    debug!(
+                        name,
+                        "skill directory exists on disk but had no tracking \
+                         entry; no restore needed"
+                    );
+                }
+                return Err(e.into());
+            }
+
+            Ok(())
         })?;
 
         debug!(name, "skill removed");
@@ -287,7 +319,7 @@ impl KiroProject {
         if let Err(e) = copy_dir_recursive(source_dir, &staging_dir) {
             // Clean up the partial staging directory.
             if let Err(cleanup_err) = fs::remove_dir_all(&staging_dir) {
-                debug!(
+                warn!(
                     path = %staging_dir.display(),
                     error = %cleanup_err,
                     "failed to clean up partial staging directory"
@@ -318,16 +350,17 @@ impl KiroProject {
         });
 
         if let Err(e) = tracking_result {
-            debug!(
+            warn!(
                 name,
                 error = %e,
                 "tracking update failed after rename, rolling back"
             );
             if let Err(rollback_err) = fs::remove_dir_all(&dir) {
-                debug!(
+                warn!(
                     path = %dir.display(),
                     error = %rollback_err,
-                    "failed to roll back skill directory after tracking failure"
+                    "failed to roll back skill directory after tracking failure — \
+                     skill is installed on disk but not tracked"
                 );
             }
             return Err(e);
@@ -581,13 +614,11 @@ mod tests {
         let content = fs::read_to_string(project.skill_dir("s").join("SKILL.md")).expect("read");
         assert!(content.contains("Updated."));
 
-        assert!(
-            project
-                .skill_dir("s")
-                .join("references")
-                .join("new.md")
-                .exists()
-        );
+        assert!(project
+            .skill_dir("s")
+            .join("references")
+            .join("new.md")
+            .exists());
     }
 
     #[test]
@@ -694,13 +725,11 @@ mod tests {
         project
             .install_skill_from_dir("s", src1.path(), sample_meta())
             .expect("first install");
-        assert!(
-            project
-                .skill_dir("s")
-                .join("references")
-                .join("old.md")
-                .exists()
-        );
+        assert!(project
+            .skill_dir("s")
+            .join("references")
+            .join("old.md")
+            .exists());
 
         // v2: SKILL.md only, no references/
         fs::write(

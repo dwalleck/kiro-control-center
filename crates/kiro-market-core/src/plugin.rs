@@ -65,11 +65,24 @@ impl DiscoveredPlugin {
         &self.relative_path
     }
 
-    /// The relative path as a `./`-prefixed string, matching the
-    /// `PluginSource::RelativePath` convention used in `marketplace.json`.
+    /// The relative path as a `./`-prefixed string with forward slashes,
+    /// matching the `PluginSource::RelativePath` convention used in
+    /// `marketplace.json`. Uses forward slashes on all platforms.
     #[must_use]
     pub fn as_relative_path_string(&self) -> String {
-        format!("./{}", self.relative_path.display())
+        let unix_path = self.relative_path_unix();
+        format!("./{unix_path}")
+    }
+
+    /// The relative path with forward slashes, suitable for cross-platform
+    /// comparison against manifest paths.
+    #[must_use]
+    pub fn relative_path_unix(&self) -> String {
+        self.relative_path
+            .components()
+            .map(|c| c.as_os_str().to_string_lossy())
+            .collect::<Vec<_>>()
+            .join("/")
     }
 }
 
@@ -236,7 +249,7 @@ pub fn discover_skill_dirs(plugin_root: &Path, skill_paths: &[&str]) -> Vec<Path
 
         let candidate = plugin_root.join(path_str);
 
-        if path_str.ends_with('/') {
+        if path_str.ends_with('/') || path_str.ends_with('\\') {
             // Scan subdirectories for those containing SKILL.md.
             match fs::read_dir(&candidate) {
                 Ok(entries) => {

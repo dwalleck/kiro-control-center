@@ -58,6 +58,8 @@ impl MarketplaceSource {
             || source.starts_with('/')
             || source.starts_with("./")
             || source.starts_with("../")
+            || source.starts_with(".\\")
+            || source.starts_with("..\\")
             || source.starts_with('~')
         {
             Self::LocalPath {
@@ -134,7 +136,7 @@ pub fn resolve_local_path(path_str: &str) -> std::io::Result<PathBuf> {
         if rest.is_empty() {
             home
         } else {
-            home.join(rest.trim_start_matches('/'))
+            home.join(rest.trim_start_matches(['/', '\\']))
         }
     } else {
         PathBuf::from(path_str)
@@ -536,10 +538,11 @@ mod tests {
         let (_dir, cache) = temp_cache();
 
         let mp = cache.marketplace_path("my-market");
-        assert!(mp.ends_with("marketplaces/my-market"));
+        // Use Path::ends_with which compares by components (cross-platform).
+        assert!(mp.ends_with(Path::new("marketplaces").join("my-market")));
 
         let pp = cache.plugin_path("my-market", "my-plugin");
-        assert!(pp.ends_with("plugins/my-market/my-plugin"));
+        assert!(pp.ends_with(Path::new("plugins").join("my-market").join("my-plugin")));
     }
 
     #[test]

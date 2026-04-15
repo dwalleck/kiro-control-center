@@ -193,7 +193,8 @@ fn shellexpand_tilde(path: &str) -> String {
             return home.to_string_lossy().into_owned();
         }
     }
-    if let Some(rest) = path.strip_prefix("~/") {
+    let rest = path.strip_prefix("~/").or_else(|| path.strip_prefix("~\\"));
+    if let Some(rest) = rest {
         if let Some(home) = dirs::home_dir() {
             return home.join(rest).to_string_lossy().into_owned();
         }
