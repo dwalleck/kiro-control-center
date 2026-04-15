@@ -69,8 +69,15 @@ impl From<CoreError> for CommandError {
             }
         };
 
+        let message = err.to_string();
+        warn!(
+            error_type = ?error_type,
+            error = %message,
+            "command failed"
+        );
+
         Self {
-            message: err.to_string(),
+            message,
             error_type,
         }
     }
