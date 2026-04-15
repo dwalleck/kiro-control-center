@@ -1,8 +1,11 @@
 //! Git operations for cloning and updating marketplace repositories.
 //!
-//! Uses `gix` for clone and repository inspection, and shells out to the
-//! `git` CLI for operations that require working-tree updates (pull,
-//! checkout). Errors are mapped into domain-specific [`GitError`] variants.
+//! Cloning tries `gix` first (fast, in-process) and falls back to the
+//! system `git` CLI when `gix` fails — for example when `curl-sys` was
+//! compiled without TLS support, or on corporate networks where the
+//! system git has proxy/certificate configuration that `gix` cannot
+//! access. Pull and checkout always use the system `git` CLI.
+//! Errors are mapped into domain-specific [`GitError`] variants.
 
 use std::num::NonZeroU32;
 use std::path::Path;
@@ -11,7 +14,7 @@ use std::sync::atomic::AtomicBool;
 
 use gix::progress::Discard;
 use serde::{Deserialize, Serialize};
-use tracing::debug;
+use tracing::{debug, warn};
 
 use crate::error::GitError;
 
@@ -115,6 +118,106 @@ impl GixCliBackend {
             },
         })
     }
+
+    /// Clone using the `gix` library (fast, in-process, no subprocess).
+    fn clone_with_gix(&self, url: &str, dest: &Path, opts: &CloneOptions) -> Result<(), GitError> {
+        let map_err = |e: Box<dyn std::error::Error + Send + Sync>| GitError::CloneFailed {
+            url: url.to_owned(),
+            source: e,
+        };
+
+        let mut prepare = gix::prepare_clone(url, dest).map_err(|e| map_err(Box::new(e)))?;
+
+        if opts.git_ref.is_none() {
+            let depth = NonZeroU32::MIN;
+            prepare = prepare.with_shallow(gix::remote::fetch::Shallow::DepthAtRemote(depth));
+        }
+
+        let (mut checkout, _outcome) = prepare
+            .fetch_then_checkout(Discard, &AtomicBool::new(false))
+            .map_err(|e| map_err(Box::new(e)))?;
+
+        let (_repo, _outcome) = checkout
+            .main_worktree(Discard, &AtomicBool::new(false))
+            .map_err(|e| map_err(Box::new(e)))?;
+
+        self.checkout_ref_if_needed(url, dest, opts)?;
+
+        Ok(())
+    }
+
+    /// Clone using the system `git` CLI.
+    ///
+    /// Falls back to this when `gix` fails (e.g. missing TLS backend on
+    /// Windows, corporate proxy issues, or unsupported transport).
+    fn clone_with_cli(&self, url: &str, dest: &Path, opts: &CloneOptions) -> Result<(), GitError> {
+        let map_err = |e: Box<dyn std::error::Error + Send + Sync>| GitError::CloneFailed {
+            url: url.to_owned(),
+            source: e,
+        };
+
+        // Build the git clone command. Use --depth 1 for shallow clones
+        // when no specific ref is requested.
+        let mut args = vec!["clone"];
+        if opts.git_ref.is_none() {
+            args.extend(["--depth", "1"]);
+        }
+        args.push(url);
+        let dest_str = dest.to_string_lossy();
+        args.push(&dest_str);
+
+        debug!(url, dest = %dest.display(), "cloning via system git CLI");
+
+        // run_git needs an existing directory for current_dir.
+        // Use the parent of dest (which should exist).
+        let work_dir = dest.parent().unwrap_or(dest);
+        let output = self
+            .run_git(&args, work_dir)
+            .map_err(|e| map_err(Box::new(e)))?;
+
+        if !output.status.success() {
+            let detail = git_error_detail(&output);
+            return Err(map_err(detail.into()));
+        }
+
+        self.checkout_ref_if_needed(url, dest, opts)?;
+
+        Ok(())
+    }
+
+    /// Check out a specific git ref if one was requested.
+    fn checkout_ref_if_needed(
+        &self,
+        url: &str,
+        dest: &Path,
+        opts: &CloneOptions,
+    ) -> Result<(), GitError> {
+        let Some(refname) = opts.git_ref.as_deref() else {
+            return Ok(());
+        };
+
+        let map_err = |e: Box<dyn std::error::Error + Send + Sync>| GitError::CloneFailed {
+            url: url.to_owned(),
+            source: e,
+        };
+
+        if refname.starts_with('-') {
+            return Err(map_err(
+                format!("invalid git ref: '{refname}' must not start with '-'").into(),
+            ));
+        }
+
+        let output = self
+            .run_git(&["checkout", refname], dest)
+            .map_err(|e| map_err(Box::new(e)))?;
+
+        if !output.status.success() {
+            let detail = git_error_detail(&output);
+            return Err(map_err(detail.into()));
+        }
+
+        Ok(())
+    }
 }
 
 /// Extract a useful error message from a failed git command.
@@ -137,44 +240,28 @@ impl GitBackend for GixCliBackend {
     fn clone_repo(&self, url: &str, dest: &Path, opts: &CloneOptions) -> Result<(), GitError> {
         debug!(url, dest = %dest.display(), git_ref = opts.git_ref.as_deref(), "cloning repository");
 
-        let map_err = |e: Box<dyn std::error::Error + Send + Sync>| GitError::CloneFailed {
-            url: url.to_owned(),
-            source: e,
-        };
-
-        let mut prepare = gix::prepare_clone(url, dest).map_err(|e| map_err(Box::new(e)))?;
-
-        if opts.git_ref.is_none() {
-            let depth = NonZeroU32::MIN;
-            prepare = prepare.with_shallow(gix::remote::fetch::Shallow::DepthAtRemote(depth));
-        }
-
-        let (mut checkout, _outcome) = prepare
-            .fetch_then_checkout(Discard, &AtomicBool::new(false))
-            .map_err(|e| map_err(Box::new(e)))?;
-
-        let (_repo, _outcome) = checkout
-            .main_worktree(Discard, &AtomicBool::new(false))
-            .map_err(|e| map_err(Box::new(e)))?;
-
-        if let Some(refname) = opts.git_ref.as_deref() {
-            if refname.starts_with('-') {
-                return Err(map_err(
-                    format!("invalid git ref: '{refname}' must not start with '-'").into(),
-                ));
-            }
-
-            let output = self
-                .run_git(&["checkout", refname], dest)
-                .map_err(|e| map_err(Box::new(e)))?;
-
-            if !output.status.success() {
-                let detail = git_error_detail(&output);
-                return Err(map_err(detail.into()));
+        match self.clone_with_gix(url, dest, opts) {
+            Ok(()) => return Ok(()),
+            Err(gix_err) => {
+                warn!(
+                    url,
+                    error = %gix_err,
+                    "gix clone failed, falling back to system git CLI"
+                );
+                // Clean up any partial gix clone before retrying.
+                if dest.exists()
+                    && let Err(e) = std::fs::remove_dir_all(dest)
+                {
+                    warn!(
+                        path = %dest.display(),
+                        error = %e,
+                        "failed to clean up partial gix clone"
+                    );
+                }
             }
         }
 
-        Ok(())
+        self.clone_with_cli(url, dest, opts)
     }
 
     fn pull_repo(&self, path: &Path) -> Result<(), GitError> {
