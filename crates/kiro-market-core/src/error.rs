@@ -28,10 +28,6 @@ pub enum MarketplaceError {
     #[error("invalid marketplace manifest: {reason}")]
     InvalidManifest { reason: String },
 
-    /// No `marketplace.json` exists at the expected location.
-    #[error("marketplace manifest not found at {path}")]
-    ManifestNotFound { path: PathBuf },
-
     /// No `marketplace.json` and no `plugin.json` files found via scan.
     #[error("no plugins found in {path}")]
     NoPluginsFound { path: PathBuf },
@@ -209,10 +205,6 @@ mod tests {
     #[case::marketplace_invalid_manifest(
         MarketplaceError::InvalidManifest { reason: "bad json".into() },
         "invalid marketplace manifest: bad json"
-    )]
-    #[case::marketplace_manifest_not_found(
-        MarketplaceError::ManifestNotFound { path: PathBuf::from("/tmp/mp.json") },
-        "marketplace manifest not found at /tmp/mp.json"
     )]
     #[case::no_plugins_found(
         MarketplaceError::NoPluginsFound { path: PathBuf::from("/tmp/repo") },

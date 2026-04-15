@@ -110,10 +110,6 @@ mod tests {
         CoreError::Marketplace(MarketplaceError::InvalidManifest { reason: "bad json".into() }),
         ErrorType::ParseError
     )]
-    #[case::marketplace_manifest_not_found(
-        CoreError::Marketplace(MarketplaceError::ManifestNotFound { path: PathBuf::from("/tmp/mp.json") }),
-        ErrorType::ParseError
-    )]
     #[case::skill_already_installed(
         CoreError::Skill(SkillError::AlreadyInstalled { name: "rust-check".into() }),
         ErrorType::AlreadyExists

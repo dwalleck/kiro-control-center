@@ -121,14 +121,17 @@ impl MarketplaceService {
     /// 1. Detect source type (GitHub, git URL, local path).
     /// 2. Clone or link into a temp directory in the cache.
     /// 3. Try to read `marketplace.json`; if missing, scan for `plugin.json` files.
-    /// 4. Merge manifest plugins with discovered plugins, deduplicating by path and name.
+    /// 4. Merge manifest plugins with discovered plugins, deduplicating by
+    ///    relative path (for `RelativePath` sources) or by name (for
+    ///    `Structured` sources).
     /// 5. Validate the name, rename to final location.
     /// 6. Register in `known_marketplaces.json`.
     ///
     /// # Errors
     ///
-    /// Returns an error if the clone/link fails, no plugins are found (neither
-    /// via manifest nor scan), the marketplace name fails validation, or a
+    /// Returns an error if the clone/link fails, a non-`NotFound` I/O error
+    /// occurs when reading the manifest, no plugins are found (neither via
+    /// manifest nor scan), the marketplace name fails validation, or a
     /// marketplace with the same name is already registered.
     pub fn add(&self, source: &str, protocol: GitProtocol) -> Result<MarketplaceAddResult, Error> {
         let ms = MarketplaceSource::detect(source);
@@ -159,7 +162,7 @@ impl MarketplaceService {
         }
 
         // Try to read marketplace manifest (optional).
-        let manifest = Self::try_read_manifest(&temp_dir);
+        let manifest = Self::try_read_manifest(&temp_dir)?;
 
         // Scan for plugin.json files.
         let discovered = crate::plugin::discover_plugins(&temp_dir, 3);
@@ -182,7 +185,10 @@ impl MarketplaceService {
                 .iter()
                 .filter_map(|p| match &p.source {
                     crate::marketplace::PluginSource::RelativePath(rel) => {
-                        Some(PathBuf::from(rel.trim_start_matches("./")))
+                        let normalized = rel
+                            .trim_start_matches("./")
+                            .trim_end_matches('/');
+                        Some(PathBuf::from(normalized))
                     }
                     crate::marketplace::PluginSource::Structured(_) => None,
                 })
@@ -194,12 +200,12 @@ impl MarketplaceService {
 
             // Add discovered plugins that aren't already listed.
             for dp in &discovered {
-                let path_match = listed_paths.iter().any(|lp| lp == &dp.relative_path);
-                let name_match = listed_names.contains(&dp.name.as_str());
+                let path_match = listed_paths.iter().any(|lp| lp == dp.relative_path());
+                let name_match = listed_names.contains(&dp.name());
                 if !path_match && !name_match {
                     plugins.push(PluginBasicInfo {
-                        name: dp.name.clone(),
-                        description: dp.description.clone(),
+                        name: dp.name().to_owned(),
+                        description: dp.description().map(String::from),
                     });
                 }
             }
@@ -222,8 +228,8 @@ impl MarketplaceService {
             let plugins = discovered
                 .iter()
                 .map(|dp| PluginBasicInfo {
-                    name: dp.name.clone(),
-                    description: dp.description.clone(),
+                    name: dp.name().to_owned(),
+                    description: dp.description().map(String::from),
                 })
                 .collect();
 
@@ -395,20 +401,24 @@ impl MarketplaceService {
         }
     }
 
-    /// Try to read the marketplace manifest. Returns `None` if the file is
-    /// missing or malformed, logging appropriately in each case.
-    fn try_read_manifest(repo_dir: &Path) -> Option<Marketplace> {
+    /// Try to read the marketplace manifest.
+    ///
+    /// Returns `Ok(Some(manifest))` if found and valid, `Ok(None)` if the file
+    /// is missing (logged at `debug`) or malformed (logged at `warn`).
+    /// Non-`NotFound` I/O errors (permission denied, disk errors) are
+    /// propagated as `Err` — they indicate a real problem, not an absent file.
+    fn try_read_manifest(repo_dir: &Path) -> Result<Option<Marketplace>, Error> {
         let manifest_path = repo_dir.join(crate::MARKETPLACE_MANIFEST_PATH);
         match fs::read(&manifest_path) {
             Ok(bytes) => match Marketplace::from_json(&bytes) {
-                Ok(m) => Some(m),
+                Ok(m) => Ok(Some(m)),
                 Err(e) => {
                     warn!(
                         path = %manifest_path.display(),
                         error = %e,
                         "marketplace.json is malformed, falling back to plugin scan"
                     );
-                    None
+                    Ok(None)
                 }
             },
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -416,16 +426,9 @@ impl MarketplaceService {
                     path = %manifest_path.display(),
                     "no marketplace.json found, will discover plugins via scan"
                 );
-                None
+                Ok(None)
             }
-            Err(e) => {
-                warn!(
-                    path = %manifest_path.display(),
-                    error = %e,
-                    "failed to read marketplace.json, falling back to plugin scan"
-                );
-                None
-            }
+            Err(e) => Err(e.into()),
         }
     }
 }
@@ -873,6 +876,119 @@ mod tests {
         assert!(
             err.to_string().contains("no plugins found"),
             "expected 'no plugins found' error, got: {err}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Malformed manifest fallback test
+    // -----------------------------------------------------------------------
+
+    /// Mock that creates a repo with a malformed marketplace.json AND valid plugin.json files.
+    #[derive(Debug)]
+    struct MalformedManifestGitBackend;
+
+    impl GitBackend for MalformedManifestGitBackend {
+        fn clone_repo(&self, _url: &str, dest: &Path, _opts: &CloneOptions) -> Result<(), GitError> {
+            // Create malformed marketplace.json.
+            let mp_dir = dest.join(".claude-plugin");
+            fs::create_dir_all(&mp_dir).unwrap();
+            fs::write(mp_dir.join("marketplace.json"), "not valid json").unwrap();
+
+            // Create a valid plugin.
+            let plugin_dir = dest.join("plugins/fallback");
+            fs::create_dir_all(&plugin_dir).unwrap();
+            fs::write(
+                plugin_dir.join("plugin.json"),
+                r#"{"name":"fallback","description":"Found via scan","skills":["./skills/"]}"#,
+            )
+            .unwrap();
+
+            Ok(())
+        }
+
+        fn pull_repo(&self, _path: &Path) -> Result<(), GitError> {
+            Ok(())
+        }
+
+        fn verify_sha(&self, _path: &Path, _expected: &str) -> Result<(), GitError> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn add_repo_with_malformed_manifest_falls_back_to_scan() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cache = CacheDir::with_root(dir.path().to_path_buf());
+        cache.ensure_dirs().expect("ensure_dirs");
+        let svc = MarketplaceService::new(cache, MalformedManifestGitBackend);
+
+        let result = svc
+            .add("owner/fallback-repo", GitProtocol::Https)
+            .expect("add should succeed via scan fallback");
+
+        // Name derived from repo since manifest is malformed.
+        assert_eq!(result.name, "fallback-repo");
+        assert_eq!(result.plugins.len(), 1);
+        assert_eq!(result.plugins[0].name, "fallback");
+    }
+
+    // -----------------------------------------------------------------------
+    // Trailing-slash dedup test
+    // -----------------------------------------------------------------------
+
+    /// Mock that creates a repo with a marketplace.json using trailing-slash source paths
+    /// AND a matching plugin.json, to test dedup with trailing slashes.
+    #[derive(Debug)]
+    struct TrailingSlashGitBackend;
+
+    impl GitBackend for TrailingSlashGitBackend {
+        fn clone_repo(&self, _url: &str, dest: &Path, _opts: &CloneOptions) -> Result<(), GitError> {
+            let mp_dir = dest.join(".claude-plugin");
+            fs::create_dir_all(&mp_dir).unwrap();
+            fs::write(
+                mp_dir.join("marketplace.json"),
+                r#"{"name":"slash-market","owner":{"name":"Test"},"plugins":[{"name":"trailing","description":"Has trailing slash","source":"./plugins/trailing/"}]}"#,
+            )
+            .unwrap();
+
+            let plugin_dir = dest.join("plugins/trailing");
+            fs::create_dir_all(&plugin_dir).unwrap();
+            fs::write(
+                plugin_dir.join("plugin.json"),
+                r#"{"name":"trailing","description":"Has trailing slash","skills":["./skills/"]}"#,
+            )
+            .unwrap();
+
+            Ok(())
+        }
+
+        fn pull_repo(&self, _path: &Path) -> Result<(), GitError> {
+            Ok(())
+        }
+
+        fn verify_sha(&self, _path: &Path, _expected: &str) -> Result<(), GitError> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn add_repo_deduplicates_with_trailing_slash_in_source() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cache = CacheDir::with_root(dir.path().to_path_buf());
+        cache.ensure_dirs().expect("ensure_dirs");
+        let svc = MarketplaceService::new(cache, TrailingSlashGitBackend);
+
+        let result = svc
+            .add("owner/repo", GitProtocol::Https)
+            .expect("add should succeed");
+
+        assert_eq!(result.name, "slash-market");
+        // Should have exactly 1 plugin, not 2 (dedup should handle trailing slash).
+        assert_eq!(
+            result.plugins.len(),
+            1,
+            "trailing slash should not cause duplicate: {:?}",
+            result.plugins
         );
     }
 }

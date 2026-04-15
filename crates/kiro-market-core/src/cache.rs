@@ -12,6 +12,8 @@ use std::path::{Path, PathBuf};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+use tracing::debug;
+
 use crate::error::MarketplaceError;
 use crate::git::GitProtocol;
 use crate::validation;
@@ -101,7 +103,14 @@ impl MarketplaceSource {
             return None;
         }
 
-        validation::validate_name(name).ok()?;
+        if let Err(e) = validation::validate_name(name) {
+            debug!(
+                name = name,
+                error = %e,
+                "derived marketplace name fails validation"
+            );
+            return None;
+        }
         Some(name.to_owned())
     }
 }

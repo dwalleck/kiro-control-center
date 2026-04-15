@@ -10,30 +10,53 @@ use tracing::{debug, warn};
 
 /// Read the marketplace manifest and find the matching plugin entry.
 ///
-/// If the plugin is not listed in `marketplace.json` (or the manifest is absent),
-/// falls back to a depth-limited scan for `plugin.json` files in the repo.
+/// Falls back to a depth-limited scan for `plugin.json` files when
+/// `marketplace.json` is absent, unreadable, malformed, or does not list
+/// the requested plugin.
 pub fn find_plugin_entry(
     marketplace_path: &Path,
     plugin_name: &str,
     marketplace_name: &str,
 ) -> Result<PluginEntry> {
-    // Try marketplace.json first.
     let manifest_path = marketplace_path.join(kiro_market_core::MARKETPLACE_MANIFEST_PATH);
-    if let Ok(manifest_bytes) = fs::read(&manifest_path)
-        && let Ok(manifest) = Marketplace::from_json(&manifest_bytes)
-        && let Some(entry) = manifest.plugins.into_iter().find(|p| p.name == plugin_name)
-    {
-        return Ok(entry);
+
+    match fs::read(&manifest_path) {
+        Ok(bytes) => match Marketplace::from_json(&bytes) {
+            Ok(manifest) => {
+                if let Some(entry) = manifest.plugins.into_iter().find(|p| p.name == plugin_name) {
+                    return Ok(entry);
+                }
+                // Plugin not in manifest — fall through to scan.
+            }
+            Err(e) => {
+                warn!(
+                    path = %manifest_path.display(),
+                    error = %e,
+                    "marketplace.json is malformed, falling back to plugin scan"
+                );
+            }
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            // Expected — manifest is optional.
+        }
+        Err(e) => {
+            warn!(
+                path = %manifest_path.display(),
+                error = %e,
+                "failed to read marketplace.json, falling back to plugin scan"
+            );
+        }
     }
 
     // Fall back to scanning for plugin.json.
     let discovered = kiro_market_core::plugin::discover_plugins(marketplace_path, 3);
-    if let Some(dp) = discovered.into_iter().find(|dp| dp.name == plugin_name) {
-        let relative = format!("./{}", dp.relative_path.display());
+    if let Some(dp) = discovered.into_iter().find(|dp| dp.name() == plugin_name) {
         return Ok(PluginEntry {
-            name: dp.name,
-            description: dp.description,
-            source: kiro_market_core::marketplace::PluginSource::RelativePath(relative),
+            name: dp.name().to_owned(),
+            description: dp.description().map(String::from),
+            source: kiro_market_core::marketplace::PluginSource::RelativePath(
+                dp.as_relative_path_string(),
+            ),
         });
     }
 
@@ -82,4 +105,110 @@ fn default_skill_paths() -> Vec<String> {
         .iter()
         .map(|&s| s.to_owned())
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs;
+
+    use super::*;
+
+    /// Helper: create a marketplace repo layout with a manifest listing one plugin.
+    fn create_marketplace_with_manifest(root: &std::path::Path, plugin_name: &str) {
+        let mp_dir = root.join(".claude-plugin");
+        fs::create_dir_all(&mp_dir).expect("create .claude-plugin");
+        fs::write(
+            mp_dir.join("marketplace.json"),
+            format!(
+                r#"{{"name":"test-market","owner":{{"name":"Test"}},"plugins":[{{"name":"{plugin_name}","description":"Listed plugin","source":"./plugins/{plugin_name}"}}]}}"#
+            ),
+        )
+        .expect("write marketplace.json");
+
+        let plugin_dir = root.join(format!("plugins/{plugin_name}"));
+        fs::create_dir_all(&plugin_dir).expect("create plugin dir");
+        fs::write(
+            plugin_dir.join("plugin.json"),
+            format!(
+                r#"{{"name":"{plugin_name}","description":"Listed plugin","skills":["./skills/"]}}"#
+            ),
+        )
+        .expect("write plugin.json");
+    }
+
+    /// Helper: create a plugin directory with plugin.json but no marketplace.json.
+    fn create_plugin_without_manifest(root: &std::path::Path, plugin_name: &str) {
+        let plugin_dir = root.join(format!("plugins/{plugin_name}"));
+        fs::create_dir_all(&plugin_dir).expect("create plugin dir");
+        fs::write(
+            plugin_dir.join("plugin.json"),
+            format!(
+                r#"{{"name":"{plugin_name}","description":"Discovered plugin","skills":["./skills/"]}}"#
+            ),
+        )
+        .expect("write plugin.json");
+    }
+
+    #[test]
+    fn find_plugin_entry_from_manifest() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        create_marketplace_with_manifest(root, "listed");
+
+        let entry =
+            find_plugin_entry(root, "listed", "test-market").expect("should find listed plugin");
+
+        assert_eq!(entry.name, "listed");
+        assert_eq!(entry.description.as_deref(), Some("Listed plugin"));
+    }
+
+    #[test]
+    fn find_plugin_entry_falls_back_to_scan_when_no_manifest() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        create_plugin_without_manifest(root, "discovered");
+
+        let entry = find_plugin_entry(root, "discovered", "test-market")
+            .expect("should find via scan fallback");
+
+        assert_eq!(entry.name, "discovered");
+        assert_eq!(entry.description.as_deref(), Some("Discovered plugin"));
+        assert!(
+            matches!(
+                &entry.source,
+                kiro_market_core::marketplace::PluginSource::RelativePath(p) if p.contains("discovered")
+            ),
+            "source should be a RelativePath: {:?}",
+            entry.source
+        );
+    }
+
+    #[test]
+    fn find_plugin_entry_falls_back_to_scan_when_plugin_unlisted() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        // Create a manifest that lists "listed" but NOT "unlisted".
+        create_marketplace_with_manifest(root, "listed");
+        create_plugin_without_manifest(root, "unlisted");
+
+        let entry = find_plugin_entry(root, "unlisted", "test-market")
+            .expect("should find unlisted via scan");
+
+        assert_eq!(entry.name, "unlisted");
+    }
+
+    #[test]
+    fn find_plugin_entry_errors_when_plugin_not_found_anywhere() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        // Empty directory — no manifest, no plugins.
+        fs::create_dir_all(root).expect("create root");
+
+        let err = find_plugin_entry(root, "nonexistent", "test-market").expect_err("should fail");
+
+        assert!(
+            err.to_string().contains("not found"),
+            "expected 'not found' in error: {err}"
+        );
+    }
 }
