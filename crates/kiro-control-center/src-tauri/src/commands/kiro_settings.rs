@@ -32,9 +32,8 @@ fn acquire_settings_lock() -> std::sync::MutexGuard<'static, ()> {
 /// Save the settings JSON to the Kiro directory, wrapping I/O errors
 /// into [`CommandError`].
 fn save_settings(dir: &std::path::Path, json: &serde_json::Value) -> Result<(), CommandError> {
-    save_kiro_settings_to(dir, json).map_err(|e| {
-        CommandError::new(format!("failed to save settings: {e}"), ErrorType::IoError)
-    })
+    save_kiro_settings_to(dir, json)
+        .map_err(|e| CommandError::new(format!("failed to save settings: {e}"), ErrorType::IoError))
 }
 
 /// Resolve the Kiro home directory (`~/.kiro`), returning a [`CommandError`]
@@ -79,14 +78,9 @@ fn validate_key(key: &str) -> Result<usize, CommandError> {
     }
 
     let reg = registry();
-    reg.iter()
-        .position(|def| def.key == key)
-        .ok_or_else(|| {
-            CommandError::new(
-                format!("unknown setting key: {key}"),
-                ErrorType::Validation,
-            )
-        })
+    reg.iter().position(|def| def.key == key).ok_or_else(|| {
+        CommandError::new(format!("unknown setting key: {key}"), ErrorType::Validation)
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -107,10 +101,7 @@ pub async fn get_kiro_settings() -> Result<Vec<SettingEntry>, CommandError> {
 #[tauri::command]
 #[specta::specta]
 #[allow(clippy::unused_async)]
-pub async fn set_kiro_setting(
-    key: String,
-    value: JsonValue,
-) -> Result<SettingEntry, CommandError> {
+pub async fn set_kiro_setting(key: String, value: JsonValue) -> Result<SettingEntry, CommandError> {
     let reg_idx = validate_key(&key)?;
 
     // Validate that the value matches the setting's declared type.

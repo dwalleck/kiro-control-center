@@ -614,11 +614,13 @@ mod tests {
         let content = fs::read_to_string(project.skill_dir("s").join("SKILL.md")).expect("read");
         assert!(content.contains("Updated."));
 
-        assert!(project
-            .skill_dir("s")
-            .join("references")
-            .join("new.md")
-            .exists());
+        assert!(
+            project
+                .skill_dir("s")
+                .join("references")
+                .join("new.md")
+                .exists()
+        );
     }
 
     #[test]
@@ -725,11 +727,13 @@ mod tests {
         project
             .install_skill_from_dir("s", src1.path(), sample_meta())
             .expect("first install");
-        assert!(project
-            .skill_dir("s")
-            .join("references")
-            .join("old.md")
-            .exists());
+        assert!(
+            project
+                .skill_dir("s")
+                .join("references")
+                .join("old.md")
+                .exists()
+        );
 
         // v2: SKILL.md only, no references/
         fs::write(

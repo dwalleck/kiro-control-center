@@ -469,20 +469,17 @@ impl MarketplaceService {
                 .plugins
                 .iter()
                 .filter_map(|p| match &p.source {
-                    crate::marketplace::PluginSource::RelativePath(rel) => {
-                        Some(
-                            rel.trim_start_matches("./")
-                                .trim_start_matches(".\\")
-                                .trim_end_matches(['/', '\\'])
-                                .replace('\\', "/"),
-                        )
-                    }
+                    crate::marketplace::PluginSource::RelativePath(rel) => Some(
+                        rel.trim_start_matches("./")
+                            .trim_start_matches(".\\")
+                            .trim_end_matches(['/', '\\'])
+                            .replace('\\', "/"),
+                    ),
                     crate::marketplace::PluginSource::Structured(_) => None,
                 })
                 .collect();
 
-            let listed_names: Vec<&str> =
-                m.plugins.iter().map(|p| p.name.as_str()).collect();
+            let listed_names: Vec<&str> = m.plugins.iter().map(|p| p.name.as_str()).collect();
 
             for dp in discovered {
                 let dp_path = dp.relative_path_unix();
@@ -982,11 +979,7 @@ mod tests {
             .add("owner/repo", GitProtocol::Https)
             .expect("add should succeed");
 
-        let listed_count = result
-            .plugins
-            .iter()
-            .filter(|p| p.name == "listed")
-            .count();
+        let listed_count = result.plugins.iter().filter(|p| p.name == "listed").count();
         assert_eq!(listed_count, 1, "listed plugin should not be duplicated");
     }
 
@@ -1039,7 +1032,12 @@ mod tests {
     struct MalformedManifestGitBackend;
 
     impl GitBackend for MalformedManifestGitBackend {
-        fn clone_repo(&self, _url: &str, dest: &Path, _opts: &CloneOptions) -> Result<(), GitError> {
+        fn clone_repo(
+            &self,
+            _url: &str,
+            dest: &Path,
+            _opts: &CloneOptions,
+        ) -> Result<(), GitError> {
             // Create malformed marketplace.json.
             let mp_dir = dest.join(".claude-plugin");
             fs::create_dir_all(&mp_dir).unwrap();
@@ -1093,7 +1091,12 @@ mod tests {
     struct TrailingSlashGitBackend;
 
     impl GitBackend for TrailingSlashGitBackend {
-        fn clone_repo(&self, _url: &str, dest: &Path, _opts: &CloneOptions) -> Result<(), GitError> {
+        fn clone_repo(
+            &self,
+            _url: &str,
+            dest: &Path,
+            _opts: &CloneOptions,
+        ) -> Result<(), GitError> {
             let mp_dir = dest.join(".claude-plugin");
             fs::create_dir_all(&mp_dir).unwrap();
             fs::write(
@@ -1255,7 +1258,10 @@ mod tests {
 
         assert_eq!(entries.len(), 2, "should have listed + unlisted");
         let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
-        assert!(names.contains(&"listed"), "should include listed: {names:?}");
+        assert!(
+            names.contains(&"listed"),
+            "should include listed: {names:?}"
+        );
         assert!(
             names.contains(&"unlisted"),
             "should include unlisted: {names:?}"
