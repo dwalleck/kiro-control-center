@@ -133,6 +133,7 @@ impl MarketplaceService {
     /// occurs when reading the manifest, no plugins are found (neither via
     /// manifest nor scan), the marketplace name fails validation, or a
     /// marketplace with the same name is already registered.
+    #[allow(clippy::too_many_lines)]
     pub fn add(&self, source: &str, protocol: GitProtocol) -> Result<MarketplaceAddResult, Error> {
         let ms = MarketplaceSource::detect(source);
         self.cache.ensure_dirs()?;
@@ -180,15 +181,18 @@ impl MarketplaceService {
                 .collect();
 
             // Collect marketplace-listed relative paths for dedup.
-            let listed_paths: Vec<PathBuf> = m
+            // Normalize to forward slashes so comparisons work on Windows.
+            let listed_paths: Vec<String> = m
                 .plugins
                 .iter()
                 .filter_map(|p| match &p.source {
                     crate::marketplace::PluginSource::RelativePath(rel) => {
                         let normalized = rel
                             .trim_start_matches("./")
-                            .trim_end_matches('/');
-                        Some(PathBuf::from(normalized))
+                            .trim_start_matches(".\\")
+                            .trim_end_matches(['/', '\\'])
+                            .replace('\\', "/");
+                        Some(normalized)
                     }
                     crate::marketplace::PluginSource::Structured(_) => None,
                 })
@@ -199,8 +203,10 @@ impl MarketplaceService {
                 m.plugins.iter().map(|p| p.name.as_str()).collect();
 
             // Add discovered plugins that aren't already listed.
+            // Use forward-slash relative paths for cross-platform comparison.
             for dp in &discovered {
-                let path_match = listed_paths.iter().any(|lp| lp == dp.relative_path());
+                let dp_path = dp.relative_path_unix();
+                let path_match = listed_paths.contains(&dp_path);
                 let name_match = listed_names.contains(&dp.name());
                 if !path_match && !name_match {
                     plugins.push(PluginBasicInfo {
@@ -244,7 +250,9 @@ impl MarketplaceService {
         }
 
         fs::rename(&temp_dir, &final_dir)?;
-        guard.defuse();
+        // Point the guard at the renamed location so its Drop targets the
+        // right path if we bail out before defusing.
+        guard.path.clone_from(&final_dir);
 
         let entry = KnownMarketplace {
             name: name.clone(),
@@ -252,7 +260,25 @@ impl MarketplaceService {
             protocol: Some(protocol),
             added_at: chrono::Utc::now(),
         };
-        self.cache.add_known_marketplace(entry)?;
+        if let Err(e) = self.cache.add_known_marketplace(entry) {
+            warn!(
+                path = %final_dir.display(),
+                error = %e,
+                "registry write failed after rename; rolling back"
+            );
+            if let Err(rb) = fs::remove_dir_all(&final_dir) {
+                warn!(
+                    path = %final_dir.display(),
+                    rollback_error = %rb,
+                    "failed to roll back renamed directory — remove it manually"
+                );
+            }
+            // Defuse so the guard doesn't attempt a second removal of the
+            // same path (or log a spurious warning if rollback succeeded).
+            guard.defuse();
+            return Err(e);
+        }
+        guard.defuse();
 
         debug!(marketplace = %name, "marketplace added");
 
@@ -990,5 +1016,74 @@ mod tests {
             "trailing slash should not cause duplicate: {:?}",
             result.plugins
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Manifest name validation test (security)
+    // -----------------------------------------------------------------------
+
+    /// Mock that creates a repo with a marketplace.json whose name contains path traversal.
+    #[derive(Debug)]
+    struct InvalidNameGitBackend;
+
+    impl GitBackend for InvalidNameGitBackend {
+        fn clone_repo(
+            &self,
+            _url: &str,
+            dest: &Path,
+            _opts: &CloneOptions,
+        ) -> Result<(), GitError> {
+            let mp_dir = dest.join(".claude-plugin");
+            fs::create_dir_all(&mp_dir).unwrap();
+            fs::write(
+                mp_dir.join("marketplace.json"),
+                r#"{"name":"../escape","owner":{"name":"Evil"},"plugins":[{"name":"evil","description":"Bad","source":"./plugins/evil"}]}"#,
+            )
+            .unwrap();
+            Ok(())
+        }
+
+        fn pull_repo(&self, _path: &Path) -> Result<(), GitError> {
+            Ok(())
+        }
+
+        fn verify_sha(&self, _path: &Path, _expected: &str) -> Result<(), GitError> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn add_repo_with_path_traversal_name_returns_validation_error() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let cache = CacheDir::with_root(dir.path().to_path_buf());
+        cache.ensure_dirs().expect("ensure_dirs");
+        let svc = MarketplaceService::new(cache, InvalidNameGitBackend);
+
+        let err = svc
+            .add("owner/evil", GitProtocol::Https)
+            .expect_err("should reject path traversal name");
+
+        assert!(
+            err.to_string().contains("invalid name"),
+            "expected validation error, got: {err}"
+        );
+
+        // Verify no directory was left behind (TempDirGuard should clean up).
+        let marketplaces_dir = dir.path().join("marketplaces");
+        if marketplaces_dir.exists() {
+            let entries: Vec<_> = fs::read_dir(&marketplaces_dir)
+                .expect("read dir")
+                .filter_map(Result::ok)
+                .filter(|e| {
+                    let name = e.file_name();
+                    let name = name.to_string_lossy();
+                    !name.starts_with('_')
+                })
+                .collect();
+            assert!(
+                entries.is_empty(),
+                "no marketplace directory should remain after validation failure: {entries:?}"
+            );
+        }
     }
 }
