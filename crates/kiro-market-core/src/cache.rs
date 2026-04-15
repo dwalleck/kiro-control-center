@@ -77,6 +77,33 @@ impl MarketplaceSource {
             Self::LocalPath { .. } => "local",
         }
     }
+
+    /// Derive a marketplace name from the source when no manifest provides one.
+    ///
+    /// Extracts the last path/URL segment, strips a `.git` suffix if present,
+    /// and validates the result. Returns `None` if the derived name fails
+    /// validation.
+    #[must_use]
+    pub fn fallback_name(&self) -> Option<String> {
+        let raw = match self {
+            Self::GitHub { repo } => repo.rsplit('/').next(),
+            Self::GitUrl { url } => url.rsplit('/').next().or_else(|| url.rsplit(':').next()),
+            Self::LocalPath { path } => {
+                let trimmed = path.trim_end_matches(['/', '\\']);
+                trimmed.rsplit(['/', '\\']).next()
+            }
+        };
+
+        let segment = raw?;
+        let name = segment.strip_suffix(".git").unwrap_or(segment);
+
+        if name.is_empty() {
+            return None;
+        }
+
+        validation::validate_name(name).ok()?;
+        Some(name.to_owned())
+    }
 }
 
 /// Resolve a local path string to an absolute path.
@@ -316,6 +343,8 @@ pub(crate) fn atomic_write(path: &Path, data: &[u8]) -> io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use rstest::rstest;
+
     use super::*;
 
     fn temp_cache() -> (tempfile::TempDir, CacheDir) {
@@ -681,6 +710,40 @@ mod tests {
             }
             .label(),
             "local"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // MarketplaceSource::fallback_name
+    // -----------------------------------------------------------------------
+
+    #[rstest]
+    #[case::github("owner/skills", "skills")]
+    #[case::github_nested("org/sub-repo", "sub-repo")]
+    #[case::git_url_https("https://github.com/dotnet/skills.git", "skills")]
+    #[case::git_url_no_suffix("https://github.com/dotnet/skills", "skills")]
+    #[case::git_ssh("git@github.com:owner/repo.git", "repo")]
+    #[case::local_path("/home/user/my-plugins", "my-plugins")]
+    #[case::local_tilde("~/marketplaces/mine", "mine")]
+    #[case::local_relative("./my-market", "my-market")]
+    fn fallback_name_derives_from_source(#[case] source_str: &str, #[case] expected: &str) {
+        let source = MarketplaceSource::detect(source_str);
+        let name = source.fallback_name();
+        assert_eq!(
+            name.as_deref(),
+            Some(expected),
+            "fallback name for '{source_str}'"
+        );
+    }
+
+    #[test]
+    fn fallback_name_returns_none_for_invalid_name() {
+        let source = MarketplaceSource::LocalPath {
+            path: "/home/user/..".into(),
+        };
+        assert!(
+            source.fallback_name().is_none(),
+            "should return None for invalid name"
         );
     }
 }
