@@ -648,6 +648,56 @@ mod tests {
         assert_eq!(parsed[0].name, "atomic-test");
     }
 
+    // -----------------------------------------------------------------------
+    // Plugin registry
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn plugin_registry_roundtrip() {
+        let (_dir, cache) = temp_cache();
+        cache.ensure_dirs().expect("ensure_dirs");
+
+        let entries = vec![
+            crate::marketplace::PluginEntry {
+                name: "dotnet".into(),
+                description: Some("Core .NET skills".into()),
+                source: crate::marketplace::PluginSource::RelativePath("./plugins/dotnet".into()),
+            },
+            crate::marketplace::PluginEntry {
+                name: "dotnet-experimental".into(),
+                description: Some("Experimental skills".into()),
+                source: crate::marketplace::PluginSource::RelativePath(
+                    "./plugins/dotnet-experimental".into(),
+                ),
+            },
+        ];
+
+        cache
+            .write_plugin_registry("my-market", &entries)
+            .expect("write should succeed");
+
+        let loaded = cache
+            .load_plugin_registry("my-market")
+            .expect("load should succeed")
+            .expect("registry should exist");
+
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(loaded[0].name, "dotnet");
+        assert_eq!(loaded[1].name, "dotnet-experimental");
+    }
+
+    #[test]
+    fn load_plugin_registry_returns_none_when_no_file() {
+        let (_dir, cache) = temp_cache();
+        cache.ensure_dirs().expect("ensure_dirs");
+
+        let result = cache
+            .load_plugin_registry("nonexistent")
+            .expect("load should succeed");
+
+        assert!(result.is_none());
+    }
+
     #[test]
     fn known_marketplace_deserializes_without_protocol_field() {
         let json = r#"{

@@ -578,6 +578,47 @@ mod tests {
     }
 
     #[test]
+    fn add_marketplace_writes_plugin_registry() {
+        let (dir, svc) = temp_service();
+        svc.add("owner/repo", GitProtocol::Https)
+            .expect("add should succeed");
+
+        let cache = CacheDir::with_root(dir.path().to_path_buf());
+        let registry = cache
+            .load_plugin_registry("mock-market")
+            .expect("load should succeed")
+            .expect("registry should exist");
+
+        assert_eq!(registry.len(), 1);
+        assert_eq!(registry[0].name, "mock-plugin");
+    }
+
+    #[test]
+    fn remove_marketplace_deletes_plugin_registry() {
+        let (dir, svc) = temp_service();
+        svc.add("owner/repo", GitProtocol::Https).expect("add");
+
+        let cache = CacheDir::with_root(dir.path().to_path_buf());
+        assert!(
+            cache
+                .load_plugin_registry("mock-market")
+                .expect("load")
+                .is_some(),
+            "registry should exist after add"
+        );
+
+        svc.remove("mock-market").expect("remove");
+
+        assert!(
+            cache
+                .load_plugin_registry("mock-market")
+                .expect("load")
+                .is_none(),
+            "registry should be gone after remove"
+        );
+    }
+
+    #[test]
     fn add_duplicate_marketplace_returns_error() {
         let (_dir, svc) = temp_service();
         svc.add("owner/repo", GitProtocol::Https)
@@ -1136,5 +1177,110 @@ mod tests {
                 "no marketplace directory should remain after validation failure: {entries:?}"
             );
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // build_registry_entries
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn build_registry_entries_merges_manifest_and_discovered() {
+        use crate::plugin::discover_plugins;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+
+        let mp_dir = root.join(".claude-plugin");
+        fs::create_dir_all(&mp_dir).unwrap();
+        fs::write(
+            mp_dir.join("marketplace.json"),
+            r#"{"name":"test","owner":{"name":"T"},"plugins":[{"name":"listed","description":"Listed","source":"./plugins/listed"}]}"#,
+        )
+        .unwrap();
+
+        let listed_dir = root.join("plugins/listed");
+        fs::create_dir_all(&listed_dir).unwrap();
+        fs::write(
+            listed_dir.join("plugin.json"),
+            r#"{"name":"listed","description":"Listed","skills":["./skills/"]}"#,
+        )
+        .unwrap();
+
+        let unlisted_dir = root.join("plugins/unlisted");
+        fs::create_dir_all(&unlisted_dir).unwrap();
+        fs::write(
+            unlisted_dir.join("plugin.json"),
+            r#"{"name":"unlisted","description":"Unlisted","skills":["./skills/"]}"#,
+        )
+        .unwrap();
+
+        let manifest_bytes = fs::read(mp_dir.join("marketplace.json")).unwrap();
+        let manifest = Marketplace::from_json(&manifest_bytes).unwrap();
+        let discovered = discover_plugins(root, 3);
+
+        let entries = MarketplaceService::build_registry_entries(Some(&manifest), &discovered);
+
+        assert_eq!(entries.len(), 2, "should have listed + unlisted");
+        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+        assert!(names.contains(&"listed"), "should include listed: {names:?}");
+        assert!(
+            names.contains(&"unlisted"),
+            "should include unlisted: {names:?}"
+        );
+    }
+
+    #[test]
+    fn build_registry_entries_deduplicates_by_path() {
+        use crate::plugin::discover_plugins;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+
+        let mp_dir = root.join(".claude-plugin");
+        fs::create_dir_all(&mp_dir).unwrap();
+        fs::write(
+            mp_dir.join("marketplace.json"),
+            r#"{"name":"test","owner":{"name":"T"},"plugins":[{"name":"alpha","description":"Alpha","source":"./plugins/alpha"}]}"#,
+        )
+        .unwrap();
+
+        let plugin_dir = root.join("plugins/alpha");
+        fs::create_dir_all(&plugin_dir).unwrap();
+        fs::write(
+            plugin_dir.join("plugin.json"),
+            r#"{"name":"alpha","description":"Alpha","skills":["./skills/"]}"#,
+        )
+        .unwrap();
+
+        let manifest_bytes = fs::read(mp_dir.join("marketplace.json")).unwrap();
+        let manifest = Marketplace::from_json(&manifest_bytes).unwrap();
+        let discovered = discover_plugins(root, 3);
+
+        let entries = MarketplaceService::build_registry_entries(Some(&manifest), &discovered);
+
+        let alpha_count = entries.iter().filter(|e| e.name == "alpha").count();
+        assert_eq!(alpha_count, 1, "alpha should not be duplicated");
+    }
+
+    #[test]
+    fn build_registry_entries_without_manifest_uses_discovered() {
+        use crate::plugin::discover_plugins;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+
+        let plugin_dir = root.join("plugins/solo");
+        fs::create_dir_all(&plugin_dir).unwrap();
+        fs::write(
+            plugin_dir.join("plugin.json"),
+            r#"{"name":"solo","description":"Solo plugin","skills":["./skills/"]}"#,
+        )
+        .unwrap();
+
+        let discovered = discover_plugins(root, 3);
+        let entries = MarketplaceService::build_registry_entries(None, &discovered);
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "solo");
     }
 }
