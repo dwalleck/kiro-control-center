@@ -234,6 +234,18 @@ impl CacheDir {
         self.plugins_dir().join(marketplace).join(plugin)
     }
 
+    /// Directory where per-marketplace plugin registries are stored.
+    #[must_use]
+    fn registries_dir(&self) -> PathBuf {
+        self.root.join("registries")
+    }
+
+    /// Path to a marketplace's plugin registry file.
+    #[must_use]
+    pub fn plugin_registry_path(&self, marketplace: &str) -> PathBuf {
+        self.registries_dir().join(format!("{marketplace}.json"))
+    }
+
     /// Create all required subdirectories if they do not already exist.
     ///
     /// # Errors
@@ -242,6 +254,50 @@ impl CacheDir {
     pub fn ensure_dirs(&self) -> std::io::Result<()> {
         fs::create_dir_all(self.marketplaces_dir())?;
         fs::create_dir_all(self.plugins_dir())?;
+        fs::create_dir_all(self.registries_dir())?;
+        Ok(())
+    }
+
+    /// Load the plugin registry for a marketplace.
+    ///
+    /// Returns `None` if the registry file does not exist (e.g. marketplace
+    /// was added before the registry feature). The caller should fall back
+    /// to reading `marketplace.json` directly and regenerate the registry.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error on I/O or JSON parse failures.
+    pub fn load_plugin_registry(
+        &self,
+        marketplace: &str,
+    ) -> Result<Option<Vec<crate::marketplace::PluginEntry>>, crate::error::Error> {
+        let path = self.plugin_registry_path(marketplace);
+        match fs::read(&path) {
+            Ok(bytes) => {
+                let entries = serde_json::from_slice(&bytes)?;
+                Ok(Some(entries))
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Write the plugin registry for a marketplace.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if directory creation or file write fails.
+    pub fn write_plugin_registry(
+        &self,
+        marketplace: &str,
+        plugins: &[crate::marketplace::PluginEntry],
+    ) -> Result<(), crate::error::Error> {
+        let path = self.plugin_registry_path(marketplace);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let json = serde_json::to_string_pretty(plugins)?;
+        atomic_write(&path, json.as_bytes())?;
         Ok(())
     }
 

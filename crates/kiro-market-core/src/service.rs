@@ -168,55 +168,11 @@ impl MarketplaceService {
         // Scan for plugin.json files.
         let discovered = crate::plugin::discover_plugins(&temp_dir, 3);
 
-        // Build the plugin list: manifest entries first, then discovered (deduplicated).
-        let (name, plugins) = if let Some(m) = manifest {
-            let manifest_name = m.name.clone();
-            let mut plugins: Vec<PluginBasicInfo> = m
-                .plugins
-                .iter()
-                .map(|p| PluginBasicInfo {
-                    name: p.name.clone(),
-                    description: p.description.clone(),
-                })
-                .collect();
+        // Build the merged plugin list and derive the marketplace name.
+        let registry_entries = Self::build_registry_entries(manifest.as_ref(), &discovered);
 
-            // Collect marketplace-listed relative paths for dedup.
-            // Normalize to forward slashes so comparisons work on Windows.
-            let listed_paths: Vec<String> = m
-                .plugins
-                .iter()
-                .filter_map(|p| match &p.source {
-                    crate::marketplace::PluginSource::RelativePath(rel) => {
-                        let normalized = rel
-                            .trim_start_matches("./")
-                            .trim_start_matches(".\\")
-                            .trim_end_matches(['/', '\\'])
-                            .replace('\\', "/");
-                        Some(normalized)
-                    }
-                    crate::marketplace::PluginSource::Structured(_) => None,
-                })
-                .collect();
-
-            // Collect listed names for dedup of structured sources.
-            let listed_names: Vec<&str> =
-                m.plugins.iter().map(|p| p.name.as_str()).collect();
-
-            // Add discovered plugins that aren't already listed.
-            // Use forward-slash relative paths for cross-platform comparison.
-            for dp in &discovered {
-                let dp_path = dp.relative_path_unix();
-                let path_match = listed_paths.contains(&dp_path);
-                let name_match = listed_names.contains(&dp.name());
-                if !path_match && !name_match {
-                    plugins.push(PluginBasicInfo {
-                        name: dp.name().to_owned(),
-                        description: dp.description().map(String::from),
-                    });
-                }
-            }
-
-            (manifest_name, plugins)
+        let name = if let Some(m) = &manifest {
+            m.name.clone()
         } else {
             if discovered.is_empty() {
                 return Err(MarketplaceError::NoPluginsFound {
@@ -224,23 +180,20 @@ impl MarketplaceService {
                 }
                 .into());
             }
-
-            let name = ms.fallback_name().ok_or_else(|| {
+            ms.fallback_name().ok_or_else(|| {
                 MarketplaceError::InvalidManifest {
                     reason: "no marketplace.json found and could not derive a name from the source; use --name to specify one".into(),
                 }
-            })?;
-
-            let plugins = discovered
-                .iter()
-                .map(|dp| PluginBasicInfo {
-                    name: dp.name().to_owned(),
-                    description: dp.description().map(String::from),
-                })
-                .collect();
-
-            (name, plugins)
+            })?
         };
+
+        let plugins: Vec<PluginBasicInfo> = registry_entries
+            .iter()
+            .map(|p| PluginBasicInfo {
+                name: p.name.clone(),
+                description: p.description.clone(),
+            })
+            .collect();
 
         validation::validate_name(&name)?;
 
@@ -280,6 +233,16 @@ impl MarketplaceService {
         }
         guard.defuse();
 
+        // Persist the merged plugin list so browse/install commands don't
+        // need to re-scan the repo on every access.
+        if let Err(e) = self.cache.write_plugin_registry(&name, &registry_entries) {
+            warn!(
+                marketplace = %name,
+                error = %e,
+                "failed to write plugin registry — browse may show incomplete plugins"
+            );
+        }
+
         debug!(marketplace = %name, "marketplace added");
 
         Ok(MarketplaceAddResult { name, plugins })
@@ -299,6 +262,18 @@ impl MarketplaceService {
             platform::remove_local_link(&mp_path)?;
         } else if mp_path.exists() {
             fs::remove_dir_all(&mp_path)?;
+        }
+
+        // Clean up the plugin registry file.
+        let registry_path = self.cache.plugin_registry_path(name);
+        if registry_path.exists()
+            && let Err(e) = fs::remove_file(&registry_path)
+        {
+            warn!(
+                path = %registry_path.display(),
+                error = %e,
+                "failed to remove plugin registry file"
+            );
         }
 
         debug!(marketplace = %name, "marketplace removed");
@@ -357,6 +332,8 @@ impl MarketplaceService {
 
             match self.git.pull_repo(&mp_path) {
                 Ok(()) => {
+                    // Regenerate the plugin registry after pulling new content.
+                    self.regenerate_plugin_registry(&entry.name, &mp_path);
                     debug!(marketplace = %entry.name, "marketplace updated");
                     result.updated.push(entry.name.clone());
                 }
@@ -424,6 +401,80 @@ impl MarketplaceService {
                 debug!(src = %src.display(), dest = %dest.display(), "linking local marketplace");
                 Ok(platform::create_local_link(&src, dest)?)
             }
+        }
+    }
+
+    /// Re-scan the marketplace and write an updated plugin registry.
+    ///
+    /// Called after `update()` pulls new content. Best-effort — a failure
+    /// here does not block the update from succeeding.
+    fn regenerate_plugin_registry(&self, name: &str, mp_path: &Path) {
+        let manifest = Self::try_read_manifest(mp_path).ok().flatten();
+        let discovered = crate::plugin::discover_plugins(mp_path, 3);
+
+        let entries = Self::build_registry_entries(manifest.as_ref(), &discovered);
+
+        if let Err(e) = self.cache.write_plugin_registry(name, &entries) {
+            warn!(
+                marketplace = %name,
+                error = %e,
+                "failed to write plugin registry after update"
+            );
+        }
+    }
+
+    /// Build a merged list of `PluginEntry` from manifest + discovered plugins.
+    fn build_registry_entries(
+        manifest: Option<&Marketplace>,
+        discovered: &[crate::plugin::DiscoveredPlugin],
+    ) -> Vec<crate::marketplace::PluginEntry> {
+        if let Some(m) = manifest {
+            let mut entries = m.plugins.clone();
+
+            let listed_paths: Vec<String> = m
+                .plugins
+                .iter()
+                .filter_map(|p| match &p.source {
+                    crate::marketplace::PluginSource::RelativePath(rel) => {
+                        Some(
+                            rel.trim_start_matches("./")
+                                .trim_start_matches(".\\")
+                                .trim_end_matches(['/', '\\'])
+                                .replace('\\', "/"),
+                        )
+                    }
+                    crate::marketplace::PluginSource::Structured(_) => None,
+                })
+                .collect();
+
+            let listed_names: Vec<&str> =
+                m.plugins.iter().map(|p| p.name.as_str()).collect();
+
+            for dp in discovered {
+                let dp_path = dp.relative_path_unix();
+                if !listed_paths.contains(&dp_path) && !listed_names.contains(&dp.name()) {
+                    entries.push(crate::marketplace::PluginEntry {
+                        name: dp.name().to_owned(),
+                        description: dp.description().map(String::from),
+                        source: crate::marketplace::PluginSource::RelativePath(
+                            dp.as_relative_path_string(),
+                        ),
+                    });
+                }
+            }
+
+            entries
+        } else {
+            discovered
+                .iter()
+                .map(|dp| crate::marketplace::PluginEntry {
+                    name: dp.name().to_owned(),
+                    description: dp.description().map(String::from),
+                    source: crate::marketplace::PluginSource::RelativePath(
+                        dp.as_relative_path_string(),
+                    ),
+                })
+                .collect()
         }
     }
 

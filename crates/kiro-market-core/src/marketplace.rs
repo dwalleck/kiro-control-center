@@ -4,10 +4,10 @@
 //! Each plugin entry may specify its source as either a bare relative path string
 //! or a structured object with provider-specific fields.
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// Top-level marketplace manifest.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Marketplace {
     pub name: String,
     pub owner: Owner,
@@ -15,14 +15,14 @@ pub struct Marketplace {
 }
 
 /// The owner / publisher of a marketplace.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Owner {
     pub name: String,
     pub url: Option<String>,
 }
 
 /// A single plugin listed in the marketplace.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PluginEntry {
     pub name: String,
     pub description: Option<String>,
@@ -38,7 +38,7 @@ pub struct PluginEntry {
 /// `#[serde(untagged)]` and rely on variant ordering — `Structured` is tried
 /// first (it expects an object), and `RelativePath` (a plain string) acts as the
 /// fallback.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum PluginSource {
     /// A structured source descriptor (GitHub, URL, git-subdir).
@@ -48,7 +48,7 @@ pub enum PluginSource {
 }
 
 /// Provider-specific structured source descriptor, internally tagged on `"source"`.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "source")]
 pub enum StructuredSource {
     /// A GitHub repository.

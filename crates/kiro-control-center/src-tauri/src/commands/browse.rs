@@ -140,10 +140,10 @@ pub async fn list_plugins(marketplace: String) -> Result<Vec<PluginInfo>, Comman
     })?;
 
     let marketplace_path = cache.marketplace_path(&marketplace);
-    let manifest = load_marketplace_manifest(&marketplace_path, &marketplace)?;
+    let plugin_entries = load_plugin_entries(&cache, &marketplace, &marketplace_path)?;
 
-    let mut results = Vec::with_capacity(manifest.plugins.len());
-    for plugin in &manifest.plugins {
+    let mut results = Vec::with_capacity(plugin_entries.len());
+    for plugin in &plugin_entries {
         let source_type = plugin_source_type(&plugin.source);
         let skill_count = count_plugin_skills(plugin, &marketplace_path);
         results.push(PluginInfo {
@@ -152,35 +152,6 @@ pub async fn list_plugins(marketplace: String) -> Result<Vec<PluginInfo>, Comman
             skill_count: skill_count as u32,
             source_type,
         });
-    }
-
-    // Merge in discovered plugins that are not listed in the manifest.
-    let discovered = kiro_market_core::plugin::discover_plugins(&marketplace_path, 3);
-    for dp in &discovered {
-        let dp_path = dp.relative_path_unix();
-        let already_listed = manifest.plugins.iter().any(|p| {
-            p.name == dp.name()
-                || matches!(&p.source, PluginSource::RelativePath(rel) if {
-                    let normalized = rel
-                        .trim_start_matches("./")
-                        .trim_start_matches(".\\")
-                        .trim_end_matches(['/', '\\'])
-                        .replace('\\', "/");
-                    normalized == dp_path
-                })
-        });
-        if !already_listed {
-            let plugin_dir = marketplace_path.join(dp.relative_path());
-            let manifest = load_plugin_manifest(&plugin_dir).ok().flatten();
-            let skill_count =
-                discover_skills_for_plugin(&plugin_dir, manifest.as_ref()).len();
-            results.push(PluginInfo {
-                name: dp.name().to_owned(),
-                description: dp.description().map(String::from),
-                skill_count: skill_count as u32,
-                source_type: SourceType::Relative,
-            });
-        }
     }
 
     Ok(results)
@@ -202,10 +173,9 @@ pub async fn list_available_skills(
     })?;
 
     let marketplace_path = cache.marketplace_path(&marketplace);
-    let manifest = load_marketplace_manifest(&marketplace_path, &marketplace)?;
+    let plugin_entries = load_plugin_entries(&cache, &marketplace, &marketplace_path)?;
 
-    let plugin_entry = manifest
-        .plugins
+    let plugin_entry = plugin_entries
         .iter()
         .find(|p| p.name == plugin)
         .ok_or_else(|| {
@@ -280,10 +250,9 @@ pub async fn install_skills(
     })?;
 
     let marketplace_path = cache.marketplace_path(&marketplace);
-    let manifest = load_marketplace_manifest(&marketplace_path, &marketplace)?;
+    let plugin_entries = load_plugin_entries(&cache, &marketplace, &marketplace_path)?;
 
-    let plugin_entry = manifest
-        .plugins
+    let plugin_entry = plugin_entries
         .iter()
         .find(|p| p.name == plugin)
         .ok_or_else(|| {
@@ -447,92 +416,42 @@ fn plugin_source_type(source: &PluginSource) -> SourceType {
 /// surface the error via `MarketplaceInfo::load_error`.
 fn count_marketplace_plugins(cache: &CacheDir, marketplace_name: &str) -> Result<usize, String> {
     let marketplace_path = cache.marketplace_path(marketplace_name);
-    let manifest_count = count_manifest_plugins(&marketplace_path, marketplace_name);
-    let discovered = kiro_market_core::plugin::discover_plugins(&marketplace_path, 3);
-
-    match manifest_count {
-        Ok(n) => Ok(n + count_unlisted_plugins(&marketplace_path, &discovered)),
-        // No manifest — use discovered count directly.
-        Err(_) if !discovered.is_empty() => Ok(discovered.len()),
-        Err(e) => Err(e),
-    }
+    load_plugin_entries(cache, marketplace_name, &marketplace_path)
+        .map(|entries| entries.len())
+        .map_err(|e| e.message)
 }
 
-/// Count plugins listed in the manifest only.
-fn count_manifest_plugins(marketplace_path: &Path, marketplace_name: &str) -> Result<usize, String> {
-    let manifest_path = marketplace_path.join(kiro_market_core::MARKETPLACE_MANIFEST_PATH);
-
-    let bytes = match fs::read(&manifest_path) {
-        Ok(b) => b,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+/// Load the merged plugin list for a marketplace.
+///
+/// Tries the persisted plugin registry first; falls back to reading
+/// `marketplace.json` directly if the registry does not exist (e.g.
+/// marketplace was added before the registry feature).
+fn load_plugin_entries(
+    cache: &CacheDir,
+    marketplace_name: &str,
+    marketplace_path: &Path,
+) -> Result<Vec<PluginEntry>, CommandError> {
+    // Try the persisted registry first.
+    match cache.load_plugin_registry(marketplace_name) {
+        Ok(Some(entries)) => return Ok(entries),
+        Ok(None) => {
             debug!(
                 marketplace = marketplace_name,
-                "marketplace manifest not found"
+                "no plugin registry found, falling back to marketplace manifest"
             );
-            return Err("no manifest".into());
         }
         Err(e) => {
             warn!(
                 marketplace = marketplace_name,
                 error = %e,
-                "failed to read marketplace manifest"
+                "failed to load plugin registry, falling back to marketplace manifest"
             );
-            return Err(format!("failed to read marketplace manifest: {e}"));
-        }
-    };
-
-    match Marketplace::from_json(&bytes) {
-        Ok(m) => Ok(m.plugins.len()),
-        Err(e) => {
-            warn!(
-                marketplace = marketplace_name,
-                error = %e,
-                "failed to parse marketplace manifest"
-            );
-            Err(format!("failed to parse marketplace manifest: {e}"))
         }
     }
-}
 
-/// Count discovered plugins that are NOT already listed in the manifest.
-fn count_unlisted_plugins(
-    marketplace_path: &Path,
-    discovered: &[kiro_market_core::plugin::DiscoveredPlugin],
-) -> usize {
-    let manifest_path = marketplace_path.join(kiro_market_core::MARKETPLACE_MANIFEST_PATH);
-    let manifest = fs::read(&manifest_path)
-        .ok()
-        .and_then(|b| Marketplace::from_json(&b).ok());
-
-    let Some(manifest) = manifest else {
-        return discovered.len();
-    };
-
-    let listed_paths: Vec<String> = manifest
-        .plugins
-        .iter()
-        .filter_map(|p| match &p.source {
-            PluginSource::RelativePath(rel) => {
-                Some(
-                    rel.trim_start_matches("./")
-                        .trim_start_matches(".\\")
-                        .trim_end_matches(['/', '\\'])
-                        .replace('\\', "/"),
-                )
-            }
-            PluginSource::Structured(_) => None,
-        })
-        .collect();
-
-    let listed_names: Vec<&str> = manifest.plugins.iter().map(|p| p.name.as_str()).collect();
-
-    discovered
-        .iter()
-        .filter(|dp| {
-            let dp_path = dp.relative_path_unix();
-            !listed_paths.contains(&dp_path) && !listed_names.contains(&dp.name())
-        })
-        .count()
+    // Fall back to reading the manifest directly.
+    let manifest = load_marketplace_manifest(marketplace_path, marketplace_name)?;
+    Ok(manifest.plugins)
 }
 
 /// Load and parse a marketplace manifest, returning a `CommandError` on failure.
