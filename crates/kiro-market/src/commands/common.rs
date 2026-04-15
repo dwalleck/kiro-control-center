@@ -3,34 +3,41 @@
 use std::fs;
 use std::path::Path;
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use kiro_market_core::marketplace::{Marketplace, PluginEntry};
 use kiro_market_core::plugin::PluginManifest;
 use tracing::{debug, warn};
 
 /// Read the marketplace manifest and find the matching plugin entry.
+///
+/// If the plugin is not listed in `marketplace.json` (or the manifest is absent),
+/// falls back to a depth-limited scan for `plugin.json` files in the repo.
 pub fn find_plugin_entry(
     marketplace_path: &Path,
     plugin_name: &str,
     marketplace_name: &str,
 ) -> Result<PluginEntry> {
+    // Try marketplace.json first.
     let manifest_path = marketplace_path.join(kiro_market_core::MARKETPLACE_MANIFEST_PATH);
-    let manifest_bytes = fs::read(&manifest_path).with_context(|| {
-        format!(
-            "failed to read marketplace manifest at {}",
-            manifest_path.display()
-        )
-    })?;
-    let manifest =
-        Marketplace::from_json(&manifest_bytes).context("failed to parse marketplace manifest")?;
+    if let Ok(manifest_bytes) = fs::read(&manifest_path)
+        && let Ok(manifest) = Marketplace::from_json(&manifest_bytes)
+        && let Some(entry) = manifest.plugins.into_iter().find(|p| p.name == plugin_name)
+    {
+        return Ok(entry);
+    }
 
-    manifest
-        .plugins
-        .into_iter()
-        .find(|p| p.name == plugin_name)
-        .with_context(|| {
-            format!("plugin '{plugin_name}' not found in marketplace '{marketplace_name}'")
-        })
+    // Fall back to scanning for plugin.json.
+    let discovered = kiro_market_core::plugin::discover_plugins(marketplace_path, 3);
+    if let Some(dp) = discovered.into_iter().find(|dp| dp.name == plugin_name) {
+        let relative = format!("./{}", dp.relative_path.display());
+        return Ok(PluginEntry {
+            name: dp.name,
+            description: dp.description,
+            source: kiro_market_core::marketplace::PluginSource::RelativePath(relative),
+        });
+    }
+
+    anyhow::bail!("plugin '{plugin_name}' not found in marketplace '{marketplace_name}'")
 }
 
 /// Load skill paths from a plugin's `plugin.json`, falling back to defaults.
