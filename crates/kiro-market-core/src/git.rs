@@ -225,6 +225,24 @@ fn clone_failed(url: &str, e: impl Into<Box<dyn std::error::Error + Send + Sync>
     }
 }
 
+/// Walk a `GitError`'s source chain to produce a full error description.
+///
+/// `GitError::CloneFailed`'s `Display` only shows `"failed to clone {url}"`
+/// because the `#[source]` field is excluded by `thiserror`. This helper
+/// appends the source chain so the root cause (TLS errors, git stderr, etc.)
+/// is visible.
+fn git_error_detail_chain(err: &GitError) -> String {
+    use std::error::Error as _;
+    let mut detail = err.to_string();
+    let mut source = err.source();
+    while let Some(cause) = source {
+        detail.push_str(": ");
+        detail.push_str(&cause.to_string());
+        source = cause.source();
+    }
+    detail
+}
+
 /// Extract a useful error message from a failed git command.
 ///
 /// Prefers stderr, falls back to stdout, and ultimately includes the exit
@@ -266,11 +284,18 @@ impl GitBackend for GixCliBackend {
                     );
                     return Err(clone_failed(
                         url,
-                        format!("gix: {gix_err}; cleanup failed: {cleanup_err}"),
+                        format!(
+                            "gix: {}; cleanup failed: {cleanup_err}",
+                            git_error_detail_chain(&gix_err)
+                        ),
                     ));
                 }
                 self.clone_with_cli(url, dest, opts).map_err(|cli_err| {
-                    clone_failed(url, format!("gix: {gix_err}; system git: {cli_err}"))
+                    // Use the full error chain (not just Display) so root
+                    // causes like TLS errors or git stderr are visible.
+                    let gix_detail = git_error_detail_chain(&gix_err);
+                    let cli_detail = git_error_detail_chain(&cli_err);
+                    clone_failed(url, format!("gix: {gix_detail}; system git: {cli_detail}"))
                 })
             }
         }
