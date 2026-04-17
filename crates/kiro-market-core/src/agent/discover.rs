@@ -41,7 +41,10 @@ pub fn discover_agents_in_dirs(plugin_dir: &Path, scan_paths: &[String]) -> Vec<
             if EXCLUDED_FILENAMES.contains(&name) {
                 continue;
             }
-            if name.ends_with(".md") {
+            if Path::new(name)
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("md"))
+            {
                 out.push(path);
             }
         }
