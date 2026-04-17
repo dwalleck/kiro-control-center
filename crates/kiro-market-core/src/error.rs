@@ -181,6 +181,42 @@ pub enum Error {
 /// Convenience alias for results using the crate-level [`Error`].
 pub type Result<T> = std::result::Result<T, Error>;
 
+// ---------------------------------------------------------------------------
+// Source-chain helpers
+// ---------------------------------------------------------------------------
+
+/// Walk the `Error::source()` chain of `err` and return the joined messages,
+/// **excluding** the top-level error's own Display.
+///
+/// Use this when constructing a *new* error that will wrap `err` and add its
+/// own context — including the top-level Display would duplicate that
+/// context. (E.g. a `CloneFailed { url, source: chain_of_inner_clone_failed }`
+/// would otherwise emit "failed to clone X: failed to clone X: <root>".)
+#[must_use]
+pub fn error_source_chain(err: &(dyn std::error::Error + 'static)) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    let mut source = err.source();
+    while let Some(cause) = source {
+        parts.push(cause.to_string());
+        source = cause.source();
+    }
+    parts.join(": ")
+}
+
+/// Walk the full chain of `err` including its top-level Display. Use this
+/// for *terminal* error reporting (logs, user-facing messages) where the
+/// caller is not wrapping the error further.
+#[must_use]
+pub fn error_full_chain(err: &(dyn std::error::Error + 'static)) -> String {
+    let mut detail = err.to_string();
+    let chain = error_source_chain(err);
+    if !chain.is_empty() {
+        detail.push_str(": ");
+        detail.push_str(&chain);
+    }
+    detail
+}
+
 #[cfg(test)]
 mod tests {
     use std::io;
@@ -376,8 +412,7 @@ mod tests {
         assert!(matches!(err, Error::Skill(SkillError::NotInstalled { .. })));
         assert!(
             err.to_string().contains("not installed"),
-            "display should contain 'not installed', got: {}",
-            err
+            "display should contain 'not installed', got: {err}"
         );
     }
 
@@ -450,5 +485,97 @@ mod tests {
         };
         let source = err.source().expect("should have a source");
         assert!(source.to_string().contains("bad repo"));
+    }
+
+    // -----------------------------------------------------------------------
+    // Source-chain helpers
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn error_source_chain_skips_top_level_display() {
+        // CloneFailed Display says "failed to clone X"; we want only the
+        // root cause back, not the URL again.
+        let inner: Box<dyn std::error::Error + Send + Sync> = "TLS handshake failed".into();
+        let err = GitError::CloneFailed {
+            url: "https://example.com/repo.git".into(),
+            source: inner,
+        };
+        let chain = error_source_chain(&err);
+        assert_eq!(chain, "TLS handshake failed");
+        assert!(
+            !chain.contains("https://example.com/repo.git"),
+            "URL must not appear in source-only chain: {chain}"
+        );
+    }
+
+    #[test]
+    fn error_full_chain_includes_top_level_display() {
+        let inner: Box<dyn std::error::Error + Send + Sync> = "stderr: bad".into();
+        let err = GitError::CloneFailed {
+            url: "https://example.com/repo.git".into(),
+            source: inner,
+        };
+        let full = error_full_chain(&err);
+        assert!(
+            full.contains("https://example.com/repo.git"),
+            "full chain must include top-level Display: {full}"
+        );
+        assert!(
+            full.contains("stderr: bad"),
+            "full chain must include source: {full}"
+        );
+    }
+
+    #[test]
+    fn nested_clone_failed_does_not_triplicate_url_when_source_chain_used() {
+        // Simulates the dual-failure path: gix and CLI both fail, the outer
+        // CloneFailed wraps a composed source containing both. When using
+        // error_source_chain (NOT to_string), the URL must appear only in
+        // the OUTER CloneFailed's Display — never inside the source.
+        let url = "https://example.com/r.git";
+        let gix_err = GitError::CloneFailed {
+            url: url.into(),
+            source: "gix root".to_owned().into(),
+        };
+        let cli_err = GitError::CloneFailed {
+            url: url.into(),
+            source: "cli root".to_owned().into(),
+        };
+        let combined = format!(
+            "gix: {}; system git: {}",
+            error_source_chain(&gix_err),
+            error_source_chain(&cli_err)
+        );
+        let outer = GitError::CloneFailed {
+            url: url.into(),
+            source: combined.into(),
+        };
+        let full = error_full_chain(&outer);
+
+        // URL appears exactly once (in the outer Display).
+        let occurrences = full.matches(url).count();
+        assert_eq!(
+            occurrences, 1,
+            "URL should appear exactly once in fully-rendered chain, got {occurrences} in: {full}"
+        );
+        // Both root causes must still be present.
+        assert!(full.contains("gix root"), "missing gix root in: {full}");
+        assert!(full.contains("cli root"), "missing cli root in: {full}");
+    }
+
+    #[test]
+    fn error_source_chain_walks_multiple_levels() {
+        let leaf = std::io::Error::other("permission denied");
+        let middle = GitError::PullFailed {
+            path: PathBuf::from("/tmp/repo"),
+            source: Box::new(leaf),
+        };
+        let outer = GitError::OpenFailed {
+            path: PathBuf::from("/tmp/repo"),
+            source: Box::new(middle),
+        };
+        let chain = error_source_chain(&outer);
+        assert!(chain.contains("failed to pull"), "chain: {chain}");
+        assert!(chain.contains("permission denied"), "chain: {chain}");
     }
 }

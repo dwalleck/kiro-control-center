@@ -723,7 +723,9 @@ mod tests {
             crate::marketplace::PluginSource::RelativePath(p) => {
                 assert_eq!(p, "./plugins/dotnet");
             }
-            other => panic!("expected RelativePath source, got {other:?}"),
+            crate::marketplace::PluginSource::Structured(s) => {
+                panic!("expected RelativePath source, got Structured({s:?})")
+            }
         }
     }
 

@@ -31,10 +31,14 @@ clap = { version = "4", features = ["derive"] }
 
 # Git
 gix = { version = "0.81", default-features = true, features = ["blocking-network-client", "blocking-http-transport-curl"] }
-# Ensure curl has SSL/TLS support — gix-transport pulls in curl without the
-# `ssl` feature, which causes curl-sys to build libcurl without any TLS
-# backend, breaking HTTPS clones on Windows (and anywhere else OpenSSL
-# isn't pre-installed).
+# Feature-unification shim: NO crate in this workspace depends on `curl`
+# directly. The entry exists solely so Cargo unifies the `ssl` feature into
+# the transitive `curl-sys` pulled by `gix-transport` — without this,
+# curl-sys builds libcurl with no TLS backend and HTTPS clones fail on
+# Windows (and anywhere else OpenSSL isn't pre-installed). DO NOT remove
+# this dep without first verifying `cargo tree -e features -i curl-sys`
+# still shows `+ssl`. If `gix-transport` is upgraded and the feature flow
+# changes, this entry may also need to be updated or moved to `curl-sys`.
 curl = { version = "0.4", features = ["ssl"] }
 
 # Console

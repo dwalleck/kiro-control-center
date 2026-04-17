@@ -16,11 +16,74 @@ use gix::progress::Discard;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
-use crate::error::GitError;
+use crate::error::{GitError, error_source_chain};
 
 // ---------------------------------------------------------------------------
 // Git backend trait
 // ---------------------------------------------------------------------------
+
+/// A validated git reference (branch, tag, or commit SHA).
+///
+/// Constructing a `GitRef` runs the validation that previously lived
+/// inside `checkout_ref_if_needed`, so by the time the value reaches the
+/// git backend it is already proven safe to feed to `git checkout`.
+/// Parse-don't-validate: an instance in hand is proof that the ref does
+/// not start with `-` (which would let an attacker smuggle a `git`
+/// option through the checkout argument list) and is non-empty.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub struct GitRef(String);
+
+impl GitRef {
+    /// Construct a `GitRef`, rejecting empty values and refs that start
+    /// with `-` (potential argument injection vector).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::error::ValidationError::InvalidName`] if the input
+    /// is empty or begins with `-`.
+    pub fn new(value: impl Into<String>) -> Result<Self, crate::error::ValidationError> {
+        let value = value.into();
+        if value.is_empty() {
+            return Err(crate::error::ValidationError::InvalidName {
+                name: value,
+                reason: "git ref must not be empty".into(),
+            });
+        }
+        if value.starts_with('-') {
+            return Err(crate::error::ValidationError::InvalidName {
+                name: value,
+                reason: "git ref must not start with '-' (would be parsed as a git flag)".into(),
+            });
+        }
+        Ok(Self(value))
+    }
+
+    /// The underlying ref string, ready to be passed to `git checkout`.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for GitRef {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl TryFrom<&str> for GitRef {
+    type Error = crate::error::ValidationError;
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+
+impl TryFrom<String> for GitRef {
+    type Error = crate::error::ValidationError;
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
 
 /// Options for cloning a repository.
 ///
@@ -29,8 +92,9 @@ use crate::error::GitError;
 /// clone is performed followed by a checkout of the specified ref.
 #[derive(Clone, Debug, Default)]
 pub struct CloneOptions {
-    /// Branch, tag, or SHA to check out after cloning.
-    pub git_ref: Option<String>,
+    /// Branch, tag, or SHA to check out after cloning. Validated at
+    /// construction via [`GitRef::new`].
+    pub git_ref: Option<GitRef>,
 }
 
 /// Trait abstracting git operations for testability and backend swapping.
@@ -85,7 +149,11 @@ impl Default for GixCliBackend {
     }
 }
 
-/// Default SSH connect timeout in seconds applied via `GIT_SSH_COMMAND`.
+/// Default SSH connect timeout (seconds), applied via `GIT_SSH_COMMAND`
+/// **only when** neither `GIT_SSH_COMMAND` nor `GIT_SSH` is already set
+/// in the environment. Prevents indefinite hangs when SSH port 22 is
+/// firewalled, while leaving custom SSH wrappers (e.g. plink, jump-host
+/// configs) untouched.
 const SSH_CONNECT_TIMEOUT_SECS: u32 = 30;
 
 impl GixCliBackend {
@@ -124,7 +192,10 @@ impl GixCliBackend {
         let mut prepare = gix::prepare_clone(url, dest).map_err(|e| clone_failed(url, e))?;
 
         if opts.git_ref.is_none() {
-            let depth = NonZeroU32::MIN;
+            // Shallow clone, depth = 1. NonZeroU32::new(1).unwrap() reads
+            // more clearly here than `NonZeroU32::MIN`, which would force
+            // the reader to remember that NonZeroU32's minimum is 1.
+            let depth = NonZeroU32::new(1).expect("1 is non-zero");
             prepare = prepare.with_shallow(gix::remote::fetch::Shallow::DepthAtRemote(depth));
         }
 
@@ -136,7 +207,12 @@ impl GixCliBackend {
             .main_worktree(Discard, &AtomicBool::new(false))
             .map_err(|e| clone_failed(url, e))?;
 
-        self.checkout_ref_if_needed(url, dest, opts)?;
+        // Checkout-after-clone may fail; clean up the populated dest so a
+        // retry is not blocked by "destination path already exists".
+        if let Err(e) = self.checkout_ref_if_needed(url, dest, opts) {
+            cleanup_failed_clone_dest(dest);
+            return Err(e);
+        }
 
         Ok(())
     }
@@ -146,8 +222,6 @@ impl GixCliBackend {
     /// Falls back to this when `gix` fails (e.g. missing TLS backend on
     /// Windows, corporate proxy issues, or unsupported transport).
     fn clone_with_cli(&self, url: &str, dest: &Path, opts: &CloneOptions) -> Result<(), GitError> {
-        // Build the git clone command. Use --depth 1 for shallow clones
-        // when no specific ref is requested.
         let mut args = vec!["clone"];
         if opts.git_ref.is_none() {
             args.extend(["--depth", "1"]);
@@ -158,8 +232,7 @@ impl GixCliBackend {
 
         debug!(url, dest = %dest.display(), "cloning via system git CLI");
 
-        // run_git needs an existing directory for current_dir.
-        // Use the parent of dest (which should exist).
+        // run_git's current_dir must already exist.
         let work_dir = dest.parent().ok_or_else(|| {
             clone_failed(
                 url,
@@ -175,34 +248,36 @@ impl GixCliBackend {
 
         if !output.status.success() {
             let detail = git_error_detail(&output);
+            // `git clone` may have created a partial dest before failing.
+            cleanup_failed_clone_dest(dest);
             return Err(clone_failed(url, detail));
         }
 
-        self.checkout_ref_if_needed(url, dest, opts)?;
+        // Checkout failure leaves the cloned tree in `dest`; remove it so a
+        // retry is not blocked by "destination path already exists".
+        if let Err(e) = self.checkout_ref_if_needed(url, dest, opts) {
+            cleanup_failed_clone_dest(dest);
+            return Err(e);
+        }
 
         Ok(())
     }
 
-    /// Check out a specific git ref if one was requested.
+    /// Check out a specific git ref if one was requested. The ref's
+    /// shape was validated at [`GitRef`] construction, so this only has
+    /// to handle the subprocess call.
     fn checkout_ref_if_needed(
         &self,
         url: &str,
         dest: &Path,
         opts: &CloneOptions,
     ) -> Result<(), GitError> {
-        let Some(refname) = opts.git_ref.as_deref() else {
+        let Some(refname) = opts.git_ref.as_ref() else {
             return Ok(());
         };
 
-        if refname.starts_with('-') {
-            return Err(clone_failed(
-                url,
-                format!("invalid git ref: '{refname}' must not start with '-'"),
-            ));
-        }
-
         let output = self
-            .run_git(&["checkout", refname], dest)
+            .run_git(&["checkout", refname.as_str()], dest)
             .map_err(|e| clone_failed(url, e))?;
 
         if !output.status.success() {
@@ -225,22 +300,48 @@ fn clone_failed(url: &str, e: impl Into<Box<dyn std::error::Error + Send + Sync>
     }
 }
 
-/// Walk a `GitError`'s source chain to produce a full error description.
-///
-/// `GitError::CloneFailed`'s `Display` only shows `"failed to clone {url}"`
-/// because the `#[source]` field is excluded by `thiserror`. This helper
-/// appends the source chain so the root cause (TLS errors, git stderr, etc.)
-/// is visible.
-fn git_error_detail_chain(err: &GitError) -> String {
-    use std::error::Error as _;
-    let mut detail = err.to_string();
-    let mut source = err.source();
-    while let Some(cause) = source {
-        detail.push_str(": ");
-        detail.push_str(&cause.to_string());
-        source = cause.source();
+/// Combine a gix failure and a system-git failure into a single
+/// [`GitError::CloneFailed`] preserving both root causes. Uses
+/// [`error_source_chain`] (not `to_string`) on the inner errors so the
+/// URL appears only once in the final rendered message.
+fn combine_clone_errors(url: &str, gix_err: &GitError, cli_err: &GitError) -> GitError {
+    let gix_detail = error_source_chain(gix_err);
+    let cli_detail = error_source_chain(cli_err);
+    clone_failed(url, format!("gix: {gix_detail}; system git: {cli_detail}"))
+}
+
+/// Combine a gix failure with a cleanup failure into a single
+/// [`GitError::CloneFailed`]. Used when gix left a partial clone behind
+/// and the cleanup itself errored, blocking the CLI fallback.
+fn combine_clone_and_cleanup_errors(
+    url: &str,
+    gix_err: &GitError,
+    cleanup_err: &std::io::Error,
+) -> GitError {
+    clone_failed(
+        url,
+        format!(
+            "gix: {}; cleanup failed: {cleanup_err}",
+            error_source_chain(gix_err)
+        ),
+    )
+}
+
+/// Best-effort removal of a clone destination after a clone or checkout
+/// failure. A leftover dest dir will fail any future `git clone` with
+/// "destination path already exists" — wiping it lets the caller retry.
+fn cleanup_failed_clone_dest(dest: &Path) {
+    match std::fs::remove_dir_all(dest) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+        Err(e) => {
+            warn!(
+                path = %dest.display(),
+                error = %e,
+                "failed to clean up clone destination after failure"
+            );
+        }
     }
-    detail
 }
 
 /// Extract a useful error message from a failed git command.
@@ -261,7 +362,12 @@ fn git_error_detail(output: &std::process::Output) -> String {
 
 impl GitBackend for GixCliBackend {
     fn clone_repo(&self, url: &str, dest: &Path, opts: &CloneOptions) -> Result<(), GitError> {
-        debug!(url, dest = %dest.display(), git_ref = opts.git_ref.as_deref(), "cloning repository");
+        debug!(
+            url,
+            dest = %dest.display(),
+            git_ref = opts.git_ref.as_ref().map(GitRef::as_str),
+            "cloning repository"
+        );
 
         match self.clone_with_gix(url, dest, opts) {
             Ok(()) => Ok(()),
@@ -282,21 +388,14 @@ impl GitBackend for GixCliBackend {
                         error = %cleanup_err,
                         "failed to clean up partial gix clone"
                     );
-                    return Err(clone_failed(
+                    return Err(combine_clone_and_cleanup_errors(
                         url,
-                        format!(
-                            "gix: {}; cleanup failed: {cleanup_err}",
-                            git_error_detail_chain(&gix_err)
-                        ),
+                        &gix_err,
+                        &cleanup_err,
                     ));
                 }
-                self.clone_with_cli(url, dest, opts).map_err(|cli_err| {
-                    // Use the full error chain (not just Display) so root
-                    // causes like TLS errors or git stderr are visible.
-                    let gix_detail = git_error_detail_chain(&gix_err);
-                    let cli_detail = git_error_detail_chain(&cli_err);
-                    clone_failed(url, format!("gix: {gix_detail}; system git: {cli_detail}"))
-                })
+                self.clone_with_cli(url, dest, opts)
+                    .map_err(|cli_err| combine_clone_errors(url, &gix_err, &cli_err))
             }
         }
     }
@@ -444,14 +543,107 @@ mod tests {
 
         let git = GixCliBackend::default();
         let opts = CloneOptions::default();
-        let err = match git.clone_repo("file:///nonexistent/repo", &dest, &opts) {
-            Err(e) => e,
-            Ok(()) => panic!("clone should fail for nonexistent URL"),
+        let Err(err) = git.clone_repo("file:///nonexistent/repo", &dest, &opts) else {
+            panic!("clone should fail for nonexistent URL");
         };
 
         assert!(
             matches!(err, GitError::CloneFailed { .. }),
             "expected CloneFailed, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn clone_combines_both_errors_when_both_backends_fail() {
+        // Real-world dual-failure path: a URL nothing can clone. The
+        // outer CloneFailed must carry BOTH "gix:" and "system git:"
+        // detail prefixes so a user (and the test) can see that both
+        // attempts were tried and what each said.
+        let dest_dir = tempfile::tempdir().expect("tempdir");
+        let dest = dest_dir.path().join("bad-clone");
+        let url = "file:///definitely/does/not/exist/xyz123";
+
+        let git = GixCliBackend::default();
+        let err = git
+            .clone_repo(url, &dest, &CloneOptions::default())
+            .expect_err("nonexistent URL must fail both backends");
+
+        let full = crate::error::error_full_chain(&err);
+        assert!(
+            full.contains("gix:"),
+            "combined error must mention gix attempt: {full}"
+        );
+        assert!(
+            full.contains("system git:"),
+            "combined error must mention system git attempt: {full}"
+        );
+
+        // Our nesting must not add duplicate "failed to clone" prefixes.
+        // Inner library errors may mention the URL on their own — that's
+        // outside our control — but our outer wrapper should contribute
+        // exactly one "failed to clone" header.
+        let prefix_count = full.matches("failed to clone").count();
+        assert_eq!(
+            prefix_count, 1,
+            "outer wrapper should contribute exactly one 'failed to clone' \
+             (more would mean to_string was used where error_source_chain belongs); got {prefix_count} in: {full}"
+        );
+    }
+
+    #[test]
+    fn combine_clone_errors_preserves_root_causes_without_url_duplication() {
+        // Direct unit test for the error-composition function used by the
+        // dual-backend fallback. Constructs the inputs explicitly so the
+        // test does not depend on filesystem state or git version.
+        let url = "https://example.com/r.git";
+        let gix_err = GitError::CloneFailed {
+            url: url.into(),
+            source: "gix root cause".to_owned().into(),
+        };
+        let cli_err = GitError::CloneFailed {
+            url: url.into(),
+            source: "stderr: cli root cause".to_owned().into(),
+        };
+
+        let combined = combine_clone_errors(url, &gix_err, &cli_err);
+
+        let full = crate::error::error_full_chain(&combined);
+        assert!(full.contains("gix root cause"), "lost gix root: {full}");
+        assert!(full.contains("cli root cause"), "lost cli root: {full}");
+        assert_eq!(
+            full.matches(url).count(),
+            1,
+            "URL must not be duplicated: {full}"
+        );
+    }
+
+    #[test]
+    fn combine_clone_and_cleanup_errors_includes_both() {
+        // Verifies the cleanup-failure branch's error composition: when
+        // gix fails AND removing the partial clone also fails, the user
+        // needs to see both pieces of information.
+        let url = "https://example.com/r.git";
+        let gix_err = GitError::CloneFailed {
+            url: url.into(),
+            source: "gix transport error".to_owned().into(),
+        };
+        let cleanup_err =
+            std::io::Error::new(std::io::ErrorKind::PermissionDenied, "cannot remove");
+
+        let combined = combine_clone_and_cleanup_errors(url, &gix_err, &cleanup_err);
+        let full = crate::error::error_full_chain(&combined);
+
+        assert!(
+            full.contains("gix transport error"),
+            "missing gix detail: {full}"
+        );
+        assert!(
+            full.contains("cleanup failed"),
+            "missing cleanup tag: {full}"
+        );
+        assert!(
+            full.contains("cannot remove"),
+            "missing cleanup detail: {full}"
         );
     }
 
@@ -495,7 +687,7 @@ mod tests {
 
         let git = GixCliBackend::default();
         let opts = CloneOptions {
-            git_ref: Some("feature-branch".to_owned()),
+            git_ref: Some(GitRef::new("feature-branch").expect("valid ref")),
         };
         git.clone_repo(&url, &dest, &opts)
             .expect("clone with ref should succeed");
@@ -517,7 +709,7 @@ mod tests {
 
         let git = GixCliBackend::default();
         let opts = CloneOptions {
-            git_ref: Some("nonexistent-branch".to_owned()),
+            git_ref: Some(GitRef::new("nonexistent-branch").expect("structurally valid")),
         };
         let err = git
             .clone_repo(&url, &dest, &opts)
@@ -530,25 +722,68 @@ mod tests {
     }
 
     #[test]
-    fn clone_repo_with_dash_prefixed_ref_returns_error() {
+    fn git_ref_rejects_dash_prefixed_value_at_construction() {
+        // Dash-prefix rejection now lives in the type, not in the backend.
+        // This proves the parse-don't-validate boundary: an invalid ref
+        // cannot be constructed and thus cannot reach `git checkout`.
+        let err = GitRef::new("--orphan=malicious").expect_err("should reject dash-prefixed");
+        assert!(
+            matches!(err, crate::error::ValidationError::InvalidName { .. }),
+            "expected InvalidName, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn git_ref_rejects_empty_value_at_construction() {
+        let err = GitRef::new("").expect_err("should reject empty");
+        assert!(
+            matches!(err, crate::error::ValidationError::InvalidName { .. }),
+            "expected InvalidName, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn git_ref_try_from_str_accepts_valid_ref() {
+        let r: GitRef = "v1.2.3".try_into().expect("tag is valid");
+        assert_eq!(r.as_str(), "v1.2.3");
+    }
+
+    #[test]
+    fn clone_failure_cleans_up_dest_so_retry_can_proceed() {
+        // After a checkout-after-clone failure, dest must be removed so a
+        // subsequent clone is not blocked by "destination path already exists".
         let origin_dir = tempfile::tempdir().expect("tempdir");
         create_local_repo(origin_dir.path());
 
         let clone_dir = tempfile::tempdir().expect("tempdir");
         let dest = clone_dir.path().join("cloned");
         let url = path_to_file_url(origin_dir.path());
-
         let git = GixCliBackend::default();
-        let opts = CloneOptions {
-            git_ref: Some("--orphan=malicious".to_owned()),
-        };
-        let err = git
-            .clone_repo(&url, &dest, &opts)
-            .expect_err("should reject dash-prefixed ref");
+
+        // First attempt: bad ref. Clone succeeds, checkout fails.
+        let _err = git
+            .clone_repo(
+                &url,
+                &dest,
+                &CloneOptions {
+                    git_ref: Some(GitRef::new("nonexistent-branch").expect("structurally valid")),
+                },
+            )
+            .expect_err("first attempt should fail");
 
         assert!(
-            matches!(err, GitError::CloneFailed { .. }),
-            "expected CloneFailed, got {err:?}"
+            !dest.exists(),
+            "dest should have been cleaned up after checkout failure, found leftover at {}",
+            dest.display()
+        );
+
+        // Second attempt with no ref must now succeed (would fail with
+        // "destination already exists" if cleanup didn't happen).
+        git.clone_repo(&url, &dest, &CloneOptions::default())
+            .expect("retry after cleanup should succeed");
+        assert!(
+            dest.join("hello.txt").exists(),
+            "retry should populate dest"
         );
     }
 

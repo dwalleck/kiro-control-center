@@ -92,12 +92,70 @@ impl DiscoveredPlugin {
 /// (`node_modules`, `target`, etc.). Returns a list of discovered plugins with
 /// their names, descriptions, and relative paths.
 ///
-/// Files that fail to read, parse, or have invalid plugin names are warned about and skipped.
-#[must_use]
-pub fn discover_plugins(repo_root: &Path, max_depth: usize) -> Vec<DiscoveredPlugin> {
+/// Per-file failures (malformed JSON, invalid names, unreadable subdirs deep in
+/// the tree) are logged at `warn`/`debug` and skipped. An I/O error on the
+/// **repo root itself** is propagated as `Err` so callers can distinguish
+/// "no plugins exist" from "couldn't read the repo" — masking these as the
+/// same condition leads to misleading "no plugins found" errors when the
+/// real cause is a permission denial.
+///
+/// # Errors
+///
+/// Returns the underlying `io::Error` if `repo_root` cannot be read.
+pub fn discover_plugins(
+    repo_root: &Path,
+    max_depth: usize,
+) -> std::io::Result<Vec<DiscoveredPlugin>> {
     let mut results = Vec::new();
-    scan_for_plugins(repo_root, repo_root, 0, max_depth, &mut results);
-    results
+    scan_root(repo_root, max_depth, &mut results)?;
+    Ok(results)
+}
+
+/// Read the repo root and dispatch into recursive scanning. The root read is
+/// the only filesystem access whose failure is propagated as `Err`.
+fn scan_root(
+    repo_root: &Path,
+    max_depth: usize,
+    results: &mut Vec<DiscoveredPlugin>,
+) -> std::io::Result<()> {
+    // Surface the read attempt so a permission denial on the repo root is
+    // not silently misreported downstream as "no plugins found".
+    let entries = fs::read_dir(repo_root).map_err(|e| {
+        std::io::Error::new(
+            e.kind(),
+            format!("failed to read repo root {}: {e}", repo_root.display()),
+        )
+    })?;
+
+    if max_depth == 0 {
+        // Caller asked for depth 0; only the root is in scope, and the root
+        // itself is not treated as a plugin (matches existing semantics).
+        let _ = entries;
+        return Ok(());
+    }
+
+    for entry in entries {
+        let entry = match entry {
+            Ok(e) => e,
+            Err(e) => {
+                warn!(error = %e, "failed to read directory entry at repo root, skipping");
+                continue;
+            }
+        };
+        let entry_path = entry.path();
+        if !entry_path.is_dir() {
+            continue;
+        }
+        let Some(dir_name) = entry.file_name().to_str().map(str::to_owned) else {
+            debug!(path = %entry_path.display(), "skipping directory with non-UTF-8 name");
+            continue;
+        };
+        if dir_name.starts_with('.') || SKIP_DIRS.contains(&dir_name.as_str()) {
+            continue;
+        }
+        scan_for_plugins(repo_root, &entry_path, 1, max_depth, results);
+    }
+    Ok(())
 }
 
 /// Try to read and validate a `plugin.json` at the given directory.
@@ -496,7 +554,7 @@ mod tests {
 
         create_plugin_json(&root.join("my-plugin"), "my-plugin", Some("A plugin"));
 
-        let discovered = discover_plugins(root, 3);
+        let discovered = discover_plugins(root, 3).expect("discover should succeed");
         assert_eq!(discovered.len(), 1);
         assert_eq!(discovered[0].name(), "my-plugin");
         assert_eq!(discovered[0].description(), Some("A plugin"));
@@ -513,7 +571,7 @@ mod tests {
             Some("Experimental"),
         );
 
-        let discovered = discover_plugins(root, 3);
+        let discovered = discover_plugins(root, 3).expect("discover should succeed");
         assert_eq!(discovered.len(), 1);
         assert_eq!(discovered[0].name(), "dotnet-experimental");
     }
@@ -526,7 +584,7 @@ mod tests {
         create_plugin_json(&root.join("plugins/alpha"), "alpha", None);
         create_plugin_json(&root.join("plugins/beta"), "beta", None);
 
-        let mut discovered = discover_plugins(root, 3);
+        let mut discovered = discover_plugins(root, 3).expect("discover should succeed");
         discovered.sort_by(|a, b| a.name().cmp(b.name()));
         assert_eq!(discovered.len(), 2);
         assert_eq!(discovered[0].name(), "alpha");
@@ -540,7 +598,7 @@ mod tests {
 
         create_plugin_json(&root.join("a/b/c/deep-plugin"), "deep-plugin", None);
 
-        let discovered = discover_plugins(root, 3);
+        let discovered = discover_plugins(root, 3).expect("discover should succeed");
         assert!(discovered.is_empty(), "should not find plugin at depth 4");
     }
 
@@ -553,7 +611,7 @@ mod tests {
         create_plugin_json(&root.join(".claude-plugin"), "claude-internal", None);
         create_plugin_json(&root.join("plugins/visible"), "visible", None);
 
-        let discovered = discover_plugins(root, 3);
+        let discovered = discover_plugins(root, 3).expect("discover should succeed");
         assert_eq!(discovered.len(), 1);
         assert_eq!(discovered[0].name(), "visible");
     }
@@ -567,7 +625,7 @@ mod tests {
         create_plugin_json(&root.join("target/debug"), "build-artifact", None);
         create_plugin_json(&root.join("plugins/real"), "real", None);
 
-        let discovered = discover_plugins(root, 3);
+        let discovered = discover_plugins(root, 3).expect("discover should succeed");
         assert_eq!(discovered.len(), 1);
         assert_eq!(discovered[0].name(), "real");
     }
@@ -583,7 +641,7 @@ mod tests {
 
         create_plugin_json(&root.join("plugins/good"), "good", None);
 
-        let discovered = discover_plugins(root, 3);
+        let discovered = discover_plugins(root, 3).expect("discover should succeed");
         assert_eq!(discovered.len(), 1);
         assert_eq!(discovered[0].name(), "good");
     }
@@ -591,7 +649,7 @@ mod tests {
     #[test]
     fn discover_plugins_returns_empty_for_no_plugins() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let discovered = discover_plugins(tmp.path(), 3);
+        let discovered = discover_plugins(tmp.path(), 3).expect("discover should succeed");
         assert!(discovered.is_empty());
     }
 
@@ -602,7 +660,7 @@ mod tests {
 
         create_plugin_json(&root.join("plugins/my-plugin"), "my-plugin", None);
 
-        let discovered = discover_plugins(root, 3);
+        let discovered = discover_plugins(root, 3).expect("discover should succeed");
         assert_eq!(discovered.len(), 1);
         assert_eq!(
             discovered[0].relative_path(),
@@ -618,7 +676,7 @@ mod tests {
         // Depth 3 exactly — should be found with max_depth 3.
         create_plugin_json(&root.join("a/b/at-limit"), "at-limit", None);
 
-        let discovered = discover_plugins(root, 3);
+        let discovered = discover_plugins(root, 3).expect("discover should succeed");
         assert_eq!(
             discovered.len(),
             1,
@@ -634,7 +692,7 @@ mod tests {
 
         create_plugin_json(&root.join("plugins/my-plugin"), "my-plugin", None);
 
-        let discovered = discover_plugins(root, 3);
+        let discovered = discover_plugins(root, 3).expect("discover should succeed");
         assert_eq!(discovered.len(), 1);
         assert_eq!(
             discovered[0].as_relative_path_string(),
@@ -649,7 +707,7 @@ mod tests {
 
         create_plugin_json(&root.join("my-plugin"), "my-plugin", None);
 
-        let discovered = discover_plugins(root, 0);
+        let discovered = discover_plugins(root, 0).expect("discover should succeed");
         assert!(
             discovered.is_empty(),
             "max_depth 0 should not find plugins at depth 1"
@@ -685,7 +743,7 @@ mod tests {
 
         create_plugin_json(&root.join("plugins/good"), "good", None);
 
-        let discovered = discover_plugins(root, 3);
+        let discovered = discover_plugins(root, 3).expect("discover should succeed");
         assert_eq!(discovered.len(), 1);
         assert_eq!(discovered[0].name(), "good");
     }

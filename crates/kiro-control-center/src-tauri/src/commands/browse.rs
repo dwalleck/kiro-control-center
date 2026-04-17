@@ -3,15 +3,15 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use chrono::Utc;
 use serde::Serialize;
 use tracing::{debug, warn};
 
 use kiro_market_core::cache::{CacheDir, MarketplaceSource};
-use kiro_market_core::error::{Error as CoreError, SkillError};
+use kiro_market_core::git::GixCliBackend;
 use kiro_market_core::marketplace::{Marketplace, PluginEntry, PluginSource, StructuredSource};
 use kiro_market_core::plugin::{discover_skill_dirs, PluginManifest};
-use kiro_market_core::project::{InstalledSkillMeta, KiroProject};
+use kiro_market_core::project::KiroProject;
+use kiro_market_core::service::{InstallFilter, MarketplaceService};
 use kiro_market_core::skill::parse_frontmatter;
 
 use crate::error::{CommandError, ErrorType};
@@ -264,101 +264,36 @@ pub async fn install_skills(
 
     let plugin_dir = resolve_local_plugin_dir(plugin_entry, &marketplace_path)?;
 
-    // Load the plugin manifest once and reuse for both skill discovery and
-    // version extraction (fixes the previous double-read).
     let plugin_manifest = load_plugin_manifest(&plugin_dir)?;
     let version = plugin_manifest.as_ref().and_then(|m| m.version.clone());
     let skill_dirs = discover_skills_for_plugin(&plugin_dir, plugin_manifest.as_ref());
 
     let project = KiroProject::new(PathBuf::from(&project_path));
+    // Borrow a fresh service for the install loop; the GitBackend is unused
+    // since the skill dirs already resolved to local paths upstream.
+    let svc = MarketplaceService::new(cache, GixCliBackend::default());
+    let svc_result = svc.install_skills(
+        &project,
+        &skill_dirs,
+        &InstallFilter::Names(&skills),
+        force,
+        &marketplace,
+        &plugin,
+        version.as_deref(),
+    );
 
-    let mut result = InstallResult {
-        installed: Vec::new(),
-        skipped: Vec::new(),
-        failed: Vec::new(),
-    };
-
-    // Track which requested skill names were actually encountered so we can
-    // report unmatched ones at the end.
-    let mut processed_skills: std::collections::HashSet<String> =
-        std::collections::HashSet::with_capacity(skills.len());
-
-    for skill_dir in &skill_dirs {
-        let skill_md_path = skill_dir.join("SKILL.md");
-        let content = match fs::read_to_string(&skill_md_path) {
-            Ok(c) => c,
-            Err(e) => {
-                warn!(
-                    path = %skill_md_path.display(),
-                    error = %e,
-                    "failed to read SKILL.md, skipping"
-                );
-                continue;
-            }
-        };
-
-        let (frontmatter, _body_offset) = match parse_frontmatter(&content) {
-            Ok(r) => r,
-            Err(e) => {
-                warn!(
-                    path = %skill_md_path.display(),
-                    error = %e,
-                    "failed to parse SKILL.md frontmatter, skipping"
-                );
-                continue;
-            }
-        };
-
-        if !skills.contains(&frontmatter.name) {
-            continue;
-        }
-
-        processed_skills.insert(frontmatter.name.clone());
-
-        let meta = InstalledSkillMeta {
-            marketplace: marketplace.clone(),
-            plugin: plugin.clone(),
-            version: version.clone(),
-            installed_at: Utc::now(),
-        };
-
-        let install_outcome = if force {
-            project.install_skill_from_dir_force(&frontmatter.name, skill_dir, meta)
-        } else {
-            project.install_skill_from_dir(&frontmatter.name, skill_dir, meta)
-        };
-
-        match install_outcome {
-            Ok(()) => {
-                debug!(skill = %frontmatter.name, "skill installed successfully");
-                result.installed.push(frontmatter.name);
-            }
-            Err(CoreError::Skill(SkillError::AlreadyInstalled { .. })) => {
-                debug!(skill = %frontmatter.name, "skill already installed, skipping");
-                result.skipped.push(frontmatter.name);
-            }
-            Err(e) => {
-                warn!(skill = %frontmatter.name, error = %e, "failed to install skill");
-                result.failed.push(FailedSkill {
-                    name: frontmatter.name,
-                    error: e.to_string(),
-                });
-            }
-        }
-    }
-
-    // Report any requested skills that were not found in this plugin.
-    for skill_name in &skills {
-        if !processed_skills.contains(skill_name) {
-            warn!(skill = %skill_name, plugin = %plugin, "requested skill not found in plugin");
-            result.failed.push(FailedSkill {
-                name: skill_name.clone(),
-                error: format!("skill '{skill_name}' not found in plugin '{plugin}'"),
-            });
-        }
-    }
-
-    Ok(result)
+    Ok(InstallResult {
+        installed: svc_result.installed,
+        skipped: svc_result.skipped,
+        failed: svc_result
+            .failed
+            .into_iter()
+            .map(|f| FailedSkill {
+                name: f.name,
+                error: f.error,
+            })
+            .collect(),
+    })
 }
 
 /// Get summary information about a Kiro project directory.
@@ -588,12 +523,27 @@ fn load_plugin_manifest(plugin_dir: &Path) -> Result<Option<PluginManifest>, Com
 
 /// Count skills within a plugin entry. Only counts for local (relative path)
 /// plugins; remote plugins report 0.
+///
+/// A malformed `plugin.json` is logged at `warn` rather than collapsed into
+/// "use defaults" so the listing count agrees with `list_available_skills`,
+/// which surfaces the parse error to the user. A genuinely missing manifest
+/// (the common case) falls back to default skill paths silently.
 fn count_plugin_skills(entry: &PluginEntry, marketplace_path: &Path) -> usize {
     match &entry.source {
         PluginSource::RelativePath(rel) => {
             let plugin_dir = marketplace_path.join(rel);
-            // Best-effort: use the manifest if available, fall back to defaults.
-            let manifest = load_plugin_manifest(&plugin_dir).ok().flatten();
+            let manifest = match load_plugin_manifest(&plugin_dir) {
+                Ok(opt) => opt,
+                Err(e) => {
+                    warn!(
+                        plugin = %entry.name,
+                        path = %plugin_dir.display(),
+                        error = %e.message,
+                        "could not load plugin.json for skill count; reporting 0"
+                    );
+                    return 0;
+                }
+            };
             discover_skills_for_plugin(&plugin_dir, manifest.as_ref()).len()
         }
         PluginSource::Structured(_) => 0,

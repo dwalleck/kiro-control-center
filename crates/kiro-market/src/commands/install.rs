@@ -4,25 +4,18 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-use chrono::Utc;
 use colored::Colorize;
 use kiro_market_core::cache::CacheDir;
-use kiro_market_core::error::{Error as CoreError, SkillError};
-use kiro_market_core::git::{self, CloneOptions, GitBackend, GitProtocol, GixCliBackend};
+use kiro_market_core::git::{self, CloneOptions, GitBackend, GitProtocol, GitRef, GixCliBackend};
 use kiro_market_core::marketplace::{PluginEntry, PluginSource, StructuredSource};
 use kiro_market_core::plugin::{PluginManifest, discover_skill_dirs};
-use kiro_market_core::project::{InstalledSkillMeta, KiroProject};
-use kiro_market_core::skill::parse_frontmatter;
+use kiro_market_core::project::KiroProject;
+use kiro_market_core::service::{
+    FailedSkill, InstallFilter, InstallSkillsResult, MarketplaceService,
+};
 use tracing::{debug, warn};
 
 use crate::cli;
-
-/// Tracks installation results across skills.
-struct InstallStats {
-    installed: u32,
-    skipped: u32,
-    failed: u32,
-}
 
 /// Run the install command.
 ///
@@ -86,19 +79,26 @@ pub fn run(plugin_ref: &str, skill_filter: Option<&str>, force: bool) -> Result<
     let project = KiroProject::new(cwd);
     let version = plugin_manifest.as_ref().and_then(|m| m.version.clone());
 
-    let stats = install_skills(
-        &skill_dirs,
-        skill_filter,
-        force,
+    // Build a one-off service just to drive `install_skills` — the CLI only
+    // needs the install loop here, not the full add/update lifecycle.
+    let svc = MarketplaceService::new(cache.clone(), GixCliBackend::default());
+    let filter = match skill_filter {
+        Some(name) => InstallFilter::SingleName(name),
+        None => InstallFilter::All,
+    };
+    let result = svc.install_skills(
         &project,
+        &skill_dirs,
+        &filter,
+        force,
         marketplace_name,
         plugin_name,
-        version.as_ref(),
+        version.as_deref(),
     );
 
-    print_summary(plugin_ref, &stats);
+    print_install_outcome(plugin_ref, &result);
 
-    if stats.installed == 0 && stats.skipped == 0 {
+    if result.installed.is_empty() && result.skipped.is_empty() {
         bail!("no skills were installed from '{plugin_ref}'");
     }
 
@@ -120,161 +120,53 @@ fn discover_plugin_skills(
     discover_skill_dirs(plugin_dir, &skill_paths)
 }
 
-/// Install each discovered skill into the project.
-fn install_skills(
-    skill_dirs: &[PathBuf],
-    skill_filter: Option<&str>,
-    force: bool,
-    project: &KiroProject,
-    marketplace_name: &str,
-    plugin_name: &str,
-    version: Option<&String>,
-) -> InstallStats {
-    let mut stats = InstallStats {
-        installed: 0,
-        skipped: 0,
-        failed: 0,
-    };
-
-    for skill_dir in skill_dirs {
-        match process_skill(
-            skill_dir,
-            skill_filter,
-            force,
-            project,
-            marketplace_name,
-            plugin_name,
-            version,
-        ) {
-            SkillResult::Installed => stats.installed += 1,
-            SkillResult::Skipped => stats.skipped += 1,
-            SkillResult::Failed => stats.failed += 1,
-            SkillResult::Filtered => {}
-        }
+/// Render a per-skill summary plus the rolled-up totals from a service-layer
+/// install result. The previous per-line `eprintln!`s during the loop are
+/// gone since the service now emits structured `warn!` events; if the user
+/// wants more detail they can set `RUST_LOG`.
+fn print_install_outcome(plugin_ref: &str, result: &InstallSkillsResult) {
+    for name in &result.installed {
+        println!("  {} Installed skill '{}'", "✓".green().bold(), name.bold());
     }
-
-    stats
-}
-
-/// Outcome of processing a single skill directory.
-enum SkillResult {
-    Installed,
-    Skipped,
-    Failed,
-    Filtered,
-}
-
-/// Process and install a single skill from its directory.
-fn process_skill(
-    skill_dir: &Path,
-    skill_filter: Option<&str>,
-    force: bool,
-    project: &KiroProject,
-    marketplace_name: &str,
-    plugin_name: &str,
-    version: Option<&String>,
-) -> SkillResult {
-    let skill_md_path = skill_dir.join("SKILL.md");
-    let skill_content = match fs::read_to_string(&skill_md_path) {
-        Ok(content) => content,
-        Err(e) => {
-            eprintln!(
-                "  {} Failed to read {}: {e}",
-                "✗".red().bold(),
-                skill_md_path.display()
-            );
-            return SkillResult::Failed;
-        }
-    };
-
-    let (frontmatter, _body_offset) = match parse_frontmatter(&skill_content) {
-        Ok(result) => result,
-        Err(e) => {
-            eprintln!(
-                "  {} Failed to parse SKILL.md in {}: {e}",
-                "✗".red().bold(),
-                skill_dir.display()
-            );
-            return SkillResult::Failed;
-        }
-    };
-
-    // Apply skill filter if provided.
-    if skill_filter.is_some_and(|filter| frontmatter.name != filter) {
-        debug!(
-            skill = %frontmatter.name,
-            "skipping skill (does not match filter)"
+    for name in &result.skipped {
+        println!(
+            "  {} Skill '{}' already installed (use --force to overwrite)",
+            "·".yellow().bold(),
+            name.bold()
         );
-        return SkillResult::Filtered;
+    }
+    for FailedSkill { name, error } in &result.failed {
+        eprintln!(
+            "  {} Failed to install skill '{}': {error}",
+            "✗".red().bold(),
+            name
+        );
     }
 
-    let meta = InstalledSkillMeta {
-        marketplace: marketplace_name.to_owned(),
-        plugin: plugin_name.to_owned(),
-        version: version.cloned(),
-        installed_at: Utc::now(),
-    };
-
-    let install_result = if force {
-        project.install_skill_from_dir_force(&frontmatter.name, skill_dir, meta)
-    } else {
-        project.install_skill_from_dir(&frontmatter.name, skill_dir, meta)
-    };
-
-    match install_result {
-        Ok(()) => {
-            println!(
-                "  {} Installed skill '{}'",
-                "✓".green().bold(),
-                frontmatter.name.bold()
-            );
-            SkillResult::Installed
-        }
-        Err(CoreError::Skill(SkillError::AlreadyInstalled { .. })) => {
-            println!(
-                "  {} Skill '{}' already installed (use --force to overwrite)",
-                "·".yellow().bold(),
-                frontmatter.name.bold()
-            );
-            SkillResult::Skipped
-        }
-        Err(e) => {
-            eprintln!(
-                "  {} Failed to install skill '{}': {e}",
-                "✗".red().bold(),
-                frontmatter.name
-            );
-            SkillResult::Failed
-        }
-    }
-}
-
-/// Print the installation summary.
-fn print_summary(plugin_ref: &str, stats: &InstallStats) {
     println!();
-    if stats.installed > 0 {
+    if !result.installed.is_empty() {
         println!(
             "{} Installed {} skill{} from {}",
             "✓".green().bold(),
-            stats.installed,
-            if stats.installed == 1 { "" } else { "s" },
+            result.installed.len(),
+            if result.installed.len() == 1 { "" } else { "s" },
             plugin_ref.bold()
         );
     }
-    if stats.skipped > 0 {
+    if !result.skipped.is_empty() {
         println!(
             "{} Skipped {} already-installed skill{}",
             "·".yellow().bold(),
-            stats.skipped,
-            if stats.skipped == 1 { "" } else { "s" }
+            result.skipped.len(),
+            if result.skipped.len() == 1 { "" } else { "s" }
         );
     }
-    if stats.failed > 0 {
+    if !result.failed.is_empty() {
         println!(
             "{} {} skill{} failed",
             "✗".red().bold(),
-            stats.failed,
-            if stats.failed == 1 { "" } else { "s" }
+            result.failed.len(),
+            if result.failed.len() == 1 { "" } else { "s" }
         );
     }
 }
@@ -345,9 +237,21 @@ fn resolve_structured_source(
         ),
     };
 
-    // If already cloned, reuse the existing directory.
+    let backend = GixCliBackend::default();
+
+    // If already cloned, reuse — but re-verify SHA so a corrupt or stale
+    // cache (e.g. the manifest's pinned SHA changed) cannot pass silently.
     if dest.exists() {
         debug!(dest = %dest.display(), "plugin already cached, reusing");
+        if let Some(expected) = sha {
+            backend.verify_sha(&dest, expected).with_context(|| {
+                format!(
+                    "cached plugin at {} fails SHA verification for '{label}' \
+                     (expected {expected}); delete the cache directory and retry",
+                    dest.display()
+                )
+            })?;
+        }
         return Ok(match subdir {
             Some(path) => dest.join(path),
             None => dest,
@@ -356,9 +260,15 @@ fn resolve_structured_source(
 
     debug!(url = %url, dest = %dest.display(), "cloning plugin");
     print!("  Cloning {label}...");
-    let backend = GixCliBackend::default();
+    // Validate the manifest-supplied git ref shape before passing to the
+    // backend. Treat failure as a clone-time error since this comes from
+    // untrusted manifest data.
+    let validated_ref = git_ref
+        .map(GitRef::new)
+        .transpose()
+        .with_context(|| format!("invalid git ref in manifest for '{label}'"))?;
     let opts = CloneOptions {
-        git_ref: git_ref.map(ToOwned::to_owned),
+        git_ref: validated_ref,
     };
     backend
         .clone_repo(&url, &dest, &opts)

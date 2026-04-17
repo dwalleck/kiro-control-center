@@ -3,7 +3,7 @@
 use std::fs;
 use std::path::Path;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use kiro_market_core::marketplace::{Marketplace, PluginEntry};
 use kiro_market_core::plugin::PluginManifest;
 use tracing::{debug, warn};
@@ -56,8 +56,15 @@ pub fn find_plugin_entry(
         }
     }
 
-    // Fall back to scanning for plugin.json.
-    let discovered = kiro_market_core::plugin::discover_plugins(marketplace_path, 3);
+    // Fall back to scanning for plugin.json. Surface a read failure as an
+    // error rather than masking it as "plugin not found".
+    let discovered =
+        kiro_market_core::plugin::discover_plugins(marketplace_path, 3).with_context(|| {
+            format!(
+                "failed to scan marketplace at {}",
+                marketplace_path.display()
+            )
+        })?;
     if let Some(dp) = discovered.into_iter().find(|dp| dp.name() == plugin_name) {
         return Ok(PluginEntry {
             name: dp.name().to_owned(),

@@ -92,6 +92,19 @@ impl From<String> for CommandError {
     }
 }
 
+/// Allow `with_file_lock`'s `E: From<io::Error>` bound to be satisfied
+/// directly. Lock-acquisition I/O failures (timeout, missing parent, etc.)
+/// surface as `IoError` to the frontend so they can be distinguished from
+/// validation or parse errors.
+impl From<std::io::Error> for CommandError {
+    fn from(e: std::io::Error) -> Self {
+        Self {
+            message: e.to_string(),
+            error_type: ErrorType::IoError,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
