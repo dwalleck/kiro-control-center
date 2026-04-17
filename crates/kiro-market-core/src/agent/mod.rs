@@ -2,10 +2,12 @@
 //! map their tools to Kiro identifiers, and emit Kiro agent JSON.
 
 mod frontmatter;
+mod parse;
 mod parse_claude;
 mod parse_copilot;
 pub mod types;
 
+pub use parse::{detect_dialect, parse_agent_file};
 pub use parse_claude::parse_claude_agent;
 pub use parse_copilot::parse_copilot_agent;
 pub use types::{AgentDefinition, AgentDialect};
