@@ -11,7 +11,7 @@ use kiro_market_core::marketplace::{PluginEntry, PluginSource, StructuredSource}
 use kiro_market_core::plugin::{PluginManifest, discover_skill_dirs};
 use kiro_market_core::project::KiroProject;
 use kiro_market_core::service::{
-    FailedSkill, InstallFilter, InstallSkillsResult, MarketplaceService,
+    FailedSkill, InstallFilter, InstallSkillsResult, InstallWarning, MarketplaceService,
 };
 use tracing::{debug, warn};
 
@@ -70,39 +70,98 @@ pub fn run(plugin_ref: &str, skill_filter: Option<&str>, force: bool) -> Result<
 
     let plugin_manifest = load_plugin_manifest(&plugin_dir);
     let skill_dirs = discover_plugin_skills(&plugin_dir, plugin_manifest.as_ref());
-
-    if skill_dirs.is_empty() {
-        bail!("no skills found in plugin '{plugin_name}'");
-    }
+    let agent_scan_paths = agent_scan_paths(plugin_manifest.as_ref());
 
     let cwd = std::env::current_dir().context("failed to determine current directory")?;
     let project = KiroProject::new(cwd);
     let version = plugin_manifest.as_ref().and_then(|m| m.version.clone());
 
-    // Build a one-off service just to drive `install_skills` — the CLI only
-    // needs the install loop here, not the full add/update lifecycle.
+    // Build a one-off service just to drive the install loops — the CLI only
+    // needs the install calls here, not the full add/update lifecycle.
     let svc = MarketplaceService::new(cache.clone(), GixCliBackend::default());
-    let filter = match skill_filter {
-        Some(name) => InstallFilter::SingleName(name),
-        None => InstallFilter::All,
+
+    let skill_result = if skill_dirs.is_empty() {
+        InstallSkillsResult::default()
+    } else {
+        let filter = match skill_filter {
+            Some(name) => InstallFilter::SingleName(name),
+            None => InstallFilter::All,
+        };
+        svc.install_skills(
+            &project,
+            &skill_dirs,
+            &filter,
+            force,
+            marketplace_name,
+            plugin_name,
+            version.as_deref(),
+        )
     };
-    let result = svc.install_skills(
-        &project,
-        &skill_dirs,
-        &filter,
-        force,
-        marketplace_name,
-        plugin_name,
-        version.as_deref(),
-    );
+    print_install_outcome(plugin_ref, &skill_result);
 
-    print_install_outcome(plugin_ref, &result);
+    // Agents: only run when the user did NOT pass `--skill <name>`. A skill
+    // filter narrows the install to one skill and never includes agents.
+    let (agents_installed, agent_warnings) = if skill_filter.is_none() {
+        match svc.install_plugin_agents(
+            &project,
+            &plugin_dir,
+            &agent_scan_paths,
+            marketplace_name,
+            plugin_name,
+            version.as_deref(),
+        ) {
+            Ok(tup) => tup,
+            Err(e) => {
+                eprintln!(
+                    "  {} Agent install failed: {}",
+                    "✗".red().bold(),
+                    format_args!("{e}")
+                );
+                (0, Vec::new())
+            }
+        }
+    } else {
+        (0, Vec::new())
+    };
+    print_agent_outcome(agents_installed, &agent_warnings);
 
-    if result.installed.is_empty() && result.skipped.is_empty() {
-        bail!("no skills were installed from '{plugin_ref}'");
+    if skill_result.installed.is_empty() && skill_result.skipped.is_empty() && agents_installed == 0
+    {
+        if skill_filter.is_some() {
+            bail!("no skills were installed from '{plugin_ref}'");
+        }
+        bail!("no skills or agents were installed from '{plugin_ref}'");
     }
 
     Ok(())
+}
+
+/// Resolve the list of agent scan paths for a plugin.
+fn agent_scan_paths(plugin_manifest: Option<&PluginManifest>) -> Vec<String> {
+    if let Some(m) = plugin_manifest.filter(|m| !m.agents.is_empty()) {
+        m.agents.clone()
+    } else {
+        kiro_market_core::DEFAULT_AGENT_PATHS
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect()
+    }
+}
+
+/// Render the agent install summary and any warnings. Warnings go to
+/// stderr so they don't pollute stdout piping, matching the skill flow.
+fn print_agent_outcome(installed: usize, warnings: &[InstallWarning]) {
+    if installed > 0 {
+        println!(
+            "  {} Installed {} agent{}",
+            "✓".green().bold(),
+            installed,
+            if installed == 1 { "" } else { "s" }
+        );
+    }
+    for w in warnings {
+        eprintln!("  {} {w}", "!".yellow().bold());
+    }
 }
 
 /// Discover skill directories from a plugin, using its manifest or defaults.
