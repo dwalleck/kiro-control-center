@@ -1,12 +1,14 @@
 //! Domain error types for kiro-market-core.
 //!
 //! Errors are organised into thematic groups ([`MarketplaceError`],
-//! [`PluginError`], [`SkillError`], [`GitError`]) and a top-level [`Error`]
-//! enum that unifies them via `From` conversions.
+//! [`PluginError`], [`SkillError`], [`AgentError`], [`GitError`]) and a
+//! top-level [`Error`] enum that unifies them via `From` conversions.
 
 use std::path::PathBuf;
 
 use thiserror::Error;
+
+use crate::agent::ParseFailure;
 
 // ---------------------------------------------------------------------------
 // Marketplace errors
@@ -77,6 +79,33 @@ pub enum SkillError {
     /// No `SKILL.md` was found for the skill.
     #[error("SKILL.md not found at {path}")]
     SkillMdNotFound { path: PathBuf },
+}
+
+// ---------------------------------------------------------------------------
+// Agent errors
+// ---------------------------------------------------------------------------
+
+/// Errors related to agent operations.
+#[derive(Debug, Error)]
+#[non_exhaustive]
+pub enum AgentError {
+    /// The agent is already installed in the target project.
+    #[error("agent `{name}` is already installed")]
+    AlreadyInstalled { name: String },
+
+    /// The agent is not installed in the target project.
+    #[error("agent `{name}` is not installed")]
+    NotInstalled { name: String },
+
+    /// The source file could not be parsed. Inspect `failure` for the
+    /// specific stage (missing frontmatter, invalid YAML, missing name,
+    /// I/O error) — callers switch on the variant rather than
+    /// substring-matching this Display.
+    #[error("failed to parse agent at {path}: {failure}")]
+    ParseFailed {
+        path: PathBuf,
+        failure: ParseFailure,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -164,6 +193,9 @@ pub enum Error {
 
     #[error(transparent)]
     Skill(#[from] SkillError),
+
+    #[error(transparent)]
+    Agent(#[from] AgentError),
 
     #[error(transparent)]
     Git(#[from] GitError),
@@ -301,6 +333,40 @@ mod tests {
         assert_eq!(err.to_string(), expected);
     }
 
+    #[rstest]
+    #[case::agent_already_installed(
+        AgentError::AlreadyInstalled { name: "reviewer".into() },
+        "agent `reviewer` is already installed"
+    )]
+    #[case::agent_not_installed(
+        AgentError::NotInstalled { name: "missing".into() },
+        "agent `missing` is not installed"
+    )]
+    #[case::agent_parse_invalid_yaml(
+        AgentError::ParseFailed {
+            path: PathBuf::from("a.md"),
+            failure: ParseFailure::InvalidYaml("bad yaml".into()),
+        },
+        "failed to parse agent at a.md: invalid YAML: bad yaml"
+    )]
+    #[case::agent_parse_missing_name(
+        AgentError::ParseFailed {
+            path: PathBuf::from("a.md"),
+            failure: ParseFailure::MissingName,
+        },
+        "failed to parse agent at a.md: missing required `name` field"
+    )]
+    #[case::agent_parse_missing_frontmatter(
+        AgentError::ParseFailed {
+            path: PathBuf::from("readme.md"),
+            failure: ParseFailure::MissingFrontmatter,
+        },
+        "failed to parse agent at readme.md: missing opening `---` frontmatter fence"
+    )]
+    fn agent_error_display(#[case] err: AgentError, #[case] expected: &str) {
+        assert_eq!(err.to_string(), expected);
+    }
+
     #[test]
     fn git_clone_failed_display() {
         let err = GitError::CloneFailed {
@@ -434,6 +500,13 @@ mod tests {
         };
         let err: Error = inner.into();
         assert!(matches!(err, Error::Validation(_)));
+    }
+
+    #[test]
+    fn from_agent_error() {
+        let inner = AgentError::NotInstalled { name: "x".into() };
+        let err: Error = inner.into();
+        assert!(matches!(err, Error::Agent(_)));
     }
 
     #[test]

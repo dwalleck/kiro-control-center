@@ -18,6 +18,11 @@ pub struct PluginManifest {
     pub description: Option<String>,
     #[serde(default)]
     pub skills: Vec<String>,
+    /// Optional list of directories (relative to the plugin root) to scan
+    /// for agent markdown files. Empty means "use the default scan paths"
+    /// ([`crate::DEFAULT_AGENT_PATHS`]).
+    #[serde(default)]
+    pub agents: Vec<String>,
 }
 
 impl PluginManifest {
@@ -396,6 +401,25 @@ mod tests {
         assert!(m.version.is_none());
         assert!(m.description.is_none());
         assert!(m.skills.is_empty());
+        assert!(m.agents.is_empty());
+    }
+
+    #[test]
+    fn parse_with_explicit_agents_list() {
+        let json = br#"{
+            "name": "agent-plugin",
+            "skills": ["./skills/"],
+            "agents": ["./agents/"]
+        }"#;
+        let m = PluginManifest::from_json(json).expect("should parse");
+        assert_eq!(m.agents, vec!["./agents/"]);
+    }
+
+    #[test]
+    fn parse_without_agents_defaults_to_empty() {
+        let json = br#"{ "name": "p" }"#;
+        let m = PluginManifest::from_json(json).expect("should parse");
+        assert!(m.agents.is_empty());
     }
 
     #[test]
