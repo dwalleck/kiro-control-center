@@ -13,8 +13,9 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
-use crate::agent::AgentDialect;
-use crate::error::SkillError;
+use crate::agent::tools::MappedTool;
+use crate::agent::{AgentDefinition, AgentDialect};
+use crate::error::{AgentError, SkillError};
 use crate::validation;
 
 /// Process-local sequence used to disambiguate concurrent staging directories.
@@ -77,7 +78,6 @@ pub struct InstalledAgents {
 const INSTALLED_SKILLS_FILE: &str = "installed-skills.json";
 
 /// Name of the agent tracking file inside `.kiro/`.
-#[allow(dead_code)] // Consumed by `install_agent` in Task 10.
 const INSTALLED_AGENTS_FILE: &str = "installed-agents.json";
 
 /// Recursively copy a directory tree from `src` to `dest`.
@@ -309,6 +309,176 @@ impl KiroProject {
         self.write_skill_dir(name, source_dir, meta, true)
     }
 
+    // -- agent installation ------------------------------------------------
+
+    /// The `.kiro/agents/` directory.
+    fn agents_dir(&self) -> PathBuf {
+        self.kiro_dir().join("agents")
+    }
+
+    /// The `.kiro/agents/prompts/` directory.
+    fn agent_prompts_dir(&self) -> PathBuf {
+        self.agents_dir().join("prompts")
+    }
+
+    /// Path to the agent tracking file.
+    fn agent_tracking_path(&self) -> PathBuf {
+        self.kiro_dir().join(INSTALLED_AGENTS_FILE)
+    }
+
+    /// Load the installed-agents tracking file.
+    ///
+    /// Returns a default (empty) [`InstalledAgents`] if the file does not
+    /// exist.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error on I/O or JSON parse failures.
+    pub fn load_installed_agents(&self) -> crate::error::Result<InstalledAgents> {
+        let path = self.agent_tracking_path();
+        match fs::read(&path) {
+            Ok(bytes) => {
+                let installed: InstalledAgents = serde_json::from_slice(&bytes)?;
+                Ok(installed)
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                debug!(path = %path.display(), "agent tracking file not found, returning default");
+                Ok(InstalledAgents::default())
+            }
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Persist the agent tracking file to disk atomically.
+    fn write_agent_tracking(&self, installed: &InstalledAgents) -> crate::error::Result<()> {
+        let path = self.agent_tracking_path();
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let json = serde_json::to_string_pretty(installed)?;
+        crate::cache::atomic_write(&path, json.as_bytes())?;
+        Ok(())
+    }
+
+    /// Generate a per-attempt staging directory path for an agent install.
+    fn fresh_agent_staging_dir(&self, name: &str) -> PathBuf {
+        use std::sync::atomic::Ordering;
+        let pid = std::process::id();
+        let seq = STAGING_COUNTER.fetch_add(1, Ordering::Relaxed);
+        self.kiro_dir()
+            .join(format!("_installing-agent-{name}-{pid}-{seq}"))
+    }
+
+    /// Install a parsed agent: emit its Kiro JSON + externalized prompt
+    /// markdown under `.kiro/agents/`, and record metadata in
+    /// `installed-agents.json`.
+    ///
+    /// The caller is responsible for parsing the source file and mapping the
+    /// tool list — the service layer does both upstream so warnings can be
+    /// surfaced before the install lock is acquired. This method is purely
+    /// the on-disk write step.
+    ///
+    /// File writes use a staging-and-rename pattern: prompt + JSON are
+    /// written to `_installing-agent-<name>-<pid>-<seq>/` under `.kiro/`,
+    /// renamed into place after the duplicate check, then tracking is
+    /// written last. The whole flow runs under the agent tracking lock.
+    ///
+    /// # Errors
+    ///
+    /// - [`AgentError::AlreadyInstalled`] if an agent with this name already exists.
+    /// - Validation errors for unsafe names.
+    /// - I/O errors or JSON serialization failures.
+    pub fn install_agent(
+        &self,
+        def: &AgentDefinition,
+        mapped_tools: &[MappedTool],
+        meta: InstalledAgentMeta,
+    ) -> crate::error::Result<()> {
+        validation::validate_name(&def.name)?;
+
+        // Build JSON outside the lock — this can't fail due to concurrency.
+        let json = crate::agent::emit::build_kiro_json(def, mapped_tools)?;
+        let json_bytes = serde_json::to_vec_pretty(&json)?;
+
+        crate::file_lock::with_file_lock(
+            &self.agent_tracking_path(),
+            || -> crate::error::Result<()> {
+                let mut installed = self.load_installed_agents()?;
+                if installed.agents.contains_key(&def.name) {
+                    return Err(AgentError::AlreadyInstalled {
+                        name: def.name.clone(),
+                    }
+                    .into());
+                }
+
+                let staging = self.fresh_agent_staging_dir(&def.name);
+                let staging_json = staging.join("agent.json");
+                let staging_prompt_dir = staging.join("prompts");
+                let staging_prompt = staging_prompt_dir.join(format!("{}.md", def.name));
+
+                // Stage both files.
+                fs::create_dir_all(&staging_prompt_dir)?;
+                if let Err(e) = fs::write(&staging_json, &json_bytes)
+                    .and_then(|()| fs::write(&staging_prompt, def.prompt_body.as_bytes()))
+                {
+                    if let Err(cleanup_err) = fs::remove_dir_all(&staging) {
+                        warn!(
+                            path = %staging.display(),
+                            error = %cleanup_err,
+                            "failed to clean up agent staging directory after write failure"
+                        );
+                    }
+                    return Err(e.into());
+                }
+
+                // Ensure target directories exist.
+                fs::create_dir_all(self.agent_prompts_dir())?;
+
+                let json_target = self.agents_dir().join(format!("{}.json", def.name));
+                let prompt_target = self.agent_prompts_dir().join(format!("{}.md", def.name));
+
+                // Rename JSON first. If the prompt rename fails afterwards,
+                // roll back the JSON rename so we never leave an agent with
+                // only half its files on disk.
+                if let Err(e) = fs::rename(&staging_json, &json_target) {
+                    let _ = fs::remove_dir_all(&staging);
+                    return Err(e.into());
+                }
+                if let Err(e) = fs::rename(&staging_prompt, &prompt_target) {
+                    if let Err(rb_err) = fs::remove_file(&json_target) {
+                        warn!(
+                            path = %json_target.display(),
+                            error = %rb_err,
+                            "failed to roll back agent JSON after prompt-rename failure"
+                        );
+                    }
+                    let _ = fs::remove_dir_all(&staging);
+                    return Err(e.into());
+                }
+
+                // Staging directory itself should now be empty (or contain
+                // the empty prompts subdir). Remove it.
+                let _ = fs::remove_dir_all(&staging);
+
+                // Tracking last. On failure, roll back both files.
+                installed.agents.insert(def.name.clone(), meta);
+                if let Err(e) = self.write_agent_tracking(&installed) {
+                    warn!(
+                        name = %def.name,
+                        error = %e,
+                        "agent tracking update failed after rename; rolling back files"
+                    );
+                    let _ = fs::remove_file(&json_target);
+                    let _ = fs::remove_file(&prompt_target);
+                    return Err(e);
+                }
+
+                debug!(name = %def.name, "agent installed");
+                Ok(())
+            },
+        )
+    }
+
     // -- internal helpers --------------------------------------------------
 
     /// Copy a source skill directory and update tracking.
@@ -527,6 +697,168 @@ mod tests {
     fn installed_agents_default_is_empty() {
         let ia = InstalledAgents::default();
         assert!(ia.agents.is_empty());
+    }
+
+    fn write_agent(tmp: &Path, name: &str, body: &str) -> PathBuf {
+        let p = tmp.join(format!("{name}.md"));
+        fs::write(&p, body).unwrap();
+        p
+    }
+
+    fn parse_and_map(source: &Path) -> (AgentDefinition, Vec<MappedTool>) {
+        let def = crate::agent::parse_agent_file(source).expect("parse");
+        let (mapped, _unmapped) = match def.dialect {
+            AgentDialect::Claude => crate::agent::tools::map_claude_tools(&def.source_tools),
+            AgentDialect::Copilot => crate::agent::tools::map_copilot_tools(&def.source_tools),
+        };
+        (def, mapped)
+    }
+
+    fn sample_agent_meta() -> InstalledAgentMeta {
+        InstalledAgentMeta {
+            marketplace: "mp".into(),
+            plugin: "p".into(),
+            version: None,
+            installed_at: Utc::now(),
+            dialect: AgentDialect::Claude,
+        }
+    }
+
+    #[test]
+    fn install_agent_writes_json_and_prompt() {
+        let (_dir, project) = temp_project();
+        let src_tmp = tempfile::tempdir().unwrap();
+        let src = write_agent(
+            src_tmp.path(),
+            "reviewer",
+            "---\nname: reviewer\ndescription: Reviews\n---\nYou are a reviewer.\n",
+        );
+        let (def, mapped) = parse_and_map(&src);
+
+        project
+            .install_agent(&def, &mapped, sample_agent_meta())
+            .expect("install");
+
+        let json_path = project.root.join(".kiro/agents/reviewer.json");
+        let prompt_path = project.root.join(".kiro/agents/prompts/reviewer.md");
+        assert!(json_path.exists(), "JSON written");
+        assert!(prompt_path.exists(), "prompt markdown written");
+
+        let json: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&json_path).unwrap()).unwrap();
+        assert_eq!(json["name"], "reviewer");
+        assert_eq!(json["prompt"], "file://./prompts/reviewer.md");
+        assert_eq!(json["description"], "Reviews");
+
+        let prompt = fs::read_to_string(&prompt_path).unwrap();
+        assert!(
+            prompt.starts_with("You are a reviewer."),
+            "prompt body written without frontmatter, got: {prompt:?}"
+        );
+    }
+
+    #[test]
+    fn install_agent_rejects_duplicate() {
+        let (_dir, project) = temp_project();
+        let src_tmp = tempfile::tempdir().unwrap();
+        let src = write_agent(src_tmp.path(), "a", "---\nname: a\n---\nbody\n");
+        let (def, mapped) = parse_and_map(&src);
+
+        project
+            .install_agent(&def, &mapped, sample_agent_meta())
+            .unwrap();
+        let err = project
+            .install_agent(&def, &mapped, sample_agent_meta())
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            crate::error::Error::Agent(AgentError::AlreadyInstalled { .. })
+        ));
+    }
+
+    #[test]
+    fn install_agent_updates_tracking() {
+        let (_dir, project) = temp_project();
+        let src_tmp = tempfile::tempdir().unwrap();
+        let src = write_agent(src_tmp.path(), "a", "---\nname: a\n---\nbody\n");
+        let (def, mapped) = parse_and_map(&src);
+
+        project
+            .install_agent(&def, &mapped, sample_agent_meta())
+            .unwrap();
+
+        let tracking_path = project.root.join(".kiro/installed-agents.json");
+        let tracking: InstalledAgents =
+            serde_json::from_str(&fs::read_to_string(tracking_path).unwrap()).unwrap();
+        assert!(tracking.agents.contains_key("a"));
+        assert_eq!(tracking.agents["a"].dialect, AgentDialect::Claude);
+    }
+
+    #[test]
+    fn install_agent_rejects_unsafe_name() {
+        let (_dir, project) = temp_project();
+        let src_tmp = tempfile::tempdir().unwrap();
+        let src = write_agent(src_tmp.path(), "x", "---\nname: x\n---\nbody\n");
+        let (mut def, mapped) = parse_and_map(&src);
+        def.name = "../escape".into();
+        let err = project
+            .install_agent(&def, &mapped, sample_agent_meta())
+            .unwrap_err();
+        assert!(matches!(err, crate::error::Error::Validation(_)));
+    }
+
+    #[test]
+    fn install_agent_emits_tools_and_allowed_tools_from_mapping() {
+        let (_dir, project) = temp_project();
+        let src_tmp = tempfile::tempdir().unwrap();
+        let src = write_agent(
+            src_tmp.path(),
+            "mixed",
+            "---\nname: mixed\ntools: [Read, Bash]\n---\nbody\n",
+        );
+        let (def, mapped) = parse_and_map(&src);
+        assert_eq!(mapped.len(), 2, "sanity: both tools mapped");
+
+        project
+            .install_agent(&def, &mapped, sample_agent_meta())
+            .expect("install");
+
+        let json_path = project.root.join(".kiro/agents/mixed.json");
+        let json: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&json_path).unwrap()).unwrap();
+        let allowed = json["allowedTools"].as_array().unwrap();
+        // Native tools go to allowedTools, not tools.
+        assert!(allowed.contains(&serde_json::Value::String("read".into())));
+        assert!(allowed.contains(&serde_json::Value::String("shell".into())));
+        assert!(json.get("tools").is_none(), "no MCP refs here");
+    }
+
+    #[test]
+    fn install_agent_no_staging_dir_left_behind_on_success() {
+        let (_dir, project) = temp_project();
+        let src_tmp = tempfile::tempdir().unwrap();
+        let src = write_agent(src_tmp.path(), "clean", "---\nname: clean\n---\nbody\n");
+        let (def, mapped) = parse_and_map(&src);
+
+        project
+            .install_agent(&def, &mapped, sample_agent_meta())
+            .unwrap();
+
+        // Staging lives directly under .kiro/, not under agents/.
+        let kiro_dir = project.root.join(".kiro");
+        let leftovers: Vec<_> = fs::read_dir(&kiro_dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| {
+                e.file_name()
+                    .to_str()
+                    .is_some_and(|s| s.starts_with("_installing-agent"))
+            })
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "no staging directories should remain after successful install"
+        );
     }
 
     #[test]
