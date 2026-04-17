@@ -153,6 +153,35 @@ pub struct FailedSkill {
     pub error: String,
 }
 
+/// Outcome of installing the agents from one plugin.
+///
+/// Mirrors [`InstallSkillsResult`]: per-agent successes and failures are
+/// collected so a single broken agent never aborts the rest of the batch,
+/// and accumulated warnings always reach the caller even when some agents
+/// fail.
+#[derive(Clone, Debug, Default, Serialize)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
+pub struct InstallAgentsResult {
+    /// Agent names successfully installed.
+    pub installed: Vec<String>,
+    /// Agent names that were already installed and left untouched.
+    pub skipped: Vec<String>,
+    /// Agents whose install attempt failed (parse, validation, or fs error).
+    pub failed: Vec<FailedAgent>,
+    /// Non-fatal issues (unmapped tools, skipped non-agent files).
+    pub warnings: Vec<InstallWarning>,
+}
+
+/// An agent that failed to install, with the reason.
+#[derive(Clone, Debug, Serialize)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
+pub struct FailedAgent {
+    /// Best-known identifier — the agent name if parse reached that far,
+    /// otherwise the source file path.
+    pub name: String,
+    pub error: String,
+}
+
 /// Non-fatal issue produced during install. Surfaced in install results
 /// so the CLI / Tauri frontend can render them without blocking the install.
 ///
@@ -670,16 +699,19 @@ impl MarketplaceService {
 
     /// Discover, parse, and install all agents from a plugin directory.
     ///
-    /// Returns `(installed_count, warnings)`. Parse failures on individual
-    /// agents are captured as warnings and do not abort the whole install.
-    /// Each file is parsed exactly once — the parsed `AgentDefinition` is
-    /// passed straight into `project.install_agent`, so the project layer
-    /// never re-reads the source.
+    /// All per-agent outcomes are collected into the returned
+    /// [`InstallAgentsResult`] — a single broken agent never aborts the
+    /// batch, and accumulated warnings always reach the caller. Each file
+    /// is parsed exactly once; the parsed `AgentDefinition` flows straight
+    /// into `project.install_agent` without re-reading the source.
     ///
-    /// # Errors
-    ///
-    /// Returns an error only for fatal problems (e.g. filesystem errors
-    /// writing the tracking file). Per-file parse failures become warnings.
+    /// Returns:
+    /// - `installed`: agent names the call wrote to disk.
+    /// - `skipped`: agents that were already installed (left untouched).
+    /// - `failed`: agents whose parse / validation / install raised an
+    ///   error. The CLI surfaces these with a non-zero exit status.
+    /// - `warnings`: non-fatal issues (unmapped tools, README-like files
+    ///   skipped, missing-name frontmatter).
     pub fn install_plugin_agents(
         &self,
         project: &crate::project::KiroProject,
@@ -688,31 +720,39 @@ impl MarketplaceService {
         marketplace: &str,
         plugin: &str,
         version: Option<&str>,
-    ) -> crate::error::Result<(usize, Vec<InstallWarning>)> {
+    ) -> InstallAgentsResult {
         let files = crate::agent::discover::discover_agents_in_dirs(plugin_dir, scan_paths);
-        let mut installed = 0_usize;
-        let mut warnings: Vec<InstallWarning> = Vec::new();
+        let mut result = InstallAgentsResult::default();
 
         for path in files {
             let def = match crate::agent::parse_agent_file(&path) {
                 Ok(d) => d,
-                Err(crate::error::AgentError::ParseFailed { path, failure }) => {
+                Err(crate::error::AgentError::ParseFailed {
+                    path: err_path,
+                    failure,
+                }) => {
                     // Demote "no frontmatter at all" to debug — these are
                     // almost always human-readable docs sharing the agents
-                    // directory, not broken agent files. Matches the variant
-                    // directly; no string-based classification.
+                    // directory, not broken agent files.
                     if matches!(failure, crate::agent::ParseFailure::MissingFrontmatter) {
-                        debug!(path = %path.display(), "skipping non-agent markdown");
+                        debug!(path = %err_path.display(), "skipping non-agent markdown");
                     } else {
-                        warnings.push(InstallWarning::AgentParseFailed { path, failure });
+                        result.warnings.push(InstallWarning::AgentParseFailed {
+                            path: err_path,
+                            failure,
+                        });
                     }
                     continue;
                 }
                 Err(e) => {
                     // Install-layer variants (AlreadyInstalled/NotInstalled)
-                    // are not produced by parse_agent_file today, but are
-                    // part of the same enum — propagate to be safe.
-                    return Err(e.into());
+                    // shouldn't come from parse_agent_file, but we collect
+                    // them as failures rather than crashing the batch.
+                    result.failed.push(FailedAgent {
+                        name: path.display().to_string(),
+                        error: crate::error::error_full_chain(&e),
+                    });
+                    continue;
                 }
             };
 
@@ -725,7 +765,7 @@ impl MarketplaceService {
                 }
             };
             for u in unmapped {
-                warnings.push(InstallWarning::UnmappedTool {
+                result.warnings.push(InstallWarning::UnmappedTool {
                     agent: def.name.clone(),
                     tool: u.source,
                     reason: u.reason,
@@ -739,11 +779,21 @@ impl MarketplaceService {
                 installed_at: chrono::Utc::now(),
                 dialect: def.dialect,
             };
-            project.install_agent(&def, &mapped, meta)?;
-            installed += 1;
+            match project.install_agent(&def, &mapped, meta) {
+                Ok(()) => result.installed.push(def.name),
+                Err(Error::Agent(crate::error::AgentError::AlreadyInstalled { name })) => {
+                    result.skipped.push(name);
+                }
+                Err(e) => {
+                    result.failed.push(FailedAgent {
+                        name: def.name,
+                        error: crate::error::error_full_chain(&e),
+                    });
+                }
+            }
         }
 
-        Ok((installed, warnings))
+        result
     }
 
     // -----------------------------------------------------------------------
@@ -1023,18 +1073,22 @@ mod tests {
         let project_tmp = tempfile::tempdir().unwrap();
         let project = KiroProject::new(project_tmp.path().to_path_buf());
 
-        let (count, warnings) = svc
-            .install_plugin_agents(
-                &project,
-                plugin_tmp.path(),
-                &["./agents/".to_string()],
-                "mp",
-                "plugin-x",
-                None,
-            )
-            .expect("install");
+        let result = svc.install_plugin_agents(
+            &project,
+            plugin_tmp.path(),
+            &["./agents/".to_string()],
+            "mp",
+            "plugin-x",
+            None,
+        );
+        let warnings = &result.warnings;
 
-        assert_eq!(count, 2, "both agents installed, README excluded");
+        assert_eq!(
+            result.installed.len(),
+            2,
+            "both agents installed, README excluded"
+        );
+        assert!(result.failed.is_empty(), "no failures: {:?}", result.failed);
         assert!(
             project_tmp
                 .path()
@@ -1092,23 +1146,113 @@ mod tests {
         let project_tmp = tempfile::tempdir().unwrap();
         let project = KiroProject::new(project_tmp.path().to_path_buf());
 
-        let (count, warnings) = svc
-            .install_plugin_agents(
-                &project,
-                plugin_tmp.path(),
-                &["./agents/".to_string()],
-                "mp",
-                "p",
-                None,
-            )
-            .unwrap();
-        assert_eq!(count, 0);
+        let result = svc.install_plugin_agents(
+            &project,
+            plugin_tmp.path(),
+            &["./agents/".to_string()],
+            "mp",
+            "p",
+            None,
+        );
+        assert!(result.installed.is_empty());
         assert!(
-            warnings
+            result
+                .warnings
                 .iter()
                 .any(|w| matches!(w, InstallWarning::AgentParseFailed { .. })),
-            "expected AgentParseFailed: {warnings:?}"
+            "expected AgentParseFailed: {:?}",
+            result.warnings
         );
+    }
+
+    #[test]
+    fn install_plugin_agents_partial_success_preserves_warnings_and_failures() {
+        use crate::project::KiroProject;
+
+        let (_dir, svc) = temp_service();
+        let plugin_tmp = tempfile::tempdir().unwrap();
+        let agents_dir = plugin_tmp.path().join("agents");
+        fs::create_dir_all(&agents_dir).unwrap();
+        // Agent A: well-formed, will install.
+        fs::write(
+            agents_dir.join("a.md"),
+            "---\nname: aaa\ntools: [NotebookEdit]\n---\nbody a\n",
+        )
+        .unwrap();
+        // Agent B: pre-existing orphan file makes install fail.
+        fs::write(agents_dir.join("b.md"), "---\nname: bbb\n---\nbody b\n").unwrap();
+
+        let project_tmp = tempfile::tempdir().unwrap();
+        let project = KiroProject::new(project_tmp.path().to_path_buf());
+        // Pre-plant orphan file for "bbb" so its install_agent fails.
+        let agents_out = project_tmp.path().join(".kiro/agents");
+        fs::create_dir_all(&agents_out).unwrap();
+        fs::write(agents_out.join("bbb.json"), b"{}").unwrap();
+
+        let result = svc.install_plugin_agents(
+            &project,
+            plugin_tmp.path(),
+            &["./agents/".to_string()],
+            "mp",
+            "p",
+            None,
+        );
+
+        // A succeeded, B failed, and the unmapped-tool warning for A still
+        // surfaces despite B's failure.
+        assert_eq!(result.installed, vec!["aaa".to_string()]);
+        assert_eq!(result.failed.len(), 1);
+        assert_eq!(result.failed[0].name, "bbb");
+        let has_unmapped = result.warnings.iter().any(|w| {
+            matches!(
+                w,
+                InstallWarning::UnmappedTool { tool, .. } if tool == "NotebookEdit"
+            )
+        });
+        assert!(
+            has_unmapped,
+            "warnings should include unmapped NotebookEdit even when a later agent fails: {:?}",
+            result.warnings
+        );
+    }
+
+    #[test]
+    fn install_plugin_agents_already_installed_goes_to_skipped() {
+        use crate::project::KiroProject;
+
+        let (_dir, svc) = temp_service();
+        let plugin_tmp = tempfile::tempdir().unwrap();
+        let agents_dir = plugin_tmp.path().join("agents");
+        fs::create_dir_all(&agents_dir).unwrap();
+        fs::write(agents_dir.join("dup.md"), "---\nname: dup\n---\nbody\n").unwrap();
+
+        let project_tmp = tempfile::tempdir().unwrap();
+        let project = KiroProject::new(project_tmp.path().to_path_buf());
+
+        // First install: should succeed.
+        let r1 = svc.install_plugin_agents(
+            &project,
+            plugin_tmp.path(),
+            &["./agents/".to_string()],
+            "mp",
+            "p",
+            None,
+        );
+        assert_eq!(r1.installed, vec!["dup".to_string()]);
+        assert!(r1.failed.is_empty());
+
+        // Second install: should be reported as skipped, not failed.
+        let r2 = svc.install_plugin_agents(
+            &project,
+            plugin_tmp.path(),
+            &["./agents/".to_string()],
+            "mp",
+            "p",
+            None,
+        );
+        assert!(r2.installed.is_empty());
+        assert_eq!(r2.skipped, vec!["dup".to_string()]);
+        assert!(r2.failed.is_empty(), "AlreadyInstalled must not be failed");
     }
 
     #[test]
@@ -1130,19 +1274,17 @@ mod tests {
         let project_tmp = tempfile::tempdir().unwrap();
         let project = KiroProject::new(project_tmp.path().to_path_buf());
 
-        let (count, warnings) = svc
-            .install_plugin_agents(
-                &project,
-                plugin_tmp.path(),
-                &["./agents/".to_string()],
-                "mp",
-                "p",
-                None,
-            )
-            .unwrap();
-        assert_eq!(count, 0);
+        let result = svc.install_plugin_agents(
+            &project,
+            plugin_tmp.path(),
+            &["./agents/".to_string()],
+            "mp",
+            "p",
+            None,
+        );
+        assert!(result.installed.is_empty());
         // Rejection happens at parse time with a typed InvalidName.
-        let has_invalid_name = warnings.iter().any(|w| {
+        let has_invalid_name = result.warnings.iter().any(|w| {
             matches!(
                 w,
                 InstallWarning::AgentParseFailed {
@@ -1153,7 +1295,8 @@ mod tests {
         });
         assert!(
             has_invalid_name,
-            "expected InvalidName warning: {warnings:?}"
+            "expected InvalidName warning: {:?}",
+            result.warnings
         );
         // Nothing should have been written outside project_tmp.
         assert!(

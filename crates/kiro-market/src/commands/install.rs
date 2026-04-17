@@ -11,7 +11,8 @@ use kiro_market_core::marketplace::{PluginEntry, PluginSource, StructuredSource}
 use kiro_market_core::plugin::{PluginManifest, discover_skill_dirs};
 use kiro_market_core::project::KiroProject;
 use kiro_market_core::service::{
-    FailedSkill, InstallFilter, InstallSkillsResult, InstallWarning, MarketplaceService,
+    FailedAgent, FailedSkill, InstallAgentsResult, InstallFilter, InstallSkillsResult,
+    MarketplaceService,
 };
 use tracing::{debug, warn};
 
@@ -21,6 +22,7 @@ use crate::cli;
 ///
 /// Resolves `plugin_ref` to a plugin, discovers skills, copies skill
 /// directories, and installs into the current Kiro project.
+#[allow(clippy::too_many_lines)]
 pub fn run(plugin_ref: &str, skill_filter: Option<&str>, force: bool) -> Result<()> {
     let (plugin_name, marketplace_name) = cli::parse_plugin_ref(plugin_ref).with_context(|| {
         format!("invalid plugin reference '{plugin_ref}': expected plugin@marketplace")
@@ -101,36 +103,45 @@ pub fn run(plugin_ref: &str, skill_filter: Option<&str>, force: bool) -> Result<
 
     // Agents: only run when the user did NOT pass `--skill <name>`. A skill
     // filter narrows the install to one skill and never includes agents.
-    let (agents_installed, agent_warnings) = if skill_filter.is_none() {
-        match svc.install_plugin_agents(
+    let agent_result = if skill_filter.is_none() {
+        svc.install_plugin_agents(
             &project,
             &plugin_dir,
             &agent_scan_paths,
             marketplace_name,
             plugin_name,
             version.as_deref(),
-        ) {
-            Ok(tup) => tup,
-            Err(e) => {
-                eprintln!(
-                    "  {} Agent install failed: {}",
-                    "✗".red().bold(),
-                    format_args!("{e}")
-                );
-                (0, Vec::new())
-            }
-        }
+        )
     } else {
-        (0, Vec::new())
+        InstallAgentsResult::default()
     };
-    print_agent_outcome(agents_installed, &agent_warnings);
+    print_agent_outcome(&agent_result);
 
-    if skill_result.installed.is_empty() && skill_result.skipped.is_empty() && agents_installed == 0
-    {
-        if skill_filter.is_some() {
-            bail!("no skills were installed from '{plugin_ref}'");
-        }
-        bail!("no skills or agents were installed from '{plugin_ref}'");
+    let nothing_installed = skill_result.installed.is_empty()
+        && skill_result.skipped.is_empty()
+        && agent_result.installed.is_empty()
+        && agent_result.skipped.is_empty();
+    if nothing_installed && agent_result.failed.is_empty() && skill_result.failed.is_empty() {
+        let kind = if skill_filter.is_some() {
+            "skills"
+        } else {
+            "skills or agents"
+        };
+        bail!("no {kind} were installed from '{plugin_ref}'");
+    }
+
+    // Any per-agent or per-skill failure surfaces as a non-zero exit so CI
+    // catches partial-success regressions.
+    if !agent_result.failed.is_empty() || !skill_result.failed.is_empty() {
+        bail!(
+            "{} item{} failed during install from '{plugin_ref}'",
+            agent_result.failed.len() + skill_result.failed.len(),
+            if agent_result.failed.len() + skill_result.failed.len() == 1 {
+                ""
+            } else {
+                "s"
+            }
+        );
     }
 
     Ok(())
@@ -148,18 +159,28 @@ fn agent_scan_paths(plugin_manifest: Option<&PluginManifest>) -> Vec<String> {
     }
 }
 
-/// Render the agent install summary and any warnings. Warnings go to
-/// stderr so they don't pollute stdout piping, matching the skill flow.
-fn print_agent_outcome(installed: usize, warnings: &[InstallWarning]) {
-    if installed > 0 {
+/// Render the agent install summary plus any warnings and per-agent
+/// failures. Warnings and failures go to stderr so they don't pollute
+/// stdout piping, matching the skill flow.
+fn print_agent_outcome(result: &InstallAgentsResult) {
+    for name in &result.installed {
+        println!("  {} Installed agent '{}'", "✓".green().bold(), name.bold());
+    }
+    for name in &result.skipped {
         println!(
-            "  {} Installed {} agent{}",
-            "✓".green().bold(),
-            installed,
-            if installed == 1 { "" } else { "s" }
+            "  {} Agent '{}' already installed",
+            "·".yellow().bold(),
+            name.bold()
         );
     }
-    for w in warnings {
+    for FailedAgent { name, error } in &result.failed {
+        eprintln!(
+            "  {} Failed to install agent '{}': {error}",
+            "✗".red().bold(),
+            name
+        );
+    }
+    for w in &result.warnings {
         eprintln!("  {} {w}", "!".yellow().bold());
     }
 }
