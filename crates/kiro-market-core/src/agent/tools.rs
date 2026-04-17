@@ -31,14 +31,14 @@ pub struct UnmappedTool {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[cfg_attr(feature = "specta", derive(specta::Type))]
 pub enum UnmappedReason {
-    /// Claude PascalCase name with no Kiro equivalent (e.g. `NotebookEdit`).
+    /// Claude `PascalCase` name with no Kiro equivalent (e.g. `NotebookEdit`).
     NoKiroEquivalent,
     /// Copilot bare name (e.g. `codebase`, `findTestFiles`) — internal Copilot
     /// concept with no reliable Kiro mapping.
     BareCopilotName,
 }
 
-/// Look up the Kiro tool name for a Claude-style PascalCase tool name.
+/// Look up the Kiro tool name for a Claude-style `PascalCase` tool name.
 ///
 /// Returns `None` for tools with no Kiro equivalent. The caller is expected
 /// to surface a warning for `None` results so the user knows the restriction

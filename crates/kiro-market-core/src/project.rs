@@ -13,6 +13,7 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
+use crate::agent::AgentDialect;
 use crate::error::SkillError;
 use crate::validation;
 
@@ -45,12 +46,39 @@ pub struct InstalledSkills {
     pub skills: HashMap<String, InstalledSkillMeta>,
 }
 
+/// Metadata recorded for each installed agent.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InstalledAgentMeta {
+    /// Name of the marketplace the agent came from.
+    pub marketplace: String,
+    /// Name of the plugin that owns the agent.
+    pub plugin: String,
+    /// Optional version string from the plugin manifest.
+    pub version: Option<String>,
+    /// Timestamp when the agent was installed.
+    pub installed_at: DateTime<Utc>,
+    /// Which source dialect the agent was parsed from. Persisted via the
+    /// enum's serde rename so the wire format stays `"claude"` / `"copilot"`.
+    pub dialect: AgentDialect,
+}
+
+/// The on-disk structure of `installed-agents.json`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct InstalledAgents {
+    /// Map from agent name to its installation metadata.
+    pub agents: HashMap<String, InstalledAgentMeta>,
+}
+
 // ---------------------------------------------------------------------------
 // KiroProject
 // ---------------------------------------------------------------------------
 
-/// Name of the tracking file inside `.kiro/`.
+/// Name of the skill tracking file inside `.kiro/`.
 const INSTALLED_SKILLS_FILE: &str = "installed-skills.json";
+
+/// Name of the agent tracking file inside `.kiro/`.
+#[allow(dead_code)] // Consumed by `install_agent` in Task 10.
+const INSTALLED_AGENTS_FILE: &str = "installed-agents.json";
 
 /// Recursively copy a directory tree from `src` to `dest`.
 ///
@@ -458,6 +486,47 @@ mod tests {
             version: Some("1.0.0".into()),
             installed_at: Utc::now(),
         }
+    }
+
+    #[test]
+    fn installed_agent_meta_roundtrips_json() {
+        let meta = InstalledAgentMeta {
+            marketplace: "mp".into(),
+            plugin: "pr-review-toolkit".into(),
+            version: Some("1.2.3".into()),
+            installed_at: Utc::now(),
+            dialect: AgentDialect::Claude,
+        };
+        let json = serde_json::to_string(&meta).unwrap();
+        let back: InstalledAgentMeta = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.plugin, "pr-review-toolkit");
+        assert_eq!(back.dialect, AgentDialect::Claude);
+        // Spot-check the wire format: dialect serializes lowercase.
+        assert!(
+            json.contains("\"dialect\":\"claude\""),
+            "unexpected wire format: {json}"
+        );
+    }
+
+    #[test]
+    fn installed_agent_meta_roundtrips_copilot_dialect() {
+        let meta = InstalledAgentMeta {
+            marketplace: "mp".into(),
+            plugin: "p".into(),
+            version: None,
+            installed_at: Utc::now(),
+            dialect: AgentDialect::Copilot,
+        };
+        let json = serde_json::to_string(&meta).unwrap();
+        assert!(json.contains("\"dialect\":\"copilot\""));
+        let back: InstalledAgentMeta = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.dialect, AgentDialect::Copilot);
+    }
+
+    #[test]
+    fn installed_agents_default_is_empty() {
+        let ia = InstalledAgents::default();
+        assert!(ia.agents.is_empty());
     }
 
     #[test]

@@ -2,7 +2,7 @@
 //!
 //! Claude agents have YAML frontmatter with: `name` (required),
 //! `description`, `model` (`opus`/`sonnet`/`inherit`), `color` (dropped),
-//! and optional `tools` (a list of PascalCase tool names).
+//! and optional `tools` (a list of `PascalCase` tool names).
 
 use serde::Deserialize;
 use std::collections::BTreeMap;
