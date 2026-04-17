@@ -1111,6 +1111,57 @@ mod tests {
         );
     }
 
+    #[test]
+    fn install_plugin_agents_rejects_frontmatter_path_traversal_end_to_end() {
+        use crate::agent::ParseFailure;
+        use crate::project::KiroProject;
+
+        let (_dir, svc) = temp_service();
+        let plugin_tmp = tempfile::tempdir().unwrap();
+        let agents_dir = plugin_tmp.path().join("agents");
+        fs::create_dir_all(&agents_dir).unwrap();
+        // Attack: name in YAML attempts to escape the agents directory.
+        fs::write(
+            agents_dir.join("evil.md"),
+            "---\nname: ../escape\n---\nbody\n",
+        )
+        .unwrap();
+
+        let project_tmp = tempfile::tempdir().unwrap();
+        let project = KiroProject::new(project_tmp.path().to_path_buf());
+
+        let (count, warnings) = svc
+            .install_plugin_agents(
+                &project,
+                plugin_tmp.path(),
+                &["./agents/".to_string()],
+                "mp",
+                "p",
+                None,
+            )
+            .unwrap();
+        assert_eq!(count, 0);
+        // Rejection happens at parse time with a typed InvalidName.
+        let has_invalid_name = warnings.iter().any(|w| {
+            matches!(
+                w,
+                InstallWarning::AgentParseFailed {
+                    failure: ParseFailure::InvalidName(_),
+                    ..
+                }
+            )
+        });
+        assert!(
+            has_invalid_name,
+            "expected InvalidName warning: {warnings:?}"
+        );
+        // Nothing should have been written outside project_tmp.
+        assert!(
+            !project_tmp.path().parent().unwrap().join("escape").exists(),
+            "traversal must not have escaped project root"
+        );
+    }
+
     /// Mock git backend that records calls and creates a minimal marketplace
     /// manifest in the destination directory during clone.
     #[derive(Debug, Default)]

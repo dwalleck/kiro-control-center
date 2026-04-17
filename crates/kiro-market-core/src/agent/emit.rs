@@ -42,7 +42,10 @@ pub fn build_kiro_json(
     }
     obj.insert(
         "prompt".into(),
-        Value::String(format!("file://./prompts/{}.md", def.name)),
+        Value::String(format!(
+            "file://./prompts/{}.md",
+            percent_encode_path_segment(&def.name)
+        )),
     );
     if let Some(model) = &def.model {
         obj.insert("model".into(), Value::String(model.clone()));
@@ -71,6 +74,27 @@ pub fn build_kiro_json(
         obj.insert("mcpServers".into(), Value::Object(servers));
     }
     Ok(Value::Object(obj))
+}
+
+/// Percent-encode characters that are invalid in a URI path segment.
+///
+/// `validate_name` already forbids `/`, `\`, `..`, `.`, and empty names,
+/// so the only characters that can appear here and break RFC 3986 are
+/// whitespace and other non-unreserved printables (Copilot agents like
+/// "Terraform Agent" contain spaces). Unreserved per RFC 3986: ASCII
+/// alphanumeric, `-`, `_`, `.`, `~`. Everything else is percent-encoded.
+fn percent_encode_path_segment(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for byte in s.bytes() {
+        let unreserved = byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~');
+        if unreserved {
+            out.push(byte as char);
+        } else {
+            use std::fmt::Write as _;
+            let _ = write!(out, "%{byte:02X}");
+        }
+    }
+    out
 }
 
 /// Normalize a Copilot MCP server entry toward Kiro's `CustomToolConfig` shape.
@@ -123,6 +147,30 @@ mod tests {
         let out = build_kiro_json(&sample_claude_def(), &[]).unwrap();
         assert_eq!(out["name"], "reviewer");
         assert_eq!(out["prompt"], "file://./prompts/reviewer.md");
+    }
+
+    #[test]
+    fn emit_percent_encodes_spaces_in_prompt_uri() {
+        // Copilot agents like "Terraform Agent" have spaces in the name.
+        // The JSON `name` field keeps the space; the file:// URI must
+        // percent-encode it per RFC 3986.
+        let mut def = sample_claude_def();
+        def.name = "Terraform Agent".into();
+        let out = build_kiro_json(&def, &[]).unwrap();
+        assert_eq!(out["name"], "Terraform Agent");
+        assert_eq!(out["prompt"], "file://./prompts/Terraform%20Agent.md");
+    }
+
+    #[test]
+    fn emit_preserves_unreserved_chars_in_prompt_uri() {
+        let mut def = sample_claude_def();
+        def.name = "pr-review_toolkit.v2~beta".into();
+        let out = build_kiro_json(&def, &[]).unwrap();
+        // Unreserved chars per RFC 3986: alphanumeric and -_.~ — no encoding.
+        assert_eq!(
+            out["prompt"],
+            "file://./prompts/pr-review_toolkit.v2~beta.md"
+        );
     }
 
     #[test]

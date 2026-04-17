@@ -33,6 +33,14 @@ pub fn parse_claude_agent(content: &str) -> Result<AgentDefinition, ParseFailure
         serde_yaml::from_str(yaml_block).map_err(|e| ParseFailure::InvalidYaml(e.to_string()))?;
 
     let name = fm.name.ok_or(ParseFailure::MissingName)?;
+    // Validate the name at parse time so downstream fs operations (and the
+    // file:// URI in the emitted JSON) can trust it without re-checking.
+    crate::validation::validate_name(&name).map_err(|e| match e {
+        crate::error::ValidationError::InvalidName { reason, .. } => {
+            ParseFailure::InvalidName(reason)
+        }
+        other => ParseFailure::InvalidName(other.to_string()),
+    })?;
     // Normalize `model: inherit` (Claude's "use parent model" sentinel) to None
     // so the Kiro emitter omits the field and defers to the CLI default.
     let model = fm.model.filter(|m| m != "inherit");
@@ -90,6 +98,23 @@ mod tests {
         let src = "---\ndescription: x\n---\nbody\n";
         let err = parse_claude_agent(src).unwrap_err();
         assert_eq!(err, ParseFailure::MissingName);
+    }
+
+    #[test]
+    fn parse_rejects_path_traversal_in_name() {
+        let src = "---\nname: ../escape\n---\nbody\n";
+        let err = parse_claude_agent(src).unwrap_err();
+        assert!(
+            matches!(err, ParseFailure::InvalidName(_)),
+            "expected InvalidName for traversal, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn parse_rejects_empty_name() {
+        let src = "---\nname: \"\"\n---\nbody\n";
+        let err = parse_claude_agent(src).unwrap_err();
+        assert!(matches!(err, ParseFailure::InvalidName(_)));
     }
 
     #[test]

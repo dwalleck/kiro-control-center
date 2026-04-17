@@ -69,6 +69,9 @@ pub enum ParseFailure {
     InvalidYaml(String),
     /// Frontmatter parsed but lacks the required `name` key.
     MissingName,
+    /// Frontmatter `name` failed validation (unsafe for use as a filename).
+    /// Carries the validator's human-readable reason.
+    InvalidName(String),
     /// File read failed (permission denied, not found during racy delete,
     /// etc.). Carries the rendered I/O error message.
     IoError(String),
@@ -85,6 +88,7 @@ impl std::fmt::Display for ParseFailure {
             }
             ParseFailure::InvalidYaml(msg) => write!(f, "invalid YAML: {msg}"),
             ParseFailure::MissingName => f.write_str("missing required `name` field"),
+            ParseFailure::InvalidName(reason) => write!(f, "invalid `name` value: {reason}"),
             ParseFailure::IoError(msg) => write!(f, "read failed: {msg}"),
         }
     }
