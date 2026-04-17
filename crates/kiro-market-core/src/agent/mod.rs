@@ -1,8 +1,11 @@
 //! Agent import: parse Claude- and Copilot-style agent markdown files,
 //! map their tools to Kiro identifiers, and emit Kiro agent JSON.
 
+mod frontmatter;
+mod parse_claude;
 pub mod types;
 
+pub use parse_claude::parse_claude_agent;
 pub use types::{AgentDefinition, AgentDialect};
 
 #[cfg(test)]
