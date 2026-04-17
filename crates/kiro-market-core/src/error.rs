@@ -1,8 +1,8 @@
 //! Domain error types for kiro-market-core.
 //!
 //! Errors are organised into thematic groups ([`MarketplaceError`],
-//! [`PluginError`], [`SkillError`], [`GitError`]) and a top-level [`Error`]
-//! enum that unifies them via `From` conversions.
+//! [`PluginError`], [`SkillError`], [`AgentError`], [`GitError`]) and a
+//! top-level [`Error`] enum that unifies them via `From` conversions.
 
 use std::path::PathBuf;
 
@@ -77,6 +77,31 @@ pub enum SkillError {
     /// No `SKILL.md` was found for the skill.
     #[error("SKILL.md not found at {path}")]
     SkillMdNotFound { path: PathBuf },
+}
+
+// ---------------------------------------------------------------------------
+// Agent errors
+// ---------------------------------------------------------------------------
+
+/// Errors related to agent operations.
+#[derive(Debug, Error)]
+#[non_exhaustive]
+pub enum AgentError {
+    /// The agent is already installed in the target project.
+    #[error("agent `{name}` is already installed")]
+    AlreadyInstalled { name: String },
+
+    /// The agent is not installed in the target project.
+    #[error("agent `{name}` is not installed")]
+    NotInstalled { name: String },
+
+    /// The source markdown could not be parsed.
+    #[error("failed to parse agent at {path}: {reason}")]
+    ParseFailed { path: PathBuf, reason: String },
+
+    /// Frontmatter lacks a required `name` field.
+    #[error("agent at {path} is missing required `name` field")]
+    MissingName { path: PathBuf },
 }
 
 // ---------------------------------------------------------------------------
@@ -164,6 +189,9 @@ pub enum Error {
 
     #[error(transparent)]
     Skill(#[from] SkillError),
+
+    #[error(transparent)]
+    Agent(#[from] AgentError),
 
     #[error(transparent)]
     Git(#[from] GitError),
@@ -301,6 +329,27 @@ mod tests {
         assert_eq!(err.to_string(), expected);
     }
 
+    #[rstest]
+    #[case::agent_already_installed(
+        AgentError::AlreadyInstalled { name: "reviewer".into() },
+        "agent `reviewer` is already installed"
+    )]
+    #[case::agent_not_installed(
+        AgentError::NotInstalled { name: "missing".into() },
+        "agent `missing` is not installed"
+    )]
+    #[case::agent_parse_failed(
+        AgentError::ParseFailed { path: PathBuf::from("a.md"), reason: "bad yaml".into() },
+        "failed to parse agent at a.md: bad yaml"
+    )]
+    #[case::agent_missing_name(
+        AgentError::MissingName { path: PathBuf::from("a.md") },
+        "agent at a.md is missing required `name` field"
+    )]
+    fn agent_error_display(#[case] err: AgentError, #[case] expected: &str) {
+        assert_eq!(err.to_string(), expected);
+    }
+
     #[test]
     fn git_clone_failed_display() {
         let err = GitError::CloneFailed {
@@ -434,6 +483,13 @@ mod tests {
         };
         let err: Error = inner.into();
         assert!(matches!(err, Error::Validation(_)));
+    }
+
+    #[test]
+    fn from_agent_error() {
+        let inner = AgentError::NotInstalled { name: "x".into() };
+        let err: Error = inner.into();
+        assert!(matches!(err, Error::Agent(_)));
     }
 
     #[test]
