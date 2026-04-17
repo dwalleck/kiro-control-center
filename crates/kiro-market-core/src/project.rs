@@ -85,14 +85,14 @@ const INSTALLED_AGENTS_FILE: &str = "installed-agents.json";
 /// already returning a more meaningful error and the staging dir is
 /// unreachable user-facing state.
 fn remove_staging_dir(staging: &Path) {
-    if let Err(e) = fs::remove_dir_all(staging) {
-        if e.kind() != std::io::ErrorKind::NotFound {
-            warn!(
-                path = %staging.display(),
-                error = %e,
-                "failed to remove staging directory"
-            );
-        }
+    if let Err(e) = fs::remove_dir_all(staging)
+        && e.kind() != std::io::ErrorKind::NotFound
+    {
+        warn!(
+            path = %staging.display(),
+            error = %e,
+            "failed to remove staging directory"
+        );
     }
 }
 
