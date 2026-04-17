@@ -195,4 +195,21 @@ mod tests {
 
         assert!(!is_local_link(&regular), "regular dir is not a link");
     }
+
+    #[cfg(unix)]
+    #[test]
+    fn create_local_link_returns_linked_on_unix() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let src = dir.path().join("source");
+        std::fs::create_dir_all(&src).expect("create source");
+
+        let dest = dir.path().join("link");
+        let result = create_local_link(&src, &dest).expect("create link");
+
+        assert_eq!(
+            result,
+            LinkResult::Linked,
+            "Unix should always return Linked"
+        );
+    }
 }

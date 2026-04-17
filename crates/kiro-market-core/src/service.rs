@@ -3,19 +3,24 @@
 //! [`MarketplaceService`] centralizes add/remove/update/list logic so that
 //! CLI and Tauri frontends remain thin presentation wrappers.
 
-use std::error::Error as _;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicU64;
 
 use serde::Serialize;
 use tracing::{debug, warn};
 
 use crate::cache::{CacheDir, KnownMarketplace, MarketplaceSource};
-use crate::error::{Error, MarketplaceError};
+use crate::error::{Error, MarketplaceError, error_full_chain};
 use crate::git::{self, CloneOptions, GitBackend, GitProtocol};
 use crate::marketplace::Marketplace;
 use crate::platform::LinkResult;
 use crate::{platform, validation};
+
+/// Process-local sequence used to disambiguate concurrent `_pending_*` temp
+/// directories during `add()`. Combined with `process::id()` so two threads
+/// in the same process never collide on the staging path.
+static PENDING_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 // ---------------------------------------------------------------------------
 // Temp directory cleanup guard
@@ -46,11 +51,12 @@ impl Drop for TempDirGuard {
     fn drop(&mut self) {
         if !self.defused
             && let Err(e) = fs::remove_dir_all(&self.path)
+            && e.kind() != std::io::ErrorKind::NotFound
         {
             warn!(
                 path = %self.path.display(),
                 error = %e,
-                "failed to clean up temp directory"
+                "failed to clean up temp directory — remove it manually"
             );
         }
     }
@@ -66,6 +72,27 @@ impl Drop for TempDirGuard {
 pub struct MarketplaceAddResult {
     pub name: String,
     pub plugins: Vec<PluginBasicInfo>,
+    /// How the marketplace contents are stored on disk. `Linked` means
+    /// changes to the source are reflected immediately; `Copied` (Windows
+    /// fallback when junctions fail) means the user must re-add to pick up
+    /// upstream edits. The frontend should surface this for `Copied` so
+    /// users aren't surprised that "live" updates do not work.
+    pub storage: MarketplaceStorage,
+}
+
+/// How a registered marketplace's contents are stored on disk.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
+#[serde(rename_all = "snake_case")]
+pub enum MarketplaceStorage {
+    /// Cloned from a remote git repository.
+    Cloned,
+    /// Linked to a local directory (symlink on Unix, junction on Windows).
+    /// Edits to the source are visible immediately.
+    Linked,
+    /// Copied from a local directory (Windows fallback when junctions fail).
+    /// Edits to the source require re-adding the marketplace.
+    Copied,
 }
 
 /// Basic information about a plugin within a marketplace.
@@ -89,6 +116,39 @@ pub struct UpdateResult {
 #[derive(Clone, Debug, Serialize)]
 #[cfg_attr(feature = "specta", derive(specta::Type))]
 pub struct FailedUpdate {
+    pub name: String,
+    pub error: String,
+}
+
+/// Filter applied to a multi-skill install operation.
+///
+/// `All` installs every discovered skill. `Names(set)` keeps only skills
+/// whose `SKILL.md` frontmatter `name` appears in the set; any names in
+/// the set that are NOT matched at the end are reported as `Failed` (so
+/// the caller can warn the user about typos).
+pub enum InstallFilter<'a> {
+    All,
+    Names(&'a [String]),
+    SingleName(&'a str),
+}
+
+/// Outcome of installing a list of skill directories from one plugin.
+#[derive(Clone, Debug, Default, Serialize)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
+pub struct InstallSkillsResult {
+    /// Skill names successfully installed.
+    pub installed: Vec<String>,
+    /// Skill names already installed and skipped (only when `force = false`).
+    pub skipped: Vec<String>,
+    /// Skill names whose install attempt failed (read/parse/install error,
+    /// or — for `Names(_)` filter — names requested but not found).
+    pub failed: Vec<FailedSkill>,
+}
+
+/// A skill that failed to install, with the reason.
+#[derive(Clone, Debug, Serialize)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
+pub struct FailedSkill {
     pub name: String,
     pub error: String,
 }
@@ -135,27 +195,35 @@ impl MarketplaceService {
     /// marketplace with the same name is already registered.
     #[allow(clippy::too_many_lines)]
     pub fn add(&self, source: &str, protocol: GitProtocol) -> Result<MarketplaceAddResult, Error> {
+        use std::sync::atomic::Ordering;
+
         let ms = MarketplaceSource::detect(source);
         self.cache.ensure_dirs()?;
 
-        let temp_name = format!("_pending_{}", std::process::id());
+        let pending_seq = PENDING_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let temp_name = format!("_pending_{}_{}", std::process::id(), pending_seq);
         let temp_dir = self.cache.marketplace_path(&temp_name);
 
-        if temp_dir.exists()
-            && let Err(e) = fs::remove_dir_all(&temp_dir)
-        {
-            warn!(
-                path = %temp_dir.display(),
-                error = %e,
-                "failed to clean up leftover temp directory"
-            );
+        // The unique name should make collisions impossible, but tolerate a
+        // leftover dir on the off-chance of pid+seq reuse across runs.
+        match fs::remove_dir_all(&temp_dir) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                warn!(
+                    path = %temp_dir.display(),
+                    error = %e,
+                    "failed to clean up leftover temp directory"
+                );
+            }
         }
 
         let mut guard = TempDirGuard::new(temp_dir.clone());
 
         let link_result = self.clone_or_link(&ms, protocol, &temp_dir)?;
+        let storage = storage_from_source_and_link(&ms, link_result);
 
-        if link_result == LinkResult::Copied {
+        if storage == MarketplaceStorage::Copied {
             warn!(
                 source = %source,
                 "marketplace was copied, not linked — local changes will NOT be live-tracked"
@@ -165,82 +233,44 @@ impl MarketplaceService {
         // Try to read marketplace manifest (optional).
         let manifest = Self::try_read_manifest(&temp_dir)?;
 
-        // Scan for plugin.json files.
-        let discovered = crate::plugin::discover_plugins(&temp_dir, 3);
+        // Scan for plugin.json files. A read failure on the repo root is
+        // bubbled up as `Error::Io`, so the caller sees the real reason
+        // (e.g. permission denied) rather than a misleading "no plugins".
+        let discovered = crate::plugin::discover_plugins(&temp_dir, 3)?;
 
-        // Build the plugin list: manifest entries first, then discovered (deduplicated).
-        let (name, plugins) = if let Some(m) = manifest {
-            let manifest_name = m.name.clone();
-            let mut plugins: Vec<PluginBasicInfo> = m
-                .plugins
-                .iter()
-                .map(|p| PluginBasicInfo {
-                    name: p.name.clone(),
-                    description: p.description.clone(),
-                })
-                .collect();
+        // Build the merged plugin list and derive the marketplace name.
+        let registry_entries = Self::build_registry_entries(manifest.as_ref(), &discovered);
 
-            // Collect marketplace-listed relative paths for dedup.
-            // Normalize to forward slashes so comparisons work on Windows.
-            let listed_paths: Vec<String> = m
-                .plugins
-                .iter()
-                .filter_map(|p| match &p.source {
-                    crate::marketplace::PluginSource::RelativePath(rel) => {
-                        let normalized = rel
-                            .trim_start_matches("./")
-                            .trim_start_matches(".\\")
-                            .trim_end_matches(['/', '\\'])
-                            .replace('\\', "/");
-                        Some(normalized)
-                    }
-                    crate::marketplace::PluginSource::Structured(_) => None,
-                })
-                .collect();
-
-            // Collect listed names for dedup of structured sources.
-            let listed_names: Vec<&str> =
-                m.plugins.iter().map(|p| p.name.as_str()).collect();
-
-            // Add discovered plugins that aren't already listed.
-            // Use forward-slash relative paths for cross-platform comparison.
-            for dp in &discovered {
-                let dp_path = dp.relative_path_unix();
-                let path_match = listed_paths.contains(&dp_path);
-                let name_match = listed_names.contains(&dp.name());
-                if !path_match && !name_match {
-                    plugins.push(PluginBasicInfo {
-                        name: dp.name().to_owned(),
-                        description: dp.description().map(String::from),
-                    });
-                }
-            }
-
-            (manifest_name, plugins)
-        } else {
-            if discovered.is_empty() {
-                return Err(MarketplaceError::NoPluginsFound {
-                    path: temp_dir.clone(),
+        let name = if let Some(m) = &manifest {
+            m.name.clone()
+        } else if discovered.is_empty() {
+            // Check if a manifest file exists but was malformed.
+            let manifest_path = temp_dir.join(crate::MARKETPLACE_MANIFEST_PATH);
+            if manifest_path.exists() {
+                return Err(MarketplaceError::InvalidManifest {
+                    reason: "marketplace.json exists but could not be parsed, and no plugin.json files were found via scan".into(),
                 }
                 .into());
             }
-
-            let name = ms.fallback_name().ok_or_else(|| {
+            return Err(MarketplaceError::NoPluginsFound {
+                path: temp_dir.clone(),
+            }
+            .into());
+        } else {
+            ms.fallback_name().ok_or_else(|| {
                 MarketplaceError::InvalidManifest {
                     reason: "no marketplace.json found and could not derive a name from the source; use --name to specify one".into(),
                 }
-            })?;
-
-            let plugins = discovered
-                .iter()
-                .map(|dp| PluginBasicInfo {
-                    name: dp.name().to_owned(),
-                    description: dp.description().map(String::from),
-                })
-                .collect();
-
-            (name, plugins)
+            })?
         };
+
+        let plugins: Vec<PluginBasicInfo> = registry_entries
+            .iter()
+            .map(|p| PluginBasicInfo {
+                name: p.name.clone(),
+                description: p.description.clone(),
+            })
+            .collect();
 
         validation::validate_name(&name)?;
 
@@ -280,9 +310,23 @@ impl MarketplaceService {
         }
         guard.defuse();
 
+        // Persist the merged plugin list so browse/install commands don't
+        // need to re-scan the repo on every access.
+        if let Err(e) = self.cache.write_plugin_registry(&name, &registry_entries) {
+            warn!(
+                marketplace = %name,
+                error = %e,
+                "failed to write plugin registry — run 'update {name}' to regenerate"
+            );
+        }
+
         debug!(marketplace = %name, "marketplace added");
 
-        Ok(MarketplaceAddResult { name, plugins })
+        Ok(MarketplaceAddResult {
+            name,
+            plugins,
+            storage,
+        })
     }
 
     /// Remove a registered marketplace and its cached data.
@@ -292,14 +336,41 @@ impl MarketplaceService {
     /// Returns an error if the marketplace is not registered or its cached
     /// data cannot be removed from disk.
     pub fn remove(&self, name: &str) -> Result<(), Error> {
-        self.cache.remove_known_marketplace(name)?;
-
         let mp_path = self.cache.marketplace_path(name);
+
+        // Verify it's registered before trying to delete.
+        let entries = self.cache.load_known_marketplaces()?;
+        if !entries.iter().any(|e| e.name == name) {
+            return Err(MarketplaceError::NotFound {
+                name: name.to_owned(),
+            }
+            .into());
+        }
+
+        // Delete the directory first — if this fails, the marketplace stays
+        // registered and the user can retry.
         if platform::is_local_link(&mp_path) {
             platform::remove_local_link(&mp_path)?;
         } else if mp_path.exists() {
             fs::remove_dir_all(&mp_path)?;
         }
+
+        // Clean up the plugin registry file (best-effort). Match on the
+        // operation result rather than `exists()` + `remove_file()` to avoid
+        // a TOCTOU window where the file disappears between the two calls.
+        let registry_path = self.cache.plugin_registry_path(name);
+        match fs::remove_file(&registry_path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => warn!(
+                path = %registry_path.display(),
+                error = %e,
+                "failed to remove plugin registry file"
+            ),
+        }
+
+        // Now unregister — directory is already gone.
+        self.cache.remove_known_marketplace(name)?;
 
         debug!(marketplace = %name, "marketplace removed");
         Ok(())
@@ -357,22 +428,16 @@ impl MarketplaceService {
 
             match self.git.pull_repo(&mp_path) {
                 Ok(()) => {
+                    // Regenerate the plugin registry after pulling new content.
+                    self.regenerate_plugin_registry(&entry.name, &mp_path);
                     debug!(marketplace = %entry.name, "marketplace updated");
                     result.updated.push(entry.name.clone());
                 }
                 Err(e) => {
                     warn!(marketplace = %entry.name, error = %e, "failed to update");
-                    // Walk the error source chain for a complete message.
-                    let mut detail = e.to_string();
-                    let mut source: Option<&dyn std::error::Error> = e.source();
-                    while let Some(cause) = source {
-                        detail.push_str(": ");
-                        detail.push_str(&cause.to_string());
-                        source = cause.source();
-                    }
                     result.failed.push(FailedUpdate {
                         name: entry.name.clone(),
-                        error: detail,
+                        error: error_full_chain(&e),
                     });
                 }
             }
@@ -388,6 +453,173 @@ impl MarketplaceService {
     /// Returns an error if the registry file cannot be read or parsed.
     pub fn list(&self) -> Result<Vec<KnownMarketplace>, Error> {
         self.cache.load_known_marketplaces()
+    }
+
+    /// On-disk location of a registered marketplace's contents.
+    ///
+    /// Exposed so Tauri/CLI handlers do not need to keep a separate
+    /// `CacheDir` reference alongside the service.
+    #[must_use]
+    pub fn marketplace_path(&self, name: &str) -> PathBuf {
+        self.cache.marketplace_path(name)
+    }
+
+    /// Resolve the canonical plugin list for a registered marketplace.
+    ///
+    /// Tries the persisted plugin registry first (fast path). Falls back to
+    /// reading `marketplace.json` directly when the registry does not exist
+    /// (e.g. marketplace was added before the registry feature) or is
+    /// corrupt — a corrupt registry is logged at `warn` so users see the
+    /// signal to run `update` to regenerate it.
+    ///
+    /// This encapsulates the registry-first-then-manifest decision so CLI
+    /// and Tauri frontends do not duplicate the strategy. If we ever add a
+    /// recovery path (e.g. invalidate-and-rescan on a registry version
+    /// mismatch), it lives here in one place.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Marketplace`] with [`MarketplaceError::NotFound`]
+    /// when neither the registry nor a `marketplace.json` exists for the
+    /// given name. Other I/O or parse failures propagate.
+    pub fn list_plugin_entries(
+        &self,
+        marketplace_name: &str,
+    ) -> Result<Vec<crate::marketplace::PluginEntry>, Error> {
+        match self.cache.load_plugin_registry(marketplace_name) {
+            Ok(Some(entries)) => return Ok(entries),
+            Ok(None) => {
+                debug!(
+                    marketplace = marketplace_name,
+                    "no plugin registry found, falling back to marketplace manifest"
+                );
+            }
+            Err(e) => {
+                warn!(
+                    marketplace = marketplace_name,
+                    error = %e,
+                    "plugin registry is corrupt or unreadable — falling back to manifest; \
+                     run 'update' to regenerate"
+                );
+            }
+        }
+
+        let mp_path = self.cache.marketplace_path(marketplace_name);
+        match Self::try_read_manifest(&mp_path)? {
+            Some(manifest) => Ok(manifest.plugins),
+            None => Err(MarketplaceError::NotFound {
+                name: marketplace_name.to_owned(),
+            }
+            .into()),
+        }
+    }
+
+    /// Install one or more skills (each represented by a SKILL.md-bearing
+    /// directory) into a Kiro project under a single marketplace + plugin
+    /// attribution. Centralises the SKILL.md → frontmatter → filter →
+    /// `install_skill_from_dir(_force)` loop that the CLI and Tauri
+    /// frontends previously duplicated.
+    ///
+    /// `version` is recorded in the per-skill tracking metadata.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` only for unrecoverable per-call setup errors. Per-skill
+    /// failures (read errors, parse errors, install errors, requested-but-
+    /// missing names) are reported in the `failed` field of the result so
+    /// the caller can render a partial-success summary.
+    #[allow(clippy::too_many_arguments)]
+    pub fn install_skills(
+        &self,
+        project: &crate::project::KiroProject,
+        skill_dirs: &[PathBuf],
+        filter: &InstallFilter<'_>,
+        force: bool,
+        marketplace: &str,
+        plugin: &str,
+        version: Option<&str>,
+    ) -> InstallSkillsResult {
+        let mut result = InstallSkillsResult::default();
+        let mut processed: std::collections::HashSet<String> = std::collections::HashSet::new();
+
+        for skill_dir in skill_dirs {
+            let skill_md_path = skill_dir.join("SKILL.md");
+            let content = match fs::read_to_string(&skill_md_path) {
+                Ok(c) => c,
+                Err(e) => {
+                    warn!(
+                        path = %skill_md_path.display(),
+                        error = %e,
+                        "failed to read SKILL.md, skipping"
+                    );
+                    continue;
+                }
+            };
+
+            let (frontmatter, _body_offset) = match crate::skill::parse_frontmatter(&content) {
+                Ok(r) => r,
+                Err(e) => {
+                    warn!(
+                        path = %skill_md_path.display(),
+                        error = %e,
+                        "failed to parse SKILL.md frontmatter, skipping"
+                    );
+                    continue;
+                }
+            };
+
+            if !filter_matches(filter, &frontmatter.name) {
+                continue;
+            }
+            processed.insert(frontmatter.name.clone());
+
+            let meta = crate::project::InstalledSkillMeta {
+                marketplace: marketplace.to_owned(),
+                plugin: plugin.to_owned(),
+                version: version.map(str::to_owned),
+                installed_at: chrono::Utc::now(),
+            };
+
+            let outcome = if force {
+                project.install_skill_from_dir_force(&frontmatter.name, skill_dir, meta)
+            } else {
+                project.install_skill_from_dir(&frontmatter.name, skill_dir, meta)
+            };
+
+            match outcome {
+                Ok(()) => {
+                    debug!(skill = %frontmatter.name, "skill installed");
+                    result.installed.push(frontmatter.name);
+                }
+                Err(Error::Skill(crate::error::SkillError::AlreadyInstalled { .. })) => {
+                    debug!(skill = %frontmatter.name, "skill already installed, skipping");
+                    result.skipped.push(frontmatter.name);
+                }
+                Err(e) => {
+                    warn!(skill = %frontmatter.name, error = %e, "skill install failed");
+                    result.failed.push(FailedSkill {
+                        name: frontmatter.name,
+                        error: error_full_chain(&e),
+                    });
+                }
+            }
+        }
+
+        // For Names(_) filters, surface unmatched requests as failures so
+        // typos and stale references don't become silent no-ops.
+        if let InstallFilter::Names(requested) = *filter {
+            for name in requested {
+                if !processed.contains(name) {
+                    warn!(skill = %name, plugin = %plugin, "requested skill not found in plugin");
+                    result.failed.push(FailedSkill {
+                        name: name.clone(),
+                        error: format!("skill '{name}' not found in plugin '{plugin}'"),
+                    });
+                }
+            }
+        }
+
+        result
     }
 
     // -----------------------------------------------------------------------
@@ -427,6 +659,93 @@ impl MarketplaceService {
         }
     }
 
+    /// Re-scan the marketplace and write an updated plugin registry.
+    ///
+    /// Called after `update()` pulls new content. Best-effort — a failure
+    /// here does not block the update from succeeding.
+    fn regenerate_plugin_registry(&self, name: &str, mp_path: &Path) {
+        let manifest = match Self::try_read_manifest(mp_path) {
+            Ok(m) => m,
+            Err(e) => {
+                warn!(
+                    marketplace = %name,
+                    error = %e,
+                    "could not read manifest during registry regeneration"
+                );
+                None
+            }
+        };
+        let discovered = match crate::plugin::discover_plugins(mp_path, 3) {
+            Ok(d) => d,
+            Err(e) => {
+                // Best-effort regeneration: an unreadable repo means we
+                // cannot find new plugins, but the prior registry stays in
+                // place so installs can still work against the old contents.
+                warn!(
+                    marketplace = %name,
+                    error = %e,
+                    "could not scan repo for plugins during registry regeneration"
+                );
+                Vec::new()
+            }
+        };
+
+        let entries = Self::build_registry_entries(manifest.as_ref(), &discovered);
+
+        if let Err(e) = self.cache.write_plugin_registry(name, &entries) {
+            warn!(
+                marketplace = %name,
+                error = %e,
+                "failed to write plugin registry after update"
+            );
+        }
+    }
+
+    /// Build a merged list of `PluginEntry` from manifest + discovered plugins.
+    ///
+    /// Uses [`plugin_entry_from_discovered`] to construct entries from
+    /// scanned `DiscoveredPlugin` values.
+    fn build_registry_entries(
+        manifest: Option<&Marketplace>,
+        discovered: &[crate::plugin::DiscoveredPlugin],
+    ) -> Vec<crate::marketplace::PluginEntry> {
+        let Some(m) = manifest else {
+            return discovered
+                .iter()
+                .map(plugin_entry_from_discovered)
+                .collect();
+        };
+
+        let mut entries = m.plugins.clone();
+
+        // O(1) membership instead of O(n) Vec::contains so dedup against a
+        // large manifest stays linear in `discovered`.
+        let listed_paths: std::collections::HashSet<String> = m
+            .plugins
+            .iter()
+            .filter_map(|p| match &p.source {
+                crate::marketplace::PluginSource::RelativePath(rel) => Some(
+                    rel.trim_start_matches("./")
+                        .trim_start_matches(".\\")
+                        .trim_end_matches(['/', '\\'])
+                        .replace('\\', "/"),
+                ),
+                crate::marketplace::PluginSource::Structured(_) => None,
+            })
+            .collect();
+        let listed_names: std::collections::HashSet<&str> =
+            m.plugins.iter().map(|p| p.name.as_str()).collect();
+
+        for dp in discovered {
+            let dp_path = dp.relative_path_unix();
+            if !listed_paths.contains(&dp_path) && !listed_names.contains(dp.name()) {
+                entries.push(plugin_entry_from_discovered(dp));
+            }
+        }
+
+        entries
+    }
+
     /// Try to read the marketplace manifest.
     ///
     /// Returns `Ok(Some(manifest))` if found and valid, `Ok(None)` if the file
@@ -456,6 +775,41 @@ impl MarketplaceService {
             }
             Err(e) => Err(e.into()),
         }
+    }
+}
+
+/// Decide whether a skill name passes the install filter.
+fn filter_matches(filter: &InstallFilter<'_>, name: &str) -> bool {
+    match filter {
+        InstallFilter::All => true,
+        InstallFilter::SingleName(target) => name == *target,
+        InstallFilter::Names(set) => set.iter().any(|n| n == name),
+    }
+}
+
+/// Map the source kind + link outcome into the public `MarketplaceStorage` signal.
+/// Git sources are always `Cloned` regardless of link result; local paths
+/// map to `Linked` or `Copied`.
+fn storage_from_source_and_link(ms: &MarketplaceSource, link: LinkResult) -> MarketplaceStorage {
+    match ms {
+        MarketplaceSource::GitHub { .. } | MarketplaceSource::GitUrl { .. } => {
+            MarketplaceStorage::Cloned
+        }
+        MarketplaceSource::LocalPath { .. } => match link {
+            LinkResult::Linked => MarketplaceStorage::Linked,
+            LinkResult::Copied => MarketplaceStorage::Copied,
+        },
+    }
+}
+
+/// Convert a [`DiscoveredPlugin`] into a [`PluginEntry`] with a relative-path source.
+fn plugin_entry_from_discovered(
+    dp: &crate::plugin::DiscoveredPlugin,
+) -> crate::marketplace::PluginEntry {
+    crate::marketplace::PluginEntry {
+        name: dp.name().to_owned(),
+        description: dp.description().map(String::from),
+        source: crate::marketplace::PluginSource::RelativePath(dp.as_relative_path_string()),
     }
 }
 
@@ -520,10 +874,156 @@ mod tests {
         assert_eq!(result.name, "mock-market");
         assert_eq!(result.plugins.len(), 1);
         assert_eq!(result.plugins[0].name, "mock-plugin");
+        assert_eq!(
+            result.storage,
+            MarketplaceStorage::Cloned,
+            "GitHub source must be reported as Cloned"
+        );
 
         let known = svc.list().expect("list");
         assert_eq!(known.len(), 1);
         assert_eq!(known[0].name, "mock-market");
+    }
+
+    #[test]
+    fn storage_from_source_and_link_maps_correctly() {
+        // Git sources always report Cloned, regardless of link result.
+        assert_eq!(
+            storage_from_source_and_link(
+                &MarketplaceSource::GitHub { repo: "x/y".into() },
+                LinkResult::Linked
+            ),
+            MarketplaceStorage::Cloned
+        );
+        assert_eq!(
+            storage_from_source_and_link(
+                &MarketplaceSource::GitUrl {
+                    url: "https://example.com/r.git".into()
+                },
+                LinkResult::Linked
+            ),
+            MarketplaceStorage::Cloned
+        );
+        // Local + true link → Linked.
+        assert_eq!(
+            storage_from_source_and_link(
+                &MarketplaceSource::LocalPath {
+                    path: "/tmp".into()
+                },
+                LinkResult::Linked
+            ),
+            MarketplaceStorage::Linked
+        );
+        // Local + copy fallback → Copied (so frontends can warn).
+        assert_eq!(
+            storage_from_source_and_link(
+                &MarketplaceSource::LocalPath {
+                    path: "/tmp".into()
+                },
+                LinkResult::Copied
+            ),
+            MarketplaceStorage::Copied
+        );
+    }
+
+    #[test]
+    fn add_marketplace_writes_plugin_registry() {
+        let (dir, svc) = temp_service();
+        svc.add("owner/repo", GitProtocol::Https)
+            .expect("add should succeed");
+
+        let cache = CacheDir::with_root(dir.path().to_path_buf());
+        let registry = cache
+            .load_plugin_registry("mock-market")
+            .expect("load should succeed")
+            .expect("registry should exist");
+
+        assert_eq!(registry.len(), 1);
+        assert_eq!(registry[0].name, "mock-plugin");
+    }
+
+    #[test]
+    fn list_plugin_entries_reads_persisted_registry() {
+        let (_dir, svc) = temp_service();
+        svc.add("owner/repo", GitProtocol::Https).expect("add");
+
+        let entries = svc
+            .list_plugin_entries("mock-market")
+            .expect("registry path should succeed");
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "mock-plugin");
+    }
+
+    #[test]
+    fn list_plugin_entries_falls_back_to_manifest_when_registry_missing() {
+        // Add a marketplace, then delete the persisted plugin-registry file
+        // so list_plugin_entries must fall back to reading marketplace.json.
+        let (dir, svc) = temp_service();
+        svc.add("owner/repo", GitProtocol::Https).expect("add");
+
+        let cache = CacheDir::with_root(dir.path().to_path_buf());
+        let registry_path = cache.plugin_registry_path("mock-market");
+        fs::remove_file(&registry_path).expect("remove registry");
+        assert!(!registry_path.exists());
+
+        let entries = svc
+            .list_plugin_entries("mock-market")
+            .expect("manifest fallback should succeed");
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "mock-plugin");
+    }
+
+    #[test]
+    fn list_plugin_entries_returns_not_found_for_unknown_marketplace() {
+        let (_dir, svc) = temp_service();
+
+        let err = svc
+            .list_plugin_entries("does-not-exist")
+            .expect_err("unknown marketplace must error, not return empty");
+
+        assert!(
+            matches!(err, Error::Marketplace(MarketplaceError::NotFound { .. })),
+            "expected NotFound, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn marketplace_path_returns_cache_path() {
+        let (dir, svc) = temp_service();
+        let p = svc.marketplace_path("acme");
+        assert!(p.starts_with(dir.path()));
+        assert!(
+            p.ends_with("acme"),
+            "should end with marketplace name, got {}",
+            p.display()
+        );
+    }
+
+    #[test]
+    fn remove_marketplace_deletes_plugin_registry() {
+        let (dir, svc) = temp_service();
+        svc.add("owner/repo", GitProtocol::Https).expect("add");
+
+        let cache = CacheDir::with_root(dir.path().to_path_buf());
+        assert!(
+            cache
+                .load_plugin_registry("mock-market")
+                .expect("load")
+                .is_some(),
+            "registry should exist after add"
+        );
+
+        svc.remove("mock-market").expect("remove");
+
+        assert!(
+            cache
+                .load_plugin_registry("mock-market")
+                .expect("load")
+                .is_none(),
+            "registry should be gone after remove"
+        );
     }
 
     #[test]
@@ -857,12 +1357,31 @@ mod tests {
             .add("owner/repo", GitProtocol::Https)
             .expect("add should succeed");
 
-        let listed_count = result
-            .plugins
-            .iter()
-            .filter(|p| p.name == "listed")
-            .count();
+        let listed_count = result.plugins.iter().filter(|p| p.name == "listed").count();
         assert_eq!(listed_count, 1, "listed plugin should not be duplicated");
+    }
+
+    #[derive(Debug)]
+    struct EmptyRepoBackend;
+
+    impl GitBackend for EmptyRepoBackend {
+        fn clone_repo(
+            &self,
+            _url: &str,
+            dest: &Path,
+            _opts: &CloneOptions,
+        ) -> Result<(), GitError> {
+            fs::create_dir_all(dest).unwrap();
+            Ok(())
+        }
+
+        fn pull_repo(&self, _path: &Path) -> Result<(), GitError> {
+            Ok(())
+        }
+
+        fn verify_sha(&self, _path: &Path, _expected: &str) -> Result<(), GitError> {
+            Ok(())
+        }
     }
 
     #[test]
@@ -870,29 +1389,6 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let cache = CacheDir::with_root(dir.path().to_path_buf());
         cache.ensure_dirs().expect("ensure_dirs");
-
-        #[derive(Debug)]
-        struct EmptyRepoBackend;
-
-        impl GitBackend for EmptyRepoBackend {
-            fn clone_repo(
-                &self,
-                _url: &str,
-                dest: &Path,
-                _opts: &CloneOptions,
-            ) -> Result<(), GitError> {
-                fs::create_dir_all(dest).unwrap();
-                Ok(())
-            }
-
-            fn pull_repo(&self, _path: &Path) -> Result<(), GitError> {
-                Ok(())
-            }
-
-            fn verify_sha(&self, _path: &Path, _expected: &str) -> Result<(), GitError> {
-                Ok(())
-            }
-        }
 
         let svc = MarketplaceService::new(cache, EmptyRepoBackend);
         let err = svc
@@ -914,7 +1410,12 @@ mod tests {
     struct MalformedManifestGitBackend;
 
     impl GitBackend for MalformedManifestGitBackend {
-        fn clone_repo(&self, _url: &str, dest: &Path, _opts: &CloneOptions) -> Result<(), GitError> {
+        fn clone_repo(
+            &self,
+            _url: &str,
+            dest: &Path,
+            _opts: &CloneOptions,
+        ) -> Result<(), GitError> {
             // Create malformed marketplace.json.
             let mp_dir = dest.join(".claude-plugin");
             fs::create_dir_all(&mp_dir).unwrap();
@@ -968,7 +1469,12 @@ mod tests {
     struct TrailingSlashGitBackend;
 
     impl GitBackend for TrailingSlashGitBackend {
-        fn clone_repo(&self, _url: &str, dest: &Path, _opts: &CloneOptions) -> Result<(), GitError> {
+        fn clone_repo(
+            &self,
+            _url: &str,
+            dest: &Path,
+            _opts: &CloneOptions,
+        ) -> Result<(), GitError> {
             let mp_dir = dest.join(".claude-plugin");
             fs::create_dir_all(&mp_dir).unwrap();
             fs::write(
@@ -1085,5 +1591,113 @@ mod tests {
                 "no marketplace directory should remain after validation failure: {entries:?}"
             );
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // build_registry_entries
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn build_registry_entries_merges_manifest_and_discovered() {
+        use crate::plugin::discover_plugins;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+
+        let mp_dir = root.join(".claude-plugin");
+        fs::create_dir_all(&mp_dir).unwrap();
+        fs::write(
+            mp_dir.join("marketplace.json"),
+            r#"{"name":"test","owner":{"name":"T"},"plugins":[{"name":"listed","description":"Listed","source":"./plugins/listed"}]}"#,
+        )
+        .unwrap();
+
+        let listed_dir = root.join("plugins/listed");
+        fs::create_dir_all(&listed_dir).unwrap();
+        fs::write(
+            listed_dir.join("plugin.json"),
+            r#"{"name":"listed","description":"Listed","skills":["./skills/"]}"#,
+        )
+        .unwrap();
+
+        let unlisted_dir = root.join("plugins/unlisted");
+        fs::create_dir_all(&unlisted_dir).unwrap();
+        fs::write(
+            unlisted_dir.join("plugin.json"),
+            r#"{"name":"unlisted","description":"Unlisted","skills":["./skills/"]}"#,
+        )
+        .unwrap();
+
+        let manifest_bytes = fs::read(mp_dir.join("marketplace.json")).unwrap();
+        let manifest = Marketplace::from_json(&manifest_bytes).unwrap();
+        let discovered = discover_plugins(root, 3).expect("discover should succeed");
+
+        let entries = MarketplaceService::build_registry_entries(Some(&manifest), &discovered);
+
+        assert_eq!(entries.len(), 2, "should have listed + unlisted");
+        let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+        assert!(
+            names.contains(&"listed"),
+            "should include listed: {names:?}"
+        );
+        assert!(
+            names.contains(&"unlisted"),
+            "should include unlisted: {names:?}"
+        );
+    }
+
+    #[test]
+    fn build_registry_entries_deduplicates_by_path() {
+        use crate::plugin::discover_plugins;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+
+        let mp_dir = root.join(".claude-plugin");
+        fs::create_dir_all(&mp_dir).unwrap();
+        fs::write(
+            mp_dir.join("marketplace.json"),
+            r#"{"name":"test","owner":{"name":"T"},"plugins":[{"name":"alpha","description":"Alpha","source":"./plugins/alpha"}]}"#,
+        )
+        .unwrap();
+
+        let plugin_dir = root.join("plugins/alpha");
+        fs::create_dir_all(&plugin_dir).unwrap();
+        fs::write(
+            plugin_dir.join("plugin.json"),
+            r#"{"name":"alpha","description":"Alpha","skills":["./skills/"]}"#,
+        )
+        .unwrap();
+
+        let manifest_bytes = fs::read(mp_dir.join("marketplace.json")).unwrap();
+        let manifest = Marketplace::from_json(&manifest_bytes).unwrap();
+        let discovered = discover_plugins(root, 3).expect("discover should succeed");
+
+        let entries = MarketplaceService::build_registry_entries(Some(&manifest), &discovered);
+
+        let alpha_count = entries.iter().filter(|e| e.name == "alpha").count();
+        assert_eq!(alpha_count, 1, "alpha should not be duplicated");
+    }
+
+    #[test]
+    fn build_registry_entries_without_manifest_uses_discovered() {
+        use crate::plugin::discover_plugins;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+
+        let plugin_dir = root.join("plugins/solo");
+        fs::create_dir_all(&plugin_dir).unwrap();
+        fs::write(
+            plugin_dir.join("plugin.json"),
+            r#"{"name":"solo","description":"Solo plugin","skills":["./skills/"]}"#,
+        )
+        .unwrap();
+
+        let discovered = discover_plugins(root, 3).expect("discover should succeed");
+        let entries = MarketplaceService::build_registry_entries(None, &discovered);
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "solo");
     }
 }

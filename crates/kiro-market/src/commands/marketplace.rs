@@ -41,6 +41,17 @@ fn add(
         if result.plugins.len() == 1 { "" } else { "s" }
     );
 
+    if matches!(
+        result.storage,
+        kiro_market_core::service::MarketplaceStorage::Copied
+    ) {
+        println!(
+            "  {} marketplace was copied (junctions unavailable); local edits to the source \
+             will not appear here. Re-add the marketplace to refresh.",
+            "warning:".yellow().bold()
+        );
+    }
+
     if !result.plugins.is_empty() {
         println!();
         println!("  {}", "Available plugins:".bold());

@@ -234,6 +234,18 @@ impl CacheDir {
         self.plugins_dir().join(marketplace).join(plugin)
     }
 
+    /// Directory where per-marketplace plugin registries are stored.
+    #[must_use]
+    fn registries_dir(&self) -> PathBuf {
+        self.root.join("registries")
+    }
+
+    /// Path to a marketplace's plugin registry file.
+    #[must_use]
+    pub fn plugin_registry_path(&self, marketplace: &str) -> PathBuf {
+        self.registries_dir().join(format!("{marketplace}.json"))
+    }
+
     /// Create all required subdirectories if they do not already exist.
     ///
     /// # Errors
@@ -242,6 +254,50 @@ impl CacheDir {
     pub fn ensure_dirs(&self) -> std::io::Result<()> {
         fs::create_dir_all(self.marketplaces_dir())?;
         fs::create_dir_all(self.plugins_dir())?;
+        fs::create_dir_all(self.registries_dir())?;
+        Ok(())
+    }
+
+    /// Load the plugin registry for a marketplace.
+    ///
+    /// Returns `None` if the registry file does not exist (e.g. marketplace
+    /// was added before the registry feature). The caller should fall back
+    /// to reading `marketplace.json` directly and regenerate the registry.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error on I/O or JSON parse failures.
+    pub fn load_plugin_registry(
+        &self,
+        marketplace: &str,
+    ) -> Result<Option<Vec<crate::marketplace::PluginEntry>>, crate::error::Error> {
+        let path = self.plugin_registry_path(marketplace);
+        match fs::read(&path) {
+            Ok(bytes) => {
+                let entries = serde_json::from_slice(&bytes)?;
+                Ok(Some(entries))
+            }
+            Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Write the plugin registry for a marketplace.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if directory creation or file write fails.
+    pub fn write_plugin_registry(
+        &self,
+        marketplace: &str,
+        plugins: &[crate::marketplace::PluginEntry],
+    ) -> Result<(), crate::error::Error> {
+        let path = self.plugin_registry_path(marketplace);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let json = serde_json::to_string_pretty(plugins)?;
+        atomic_write(&path, json.as_bytes())?;
         Ok(())
     }
 
@@ -590,6 +646,121 @@ mod tests {
             serde_json::from_slice(&raw).expect("registry should be valid JSON");
         assert_eq!(parsed.len(), 1);
         assert_eq!(parsed[0].name, "atomic-test");
+    }
+
+    // -----------------------------------------------------------------------
+    // Plugin registry
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn plugin_registry_roundtrip() {
+        let (_dir, cache) = temp_cache();
+        cache.ensure_dirs().expect("ensure_dirs");
+
+        let entries = vec![
+            crate::marketplace::PluginEntry {
+                name: "dotnet".into(),
+                description: Some("Core .NET skills".into()),
+                source: crate::marketplace::PluginSource::RelativePath("./plugins/dotnet".into()),
+            },
+            crate::marketplace::PluginEntry {
+                name: "dotnet-experimental".into(),
+                description: Some("Experimental skills".into()),
+                source: crate::marketplace::PluginSource::RelativePath(
+                    "./plugins/dotnet-experimental".into(),
+                ),
+            },
+        ];
+
+        cache
+            .write_plugin_registry("my-market", &entries)
+            .expect("write should succeed");
+
+        let loaded = cache
+            .load_plugin_registry("my-market")
+            .expect("load should succeed")
+            .expect("registry should exist");
+
+        assert_eq!(loaded.len(), 2);
+        assert_eq!(loaded[0].name, "dotnet");
+        assert_eq!(loaded[1].name, "dotnet-experimental");
+    }
+
+    #[test]
+    fn load_plugin_registry_returns_none_when_no_file() {
+        let (_dir, cache) = temp_cache();
+        cache.ensure_dirs().expect("ensure_dirs");
+
+        let result = cache
+            .load_plugin_registry("nonexistent")
+            .expect("load should succeed");
+
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn plugin_registry_roundtrip_preserves_source() {
+        let (_dir, cache) = temp_cache();
+        cache.ensure_dirs().expect("ensure_dirs");
+
+        let entries = vec![crate::marketplace::PluginEntry {
+            name: "dotnet".into(),
+            description: Some("Core .NET skills".into()),
+            source: crate::marketplace::PluginSource::RelativePath("./plugins/dotnet".into()),
+        }];
+
+        cache
+            .write_plugin_registry("source-test", &entries)
+            .expect("write should succeed");
+
+        let loaded = cache
+            .load_plugin_registry("source-test")
+            .expect("load should succeed")
+            .expect("registry should exist");
+
+        assert_eq!(loaded.len(), 1);
+        match &loaded[0].source {
+            crate::marketplace::PluginSource::RelativePath(p) => {
+                assert_eq!(p, "./plugins/dotnet");
+            }
+            crate::marketplace::PluginSource::Structured(s) => {
+                panic!("expected RelativePath source, got Structured({s:?})")
+            }
+        }
+    }
+
+    #[test]
+    fn remove_known_marketplace_leaves_other_entries() {
+        let (_dir, cache) = temp_cache();
+        cache.ensure_dirs().expect("ensure_dirs");
+
+        for name in ["alpha", "beta", "gamma"] {
+            let entry = KnownMarketplace {
+                name: name.into(),
+                source: MarketplaceSource::GitHub {
+                    repo: format!("owner/{name}"),
+                },
+                protocol: None,
+                added_at: Utc::now(),
+            };
+            cache
+                .add_known_marketplace(entry)
+                .expect("add should succeed");
+        }
+
+        cache
+            .remove_known_marketplace("beta")
+            .expect("remove should succeed");
+
+        let remaining = cache
+            .load_known_marketplaces()
+            .expect("load should succeed");
+
+        assert_eq!(remaining.len(), 2);
+        assert!(
+            !remaining.iter().any(|e| e.name == "beta"),
+            "beta should have been removed"
+        );
     }
 
     #[test]

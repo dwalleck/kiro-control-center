@@ -3,7 +3,7 @@
 use std::fs;
 use std::path::Path;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use kiro_market_core::marketplace::{Marketplace, PluginEntry};
 use kiro_market_core::plugin::PluginManifest;
 use tracing::{debug, warn};
@@ -37,7 +37,10 @@ pub fn find_plugin_entry(
             }
         },
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            // Expected — manifest is optional.
+            debug!(
+                path = %manifest_path.display(),
+                "no marketplace.json found, falling back to plugin scan"
+            );
         }
         Err(e) => {
             warn!(
@@ -45,11 +48,23 @@ pub fn find_plugin_entry(
                 error = %e,
                 "failed to read marketplace.json, falling back to plugin scan"
             );
+            // Still fall through to scan -- the manifest may be optional.
+            // But propagate permission errors instead of silently scanning.
+            if e.kind() == std::io::ErrorKind::PermissionDenied {
+                anyhow::bail!("permission denied reading {}: {e}", manifest_path.display());
+            }
         }
     }
 
-    // Fall back to scanning for plugin.json.
-    let discovered = kiro_market_core::plugin::discover_plugins(marketplace_path, 3);
+    // Fall back to scanning for plugin.json. Surface a read failure as an
+    // error rather than masking it as "plugin not found".
+    let discovered =
+        kiro_market_core::plugin::discover_plugins(marketplace_path, 3).with_context(|| {
+            format!(
+                "failed to scan marketplace at {}",
+                marketplace_path.display()
+            )
+        })?;
     if let Some(dp) = discovered.into_iter().find(|dp| dp.name() == plugin_name) {
         return Ok(PluginEntry {
             name: dp.name().to_owned(),

@@ -4,10 +4,10 @@
 //! Each plugin entry may specify its source as either a bare relative path string
 //! or a structured object with provider-specific fields.
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 /// Top-level marketplace manifest.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Marketplace {
     pub name: String,
     pub owner: Owner,
@@ -15,14 +15,14 @@ pub struct Marketplace {
 }
 
 /// The owner / publisher of a marketplace.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Owner {
     pub name: String,
     pub url: Option<String>,
 }
 
 /// A single plugin listed in the marketplace.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PluginEntry {
     pub name: String,
     pub description: Option<String>,
@@ -38,7 +38,7 @@ pub struct PluginEntry {
 /// `#[serde(untagged)]` and rely on variant ordering — `Structured` is tried
 /// first (it expects an object), and `RelativePath` (a plain string) acts as the
 /// fallback.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
 pub enum PluginSource {
     /// A structured source descriptor (GitHub, URL, git-subdir).
@@ -48,7 +48,7 @@ pub enum PluginSource {
 }
 
 /// Provider-specific structured source descriptor, internally tagged on `"source"`.
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "source")]
 pub enum StructuredSource {
     /// A GitHub repository.
@@ -206,5 +206,68 @@ mod tests {
             msg.contains(field),
             "error should mention `{field}`, got: {msg}"
         );
+    }
+
+    #[test]
+    fn parse_marketplace_with_git_url_source() {
+        let json = br#"{
+            "name": "url-skills",
+            "owner": { "name": "bob" },
+            "plugins": [
+                {
+                    "name": "remote-plugin",
+                    "source": {
+                        "source": "url",
+                        "url": "https://example.com/repo.git",
+                        "ref": "v1.0",
+                        "sha": "deadbeef"
+                    }
+                }
+            ]
+        }"#;
+
+        let m = Marketplace::from_json(json).expect("should parse");
+        assert_eq!(m.plugins.len(), 1);
+
+        match &m.plugins[0].source {
+            PluginSource::Structured(StructuredSource::GitUrl { url, git_ref, sha }) => {
+                assert_eq!(url, "https://example.com/repo.git");
+                assert_eq!(git_ref.as_deref(), Some("v1.0"));
+                assert_eq!(sha.as_deref(), Some("deadbeef"));
+            }
+            other => panic!("expected GitUrl source, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_marketplace_optional_fields_default_to_none() {
+        let json = br#"{
+            "name": "minimal",
+            "owner": { "name": "anon" },
+            "plugins": [
+                {
+                    "name": "bare",
+                    "source": {
+                        "source": "github",
+                        "repo": "anon/bare"
+                    }
+                }
+            ]
+        }"#;
+
+        let m = Marketplace::from_json(json).expect("should parse");
+        assert!(m.owner.url.is_none(), "owner.url should be None");
+        assert!(
+            m.plugins[0].description.is_none(),
+            "description should be None"
+        );
+
+        match &m.plugins[0].source {
+            PluginSource::Structured(StructuredSource::GitHub { git_ref, sha, .. }) => {
+                assert!(git_ref.is_none(), "git_ref should be None");
+                assert!(sha.is_none(), "sha should be None");
+            }
+            other => panic!("expected GitHub source, got {other:?}"),
+        }
     }
 }

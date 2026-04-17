@@ -144,4 +144,40 @@ mod tests {
             "expected InvalidYaml, got {err:?}"
         );
     }
+
+    #[test]
+    fn parse_crlf_frontmatter_body_offset() {
+        let content = "---\r\nname: s\r\ndescription: d\r\n---\r\nBody\r\n";
+
+        let (fm, offset) = parse_frontmatter(content).expect("should parse");
+        assert_eq!(fm.name, "s");
+        assert!(
+            content[offset..].starts_with("Body"),
+            "body should start with `Body`, got {:?}",
+            &content[offset..]
+        );
+    }
+
+    #[test]
+    fn parse_no_trailing_newline_after_close_fence() {
+        let content = "---\nname: s\ndescription: d\n---";
+
+        let (_fm, offset) = parse_frontmatter(content).expect("should parse");
+        assert_eq!(
+            &content[offset..],
+            "",
+            "body offset should point to empty string"
+        );
+    }
+
+    #[test]
+    fn invocable_non_bool_yields_invalid_yaml() {
+        let content = "---\nname: s\ndescription: d\ninvocable: maybe\n---\n";
+
+        let err = parse_frontmatter(content).expect_err("should fail");
+        assert!(
+            matches!(err, ParseError::InvalidYaml(_)),
+            "expected InvalidYaml, got {err:?}"
+        );
+    }
 }

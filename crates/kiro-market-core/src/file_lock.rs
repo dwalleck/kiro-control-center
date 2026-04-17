@@ -2,16 +2,10 @@
 //!
 //! Uses [`fs4`] exclusive advisory locks to serialise read-modify-write cycles
 //! on shared JSON files (`installed-skills.json`, `known_marketplaces.json`, etc.).
-//!
-//! ## Windows caveat
-//!
-//! Read-only calls are not locked. While atomic rename (used by the write path)
-//! is safe for concurrent readers on Linux/macOS, it is not guaranteed on
-//! Windows NTFS. This is accepted as a low-risk edge case for a developer CLI
-//! tool.
 
 use std::fs::{self, OpenOptions};
 use std::io;
+use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
@@ -25,36 +19,47 @@ const LOCK_RETRY_INTERVAL: Duration = Duration::from_millis(100);
 
 /// Returns the `.lock` sibling path for a given file path.
 ///
-/// # Panics
+/// # Errors
 ///
-/// Panics if `path` has no file name component (e.g. a bare root path like `/`).
-#[must_use]
-pub fn lock_path_for(path: &Path) -> PathBuf {
-    let name = path
-        .file_name()
-        .expect("lock target path must have a file name component");
+/// Returns an `io::Error` with `ErrorKind::InvalidInput` if `path` has no
+/// file-name component (e.g. a bare root path like `/`). Returning `Result`
+/// rather than panicking lets callers — including those handling user input
+/// downstream of validation — surface the failure cleanly.
+pub fn lock_path_for(path: &Path) -> io::Result<PathBuf> {
+    let name = path.file_name().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "cannot derive lock path: '{}' has no file-name component",
+                path.display()
+            ),
+        )
+    })?;
     let mut lock_name = name.to_os_string();
     lock_name.push(".lock");
-    path.with_file_name(lock_name)
+    Ok(path.with_file_name(lock_name))
 }
 
 /// Acquires an exclusive advisory lock on a `.lock` sibling of `path`, then
 /// runs the closure `f` while the lock is held.
 ///
 /// The lock file and any missing parent directories are created automatically.
-/// The lock is released when the file handle is dropped (i.e. when this
-/// function returns).
+/// The lock is released when the file handle is dropped — including on a
+/// panic from `f`. Panics from `f` are caught with [`catch_unwind`], a warning
+/// is emitted (since the locked file may now contain partial writes), and the
+/// panic is then resumed so callers see the original failure.
 ///
 /// # Errors
 ///
 /// Returns `io::Error` with `ErrorKind::TimedOut` if the lock cannot be
-/// acquired within [`LOCK_TIMEOUT`]. Otherwise, propagates any I/O error
+/// acquired within [`LOCK_TIMEOUT`]. Returns `ErrorKind::InvalidInput` if
+/// `path` has no file-name component. Otherwise, propagates any I/O error
 /// from lock-file creation or errors returned by the closure.
 pub fn with_file_lock<T, E>(path: &Path, f: impl FnOnce() -> Result<T, E>) -> Result<T, E>
 where
     E: From<io::Error>,
 {
-    let lock_path = lock_path_for(path);
+    let lock_path = lock_path_for(path)?;
 
     if let Some(parent) = lock_path.parent().filter(|p| !p.as_os_str().is_empty()) {
         fs::create_dir_all(parent)?;
@@ -72,9 +77,7 @@ where
     loop {
         match file.try_lock_exclusive() {
             Ok(true) => break,
-            Ok(false) => {
-                // Lock is held by another process/thread.
-            }
+            Ok(false) => {}
             Err(e) => return Err(e.into()),
         }
 
@@ -87,17 +90,31 @@ where
         }
 
         if first_attempt {
-            tracing::debug!(path = %lock_path.display(), "waiting for file lock");
-            tracing::warn!(path = %path.display(), "waiting for lock, another process may be running");
+            tracing::warn!(
+                target = %path.display(),
+                lock = %lock_path.display(),
+                "waiting for file lock, another process may be running"
+            );
             first_attempt = false;
         }
 
         std::thread::sleep(LOCK_RETRY_INTERVAL);
     }
 
-    f()
-
-    // Lock is released when `file` is dropped here.
+    // Catch panics so the lock is reliably released. Without this the OS
+    // still drops the file (releasing the lock), but no warning is emitted
+    // about possible mid-write corruption inside the locked region.
+    match catch_unwind(AssertUnwindSafe(f)) {
+        Ok(result) => result,
+        Err(panic_payload) => {
+            tracing::warn!(
+                target = %path.display(),
+                "closure panicked while holding file lock; the locked file may contain partial writes"
+            );
+            // Lock release happens on `file` Drop during stack unwinding.
+            resume_unwind(panic_payload);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -114,13 +131,17 @@ mod tests {
     fn lock_path_for_appends_lock_extension() {
         let input = Path::new("/tmp/installed-skills.json");
         let expected = PathBuf::from("/tmp/installed-skills.json.lock");
-        assert_eq!(lock_path_for(input), expected);
+        assert_eq!(lock_path_for(input).expect("file name present"), expected);
     }
 
     #[test]
-    #[should_panic(expected = "file name component")]
-    fn lock_path_for_panics_on_root_path() {
-        let _ = lock_path_for(Path::new("/"));
+    fn lock_path_for_returns_invalid_input_on_root_path() {
+        let err = lock_path_for(Path::new("/")).expect_err("root has no file name");
+        assert_eq!(err.kind(), io::ErrorKind::InvalidInput);
+        assert!(
+            err.to_string().contains("file-name component"),
+            "message should hint at the cause: {err}"
+        );
     }
 
     #[test]
@@ -131,7 +152,10 @@ mod tests {
         let result: Result<&str, io::Error> = with_file_lock(&target, || Ok("done"));
 
         assert_eq!(result.unwrap(), "done");
-        assert!(lock_path_for(&target).exists(), "lock file should exist");
+        assert!(
+            lock_path_for(&target).expect("file name present").exists(),
+            "lock file should exist"
+        );
     }
 
     #[test]
@@ -157,8 +181,42 @@ mod tests {
 
         assert_eq!(result.unwrap(), 42);
         assert!(
-            lock_path_for(&target).exists(),
+            lock_path_for(&target).expect("file name present").exists(),
             "lock file should exist in nested directory"
+        );
+    }
+
+    #[test]
+    fn with_file_lock_releases_lock_when_closure_panics() {
+        // After a panicking closure, the OS lock should still be released
+        // (via Drop on the file handle during unwind), so a subsequent
+        // acquire on the SAME path succeeds. This pins the catch_unwind +
+        // resume_unwind contract: panic surfaces, but lock state is clean.
+        let dir = TempDir::new().unwrap();
+        let target = dir.path().join("state.json");
+        let target_clone = target.clone();
+
+        let panic_outcome = std::panic::catch_unwind(move || {
+            let _: Result<(), io::Error> =
+                with_file_lock(&target_clone, || -> Result<(), io::Error> {
+                    panic!("simulated mid-write panic");
+                });
+        });
+        assert!(
+            panic_outcome.is_err(),
+            "panic from closure should propagate to caller"
+        );
+
+        // Lock must be free now: a second acquire on the same path succeeds
+        // immediately (no LOCK_TIMEOUT delay).
+        let start = std::time::Instant::now();
+        let result: Result<(), io::Error> = with_file_lock(&target, || Ok(()));
+        let elapsed = start.elapsed();
+
+        result.expect("second acquire should succeed");
+        assert!(
+            elapsed < std::time::Duration::from_secs(1),
+            "second acquire should not wait for timeout, took {elapsed:?}"
         );
     }
 

@@ -7,6 +7,7 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicU64;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -14,6 +15,11 @@ use tracing::{debug, warn};
 
 use crate::error::SkillError;
 use crate::validation;
+
+/// Process-local sequence used to disambiguate concurrent staging directories.
+/// Combined with `process::id()` to guarantee unique paths even when two
+/// threads in the same process race past the file lock.
+static STAGING_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 // ---------------------------------------------------------------------------
 // Types
@@ -253,16 +259,7 @@ impl KiroProject {
         meta: InstalledSkillMeta,
     ) -> crate::error::Result<()> {
         validation::validate_name(name)?;
-        let dir = self.skill_dir(name);
-
-        if dir.exists() {
-            return Err(SkillError::AlreadyInstalled {
-                name: name.to_owned(),
-            }
-            .into());
-        }
-
-        self.write_skill_dir(name, source_dir, meta)
+        self.write_skill_dir(name, source_dir, meta, false)
     }
 
     /// Install a skill by copying a source directory, overwriting any existing installation.
@@ -281,92 +278,149 @@ impl KiroProject {
         meta: InstalledSkillMeta,
     ) -> crate::error::Result<()> {
         validation::validate_name(name)?;
-        self.write_skill_dir(name, source_dir, meta)
+        self.write_skill_dir(name, source_dir, meta, true)
     }
 
     // -- internal helpers --------------------------------------------------
 
     /// Copy a source skill directory and update tracking.
     ///
-    /// Copies to a staging directory (`_installing-<name>`) first, then
-    /// renames into the final location so a crash during the copy phase
-    /// cannot leave a partially installed skill directory. The tracking
-    /// file update is locked to prevent concurrent processes from
-    /// clobbering each other. For force installs, the old directory is
-    /// removed after staging succeeds but before the rename.
+    /// The entire flow — existence check, staging copy, rename, and tracking
+    /// update — runs under a single advisory lock on the tracking file so
+    /// two concurrent installs of the same skill name cannot both pass the
+    /// existence check and clobber each other's staging directory.
+    ///
+    /// Per-attempt staging directory naming (`_installing-<name>-<pid>-<seq>`)
+    /// provides defense-in-depth against impossible races and ensures two
+    /// threads in the same process always have distinct staging paths.
     fn write_skill_dir(
         &self,
         name: &str,
         source_dir: &Path,
         meta: InstalledSkillMeta,
+        force: bool,
     ) -> crate::error::Result<()> {
-        let dir = self.skill_dir(name);
-        let staging_dir = self.skills_dir().join(format!("_installing-{name}"));
+        crate::file_lock::with_file_lock(&self.tracking_path(), || -> crate::error::Result<()> {
+            let dir = self.skill_dir(name);
 
-        // Clean up any leftover staging dir from a previous crash.
-        if staging_dir.exists() {
-            debug!(
-                path = %staging_dir.display(),
-                "removing leftover staging directory"
-            );
-            fs::remove_dir_all(&staging_dir)?;
-        }
-
-        // Ensure the skills parent directory exists.
-        fs::create_dir_all(self.skills_dir())?;
-
-        // Stage the copy into the temp directory.
-        if let Err(e) = copy_dir_recursive(source_dir, &staging_dir) {
-            // Clean up the partial staging directory.
-            if let Err(cleanup_err) = fs::remove_dir_all(&staging_dir) {
-                warn!(
-                    path = %staging_dir.display(),
-                    error = %cleanup_err,
-                    "failed to clean up partial staging directory"
-                );
+            if !force && dir.exists() {
+                return Err(SkillError::AlreadyInstalled {
+                    name: name.to_owned(),
+                }
+                .into());
             }
-            return Err(e.into());
-        }
 
-        // For force installs, remove the old directory now that the new
-        // content is safely staged.
-        if dir.exists() {
-            debug!(name, "removing existing skill directory for force install");
-            fs::remove_dir_all(&dir)?;
-        }
+            // Ensure the skills parent directory exists.
+            fs::create_dir_all(self.skills_dir())?;
 
-        // Rename staging to final location.
-        fs::rename(&staging_dir, &dir)?;
+            // Sweep any leftover staging dirs for THIS skill from prior
+            // crashed attempts. Safe because we hold the lock — no other
+            // installer of this skill is currently running.
+            self.cleanup_leftover_staging(name)?;
 
-        // Update the tracking file under an advisory lock to prevent
-        // concurrent processes from clobbering each other's writes.
-        // If this fails, roll back the rename to keep the filesystem
-        // and tracking file consistent.
-        let tracking_result = crate::file_lock::with_file_lock(&self.tracking_path(), || {
-            self.load_installed().and_then(|mut installed| {
+            let staging_dir = self.fresh_staging_dir(name);
+
+            // Stage the copy into the temp directory.
+            if let Err(e) = copy_dir_recursive(source_dir, &staging_dir) {
+                if let Err(cleanup_err) = fs::remove_dir_all(&staging_dir) {
+                    warn!(
+                        path = %staging_dir.display(),
+                        error = %cleanup_err,
+                        "failed to clean up partial staging directory"
+                    );
+                }
+                return Err(e.into());
+            }
+
+            // For force installs, remove the old directory now that the new
+            // content is safely staged.
+            if dir.exists() {
+                debug!(name, "removing existing skill directory for force install");
+                fs::remove_dir_all(&dir)?;
+            }
+
+            // Rename staging to final location.
+            fs::rename(&staging_dir, &dir)?;
+
+            // Update tracking. If this fails, roll back the rename so the
+            // filesystem and tracking file stay consistent.
+            let tracking_result = self.load_installed().and_then(|mut installed| {
                 installed.skills.insert(name.to_owned(), meta);
                 self.write_tracking(&installed)
-            })
-        });
+            });
 
-        if let Err(e) = tracking_result {
-            warn!(
-                name,
-                error = %e,
-                "tracking update failed after rename, rolling back"
-            );
-            if let Err(rollback_err) = fs::remove_dir_all(&dir) {
+            if let Err(e) = tracking_result {
                 warn!(
-                    path = %dir.display(),
-                    error = %rollback_err,
-                    "failed to roll back skill directory after tracking failure — \
-                     skill is installed on disk but not tracked"
+                    name,
+                    error = %e,
+                    "tracking update failed after rename, rolling back"
+                );
+                if let Err(rollback_err) = fs::remove_dir_all(&dir) {
+                    warn!(
+                        path = %dir.display(),
+                        error = %rollback_err,
+                        "failed to roll back skill directory after tracking failure — \
+                         skill is installed on disk but not tracked"
+                    );
+                }
+                return Err(e);
+            }
+
+            debug!(name, "skill installed from directory");
+            Ok(())
+        })
+    }
+
+    /// Generate a per-attempt staging directory path for a skill install.
+    ///
+    /// Encoding the pid and a process-local atomic sequence guarantees two
+    /// threads (or two processes) computing this for the same skill name get
+    /// different paths.
+    fn fresh_staging_dir(&self, name: &str) -> PathBuf {
+        use std::sync::atomic::Ordering;
+        let pid = std::process::id();
+        let seq = STAGING_COUNTER.fetch_add(1, Ordering::Relaxed);
+        self.skills_dir()
+            .join(format!("_installing-{name}-{pid}-{seq}"))
+    }
+
+    /// Remove any staging directories left over for this skill from prior
+    /// crashed attempts. Matches both the new `_installing-<name>-<pid>-<seq>`
+    /// form and the legacy `_installing-<name>` form. Caller must hold the
+    /// tracking-file lock.
+    fn cleanup_leftover_staging(&self, name: &str) -> std::io::Result<()> {
+        let exact = format!("_installing-{name}");
+        let prefix = format!("_installing-{name}-");
+        let skills_dir = self.skills_dir();
+
+        let entries = match fs::read_dir(&skills_dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e),
+        };
+
+        for entry in entries {
+            let entry = entry?;
+            let file_name = entry.file_name();
+            let Some(name_str) = file_name.to_str() else {
+                continue;
+            };
+            if name_str != exact && !name_str.starts_with(&prefix) {
+                continue;
+            }
+            let path = entry.path();
+            debug!(
+                path = %path.display(),
+                "removing leftover staging directory from prior install"
+            );
+            if let Err(e) = fs::remove_dir_all(&path) {
+                warn!(
+                    path = %path.display(),
+                    error = %e,
+                    "failed to remove leftover staging directory"
                 );
             }
-            return Err(e);
         }
-
-        debug!(name, "skill installed from directory");
         Ok(())
     }
 
@@ -614,11 +668,13 @@ mod tests {
         let content = fs::read_to_string(project.skill_dir("s").join("SKILL.md")).expect("read");
         assert!(content.contains("Updated."));
 
-        assert!(project
-            .skill_dir("s")
-            .join("references")
-            .join("new.md")
-            .exists());
+        assert!(
+            project
+                .skill_dir("s")
+                .join("references")
+                .join("new.md")
+                .exists()
+        );
     }
 
     #[test]
@@ -725,11 +781,13 @@ mod tests {
         project
             .install_skill_from_dir("s", src1.path(), sample_meta())
             .expect("first install");
-        assert!(project
-            .skill_dir("s")
-            .join("references")
-            .join("old.md")
-            .exists());
+        assert!(
+            project
+                .skill_dir("s")
+                .join("references")
+                .join("old.md")
+                .exists()
+        );
 
         // v2: SKILL.md only, no references/
         fs::write(
@@ -827,5 +885,103 @@ mod tests {
             !dest_path.join("evil-link").exists(),
             "symlinks should be skipped during copy"
         );
+    }
+
+    #[test]
+    fn install_skill_from_dir_serializes_concurrent_same_name_installs() {
+        // Two threads racing to install the same skill name. Without the
+        // file lock + existence-check-inside-lock, both could pass the
+        // existence check and clobber each other's staging directories.
+        let (_dir, project) = temp_project();
+        let project = std::sync::Arc::new(project);
+
+        let src = tempfile::tempdir().expect("tempdir");
+        fs::write(
+            src.path().join("SKILL.md"),
+            "---\nname: racey\ndescription: Racey\n---\n",
+        )
+        .expect("write");
+        let src_path = src.path().to_path_buf();
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+
+        let handles: Vec<_> = (0..2)
+            .map(|_| {
+                let project = std::sync::Arc::clone(&project);
+                let barrier = std::sync::Arc::clone(&barrier);
+                let src_path = src_path.clone();
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    project.install_skill_from_dir("racey", &src_path, sample_meta())
+                })
+            })
+            .collect();
+
+        let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+
+        // Exactly one should succeed; the other should see AlreadyInstalled.
+        let ok_count = results.iter().filter(|r| r.is_ok()).count();
+        let already_count = results
+            .iter()
+            .filter(|r| {
+                matches!(
+                    r,
+                    Err(crate::error::Error::Skill(
+                        SkillError::AlreadyInstalled { .. }
+                    ))
+                )
+            })
+            .count();
+        assert_eq!(ok_count, 1, "exactly one install should succeed");
+        assert_eq!(already_count, 1, "the other should be AlreadyInstalled");
+
+        // No leftover staging dirs from either attempt.
+        let leftover: Vec<_> = fs::read_dir(project.skills_dir())
+            .expect("read skills dir")
+            .filter_map(Result::ok)
+            .filter(|e| e.file_name().to_string_lossy().starts_with("_installing-"))
+            .collect();
+        assert!(
+            leftover.is_empty(),
+            "no staging dirs should remain after race: {leftover:?}"
+        );
+
+        // The skill should be installed and tracked exactly once.
+        let installed = project.load_installed().expect("load");
+        assert_eq!(installed.skills.len(), 1);
+        assert!(installed.skills.contains_key("racey"));
+    }
+
+    #[test]
+    fn fresh_staging_dir_returns_unique_paths_within_process() {
+        let (_dir, project) = temp_project();
+        let p1 = project.fresh_staging_dir("foo");
+        let p2 = project.fresh_staging_dir("foo");
+        assert_ne!(
+            p1, p2,
+            "two staging dirs for the same skill name must be distinct"
+        );
+    }
+
+    #[test]
+    fn cleanup_leftover_staging_handles_legacy_format() {
+        let (_dir, project) = temp_project();
+        fs::create_dir_all(project.skills_dir()).expect("mkdir");
+
+        // Both formats: legacy bare and new pid-suffixed.
+        let legacy = project.skills_dir().join("_installing-skillX");
+        fs::create_dir_all(&legacy).expect("create legacy staging");
+        let new_format = project.skills_dir().join("_installing-skillX-9999-42");
+        fs::create_dir_all(&new_format).expect("create new staging");
+        let unrelated = project.skills_dir().join("_installing-other-1-2");
+        fs::create_dir_all(&unrelated).expect("create unrelated staging");
+
+        project
+            .cleanup_leftover_staging("skillX")
+            .expect("cleanup should succeed");
+
+        assert!(!legacy.exists(), "legacy staging dir should be removed");
+        assert!(!new_format.exists(), "new staging dir should be removed");
+        assert!(unrelated.exists(), "unrelated skill's staging is untouched");
     }
 }

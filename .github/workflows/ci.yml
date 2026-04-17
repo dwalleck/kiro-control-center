@@ -9,6 +9,10 @@ on:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  # Disable incremental compilation in CI — it slows clean builds
+  # and inflates the cache size without benefit (CI rarely rebuilds
+  # the same commit).
+  CARGO_INCREMENTAL: 0
 
 jobs:
   # Validate conventional commit messages on PRs
@@ -85,6 +89,9 @@ jobs:
 
       - name: Setup Rust cache
         uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "rust-ubuntu-latest"
+          save-if: false
 
       - name: Run clippy
         run: cargo clippy --workspace -- -D warnings
@@ -120,6 +127,11 @@ jobs:
 
       - name: Setup Rust cache
         uses: Swatinem/rust-cache@v2
+        with:
+          # Share cache between test and build-cli jobs on the same OS.
+          shared-key: "rust-${{ matrix.os }}"
+          # Only save from build-cli (has superset of compiled artifacts).
+          save-if: false
 
       - name: Run tests (full workspace, Linux only)
         if: matrix.os == 'ubuntu-latest'
@@ -181,6 +193,9 @@ jobs:
 
       - name: Setup Rust cache
         uses: Swatinem/rust-cache@v2
+        with:
+          # Share cache with the test job on the same OS.
+          shared-key: "rust-${{ matrix.os }}"
 
       - name: Build CLI (release)
         run: cargo build --release -p kiro-market
@@ -239,6 +254,8 @@ jobs:
 
       - name: Setup Rust cache
         uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "rust-${{ matrix.platform }}"
 
       - name: Install frontend dependencies
         working-directory: crates/kiro-control-center

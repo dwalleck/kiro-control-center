@@ -69,8 +69,15 @@ impl From<CoreError> for CommandError {
             }
         };
 
+        let message = err.to_string();
+        warn!(
+            error_type = ?error_type,
+            error = %message,
+            "command failed"
+        );
+
         Self {
-            message: err.to_string(),
+            message,
             error_type,
         }
     }
@@ -81,6 +88,19 @@ impl From<String> for CommandError {
         Self {
             message,
             error_type: ErrorType::Unknown,
+        }
+    }
+}
+
+/// Allow `with_file_lock`'s `E: From<io::Error>` bound to be satisfied
+/// directly. Lock-acquisition I/O failures (timeout, missing parent, etc.)
+/// surface as `IoError` to the frontend so they can be distinguished from
+/// validation or parse errors.
+impl From<std::io::Error> for CommandError {
+    fn from(e: std::io::Error) -> Self {
+        Self {
+            message: e.to_string(),
+            error_type: ErrorType::IoError,
         }
     }
 }

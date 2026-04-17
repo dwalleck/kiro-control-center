@@ -3,15 +3,15 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use chrono::Utc;
 use serde::Serialize;
 use tracing::{debug, warn};
 
 use kiro_market_core::cache::{CacheDir, MarketplaceSource};
-use kiro_market_core::error::{Error as CoreError, SkillError};
-use kiro_market_core::marketplace::{Marketplace, PluginEntry, PluginSource, StructuredSource};
+use kiro_market_core::git::GixCliBackend;
+use kiro_market_core::marketplace::{PluginEntry, PluginSource, StructuredSource};
 use kiro_market_core::plugin::{discover_skill_dirs, PluginManifest};
-use kiro_market_core::project::{InstalledSkillMeta, KiroProject};
+use kiro_market_core::project::KiroProject;
+use kiro_market_core::service::{InstallFilter, MarketplaceService};
 use kiro_market_core::skill::parse_frontmatter;
 
 use crate::error::{CommandError, ErrorType};
@@ -95,27 +95,33 @@ pub struct ProjectInfo {
 // Commands
 // ---------------------------------------------------------------------------
 
-/// List all registered marketplaces with plugin counts.
-#[tauri::command]
-#[specta::specta]
-pub async fn list_marketplaces() -> Result<Vec<MarketplaceInfo>, CommandError> {
+/// Construct a `MarketplaceService` for read-side handlers.
+///
+/// All Tauri commands here are read-only or install-only; the [`GitBackend`]
+/// is unused on every code path, so the default `GixCliBackend` is fine.
+fn make_service() -> Result<MarketplaceService, CommandError> {
     let cache = CacheDir::default_location().ok_or_else(|| {
         CommandError::new(
             "could not determine data directory; is $HOME set?",
             ErrorType::IoError,
         )
     })?;
+    Ok(MarketplaceService::new(cache, GixCliBackend::default()))
+}
 
-    let known = cache
-        .load_known_marketplaces()
-        .map_err(CommandError::from)?;
+/// List all registered marketplaces with plugin counts.
+#[tauri::command]
+#[specta::specta]
+pub async fn list_marketplaces() -> Result<Vec<MarketplaceInfo>, CommandError> {
+    let svc = make_service()?;
+    let known = svc.list().map_err(CommandError::from)?;
 
     let mut results = Vec::with_capacity(known.len());
     for entry in &known {
         let source_type = marketplace_source_type(&entry.source);
-        let (plugin_count, load_error) = match count_marketplace_plugins(&cache, &entry.name) {
-            Ok(count) => (count as u32, None),
-            Err(msg) => (0, Some(msg)),
+        let (plugin_count, load_error) = match svc.list_plugin_entries(&entry.name) {
+            Ok(entries) => (entries.len() as u32, None),
+            Err(e) => (0, Some(e.to_string())),
         };
         results.push(MarketplaceInfo {
             name: entry.name.clone(),
@@ -132,18 +138,14 @@ pub async fn list_marketplaces() -> Result<Vec<MarketplaceInfo>, CommandError> {
 #[tauri::command]
 #[specta::specta]
 pub async fn list_plugins(marketplace: String) -> Result<Vec<PluginInfo>, CommandError> {
-    let cache = CacheDir::default_location().ok_or_else(|| {
-        CommandError::new(
-            "could not determine data directory; is $HOME set?",
-            ErrorType::IoError,
-        )
-    })?;
+    let svc = make_service()?;
+    let marketplace_path = svc.marketplace_path(&marketplace);
+    let plugin_entries = svc
+        .list_plugin_entries(&marketplace)
+        .map_err(CommandError::from)?;
 
-    let marketplace_path = cache.marketplace_path(&marketplace);
-    let manifest = load_marketplace_manifest(&marketplace_path, &marketplace)?;
-
-    let mut results = Vec::with_capacity(manifest.plugins.len());
-    for plugin in &manifest.plugins {
+    let mut results = Vec::with_capacity(plugin_entries.len());
+    for plugin in &plugin_entries {
         let source_type = plugin_source_type(&plugin.source);
         let skill_count = count_plugin_skills(plugin, &marketplace_path);
         results.push(PluginInfo {
@@ -165,18 +167,13 @@ pub async fn list_available_skills(
     plugin: String,
     project_path: String,
 ) -> Result<Vec<SkillInfo>, CommandError> {
-    let cache = CacheDir::default_location().ok_or_else(|| {
-        CommandError::new(
-            "could not determine data directory; is $HOME set?",
-            ErrorType::IoError,
-        )
-    })?;
+    let svc = make_service()?;
+    let marketplace_path = svc.marketplace_path(&marketplace);
+    let plugin_entries = svc
+        .list_plugin_entries(&marketplace)
+        .map_err(CommandError::from)?;
 
-    let marketplace_path = cache.marketplace_path(&marketplace);
-    let manifest = load_marketplace_manifest(&marketplace_path, &marketplace)?;
-
-    let plugin_entry = manifest
-        .plugins
+    let plugin_entry = plugin_entries
         .iter()
         .find(|p| p.name == plugin)
         .ok_or_else(|| {
@@ -243,18 +240,13 @@ pub async fn install_skills(
     force: bool,
     project_path: String,
 ) -> Result<InstallResult, CommandError> {
-    let cache = CacheDir::default_location().ok_or_else(|| {
-        CommandError::new(
-            "could not determine data directory; is $HOME set?",
-            ErrorType::IoError,
-        )
-    })?;
+    let svc = make_service()?;
+    let marketplace_path = svc.marketplace_path(&marketplace);
+    let plugin_entries = svc
+        .list_plugin_entries(&marketplace)
+        .map_err(CommandError::from)?;
 
-    let marketplace_path = cache.marketplace_path(&marketplace);
-    let manifest = load_marketplace_manifest(&marketplace_path, &marketplace)?;
-
-    let plugin_entry = manifest
-        .plugins
+    let plugin_entry = plugin_entries
         .iter()
         .find(|p| p.name == plugin)
         .ok_or_else(|| {
@@ -266,101 +258,33 @@ pub async fn install_skills(
 
     let plugin_dir = resolve_local_plugin_dir(plugin_entry, &marketplace_path)?;
 
-    // Load the plugin manifest once and reuse for both skill discovery and
-    // version extraction (fixes the previous double-read).
     let plugin_manifest = load_plugin_manifest(&plugin_dir)?;
     let version = plugin_manifest.as_ref().and_then(|m| m.version.clone());
     let skill_dirs = discover_skills_for_plugin(&plugin_dir, plugin_manifest.as_ref());
 
     let project = KiroProject::new(PathBuf::from(&project_path));
+    let svc_result = svc.install_skills(
+        &project,
+        &skill_dirs,
+        &InstallFilter::Names(&skills),
+        force,
+        &marketplace,
+        &plugin,
+        version.as_deref(),
+    );
 
-    let mut result = InstallResult {
-        installed: Vec::new(),
-        skipped: Vec::new(),
-        failed: Vec::new(),
-    };
-
-    // Track which requested skill names were actually encountered so we can
-    // report unmatched ones at the end.
-    let mut processed_skills: std::collections::HashSet<String> =
-        std::collections::HashSet::with_capacity(skills.len());
-
-    for skill_dir in &skill_dirs {
-        let skill_md_path = skill_dir.join("SKILL.md");
-        let content = match fs::read_to_string(&skill_md_path) {
-            Ok(c) => c,
-            Err(e) => {
-                warn!(
-                    path = %skill_md_path.display(),
-                    error = %e,
-                    "failed to read SKILL.md, skipping"
-                );
-                continue;
-            }
-        };
-
-        let (frontmatter, _body_offset) = match parse_frontmatter(&content) {
-            Ok(r) => r,
-            Err(e) => {
-                warn!(
-                    path = %skill_md_path.display(),
-                    error = %e,
-                    "failed to parse SKILL.md frontmatter, skipping"
-                );
-                continue;
-            }
-        };
-
-        if !skills.contains(&frontmatter.name) {
-            continue;
-        }
-
-        processed_skills.insert(frontmatter.name.clone());
-
-        let meta = InstalledSkillMeta {
-            marketplace: marketplace.clone(),
-            plugin: plugin.clone(),
-            version: version.clone(),
-            installed_at: Utc::now(),
-        };
-
-        let install_outcome = if force {
-            project.install_skill_from_dir_force(&frontmatter.name, skill_dir, meta)
-        } else {
-            project.install_skill_from_dir(&frontmatter.name, skill_dir, meta)
-        };
-
-        match install_outcome {
-            Ok(()) => {
-                debug!(skill = %frontmatter.name, "skill installed successfully");
-                result.installed.push(frontmatter.name);
-            }
-            Err(CoreError::Skill(SkillError::AlreadyInstalled { .. })) => {
-                debug!(skill = %frontmatter.name, "skill already installed, skipping");
-                result.skipped.push(frontmatter.name);
-            }
-            Err(e) => {
-                warn!(skill = %frontmatter.name, error = %e, "failed to install skill");
-                result.failed.push(FailedSkill {
-                    name: frontmatter.name,
-                    error: e.to_string(),
-                });
-            }
-        }
-    }
-
-    // Report any requested skills that were not found in this plugin.
-    for skill_name in &skills {
-        if !processed_skills.contains(skill_name) {
-            warn!(skill = %skill_name, plugin = %plugin, "requested skill not found in plugin");
-            result.failed.push(FailedSkill {
-                name: skill_name.clone(),
-                error: format!("skill '{skill_name}' not found in plugin '{plugin}'"),
-            });
-        }
-    }
-
-    Ok(result)
+    Ok(InstallResult {
+        installed: svc_result.installed,
+        skipped: svc_result.skipped,
+        failed: svc_result
+            .failed
+            .into_iter()
+            .map(|f| FailedSkill {
+                name: f.name,
+                error: f.error,
+            })
+            .collect(),
+    })
 }
 
 /// Get summary information about a Kiro project directory.
@@ -409,79 +333,6 @@ fn plugin_source_type(source: &PluginSource) -> SourceType {
         PluginSource::Structured(StructuredSource::GitUrl { .. }) => SourceType::Git,
         PluginSource::Structured(StructuredSource::GitSubdir { .. }) => SourceType::GitSubdir,
     }
-}
-
-/// Count the number of plugins in a marketplace by reading its manifest.
-///
-/// Returns `Ok(count)` on success, or `Err(message)` if the manifest could
-/// not be read or parsed.  The caller should set `plugin_count` to 0 and
-/// surface the error via `MarketplaceInfo::load_error`.
-fn count_marketplace_plugins(cache: &CacheDir, marketplace_name: &str) -> Result<usize, String> {
-    let marketplace_path = cache.marketplace_path(marketplace_name);
-    let manifest_path = marketplace_path.join(kiro_market_core::MARKETPLACE_MANIFEST_PATH);
-
-    let bytes = match fs::read(&manifest_path) {
-        Ok(b) => b,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            debug!(
-                marketplace = marketplace_name,
-                "marketplace manifest not found, reporting 0 plugins"
-            );
-            return Ok(0);
-        }
-        Err(e) => {
-            warn!(
-                marketplace = marketplace_name,
-                error = %e,
-                "failed to read marketplace manifest"
-            );
-            return Err(format!("failed to read marketplace manifest: {e}"));
-        }
-    };
-
-    match Marketplace::from_json(&bytes) {
-        Ok(m) => Ok(m.plugins.len()),
-        Err(e) => {
-            warn!(
-                marketplace = marketplace_name,
-                error = %e,
-                "failed to parse marketplace manifest"
-            );
-            Err(format!("failed to parse marketplace manifest: {e}"))
-        }
-    }
-}
-
-/// Load and parse a marketplace manifest, returning a `CommandError` on failure.
-fn load_marketplace_manifest(
-    marketplace_path: &Path,
-    marketplace_name: &str,
-) -> Result<Marketplace, CommandError> {
-    let manifest_path = marketplace_path.join(kiro_market_core::MARKETPLACE_MANIFEST_PATH);
-
-    let bytes = fs::read(&manifest_path).map_err(|e| {
-        if e.kind() == std::io::ErrorKind::NotFound {
-            CommandError::new(
-                format!("marketplace '{marketplace_name}' not found or has no manifest"),
-                ErrorType::NotFound,
-            )
-        } else {
-            CommandError::new(
-                format!(
-                    "failed to read marketplace manifest at {}: {e}",
-                    manifest_path.display()
-                ),
-                ErrorType::IoError,
-            )
-        }
-    })?;
-
-    Marketplace::from_json(&bytes).map_err(|e| {
-        CommandError::new(
-            format!("failed to parse marketplace manifest for '{marketplace_name}': {e}"),
-            ErrorType::ParseError,
-        )
-    })
 }
 
 /// Resolve the local directory for a plugin. Only supports `RelativePath` sources;
@@ -585,12 +436,27 @@ fn load_plugin_manifest(plugin_dir: &Path) -> Result<Option<PluginManifest>, Com
 
 /// Count skills within a plugin entry. Only counts for local (relative path)
 /// plugins; remote plugins report 0.
+///
+/// A malformed `plugin.json` is logged at `warn` rather than collapsed into
+/// "use defaults" so the listing count agrees with `list_available_skills`,
+/// which surfaces the parse error to the user. A genuinely missing manifest
+/// (the common case) falls back to default skill paths silently.
 fn count_plugin_skills(entry: &PluginEntry, marketplace_path: &Path) -> usize {
     match &entry.source {
         PluginSource::RelativePath(rel) => {
             let plugin_dir = marketplace_path.join(rel);
-            // Best-effort: use the manifest if available, fall back to defaults.
-            let manifest = load_plugin_manifest(&plugin_dir).ok().flatten();
+            let manifest = match load_plugin_manifest(&plugin_dir) {
+                Ok(opt) => opt,
+                Err(e) => {
+                    warn!(
+                        plugin = %entry.name,
+                        path = %plugin_dir.display(),
+                        error = %e.message,
+                        "could not load plugin.json for skill count; reporting 0"
+                    );
+                    return 0;
+                }
+            };
             discover_skills_for_plugin(&plugin_dir, manifest.as_ref()).len()
         }
         PluginSource::Structured(_) => 0,

@@ -66,7 +66,7 @@ mod tests {
     /// Generate TypeScript bindings.
     /// Run with: cargo test -p kiro-control-center generate_types -- --exact --ignored
     #[test]
-    #[ignore]
+    #[ignore = "build-only: regenerates bindings, not a regression test"]
     fn generate_types() {
         let builder = create_builder();
         builder

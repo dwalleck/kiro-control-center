@@ -533,37 +533,78 @@ pub fn get_nested<'a>(value: &'a JsonValue, path: &str) -> Option<&'a JsonValue>
 /// Write a value at a dotted key path, creating intermediate objects as needed.
 ///
 /// If any intermediate node already exists but is not an object it is replaced
-/// with an empty object before descending.
+/// with an empty object before descending. The replacement is logged at
+/// `warn` so that unexpectedly destroying a leaf value is not silent — a
+/// user with `{"chat": "broken"}` calling `set_nested("chat.model", v)`
+/// loses the `"broken"` string, and the warning gives them a trail.
+///
+/// A path of `""` is treated as a single empty segment ("" is what
+/// `"".split('.').collect::<Vec<_>>()` produces).
 ///
 /// # Panics
 ///
-/// The internal `expect` calls are defensive assertions that cannot be reached
-/// in practice: `str::split('.')` always produces at least one element, so
-/// `split_last` never returns `None`, and the object-mutation invariants are
-/// upheld by the preceding `if !current.is_object()` guards.
+/// The internal `expect` calls assert post-conditions established by the
+/// preceding statements (`split('.')` always yields at least one element,
+/// and the `if !current.is_object()` guards ensure object access succeeds).
+/// They are unreachable in practice.
 pub fn set_nested(value: &mut JsonValue, path: &str, val: JsonValue) {
     let segments: Vec<&str> = path.split('.').collect();
-    let (last, parents) = segments.split_last().expect("path must not be empty");
+    let (last, parents) = segments
+        .split_last()
+        .expect("split('.') always yields at least one segment");
 
     let mut current = value;
+    let mut traversed = String::new();
     for &segment in parents {
         if !current.is_object() {
+            tracing::warn!(
+                path = %path,
+                at = %if traversed.is_empty() { "<root>".to_owned() } else { traversed.clone() },
+                replaced_kind = json_kind(current),
+                "set_nested overwrote non-object intermediate with an empty object"
+            );
             *current = serde_json::json!({});
         }
-        let obj = current.as_object_mut().expect("ensured above");
+        let obj = current
+            .as_object_mut()
+            .expect("just ensured current is an object");
         if !obj.contains_key(segment) {
             obj.insert(segment.to_owned(), serde_json::json!({}));
         }
-        current = obj.get_mut(segment).expect("just inserted");
+        current = obj
+            .get_mut(segment)
+            .expect("just inserted or already present");
+        if !traversed.is_empty() {
+            traversed.push('.');
+        }
+        traversed.push_str(segment);
     }
 
     if !current.is_object() {
+        tracing::warn!(
+            path = %path,
+            at = %if traversed.is_empty() { "<root>".to_owned() } else { traversed },
+            replaced_kind = json_kind(current),
+            "set_nested overwrote non-object leaf parent with an empty object"
+        );
         *current = serde_json::json!({});
     }
     current
         .as_object_mut()
-        .expect("ensured above")
+        .expect("just ensured current is an object")
         .insert((*last).to_owned(), val);
+}
+
+/// Human-readable label for a JSON value's variant, used in `set_nested` warnings.
+fn json_kind(v: &JsonValue) -> &'static str {
+    match v {
+        JsonValue::Null => "null",
+        JsonValue::Bool(_) => "bool",
+        JsonValue::Number(_) => "number",
+        JsonValue::String(_) => "string",
+        JsonValue::Array(_) => "array",
+        JsonValue::Object(_) => "object",
+    }
 }
 
 /// Remove the value at a dotted key path, cleaning up empty parent objects.
@@ -728,6 +769,16 @@ pub fn default_kiro_dir() -> Option<PathBuf> {
     dirs::home_dir().map(|h| h.join(".kiro"))
 }
 
+/// Path to `settings/cli.json` inside the given Kiro home directory.
+///
+/// Exposed so callers (e.g. Tauri commands using
+/// [`crate::file_lock::with_file_lock`]) can lock the same file the
+/// load/save functions touch, providing cross-process serialisation.
+#[must_use]
+pub fn kiro_settings_path(kiro_dir: &Path) -> PathBuf {
+    kiro_dir.join(SETTINGS_FILE)
+}
+
 // ---------------------------------------------------------------------------
 // Tests
 // ---------------------------------------------------------------------------
@@ -768,8 +819,7 @@ mod tests {
         for cat in all_categories {
             assert!(
                 present.contains(&cat),
-                "no settings found for category {:?}",
-                cat
+                "no settings found for category {cat:?}"
             );
         }
     }
@@ -788,11 +838,7 @@ mod tests {
         ];
 
         for cat in all_categories {
-            assert!(
-                !cat.label().is_empty(),
-                "empty label for category {:?}",
-                cat
-            );
+            assert!(!cat.label().is_empty(), "empty label for category {cat:?}");
         }
     }
 
@@ -1122,6 +1168,8 @@ mod tests {
     #[case::string_array_accepts_empty(SettingType::StringArray, serde_json::json!([]), true)]
     #[case::enum_accepts_valid(SettingType::Enum(vec!["a", "b"]), serde_json::json!("a"), true)]
     #[case::enum_rejects_invalid(SettingType::Enum(vec!["a", "b"]), serde_json::json!("c"), false)]
+    #[case::string_array_rejects_mixed(SettingType::StringArray, serde_json::json!([1, "a"]), false)]
+    #[case::enum_rejects_when_options_empty(SettingType::Enum(vec![]), serde_json::json!("any"), false)]
     fn is_compatible_value_validates_types(
         #[case] setting_type: SettingType,
         #[case] value: JsonValue,
@@ -1131,6 +1179,67 @@ mod tests {
             setting_type.is_compatible_value(&value),
             expected,
             "is_compatible_value({setting_type:?}, {value}) should be {expected}"
+        );
+    }
+
+    #[test]
+    fn resolve_settings_populates_value_type_and_default() {
+        let empty = serde_json::json!({});
+        let entries = resolve_settings(&empty);
+
+        let telemetry = entries
+            .iter()
+            .find(|e| e.key == "telemetry.enabled")
+            .expect("telemetry.enabled must be in registry");
+
+        assert!(
+            matches!(telemetry.value_type, SettingValueInfo::Bool),
+            "expected Bool value_type, got {:?}",
+            telemetry.value_type
+        );
+        assert_eq!(
+            telemetry.default_value,
+            Some(serde_json::json!(true)),
+            "telemetry.enabled should default to true"
+        );
+        assert!(
+            telemetry.current_value.is_none(),
+            "current_value should be None when resolved against empty JSON"
+        );
+    }
+
+    #[test]
+    fn set_nested_preserves_sibling_keys() {
+        let mut json = serde_json::json!({
+            "chat": {
+                "defaultModel": "claude-sonnet-4-5",
+                "temperature": 0.7
+            },
+            "mcp": {
+                "initTimeout": 5000
+            }
+        });
+
+        set_nested(
+            &mut json,
+            "chat.defaultModel",
+            serde_json::json!("claude-opus-4"),
+        );
+
+        assert_eq!(
+            get_nested(&json, "chat.defaultModel"),
+            Some(&serde_json::json!("claude-opus-4")),
+            "chat.defaultModel should be updated"
+        );
+        assert_eq!(
+            get_nested(&json, "chat.temperature"),
+            Some(&serde_json::json!(0.7)),
+            "chat.temperature should be unchanged"
+        );
+        assert_eq!(
+            get_nested(&json, "mcp.initTimeout"),
+            Some(&serde_json::json!(5000)),
+            "mcp.initTimeout should be unchanged"
         );
     }
 }

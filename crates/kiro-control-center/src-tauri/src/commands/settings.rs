@@ -43,26 +43,68 @@ fn default_config_dir() -> Option<PathBuf> {
     dirs::config_dir().map(|d| d.join("kiro-market"))
 }
 
-/// Load settings from `config_dir/settings.json`, returning defaults if
-/// the file doesn't exist or is corrupt.
-fn load_settings_from(config_dir: &Path) -> Settings {
+/// Distinct outcomes from attempting to load the settings file.
+///
+/// Distinguishing `Missing` from `Corrupt` is load-bearing: read-only
+/// callers can treat either as "fall back to defaults", but write callers
+/// MUST refuse to overwrite a corrupt file (otherwise saving any single
+/// field silently destroys the rest of the user's settings).
+enum LoadOutcome {
+    Loaded(Settings),
+    Missing,
+    Corrupt(String),
+}
+
+/// Try to load settings, distinguishing missing/corrupt/loaded outcomes.
+fn try_load_settings_from(config_dir: &Path) -> LoadOutcome {
     let path = config_dir.join("settings.json");
     match fs::read(&path) {
         Ok(bytes) => match serde_json::from_slice(&bytes) {
-            Ok(settings) => settings,
+            Ok(settings) => LoadOutcome::Loaded(settings),
             Err(e) => {
                 warn!(
                     path = %path.display(),
                     error = %e,
-                    "settings file is corrupt or incompatible, using defaults"
+                    "settings file contains invalid JSON; refusing to overwrite from save paths"
                 );
-                Settings::default()
+                LoadOutcome::Corrupt(e.to_string())
             }
         },
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Settings::default(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => LoadOutcome::Missing,
         Err(e) => {
             warn!(path = %path.display(), error = %e, "failed to read settings");
-            Settings::default()
+            LoadOutcome::Corrupt(e.to_string())
+        }
+    }
+}
+
+/// Load settings for read-only callers (e.g. `get_settings`, `discover_projects`).
+/// Falls back to defaults whether the file is missing or corrupt — display
+/// paths must never fail the UI for this.
+fn load_settings_from(config_dir: &Path) -> Settings {
+    match try_load_settings_from(config_dir) {
+        LoadOutcome::Loaded(s) => s,
+        LoadOutcome::Missing | LoadOutcome::Corrupt(_) => Settings::default(),
+    }
+}
+
+/// Load settings for callers that intend to write back. A corrupt file is
+/// returned as an error so we never silently destroy a partially-recoverable
+/// settings file by saving defaults+one-new-field over it.
+fn load_settings_for_modification(config_dir: &Path) -> Result<Settings, CommandError> {
+    match try_load_settings_from(config_dir) {
+        LoadOutcome::Loaded(s) => Ok(s),
+        LoadOutcome::Missing => Ok(Settings::default()),
+        LoadOutcome::Corrupt(detail) => {
+            let path = config_dir.join("settings.json");
+            Err(CommandError::new(
+                format!(
+                    "settings file at {} contains invalid JSON and cannot be safely updated: {detail}. \
+                     Back up or delete the file and try again.",
+                    path.display()
+                ),
+                crate::error::ErrorType::ParseError,
+            ))
         }
     }
 }
@@ -92,12 +134,23 @@ fn save_settings_to(config_dir: &Path, settings: &Settings) -> Result<(), Comman
     Ok(())
 }
 
-/// Convenience: load from the default config directory.
+/// Convenience: load from the default config directory (read-only paths).
 fn load_settings() -> Settings {
     let Some(dir) = default_config_dir() else {
         return Settings::default();
     };
     load_settings_from(&dir)
+}
+
+/// Convenience: load from the default config directory for write-back paths.
+fn load_settings_for_save() -> Result<Settings, CommandError> {
+    let dir = default_config_dir().ok_or_else(|| {
+        CommandError::new(
+            "could not determine config directory",
+            crate::error::ErrorType::IoError,
+        )
+    })?;
+    load_settings_for_modification(&dir)
 }
 
 /// Convenience: save to the default config directory.
@@ -128,7 +181,7 @@ pub async fn get_settings() -> Result<Settings, CommandError> {
 #[specta::specta]
 #[allow(clippy::unused_async)] // Tauri commands must be async
 pub async fn save_scan_roots(roots: Vec<String>) -> Result<(), CommandError> {
-    let mut settings = load_settings();
+    let mut settings = load_settings_for_save()?;
     settings.scan_roots = roots;
     save_settings(&settings)
 }
@@ -173,8 +226,9 @@ pub async fn set_active_project(
         ));
     }
 
-    // Persist as last_project.
-    let mut settings = load_settings();
+    // Persist as last_project. Use the strict loader so a corrupt settings
+    // file is not silently overwritten with defaults+last_project.
+    let mut settings = load_settings_for_save()?;
     settings.last_project = Some(path.clone());
     save_settings(&settings)?;
 
@@ -270,9 +324,10 @@ mod tests {
     #[test]
     fn save_and_load_settings_roundtrip() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let mut settings = Settings::default();
-        settings.scan_roots = vec!["~/repos".into(), "~/work".into()];
-        settings.last_project = Some("/home/user/project".into());
+        let settings = Settings {
+            scan_roots: vec!["~/repos".into(), "~/work".into()],
+            last_project: Some("/home/user/project".into()),
+        };
         save_settings_to(dir.path(), &settings).expect("save");
 
         let loaded = load_settings_from(dir.path());
@@ -369,13 +424,53 @@ mod tests {
     }
 
     #[test]
+    fn load_settings_for_modification_refuses_to_overwrite_corrupt_file() {
+        // Corrupt JSON with recoverable content — saving defaults+new_field
+        // would destroy the user's last_project line. The strict loader
+        // must surface an error so the save path bails before write.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("settings.json");
+        std::fs::write(
+            &path,
+            // Looks like JSON but has a trailing comma — invalid.
+            r#"{"scan_roots": ["~/repos"], "last_project": "/home/user/proj",}"#,
+        )
+        .expect("write");
+
+        let err = load_settings_for_modification(dir.path())
+            .expect_err("strict loader should refuse corrupt file");
+        assert_eq!(err.error_type, crate::error::ErrorType::ParseError);
+        assert!(
+            err.message.contains("invalid JSON"),
+            "expected hint about invalid JSON in error: {}",
+            err.message
+        );
+
+        // Verify the file is unchanged after the failed load.
+        let after = std::fs::read_to_string(&path).expect("read");
+        assert!(
+            after.contains("/home/user/proj"),
+            "corrupt file must not be touched, got: {after}"
+        );
+    }
+
+    #[test]
+    fn load_settings_for_modification_returns_defaults_when_missing() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let settings = load_settings_for_modification(dir.path()).expect("missing should be ok");
+        assert!(settings.scan_roots.is_empty());
+        assert!(settings.last_project.is_none());
+    }
+
+    #[test]
     fn save_scan_roots_preserves_last_project() {
         let dir = tempfile::tempdir().expect("tempdir");
 
         // Save settings with both fields populated.
-        let mut settings = Settings::default();
-        settings.scan_roots = vec!["~/old-root".into()];
-        settings.last_project = Some("/home/user/my-project".into());
+        let settings = Settings {
+            scan_roots: vec!["~/old-root".into()],
+            last_project: Some("/home/user/my-project".into()),
+        };
         save_settings_to(dir.path(), &settings).expect("save initial");
 
         // Now update only scan_roots (simulating save_scan_roots).
