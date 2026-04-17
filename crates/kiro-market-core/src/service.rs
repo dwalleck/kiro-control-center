@@ -153,6 +153,44 @@ pub struct FailedSkill {
     pub error: String,
 }
 
+/// Non-fatal issue produced during install. Surfaced in install results
+/// so the CLI / Tauri frontend can render them without blocking the install.
+#[derive(Clone, Debug, Serialize)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
+pub enum InstallWarning {
+    /// A source-declared tool had no Kiro equivalent and was dropped.
+    /// The emitted agent will inherit the full parent toolset for that slot.
+    UnmappedTool {
+        agent: String,
+        tool: String,
+        reason: crate::agent::tools::UnmappedReason,
+    },
+    /// An agent file could not be parsed; it was skipped.
+    AgentParseFailed { path: PathBuf, reason: String },
+}
+
+impl std::fmt::Display for InstallWarning {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        use crate::agent::tools::UnmappedReason;
+        match self {
+            InstallWarning::UnmappedTool {
+                agent,
+                tool,
+                reason,
+            } => {
+                let why = match reason {
+                    UnmappedReason::NoKiroEquivalent => "no Kiro equivalent",
+                    UnmappedReason::BareCopilotName => "Copilot bare name; not portable",
+                };
+                write!(f, "agent `{agent}`: tool `{tool}` dropped ({why})")
+            }
+            InstallWarning::AgentParseFailed { path, reason } => {
+                write!(f, "skipped agent at {}: {reason}", path.display())
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Service
 // ---------------------------------------------------------------------------
@@ -821,6 +859,43 @@ mod tests {
     use crate::cache::CacheDir;
     use crate::error::GitError;
     use crate::git::CloneOptions;
+
+    #[test]
+    fn install_warning_unmapped_tool_renders_with_reason() {
+        use crate::agent::tools::UnmappedReason;
+        let w = InstallWarning::UnmappedTool {
+            agent: "reviewer".into(),
+            tool: "NotebookEdit".into(),
+            reason: UnmappedReason::NoKiroEquivalent,
+        };
+        let s = w.to_string();
+        assert!(s.contains("reviewer"));
+        assert!(s.contains("NotebookEdit"));
+        assert!(s.contains("no Kiro equivalent"));
+    }
+
+    #[test]
+    fn install_warning_bare_copilot_name_reason_rendered() {
+        use crate::agent::tools::UnmappedReason;
+        let w = InstallWarning::UnmappedTool {
+            agent: "tester".into(),
+            tool: "codebase".into(),
+            reason: UnmappedReason::BareCopilotName,
+        };
+        let s = w.to_string();
+        assert!(s.contains("Copilot bare name"));
+    }
+
+    #[test]
+    fn install_warning_agent_parse_failed_renders_path_and_reason() {
+        let w = InstallWarning::AgentParseFailed {
+            path: PathBuf::from("/tmp/bad.md"),
+            reason: "invalid YAML".into(),
+        };
+        let s = w.to_string();
+        assert!(s.contains("/tmp/bad.md"));
+        assert!(s.contains("invalid YAML"));
+    }
 
     /// Mock git backend that records calls and creates a minimal marketplace
     /// manifest in the destination directory during clone.
