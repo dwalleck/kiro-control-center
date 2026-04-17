@@ -83,6 +83,42 @@ pub fn map_claude_tools(source: &[String]) -> (Vec<MappedTool>, Vec<UnmappedTool
     (mapped, unmapped)
 }
 
+/// Map a list of Copilot source tool names to Kiro identifiers.
+///
+/// Copilot tools use mixed conventions:
+/// - `{server}/*`     → [`MappedTool::McpRef("@{server}")`]        (whole-server access)
+/// - `{server}/{tool}` → [`MappedTool::McpRef("@{server}/{tool}")`] (specific MCP tool)
+/// - bare names (`codebase`, `findTestFiles`) → unmapped ([`UnmappedReason::BareCopilotName`])
+///
+/// The bare-name drop is intentional: Copilot's bare names are internal
+/// GitHub Copilot concepts with no reliable Kiro equivalent. Users see the
+/// source tool list in the install output and can restrict the emitted
+/// agent manually if desired.
+#[must_use]
+pub fn map_copilot_tools(source: &[String]) -> (Vec<MappedTool>, Vec<UnmappedTool>) {
+    let mut mapped: Vec<MappedTool> = Vec::new();
+    let mut unmapped: Vec<UnmappedTool> = Vec::new();
+    for tool in source {
+        if let Some((server, rest)) = tool.split_once('/') {
+            let kiro = if rest == "*" {
+                format!("@{server}")
+            } else {
+                format!("@{server}/{rest}")
+            };
+            let entry = MappedTool::McpRef(kiro);
+            if !mapped.contains(&entry) {
+                mapped.push(entry);
+            }
+        } else {
+            unmapped.push(UnmappedTool {
+                source: tool.clone(),
+                reason: UnmappedReason::BareCopilotName,
+            });
+        }
+    }
+    (mapped, unmapped)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -142,5 +178,52 @@ mod tests {
                 MappedTool::Native("read".into()),
             ]
         );
+    }
+
+    #[test]
+    fn copilot_mcp_wildcard_maps_to_kiro_server_ref() {
+        let (mapped, unmapped) =
+            map_copilot_tools(&["terraform/*".into(), "playwright/click".into()]);
+        assert_eq!(
+            mapped,
+            vec![
+                MappedTool::McpRef("@terraform".into()),
+                MappedTool::McpRef("@playwright/click".into()),
+            ]
+        );
+        assert!(unmapped.is_empty());
+    }
+
+    #[test]
+    fn copilot_bare_names_drop_with_structured_reason() {
+        let (mapped, unmapped) =
+            map_copilot_tools(&["codebase".into(), "findTestFiles".into(), "problems".into()]);
+        assert!(mapped.is_empty());
+        assert_eq!(unmapped.len(), 3);
+        assert!(
+            unmapped
+                .iter()
+                .all(|u| u.reason == UnmappedReason::BareCopilotName)
+        );
+        assert_eq!(unmapped[0].source, "codebase");
+    }
+
+    #[test]
+    fn copilot_mixed_list_preserves_mcp_refs_drops_bare() {
+        let (mapped, unmapped) = map_copilot_tools(&[
+            "edit/editFiles".into(),
+            "terraform/*".into(),
+            "codebase".into(),
+        ]);
+        assert!(mapped.contains(&MappedTool::McpRef("@edit/editFiles".into())));
+        assert!(mapped.contains(&MappedTool::McpRef("@terraform".into())));
+        assert_eq!(unmapped.len(), 1);
+        assert_eq!(unmapped[0].source, "codebase");
+    }
+
+    #[test]
+    fn copilot_dedupes_repeated_refs() {
+        let (mapped, _) = map_copilot_tools(&["terraform/*".into(), "terraform/*".into()]);
+        assert_eq!(mapped, vec![MappedTool::McpRef("@terraform".into())]);
     }
 }
