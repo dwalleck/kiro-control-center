@@ -12,11 +12,17 @@ const EXCLUDED_FILENAMES: &[&str] = &["README.md", "CONTRIBUTING.md", "CHANGELOG
 
 /// Find agent markdown files inside `plugin_dir` according to `scan_paths`.
 ///
-/// `scan_paths` are relative to `plugin_dir`. Files whose extension is `md`
-/// (case-insensitive) are included; the caller uses `detect_dialect` at
-/// parse time to route to the right parser. Scans are non-recursive: only
-/// direct children of each scan directory are considered. This avoids
-/// grabbing nested `prompts/*.md` or editor backup files.
+/// `scan_paths` are relative to `plugin_dir`. Each entry is first validated
+/// by [`crate::validation::validate_relative_path`] so a malicious plugin
+/// manifest cannot escape the plugin root via absolute paths or `..`
+/// components. Invalid entries are skipped with a `warn!`. This matches
+/// the skill discovery guard in `plugin::discover_skill_dirs`.
+///
+/// Files whose extension is `md` (case-insensitive) are included; the
+/// caller uses `detect_dialect` at parse time to route to the right
+/// parser. Scans are non-recursive: only direct children of each scan
+/// directory are considered. This avoids grabbing nested `prompts/*.md`
+/// or editor backup files.
 ///
 /// README / CONTRIBUTING / CHANGELOG are excluded by filename so plugins
 /// can keep docs in their `agents/` directory without producing
@@ -33,6 +39,14 @@ const EXCLUDED_FILENAMES: &[&str] = &["README.md", "CONTRIBUTING.md", "CHANGELOG
 pub fn discover_agents_in_dirs(plugin_dir: &Path, scan_paths: &[String]) -> Vec<PathBuf> {
     let mut out = Vec::new();
     for rel in scan_paths {
+        if let Err(e) = crate::validation::validate_relative_path(rel) {
+            warn!(
+                path = %rel,
+                error = %e,
+                "skipping agent scan path that fails validation"
+            );
+            continue;
+        }
         let dir = plugin_dir.join(rel.trim_start_matches("./"));
         let entries = match fs::read_dir(&dir) {
             Ok(entries) => entries,
@@ -173,6 +187,58 @@ mod tests {
         // Caller passes bare "agents/" (no ./), should still work.
         let found = discover_agents_in_dirs(tmp.path(), &["agents/".to_string()]);
         assert_eq!(found.len(), 1);
+    }
+
+    #[test]
+    fn discover_rejects_path_traversal_in_scan_paths() {
+        // A malicious plugin manifest claims agents live outside the plugin
+        // root. The returned list must be empty; the warn! fires but does
+        // not fail the call.
+        let tmp = tempdir().unwrap();
+        let plugin = tmp.path().join("plugin");
+        fs::create_dir_all(&plugin).unwrap();
+
+        // Prime a directory next to the plugin that would otherwise be
+        // readable.
+        let escape = tmp.path().join("secrets");
+        fs::create_dir_all(&escape).unwrap();
+        fs::write(escape.join("loot.md"), "---\nname: loot\n---\n").unwrap();
+
+        let found = discover_agents_in_dirs(&plugin, &["../secrets/".to_string()]);
+        assert!(
+            found.is_empty(),
+            "path traversal must not escape plugin root: {found:?}"
+        );
+    }
+
+    #[test]
+    fn discover_rejects_absolute_scan_paths() {
+        let tmp = tempdir().unwrap();
+        let plugin = tmp.path().join("plugin");
+        fs::create_dir_all(&plugin).unwrap();
+
+        let found = discover_agents_in_dirs(&plugin, &["/etc/".to_string()]);
+        assert!(found.is_empty(), "absolute path must be rejected");
+    }
+
+    #[test]
+    fn discover_scans_valid_paths_alongside_rejected_ones() {
+        // Mixed list: one bad, one good. The good one still works.
+        let tmp = tempdir().unwrap();
+        let plugin = tmp.path().join("plugin");
+        let agents = plugin.join("agents");
+        fs::create_dir_all(&agents).unwrap();
+        fs::write(agents.join("legit.md"), "---\nname: ok\n---\n").unwrap();
+
+        let found = discover_agents_in_dirs(
+            &plugin,
+            &["../../etc/".to_string(), "./agents/".to_string()],
+        );
+        let names: Vec<_> = found
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(names, vec!["legit.md"]);
     }
 
     #[test]

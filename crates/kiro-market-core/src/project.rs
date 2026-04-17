@@ -528,6 +528,13 @@ impl KiroProject {
 
     /// Remove any `_installing-agent-<name>-*` staging directories left over
     /// from prior crashed installs. Caller must hold the agent tracking lock.
+    ///
+    /// Best-effort: per-entry iteration errors are logged via `warn!` and
+    /// skipped rather than aborting the install. A transient filesystem
+    /// glitch reading one entry under `.kiro/` should not prevent the
+    /// install — the staging dir is unreachable user-facing state, and
+    /// the subsequent `fresh_agent_staging_dir` uses a unique per-attempt
+    /// path regardless of whether cleanup fully succeeded.
     fn cleanup_leftover_agent_staging(&self, name: &str) -> std::io::Result<()> {
         let prefix = format!("_installing-agent-{name}-");
         let kiro_dir = self.kiro_dir();
@@ -537,7 +544,17 @@ impl KiroProject {
             Err(e) => return Err(e),
         };
         for entry in entries {
-            let entry = entry?;
+            let entry = match entry {
+                Ok(e) => e,
+                Err(e) => {
+                    warn!(
+                        dir = %kiro_dir.display(),
+                        error = %e,
+                        "failed to read entry during agent staging cleanup; skipping"
+                    );
+                    continue;
+                }
+            };
             let file_name = entry.file_name();
             let Some(name_str) = file_name.to_str() else {
                 continue;
