@@ -3,9 +3,11 @@
 
 mod frontmatter;
 mod parse_claude;
+mod parse_copilot;
 pub mod types;
 
 pub use parse_claude::parse_claude_agent;
+pub use parse_copilot::parse_copilot_agent;
 pub use types::{AgentDefinition, AgentDialect};
 
 #[cfg(test)]
