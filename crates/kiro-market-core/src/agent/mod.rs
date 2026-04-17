@@ -13,7 +13,7 @@ pub mod types;
 pub use parse::{detect_dialect, parse_agent_file};
 pub use parse_claude::parse_claude_agent;
 pub use parse_copilot::parse_copilot_agent;
-pub use types::{AgentDefinition, AgentDialect};
+pub use types::{AgentDefinition, AgentDialect, ParseFailure};
 
 #[cfg(test)]
 mod tests {

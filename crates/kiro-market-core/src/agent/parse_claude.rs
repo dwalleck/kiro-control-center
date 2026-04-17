@@ -8,7 +8,7 @@ use serde::Deserialize;
 use std::collections::BTreeMap;
 
 use super::frontmatter::split_frontmatter;
-use super::types::{AgentDefinition, AgentDialect};
+use super::types::{AgentDefinition, AgentDialect, ParseFailure};
 
 #[derive(Debug, Deserialize)]
 struct ClaudeFrontmatter {
@@ -24,15 +24,15 @@ struct ClaudeFrontmatter {
 ///
 /// # Errors
 ///
-/// Returns a string describing the parse failure. The caller wraps this
-/// into `AgentError::ParseFailed` or `AgentError::MissingName` with the
-/// source path attached.
-pub fn parse_claude_agent(content: &str) -> Result<AgentDefinition, String> {
+/// Returns a [`ParseFailure`] variant describing which stage of parsing
+/// failed. The caller (`parse::parse_agent_file`) attaches the source
+/// path and lifts into `AgentError::ParseFailed`.
+pub fn parse_claude_agent(content: &str) -> Result<AgentDefinition, ParseFailure> {
     let (yaml_block, body) = split_frontmatter(content)?;
     let fm: ClaudeFrontmatter =
-        serde_yaml::from_str(yaml_block).map_err(|e| format!("invalid YAML: {e}"))?;
+        serde_yaml::from_str(yaml_block).map_err(|e| ParseFailure::InvalidYaml(e.to_string()))?;
 
-    let name = fm.name.ok_or_else(|| "missing `name` field".to_string())?;
+    let name = fm.name.ok_or(ParseFailure::MissingName)?;
     // Normalize `model: inherit` (Claude's "use parent model" sentinel) to None
     // so the Kiro emitter omits the field and defers to the CLI default.
     let model = fm.model.filter(|m| m != "inherit");
@@ -89,7 +89,7 @@ mod tests {
     fn parse_missing_name_errors() {
         let src = "---\ndescription: x\n---\nbody\n";
         let err = parse_claude_agent(src).unwrap_err();
-        assert!(err.contains("name"));
+        assert_eq!(err, ParseFailure::MissingName);
     }
 
     #[test]

@@ -5,7 +5,7 @@ use std::path::Path;
 
 use crate::error::AgentError;
 
-use super::types::{AgentDefinition, AgentDialect};
+use super::types::{AgentDefinition, AgentDialect, ParseFailure};
 use super::{parse_claude_agent, parse_copilot_agent};
 
 /// Detect the source dialect from a filename.
@@ -25,32 +25,28 @@ pub fn detect_dialect(path: &Path) -> AgentDialect {
 
 /// Read and parse an agent file, dispatching to the correct dialect parser.
 ///
+/// All failures — I/O, YAML, missing frontmatter, missing name — are
+/// returned as [`AgentError::ParseFailed`] carrying a structured
+/// [`ParseFailure`] so callers can switch on the variant (e.g. to demote
+/// `MissingFrontmatter` to a debug log) without string matching.
+///
 /// # Errors
 ///
-/// - [`AgentError::ParseFailed`] if the file cannot be read or its contents
-///   cannot be parsed.
-/// - [`AgentError::MissingName`] if the parsed frontmatter lacks `name`.
+/// Always [`AgentError::ParseFailed`]; inspect its `failure` field for the
+/// specific failure mode.
 pub fn parse_agent_file(path: &Path) -> Result<AgentDefinition, AgentError> {
     let content = fs::read_to_string(path).map_err(|e| AgentError::ParseFailed {
         path: path.to_path_buf(),
-        reason: format!("read failed: {e}"),
+        failure: ParseFailure::IoError(e.to_string()),
     })?;
     let dialect = detect_dialect(path);
     let result = match dialect {
         AgentDialect::Claude => parse_claude_agent(&content),
         AgentDialect::Copilot => parse_copilot_agent(&content),
     };
-    result.map_err(|reason| {
-        if reason.contains("missing `name`") {
-            AgentError::MissingName {
-                path: path.to_path_buf(),
-            }
-        } else {
-            AgentError::ParseFailed {
-                path: path.to_path_buf(),
-                reason,
-            }
-        }
+    result.map_err(|failure| AgentError::ParseFailed {
+        path: path.to_path_buf(),
+        failure,
     })
 }
 
@@ -90,18 +86,60 @@ mod tests {
     }
 
     #[test]
-    fn parse_agent_file_missing_name_returns_missing_name_error() {
+    fn parse_agent_file_missing_name_is_typed() {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("no-name.md");
         std::fs::write(&path, "---\ndescription: x\n---\nbody\n").unwrap();
         let err = parse_agent_file(&path).unwrap_err();
-        assert!(matches!(err, AgentError::MissingName { .. }));
+        assert!(matches!(
+            err,
+            AgentError::ParseFailed {
+                failure: ParseFailure::MissingName,
+                ..
+            }
+        ));
     }
 
     #[test]
-    fn parse_agent_file_unreadable_returns_parse_failed() {
+    fn parse_agent_file_missing_frontmatter_is_typed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("readme.md");
+        std::fs::write(&path, "# just a readme\n").unwrap();
+        let err = parse_agent_file(&path).unwrap_err();
+        assert!(matches!(
+            err,
+            AgentError::ParseFailed {
+                failure: ParseFailure::MissingFrontmatter,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn parse_agent_file_invalid_yaml_is_typed() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("broken.md");
+        std::fs::write(&path, "---\nname: [unclosed\n---\nbody\n").unwrap();
+        let err = parse_agent_file(&path).unwrap_err();
+        assert!(matches!(
+            err,
+            AgentError::ParseFailed {
+                failure: ParseFailure::InvalidYaml(_),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn parse_agent_file_unreadable_is_io_error() {
         let path = Path::new("/nonexistent/agent.md");
         let err = parse_agent_file(path).unwrap_err();
-        assert!(matches!(err, AgentError::ParseFailed { .. }));
+        assert!(matches!(
+            err,
+            AgentError::ParseFailed {
+                failure: ParseFailure::IoError(_),
+                ..
+            }
+        ));
     }
 }

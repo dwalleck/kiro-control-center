@@ -155,8 +155,13 @@ pub struct FailedSkill {
 
 /// Non-fatal issue produced during install. Surfaced in install results
 /// so the CLI / Tauri frontend can render them without blocking the install.
+///
+/// Carries structured reason enums (not pre-rendered strings) so consumers
+/// can switch on them — the CLI formats for a human, the Tauri frontend
+/// can localize or map to its own UI states.
 #[derive(Clone, Debug, Serialize)]
 #[cfg_attr(feature = "specta", derive(specta::Type))]
+#[non_exhaustive]
 pub enum InstallWarning {
     /// A source-declared tool had no Kiro equivalent and was dropped.
     /// The emitted agent will inherit the full parent toolset for that slot.
@@ -166,7 +171,10 @@ pub enum InstallWarning {
         reason: crate::agent::tools::UnmappedReason,
     },
     /// An agent file could not be parsed; it was skipped.
-    AgentParseFailed { path: PathBuf, reason: String },
+    AgentParseFailed {
+        path: PathBuf,
+        failure: crate::agent::ParseFailure,
+    },
 }
 
 impl std::fmt::Display for InstallWarning {
@@ -184,8 +192,8 @@ impl std::fmt::Display for InstallWarning {
                 };
                 write!(f, "agent `{agent}`: tool `{tool}` dropped ({why})")
             }
-            InstallWarning::AgentParseFailed { path, reason } => {
-                write!(f, "skipped agent at {}: {reason}", path.display())
+            InstallWarning::AgentParseFailed { path, failure } => {
+                write!(f, "skipped agent at {}: {failure}", path.display())
             }
         }
     }
@@ -688,20 +696,23 @@ impl MarketplaceService {
         for path in files {
             let def = match crate::agent::parse_agent_file(&path) {
                 Ok(d) => d,
-                Err(e) => {
-                    let reason = e.to_string();
-                    // Demote "no frontmatter at all" — these are usually
-                    // human-readable docs that share an `agents/` directory
-                    // with real agent files.
-                    if reason.contains("missing opening `---` frontmatter fence") {
+                Err(crate::error::AgentError::ParseFailed { path, failure }) => {
+                    // Demote "no frontmatter at all" to debug — these are
+                    // almost always human-readable docs sharing the agents
+                    // directory, not broken agent files. Matches the variant
+                    // directly; no string-based classification.
+                    if matches!(failure, crate::agent::ParseFailure::MissingFrontmatter) {
                         debug!(path = %path.display(), "skipping non-agent markdown");
                     } else {
-                        warnings.push(InstallWarning::AgentParseFailed {
-                            path: path.clone(),
-                            reason,
-                        });
+                        warnings.push(InstallWarning::AgentParseFailed { path, failure });
                     }
                     continue;
+                }
+                Err(e) => {
+                    // Install-layer variants (AlreadyInstalled/NotInstalled)
+                    // are not produced by parse_agent_file today, but are
+                    // part of the same enum — propagate to be safe.
+                    return Err(e.into());
                 }
             };
 
@@ -962,14 +973,27 @@ mod tests {
     }
 
     #[test]
-    fn install_warning_agent_parse_failed_renders_path_and_reason() {
+    fn install_warning_agent_parse_failed_renders_path_and_failure() {
+        use crate::agent::ParseFailure;
         let w = InstallWarning::AgentParseFailed {
             path: PathBuf::from("/tmp/bad.md"),
-            reason: "invalid YAML".into(),
+            failure: ParseFailure::InvalidYaml("unexpected token".into()),
         };
         let s = w.to_string();
         assert!(s.contains("/tmp/bad.md"));
         assert!(s.contains("invalid YAML"));
+        assert!(s.contains("unexpected token"));
+    }
+
+    #[test]
+    fn install_warning_agent_parse_failed_missing_name_renders_cleanly() {
+        use crate::agent::ParseFailure;
+        let w = InstallWarning::AgentParseFailed {
+            path: PathBuf::from("/tmp/noname.md"),
+            failure: ParseFailure::MissingName,
+        };
+        let s = w.to_string();
+        assert!(s.contains("name"));
     }
 
     #[test]

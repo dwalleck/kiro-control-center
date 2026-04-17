@@ -8,6 +8,8 @@ use std::path::PathBuf;
 
 use thiserror::Error;
 
+use crate::agent::ParseFailure;
+
 // ---------------------------------------------------------------------------
 // Marketplace errors
 // ---------------------------------------------------------------------------
@@ -95,13 +97,15 @@ pub enum AgentError {
     #[error("agent `{name}` is not installed")]
     NotInstalled { name: String },
 
-    /// The source markdown could not be parsed.
-    #[error("failed to parse agent at {path}: {reason}")]
-    ParseFailed { path: PathBuf, reason: String },
-
-    /// Frontmatter lacks a required `name` field.
-    #[error("agent at {path} is missing required `name` field")]
-    MissingName { path: PathBuf },
+    /// The source file could not be parsed. Inspect `failure` for the
+    /// specific stage (missing frontmatter, invalid YAML, missing name,
+    /// I/O error) — callers switch on the variant rather than
+    /// substring-matching this Display.
+    #[error("failed to parse agent at {path}: {failure}")]
+    ParseFailed {
+        path: PathBuf,
+        failure: ParseFailure,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -338,13 +342,26 @@ mod tests {
         AgentError::NotInstalled { name: "missing".into() },
         "agent `missing` is not installed"
     )]
-    #[case::agent_parse_failed(
-        AgentError::ParseFailed { path: PathBuf::from("a.md"), reason: "bad yaml".into() },
-        "failed to parse agent at a.md: bad yaml"
+    #[case::agent_parse_invalid_yaml(
+        AgentError::ParseFailed {
+            path: PathBuf::from("a.md"),
+            failure: ParseFailure::InvalidYaml("bad yaml".into()),
+        },
+        "failed to parse agent at a.md: invalid YAML: bad yaml"
     )]
-    #[case::agent_missing_name(
-        AgentError::MissingName { path: PathBuf::from("a.md") },
-        "agent at a.md is missing required `name` field"
+    #[case::agent_parse_missing_name(
+        AgentError::ParseFailed {
+            path: PathBuf::from("a.md"),
+            failure: ParseFailure::MissingName,
+        },
+        "failed to parse agent at a.md: missing required `name` field"
+    )]
+    #[case::agent_parse_missing_frontmatter(
+        AgentError::ParseFailed {
+            path: PathBuf::from("readme.md"),
+            failure: ParseFailure::MissingFrontmatter,
+        },
+        "failed to parse agent at readme.md: missing opening `---` frontmatter fence"
     )]
     fn agent_error_display(#[case] err: AgentError, #[case] expected: &str) {
         assert_eq!(err.to_string(), expected);

@@ -12,7 +12,7 @@ use serde::Deserialize;
 use std::collections::BTreeMap;
 
 use super::frontmatter::split_frontmatter;
-use super::types::{AgentDefinition, AgentDialect};
+use super::types::{AgentDefinition, AgentDialect, ParseFailure};
 
 #[derive(Debug, Deserialize)]
 struct CopilotFrontmatter {
@@ -22,23 +22,27 @@ struct CopilotFrontmatter {
     tools: Vec<String>,
     #[serde(rename = "mcp-servers", default)]
     mcp_servers: BTreeMap<String, serde_json::Value>,
-    // `model` intentionally not modeled — Copilot uses display names (e.g.
-    // "Claude Sonnet 4") which cannot be mapped to Kiro model IDs.
+    // `model` accepted and ignored: Copilot uses display names ("Claude
+    // Sonnet 4") with no reliable mapping to Kiro model IDs. We take it
+    // as Option<String> rather than `#[serde(deny_unknown_fields)]` so
+    // real-world Copilot files continue to parse.
+    #[allow(dead_code)]
+    model: Option<String>,
 }
 
 /// Parse a Copilot-style `.agent.md` file into an `AgentDefinition`.
 ///
 /// # Errors
 ///
-/// Returns a string describing the parse failure. The caller wraps this
-/// into `AgentError::ParseFailed` or `AgentError::MissingName` with the
-/// source path attached.
-pub fn parse_copilot_agent(content: &str) -> Result<AgentDefinition, String> {
+/// Returns a [`ParseFailure`] variant describing which stage of parsing
+/// failed. The caller (`parse::parse_agent_file`) attaches the source
+/// path and lifts into `AgentError::ParseFailed`.
+pub fn parse_copilot_agent(content: &str) -> Result<AgentDefinition, ParseFailure> {
     let (yaml, body) = split_frontmatter(content)?;
     let fm: CopilotFrontmatter =
-        serde_yaml::from_str(yaml).map_err(|e| format!("invalid YAML: {e}"))?;
+        serde_yaml::from_str(yaml).map_err(|e| ParseFailure::InvalidYaml(e.to_string()))?;
 
-    let name = fm.name.ok_or_else(|| "missing `name` field".to_string())?;
+    let name = fm.name.ok_or(ParseFailure::MissingName)?;
 
     Ok(AgentDefinition {
         name,
