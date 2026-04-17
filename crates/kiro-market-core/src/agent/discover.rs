@@ -1,36 +1,63 @@
 //! Scan a plugin directory for agent markdown files.
 
 use std::fs;
+use std::io;
 use std::path::{Path, PathBuf};
 
+use tracing::warn;
+
 /// Files commonly found in `agents/` directories that are documentation,
-/// not agents. Excluded by name so plugins can keep READMEs alongside
-/// their agent files without producing install-time warnings.
+/// not agents. Compared case-insensitively so `readme.md` is also excluded.
 const EXCLUDED_FILENAMES: &[&str] = &["README.md", "CONTRIBUTING.md", "CHANGELOG.md"];
 
 /// Find agent markdown files inside `plugin_dir` according to `scan_paths`.
 ///
-/// `scan_paths` are relative to `plugin_dir`. Files ending in `.md` or
-/// `.agent.md` are included; the caller uses `detect_dialect` at parse time
-/// to route to the right parser. Scans are non-recursive: only direct
-/// children of each scan directory are considered. This avoids grabbing
-/// nested `prompts/*.md` or editor backup files.
+/// `scan_paths` are relative to `plugin_dir`. Files whose extension is `md`
+/// (case-insensitive) are included; the caller uses `detect_dialect` at
+/// parse time to route to the right parser. Scans are non-recursive: only
+/// direct children of each scan directory are considered. This avoids
+/// grabbing nested `prompts/*.md` or editor backup files.
 ///
-/// Files listed in [`EXCLUDED_FILENAMES`] are skipped so shared
-/// documentation doesn't surface as parse-failure warnings. Other
-/// non-agent `.md` files (e.g. ad-hoc notes a plugin author drops in)
+/// README / CONTRIBUTING / CHANGELOG are excluded by filename so plugins
+/// can keep docs in their `agents/` directory without producing
+/// parse-failure warnings. Other non-agent `.md` files (e.g. ad-hoc notes)
 /// will still be picked up, parsed, and surfaced as `AgentParseFailed`
-/// warnings. The service layer further demotes the "no frontmatter fence"
-/// flavor of parse error to a debug log so it doesn't spam the user.
+/// warnings — the service layer demotes the `MissingFrontmatter` flavor
+/// specifically via a variant match on `ParseFailure`.
+///
+/// `read_dir` failures are handled narrowly: `NotFound` silently yields
+/// an empty list (the scan dir may legitimately not exist), but every
+/// other I/O error is logged via `warn!` so a permission-denied or
+/// filesystem error cannot present as "no agents here".
 #[must_use]
 pub fn discover_agents_in_dirs(plugin_dir: &Path, scan_paths: &[String]) -> Vec<PathBuf> {
     let mut out = Vec::new();
     for rel in scan_paths {
         let dir = plugin_dir.join(rel.trim_start_matches("./"));
-        let Ok(entries) = fs::read_dir(&dir) else {
-            continue;
+        let entries = match fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+            Err(e) => {
+                warn!(
+                    path = %dir.display(),
+                    error = %e,
+                    "failed to read agent scan directory; skipping"
+                );
+                continue;
+            }
         };
-        for entry in entries.flatten() {
+        for entry in entries {
+            let entry = match entry {
+                Ok(e) => e,
+                Err(e) => {
+                    warn!(
+                        dir = %dir.display(),
+                        error = %e,
+                        "failed to read directory entry; skipping"
+                    );
+                    continue;
+                }
+            };
             let path = entry.path();
             if !path.is_file() {
                 continue;
@@ -38,7 +65,10 @@ pub fn discover_agents_in_dirs(plugin_dir: &Path, scan_paths: &[String]) -> Vec<
             let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
                 continue;
             };
-            if EXCLUDED_FILENAMES.contains(&name) {
+            if EXCLUDED_FILENAMES
+                .iter()
+                .any(|excluded| excluded.eq_ignore_ascii_case(name))
+            {
                 continue;
             }
             if Path::new(name)
@@ -84,13 +114,14 @@ mod tests {
     }
 
     #[test]
-    fn discover_excludes_readme_and_contributing() {
+    fn discover_excludes_readme_and_contributing_case_insensitive() {
         let tmp = tempdir().unwrap();
         let agents = tmp.path().join("agents");
         fs::create_dir_all(&agents).unwrap();
         fs::write(agents.join("README.md"), "# README").unwrap();
         fs::write(agents.join("CONTRIBUTING.md"), "# Contrib").unwrap();
         fs::write(agents.join("CHANGELOG.md"), "# Changelog").unwrap();
+        fs::write(agents.join("readme.md"), "# lowercase readme").unwrap();
         fs::write(agents.join("real.md"), "---\nname: r\n---\n").unwrap();
 
         let found = discover_agents_in_dirs(tmp.path(), &["./agents/".to_string()]);
@@ -99,6 +130,18 @@ mod tests {
             .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
             .collect();
         assert_eq!(names, vec!["real.md"]);
+    }
+
+    #[test]
+    fn discover_accepts_uppercase_md_extension() {
+        let tmp = tempdir().unwrap();
+        let agents = tmp.path().join("agents");
+        fs::create_dir_all(&agents).unwrap();
+        fs::write(agents.join("Uppercase.MD"), "---\nname: u\n---\n").unwrap();
+        fs::write(agents.join("normal.md"), "---\nname: n\n---\n").unwrap();
+
+        let found = discover_agents_in_dirs(tmp.path(), &["./agents/".to_string()]);
+        assert_eq!(found.len(), 2, "both extensions should be matched");
     }
 
     #[test]
