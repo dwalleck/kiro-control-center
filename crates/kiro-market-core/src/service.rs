@@ -455,6 +455,65 @@ impl MarketplaceService {
         self.cache.load_known_marketplaces()
     }
 
+    /// On-disk location of a registered marketplace's contents.
+    ///
+    /// Exposed so Tauri/CLI handlers do not need to keep a separate
+    /// `CacheDir` reference alongside the service.
+    #[must_use]
+    pub fn marketplace_path(&self, name: &str) -> PathBuf {
+        self.cache.marketplace_path(name)
+    }
+
+    /// Resolve the canonical plugin list for a registered marketplace.
+    ///
+    /// Tries the persisted plugin registry first (fast path). Falls back to
+    /// reading `marketplace.json` directly when the registry does not exist
+    /// (e.g. marketplace was added before the registry feature) or is
+    /// corrupt — a corrupt registry is logged at `warn` so users see the
+    /// signal to run `update` to regenerate it.
+    ///
+    /// This encapsulates the registry-first-then-manifest decision so CLI
+    /// and Tauri frontends do not duplicate the strategy. If we ever add a
+    /// recovery path (e.g. invalidate-and-rescan on a registry version
+    /// mismatch), it lives here in one place.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Marketplace`] with [`MarketplaceError::NotFound`]
+    /// when neither the registry nor a `marketplace.json` exists for the
+    /// given name. Other I/O or parse failures propagate.
+    pub fn list_plugin_entries(
+        &self,
+        marketplace_name: &str,
+    ) -> Result<Vec<crate::marketplace::PluginEntry>, Error> {
+        match self.cache.load_plugin_registry(marketplace_name) {
+            Ok(Some(entries)) => return Ok(entries),
+            Ok(None) => {
+                debug!(
+                    marketplace = marketplace_name,
+                    "no plugin registry found, falling back to marketplace manifest"
+                );
+            }
+            Err(e) => {
+                warn!(
+                    marketplace = marketplace_name,
+                    error = %e,
+                    "plugin registry is corrupt or unreadable — falling back to manifest; \
+                     run 'update' to regenerate"
+                );
+            }
+        }
+
+        let mp_path = self.cache.marketplace_path(marketplace_name);
+        match Self::try_read_manifest(&mp_path)? {
+            Some(manifest) => Ok(manifest.plugins),
+            None => Err(MarketplaceError::NotFound {
+                name: marketplace_name.to_owned(),
+            }
+            .into()),
+        }
+    }
+
     /// Install one or more skills (each represented by a SKILL.md-bearing
     /// directory) into a Kiro project under a single marketplace + plugin
     /// attribution. Centralises the SKILL.md → frontmatter → filter →
@@ -881,6 +940,65 @@ mod tests {
 
         assert_eq!(registry.len(), 1);
         assert_eq!(registry[0].name, "mock-plugin");
+    }
+
+    #[test]
+    fn list_plugin_entries_reads_persisted_registry() {
+        let (_dir, svc) = temp_service();
+        svc.add("owner/repo", GitProtocol::Https).expect("add");
+
+        let entries = svc
+            .list_plugin_entries("mock-market")
+            .expect("registry path should succeed");
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "mock-plugin");
+    }
+
+    #[test]
+    fn list_plugin_entries_falls_back_to_manifest_when_registry_missing() {
+        // Add a marketplace, then delete the persisted plugin-registry file
+        // so list_plugin_entries must fall back to reading marketplace.json.
+        let (dir, svc) = temp_service();
+        svc.add("owner/repo", GitProtocol::Https).expect("add");
+
+        let cache = CacheDir::with_root(dir.path().to_path_buf());
+        let registry_path = cache.plugin_registry_path("mock-market");
+        fs::remove_file(&registry_path).expect("remove registry");
+        assert!(!registry_path.exists());
+
+        let entries = svc
+            .list_plugin_entries("mock-market")
+            .expect("manifest fallback should succeed");
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name, "mock-plugin");
+    }
+
+    #[test]
+    fn list_plugin_entries_returns_not_found_for_unknown_marketplace() {
+        let (_dir, svc) = temp_service();
+
+        let err = svc
+            .list_plugin_entries("does-not-exist")
+            .expect_err("unknown marketplace must error, not return empty");
+
+        assert!(
+            matches!(err, Error::Marketplace(MarketplaceError::NotFound { .. })),
+            "expected NotFound, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn marketplace_path_returns_cache_path() {
+        let (dir, svc) = temp_service();
+        let p = svc.marketplace_path("acme");
+        assert!(p.starts_with(dir.path()));
+        assert!(
+            p.ends_with("acme"),
+            "should end with marketplace name, got {}",
+            p.display()
+        );
     }
 
     #[test]

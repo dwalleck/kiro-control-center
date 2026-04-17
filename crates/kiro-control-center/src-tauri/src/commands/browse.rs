@@ -8,7 +8,7 @@ use tracing::{debug, warn};
 
 use kiro_market_core::cache::{CacheDir, MarketplaceSource};
 use kiro_market_core::git::GixCliBackend;
-use kiro_market_core::marketplace::{Marketplace, PluginEntry, PluginSource, StructuredSource};
+use kiro_market_core::marketplace::{PluginEntry, PluginSource, StructuredSource};
 use kiro_market_core::plugin::{discover_skill_dirs, PluginManifest};
 use kiro_market_core::project::KiroProject;
 use kiro_market_core::service::{InstallFilter, MarketplaceService};
@@ -95,27 +95,33 @@ pub struct ProjectInfo {
 // Commands
 // ---------------------------------------------------------------------------
 
-/// List all registered marketplaces with plugin counts.
-#[tauri::command]
-#[specta::specta]
-pub async fn list_marketplaces() -> Result<Vec<MarketplaceInfo>, CommandError> {
+/// Construct a `MarketplaceService` for read-side handlers.
+///
+/// All Tauri commands here are read-only or install-only; the [`GitBackend`]
+/// is unused on every code path, so the default `GixCliBackend` is fine.
+fn make_service() -> Result<MarketplaceService, CommandError> {
     let cache = CacheDir::default_location().ok_or_else(|| {
         CommandError::new(
             "could not determine data directory; is $HOME set?",
             ErrorType::IoError,
         )
     })?;
+    Ok(MarketplaceService::new(cache, GixCliBackend::default()))
+}
 
-    let known = cache
-        .load_known_marketplaces()
-        .map_err(CommandError::from)?;
+/// List all registered marketplaces with plugin counts.
+#[tauri::command]
+#[specta::specta]
+pub async fn list_marketplaces() -> Result<Vec<MarketplaceInfo>, CommandError> {
+    let svc = make_service()?;
+    let known = svc.list().map_err(CommandError::from)?;
 
     let mut results = Vec::with_capacity(known.len());
     for entry in &known {
         let source_type = marketplace_source_type(&entry.source);
-        let (plugin_count, load_error) = match count_marketplace_plugins(&cache, &entry.name) {
-            Ok(count) => (count as u32, None),
-            Err(msg) => (0, Some(msg)),
+        let (plugin_count, load_error) = match svc.list_plugin_entries(&entry.name) {
+            Ok(entries) => (entries.len() as u32, None),
+            Err(e) => (0, Some(e.to_string())),
         };
         results.push(MarketplaceInfo {
             name: entry.name.clone(),
@@ -132,15 +138,11 @@ pub async fn list_marketplaces() -> Result<Vec<MarketplaceInfo>, CommandError> {
 #[tauri::command]
 #[specta::specta]
 pub async fn list_plugins(marketplace: String) -> Result<Vec<PluginInfo>, CommandError> {
-    let cache = CacheDir::default_location().ok_or_else(|| {
-        CommandError::new(
-            "could not determine data directory; is $HOME set?",
-            ErrorType::IoError,
-        )
-    })?;
-
-    let marketplace_path = cache.marketplace_path(&marketplace);
-    let plugin_entries = load_plugin_entries(&cache, &marketplace, &marketplace_path)?;
+    let svc = make_service()?;
+    let marketplace_path = svc.marketplace_path(&marketplace);
+    let plugin_entries = svc
+        .list_plugin_entries(&marketplace)
+        .map_err(CommandError::from)?;
 
     let mut results = Vec::with_capacity(plugin_entries.len());
     for plugin in &plugin_entries {
@@ -165,15 +167,11 @@ pub async fn list_available_skills(
     plugin: String,
     project_path: String,
 ) -> Result<Vec<SkillInfo>, CommandError> {
-    let cache = CacheDir::default_location().ok_or_else(|| {
-        CommandError::new(
-            "could not determine data directory; is $HOME set?",
-            ErrorType::IoError,
-        )
-    })?;
-
-    let marketplace_path = cache.marketplace_path(&marketplace);
-    let plugin_entries = load_plugin_entries(&cache, &marketplace, &marketplace_path)?;
+    let svc = make_service()?;
+    let marketplace_path = svc.marketplace_path(&marketplace);
+    let plugin_entries = svc
+        .list_plugin_entries(&marketplace)
+        .map_err(CommandError::from)?;
 
     let plugin_entry = plugin_entries
         .iter()
@@ -242,15 +240,11 @@ pub async fn install_skills(
     force: bool,
     project_path: String,
 ) -> Result<InstallResult, CommandError> {
-    let cache = CacheDir::default_location().ok_or_else(|| {
-        CommandError::new(
-            "could not determine data directory; is $HOME set?",
-            ErrorType::IoError,
-        )
-    })?;
-
-    let marketplace_path = cache.marketplace_path(&marketplace);
-    let plugin_entries = load_plugin_entries(&cache, &marketplace, &marketplace_path)?;
+    let svc = make_service()?;
+    let marketplace_path = svc.marketplace_path(&marketplace);
+    let plugin_entries = svc
+        .list_plugin_entries(&marketplace)
+        .map_err(CommandError::from)?;
 
     let plugin_entry = plugin_entries
         .iter()
@@ -269,9 +263,6 @@ pub async fn install_skills(
     let skill_dirs = discover_skills_for_plugin(&plugin_dir, plugin_manifest.as_ref());
 
     let project = KiroProject::new(PathBuf::from(&project_path));
-    // Borrow a fresh service for the install loop; the GitBackend is unused
-    // since the skill dirs already resolved to local paths upstream.
-    let svc = MarketplaceService::new(cache, GixCliBackend::default());
     let svc_result = svc.install_skills(
         &project,
         &skill_dirs,
@@ -342,84 +333,6 @@ fn plugin_source_type(source: &PluginSource) -> SourceType {
         PluginSource::Structured(StructuredSource::GitUrl { .. }) => SourceType::Git,
         PluginSource::Structured(StructuredSource::GitSubdir { .. }) => SourceType::GitSubdir,
     }
-}
-
-/// Count the number of plugins in a marketplace by reading its manifest.
-///
-/// Returns `Ok(count)` on success, or `Err(message)` if the manifest could
-/// not be read or parsed.  The caller should set `plugin_count` to 0 and
-/// surface the error via `MarketplaceInfo::load_error`.
-fn count_marketplace_plugins(cache: &CacheDir, marketplace_name: &str) -> Result<usize, String> {
-    let marketplace_path = cache.marketplace_path(marketplace_name);
-    load_plugin_entries(cache, marketplace_name, &marketplace_path)
-        .map(|entries| entries.len())
-        .map_err(|e| e.message)
-}
-
-/// Load the merged plugin list for a marketplace.
-///
-/// Tries the persisted plugin registry first; falls back to reading
-/// `marketplace.json` directly if the registry does not exist (e.g.
-/// marketplace was added before the registry feature).
-fn load_plugin_entries(
-    cache: &CacheDir,
-    marketplace_name: &str,
-    marketplace_path: &Path,
-) -> Result<Vec<PluginEntry>, CommandError> {
-    // Try the persisted registry first.
-    match cache.load_plugin_registry(marketplace_name) {
-        Ok(Some(entries)) => return Ok(entries),
-        Ok(None) => {
-            debug!(
-                marketplace = marketplace_name,
-                "no plugin registry found, falling back to marketplace manifest"
-            );
-        }
-        Err(e) => {
-            warn!(
-                marketplace = marketplace_name,
-                error = %e,
-                "plugin registry is corrupt or unreadable — falling back to manifest; \
-                 run 'update' to regenerate"
-            );
-        }
-    }
-
-    // Fall back to reading the manifest directly.
-    let manifest = load_marketplace_manifest(marketplace_path, marketplace_name)?;
-    Ok(manifest.plugins)
-}
-
-/// Load and parse a marketplace manifest, returning a `CommandError` on failure.
-fn load_marketplace_manifest(
-    marketplace_path: &Path,
-    marketplace_name: &str,
-) -> Result<Marketplace, CommandError> {
-    let manifest_path = marketplace_path.join(kiro_market_core::MARKETPLACE_MANIFEST_PATH);
-
-    let bytes = fs::read(&manifest_path).map_err(|e| {
-        if e.kind() == std::io::ErrorKind::NotFound {
-            CommandError::new(
-                format!("marketplace '{marketplace_name}' not found or has no manifest"),
-                ErrorType::NotFound,
-            )
-        } else {
-            CommandError::new(
-                format!(
-                    "failed to read marketplace manifest at {}: {e}",
-                    manifest_path.display()
-                ),
-                ErrorType::IoError,
-            )
-        }
-    })?;
-
-    Marketplace::from_json(&bytes).map_err(|e| {
-        CommandError::new(
-            format!("failed to parse marketplace manifest for '{marketplace_name}': {e}"),
-            ErrorType::ParseError,
-        )
-    })
 }
 
 /// Resolve the local directory for a plugin. Only supports `RelativePath` sources;
