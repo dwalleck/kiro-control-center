@@ -5,6 +5,7 @@ mod frontmatter;
 mod parse;
 mod parse_claude;
 mod parse_copilot;
+pub mod tools;
 pub mod types;
 
 pub use parse::{detect_dialect, parse_agent_file};
