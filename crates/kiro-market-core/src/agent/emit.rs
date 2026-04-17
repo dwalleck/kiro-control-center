@@ -268,6 +268,47 @@ mod tests {
     }
 
     #[test]
+    fn emit_serializes_keys_alphabetically() {
+        // The emitted JSON's on-disk key order depends on whether
+        // `serde_json` was built with the `preserve_order` feature. This
+        // crate does NOT enable it, so keys land alphabetically. If
+        // someone flips that flag we want a loud test failure, not a
+        // silent shape change that confuses downstream parsers.
+        let mapped = vec![
+            MappedTool::Native("read".into()),
+            MappedTool::McpRef("@terraform".into()),
+        ];
+        let out = build_kiro_json(&sample_claude_def(), &mapped).unwrap();
+        let s = serde_json::to_string(&out).unwrap();
+
+        // Build an iterator of the positions of each expected key to verify
+        // they appear in alphabetical order.
+        let keys = [
+            "allowedTools",
+            "description",
+            "model",
+            "name",
+            "prompt",
+            "tools",
+        ];
+        let positions: Vec<_> = keys
+            .iter()
+            .map(|k| (k, s.find(&format!("\"{k}\"")).expect(k)))
+            .collect();
+        for w in positions.windows(2) {
+            assert!(
+                w[0].1 < w[1].1,
+                "key `{}` should come before `{}` alphabetically, \
+                 got positions {} and {} in: {s}",
+                w[0].0,
+                w[1].0,
+                w[0].1,
+                w[1].1
+            );
+        }
+    }
+
+    #[test]
     fn emit_preserves_non_local_mcp_server_type() {
         let mut def = sample_claude_def();
         def.mcp_servers.insert(

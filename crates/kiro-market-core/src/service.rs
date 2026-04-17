@@ -1217,6 +1217,49 @@ mod tests {
     }
 
     #[test]
+    fn install_plugin_agents_demotes_missing_fence_for_non_readme_files() {
+        // Coverage for the service-layer demotion path: a plain `.md` file
+        // (not README/CONTRIBUTING/CHANGELOG) with no frontmatter fence
+        // must not surface as a warning — it should be debug-logged and
+        // dropped. Previously only the README exclusion in `discover`
+        // was tested, which short-circuited this path.
+        use crate::project::KiroProject;
+
+        let (_dir, svc) = temp_service();
+        let plugin_tmp = tempfile::tempdir().unwrap();
+        let agents_dir = plugin_tmp.path().join("agents");
+        fs::create_dir_all(&agents_dir).unwrap();
+        // A non-excluded filename that lacks frontmatter entirely.
+        fs::write(
+            agents_dir.join("notes.md"),
+            "# just notes, no frontmatter\n",
+        )
+        .unwrap();
+
+        let project_tmp = tempfile::tempdir().unwrap();
+        let project = KiroProject::new(project_tmp.path().to_path_buf());
+
+        let result = svc.install_plugin_agents(
+            &project,
+            plugin_tmp.path(),
+            &["./agents/".to_string()],
+            "mp",
+            "p",
+            None,
+        );
+        assert!(result.installed.is_empty());
+        assert!(result.failed.is_empty());
+        assert!(
+            !result
+                .warnings
+                .iter()
+                .any(|w| matches!(w, InstallWarning::AgentParseFailed { .. })),
+            "missing-fence non-README file must be demoted silently, got: {:?}",
+            result.warnings
+        );
+    }
+
+    #[test]
     fn install_plugin_agents_already_installed_goes_to_skipped() {
         use crate::project::KiroProject;
 

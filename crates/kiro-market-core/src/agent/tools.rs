@@ -10,7 +10,9 @@
 //! can re-render them as `InstallWarning` variants without string surgery.
 //!
 //! Kiro tool names are verified against
-//! <https://kiro.dev/docs/cli/reference/built-in-tools/>.
+//! <https://kiro.dev/docs/cli/reference/built-in-tools/>
+//! (retrieved 2026-04-16). Update this comment with a new retrieval date
+//! whenever the table below is re-validated.
 
 /// A single source tool that has been successfully mapped to a Kiro identifier.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -219,6 +221,37 @@ mod tests {
         assert!(mapped.contains(&MappedTool::McpRef("@terraform".into())));
         assert_eq!(unmapped.len(), 1);
         assert_eq!(unmapped[0].source, "codebase");
+    }
+
+    #[test]
+    fn claude_dedupes_edit_and_write_across_mixed_input() {
+        // Input order: Edit, Read, Write, Edit — should dedupe to write+read.
+        let (mapped, _) =
+            map_claude_tools(&["Edit".into(), "Read".into(), "Write".into(), "Edit".into()]);
+        assert_eq!(
+            mapped,
+            vec![
+                MappedTool::Native("write".into()),
+                MappedTool::Native("read".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn copilot_dedupes_mixed_refs_and_wildcards() {
+        let (mapped, _) = map_copilot_tools(&[
+            "terraform/*".into(),
+            "playwright/click".into(),
+            "terraform/*".into(),
+            "playwright/click".into(),
+        ]);
+        assert_eq!(
+            mapped,
+            vec![
+                MappedTool::McpRef("@terraform".into()),
+                MappedTool::McpRef("@playwright/click".into()),
+            ]
+        );
     }
 
     #[test]
