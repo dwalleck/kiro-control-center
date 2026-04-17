@@ -3,6 +3,7 @@
 //! Provides types and logic for discovering and installing Claude Code
 //! marketplace skills into Kiro CLI projects.
 
+pub mod agent;
 pub mod cache;
 pub mod error;
 pub mod file_lock;
