@@ -80,6 +80,22 @@ const INSTALLED_SKILLS_FILE: &str = "installed-skills.json";
 /// Name of the agent tracking file inside `.kiro/`.
 const INSTALLED_AGENTS_FILE: &str = "installed-agents.json";
 
+/// Best-effort removal of a staging directory, logging on failure instead
+/// of propagating the error. Used in rollback paths where the caller is
+/// already returning a more meaningful error and the staging dir is
+/// unreachable user-facing state.
+fn remove_staging_dir(staging: &Path) {
+    if let Err(e) = fs::remove_dir_all(staging) {
+        if e.kind() != std::io::ErrorKind::NotFound {
+            warn!(
+                path = %staging.display(),
+                error = %e,
+                "failed to remove staging directory"
+            );
+        }
+    }
+}
+
 /// Recursively copy a directory tree from `src` to `dest`.
 ///
 /// Creates `dest` and all intermediate directories. Files are copied
@@ -396,7 +412,7 @@ impl KiroProject {
     ) -> crate::error::Result<()> {
         validation::validate_name(&def.name)?;
 
-        // Build JSON outside the lock — this can't fail due to concurrency.
+        // CPU-bound work outside the lock to keep the critical section short.
         let json = crate::agent::emit::build_kiro_json(def, mapped_tools)?;
         let json_bytes = serde_json::to_vec_pretty(&json)?;
 
@@ -411,6 +427,11 @@ impl KiroProject {
                     .into());
                 }
 
+                // Sweep leftover staging dirs for THIS agent from prior crashed
+                // attempts. Safe because we hold the lock — no other installer
+                // of this agent is currently running.
+                self.cleanup_leftover_agent_staging(&def.name)?;
+
                 let staging = self.fresh_agent_staging_dir(&def.name);
                 let staging_json = staging.join("agent.json");
                 let staging_prompt_dir = staging.join("prompts");
@@ -421,27 +442,40 @@ impl KiroProject {
                 if let Err(e) = fs::write(&staging_json, &json_bytes)
                     .and_then(|()| fs::write(&staging_prompt, def.prompt_body.as_bytes()))
                 {
-                    if let Err(cleanup_err) = fs::remove_dir_all(&staging) {
-                        warn!(
-                            path = %staging.display(),
-                            error = %cleanup_err,
-                            "failed to clean up agent staging directory after write failure"
-                        );
-                    }
+                    remove_staging_dir(&staging);
                     return Err(e.into());
                 }
 
-                // Ensure target directories exist.
                 fs::create_dir_all(self.agent_prompts_dir())?;
 
                 let json_target = self.agents_dir().join(format!("{}.json", def.name));
                 let prompt_target = self.agent_prompts_dir().join(format!("{}.md", def.name));
 
+                // Tracking is authoritative: duplicate detection above rejects
+                // already-installed agents. But a prior crash could leave
+                // orphaned files on disk without a tracking entry. Refuse to
+                // silently clobber — the user should either manually clean up
+                // or a future `install_agent_force` can handle it explicitly.
+                if json_target.exists() || prompt_target.exists() {
+                    remove_staging_dir(&staging);
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::AlreadyExists,
+                        format!(
+                            "agent files for `{}` exist on disk but have no tracking entry; \
+                             remove {} and {} manually before re-installing",
+                            def.name,
+                            json_target.display(),
+                            prompt_target.display(),
+                        ),
+                    )
+                    .into());
+                }
+
                 // Rename JSON first. If the prompt rename fails afterwards,
                 // roll back the JSON rename so we never leave an agent with
                 // only half its files on disk.
                 if let Err(e) = fs::rename(&staging_json, &json_target) {
-                    let _ = fs::remove_dir_all(&staging);
+                    remove_staging_dir(&staging);
                     return Err(e.into());
                 }
                 if let Err(e) = fs::rename(&staging_prompt, &prompt_target) {
@@ -452,13 +486,13 @@ impl KiroProject {
                             "failed to roll back agent JSON after prompt-rename failure"
                         );
                     }
-                    let _ = fs::remove_dir_all(&staging);
+                    remove_staging_dir(&staging);
                     return Err(e.into());
                 }
 
-                // Staging directory itself should now be empty (or contain
-                // the empty prompts subdir). Remove it.
-                let _ = fs::remove_dir_all(&staging);
+                // Staging directory should now be empty (or contain the empty
+                // prompts subdir).
+                remove_staging_dir(&staging);
 
                 // Tracking last. On failure, roll back both files.
                 installed.agents.insert(def.name.clone(), meta);
@@ -468,8 +502,21 @@ impl KiroProject {
                         error = %e,
                         "agent tracking update failed after rename; rolling back files"
                     );
-                    let _ = fs::remove_file(&json_target);
-                    let _ = fs::remove_file(&prompt_target);
+                    if let Err(rb_err) = fs::remove_file(&json_target) {
+                        warn!(
+                            path = %json_target.display(),
+                            error = %rb_err,
+                            "failed to roll back agent JSON after tracking failure — \
+                             agent is on disk but not tracked"
+                        );
+                    }
+                    if let Err(rb_err) = fs::remove_file(&prompt_target) {
+                        warn!(
+                            path = %prompt_target.display(),
+                            error = %rb_err,
+                            "failed to roll back agent prompt after tracking failure"
+                        );
+                    }
                     return Err(e);
                 }
 
@@ -477,6 +524,41 @@ impl KiroProject {
                 Ok(())
             },
         )
+    }
+
+    /// Remove any `_installing-agent-<name>-*` staging directories left over
+    /// from prior crashed installs. Caller must hold the agent tracking lock.
+    fn cleanup_leftover_agent_staging(&self, name: &str) -> std::io::Result<()> {
+        let prefix = format!("_installing-agent-{name}-");
+        let kiro_dir = self.kiro_dir();
+        let entries = match fs::read_dir(&kiro_dir) {
+            Ok(e) => e,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e),
+        };
+        for entry in entries {
+            let entry = entry?;
+            let file_name = entry.file_name();
+            let Some(name_str) = file_name.to_str() else {
+                continue;
+            };
+            if !name_str.starts_with(&prefix) {
+                continue;
+            }
+            let path = entry.path();
+            debug!(
+                path = %path.display(),
+                "removing leftover agent staging directory from prior install"
+            );
+            if let Err(e) = fs::remove_dir_all(&path) {
+                warn!(
+                    path = %path.display(),
+                    error = %e,
+                    "failed to remove leftover agent staging directory"
+                );
+            }
+        }
+        Ok(())
     }
 
     // -- internal helpers --------------------------------------------------
@@ -858,6 +940,171 @@ mod tests {
         assert!(
             leftovers.is_empty(),
             "no staging directories should remain after successful install"
+        );
+    }
+
+    #[test]
+    fn install_agent_sweeps_leftover_staging_from_prior_crash() {
+        let (_dir, project) = temp_project();
+        let src_tmp = tempfile::tempdir().unwrap();
+        let src = write_agent(src_tmp.path(), "sweep", "---\nname: sweep\n---\nbody\n");
+        let (def, mapped) = parse_and_map(&src);
+
+        // Simulate a crashed prior attempt that left staging around.
+        fs::create_dir_all(project.root.join(".kiro")).unwrap();
+        let ghost = project.root.join(".kiro/_installing-agent-sweep-99999-0");
+        fs::create_dir_all(ghost.join("prompts")).unwrap();
+        fs::write(ghost.join("agent.json"), b"{}").unwrap();
+
+        project
+            .install_agent(&def, &mapped, sample_agent_meta())
+            .expect("install should succeed and sweep leftover");
+
+        assert!(!ghost.exists(), "leftover staging should have been swept");
+        assert!(project.root.join(".kiro/agents/sweep.json").exists());
+    }
+
+    #[test]
+    fn install_agent_refuses_to_clobber_orphaned_files() {
+        let (_dir, project) = temp_project();
+        let src_tmp = tempfile::tempdir().unwrap();
+        let src = write_agent(src_tmp.path(), "orphan", "---\nname: orphan\n---\nbody\n");
+        let (def, mapped) = parse_and_map(&src);
+
+        // Pre-create an orphan JSON (no tracking entry) — a prior crash or
+        // manual tinkering.
+        let agents_dir = project.root.join(".kiro/agents");
+        fs::create_dir_all(&agents_dir).unwrap();
+        fs::write(agents_dir.join("orphan.json"), b"{}").unwrap();
+
+        let err = project
+            .install_agent(&def, &mapped, sample_agent_meta())
+            .unwrap_err();
+        // Surfaced as an Io error (AlreadyExists) with a message pointing at
+        // the offending files.
+        assert!(matches!(err, crate::error::Error::Io(_)));
+        assert!(err.to_string().contains("orphan"));
+    }
+
+    #[test]
+    fn install_agent_rollback_removes_json_when_prompt_target_already_a_dir() {
+        // Force `fs::rename(staging_prompt, prompt_target)` to fail by making
+        // prompt_target a non-empty directory. After the failure, the JSON
+        // rollback must remove `.kiro/agents/<name>.json`.
+        let (_dir, project) = temp_project();
+        let src_tmp = tempfile::tempdir().unwrap();
+        let src = write_agent(src_tmp.path(), "rb", "---\nname: rb\n---\nbody\n");
+        let (def, mapped) = parse_and_map(&src);
+
+        // Pre-create a non-empty directory where the prompt file would go.
+        let prompts_dir = project.root.join(".kiro/agents/prompts");
+        fs::create_dir_all(prompts_dir.join("rb.md")).unwrap();
+        fs::write(prompts_dir.join("rb.md").join("inside.txt"), b"x").unwrap();
+
+        let err = project
+            .install_agent(&def, &mapped, sample_agent_meta())
+            .unwrap_err();
+        assert!(matches!(err, crate::error::Error::Io(_)));
+
+        // JSON target must not exist (rolled back).
+        assert!(
+            !project.root.join(".kiro/agents/rb.json").exists(),
+            "JSON file should have been rolled back after prompt-rename failure"
+        );
+        // Tracking must not contain the agent.
+        let tracking = project.load_installed_agents().unwrap();
+        assert!(!tracking.agents.contains_key("rb"));
+    }
+
+    #[test]
+    fn install_agent_serializes_concurrent_same_name_installs() {
+        // Mirrors `install_skill_from_dir_serializes_concurrent_same_name_installs`:
+        // two threads racing to install the same agent name. Exactly one
+        // should succeed; the other must see AlreadyInstalled. No staging
+        // dirs may leak under `.kiro/`.
+        let (_dir, project) = temp_project();
+        let project = std::sync::Arc::new(project);
+
+        let src_tmp = tempfile::tempdir().unwrap();
+        let src = write_agent(src_tmp.path(), "racey", "---\nname: racey\n---\nbody\n");
+        let (def, mapped) = parse_and_map(&src);
+        let def = std::sync::Arc::new(def);
+        let mapped = std::sync::Arc::new(mapped);
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+
+        let handles: Vec<_> = (0..2)
+            .map(|_| {
+                let project = std::sync::Arc::clone(&project);
+                let barrier = std::sync::Arc::clone(&barrier);
+                let def = std::sync::Arc::clone(&def);
+                let mapped = std::sync::Arc::clone(&mapped);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    project.install_agent(&def, &mapped, sample_agent_meta())
+                })
+            })
+            .collect();
+
+        let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        let ok_count = results.iter().filter(|r| r.is_ok()).count();
+        let already_count = results
+            .iter()
+            .filter(|r| {
+                matches!(
+                    r,
+                    Err(crate::error::Error::Agent(
+                        AgentError::AlreadyInstalled { .. }
+                    ))
+                )
+            })
+            .count();
+        assert_eq!(ok_count, 1, "exactly one install should succeed");
+        assert_eq!(already_count, 1, "the other should be AlreadyInstalled");
+
+        let kiro = project.root.join(".kiro");
+        let leftover: Vec<_> = fs::read_dir(&kiro)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with("_installing-agent-")
+            })
+            .collect();
+        assert!(
+            leftover.is_empty(),
+            "no agent staging dirs should remain after race: {leftover:?}"
+        );
+    }
+
+    #[test]
+    fn install_agent_rollback_removes_files_when_tracking_write_fails() {
+        // Pre-create the tracking path as a directory — `write_agent_tracking`
+        // will fail, and the flow should roll back both files.
+        let (_dir, project) = temp_project();
+        let src_tmp = tempfile::tempdir().unwrap();
+        let src = write_agent(src_tmp.path(), "trkfail", "---\nname: trkfail\n---\nbody\n");
+        let (def, mapped) = parse_and_map(&src);
+
+        // `.kiro/installed-agents.json` as a directory → atomic_write fails.
+        fs::create_dir_all(project.root.join(".kiro/installed-agents.json")).unwrap();
+
+        let err = project
+            .install_agent(&def, &mapped, sample_agent_meta())
+            .unwrap_err();
+        assert!(matches!(err, crate::error::Error::Io(_)));
+
+        assert!(
+            !project.root.join(".kiro/agents/trkfail.json").exists(),
+            "JSON file should have been rolled back after tracking failure"
+        );
+        assert!(
+            !project
+                .root
+                .join(".kiro/agents/prompts/trkfail.md")
+                .exists(),
+            "prompt file should have been rolled back after tracking failure"
         );
     }
 
