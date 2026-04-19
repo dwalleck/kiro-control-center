@@ -6,12 +6,11 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use colored::Colorize;
 use kiro_market_core::cache::CacheDir;
-use kiro_market_core::git::{self, CloneOptions, GitBackend, GitProtocol, GitRef, GixCliBackend};
-use kiro_market_core::marketplace::{PluginEntry, PluginSource, StructuredSource};
+use kiro_market_core::git::{GitProtocol, GixCliBackend};
 use kiro_market_core::plugin::{PluginManifest, discover_skill_dirs};
 use kiro_market_core::project::KiroProject;
 use kiro_market_core::service::{
-    FailedAgent, FailedSkill, InstallAgentsResult, InstallFilter, InstallSkillsResult,
+    FailedAgent, FailedSkill, InstallAgentsResult, InstallFilter, InstallMode, InstallSkillsResult,
     MarketplaceService,
 };
 use tracing::{debug, warn};
@@ -22,8 +21,8 @@ use crate::cli;
 ///
 /// Resolves `plugin_ref` to a plugin, discovers skills, copies skill
 /// directories, and installs into the current Kiro project.
-#[allow(clippy::too_many_lines)]
 pub fn run(plugin_ref: &str, skill_filter: Option<&str>, force: bool) -> Result<()> {
+    let mode = InstallMode::from(force);
     let (plugin_name, marketplace_name) = cli::parse_plugin_ref(plugin_ref).with_context(|| {
         format!("invalid plugin reference '{plugin_ref}': expected plugin@marketplace")
     })?;
@@ -39,8 +38,62 @@ pub fn run(plugin_ref: &str, skill_filter: Option<&str>, force: bool) -> Result<
         );
     }
 
-    // Look up the stored protocol preference for this marketplace.
-    let protocol = match cache.load_known_marketplaces() {
+    let protocol = load_protocol(&cache, marketplace_name);
+    let plugin_entry =
+        super::common::find_plugin_entry(&marketplace_path, plugin_name, marketplace_name)?;
+
+    // One service instance drives plugin-dir resolution plus the install
+    // loops; no second `GixCliBackend` needed.
+    let svc = MarketplaceService::new(cache.clone(), GixCliBackend::default());
+    let plugin_dir = fetch_plugin_dir(
+        &svc,
+        &plugin_entry,
+        &marketplace_path,
+        marketplace_name,
+        plugin_name,
+        protocol,
+    )?;
+
+    let plugin_manifest = load_plugin_manifest(&plugin_dir)?;
+    let skill_dirs = discover_plugin_skills(&plugin_dir, plugin_manifest.as_ref());
+    let agent_scan_paths = agent_scan_paths(plugin_manifest.as_ref());
+
+    let cwd = std::env::current_dir().context("failed to determine current directory")?;
+    let project = KiroProject::new(cwd);
+    let version = plugin_manifest.as_ref().and_then(|m| m.version.clone());
+
+    let skill_result = run_skill_install(
+        &svc,
+        &project,
+        &skill_dirs,
+        skill_filter,
+        mode,
+        marketplace_name,
+        plugin_name,
+        version.as_deref(),
+    );
+    print_install_outcome(plugin_ref, &skill_result);
+
+    let agent_result = run_agent_install(
+        &svc,
+        &project,
+        &plugin_dir,
+        &agent_scan_paths,
+        skill_filter,
+        mode,
+        marketplace_name,
+        plugin_name,
+        version.as_deref(),
+    );
+    print_agent_outcome(&agent_result);
+
+    summarize_outcome(plugin_ref, skill_filter, &skill_result, &agent_result)
+}
+
+/// Look up the stored git protocol preference for a marketplace, falling back
+/// to the default if the registry is unreadable.
+fn load_protocol(cache: &CacheDir, marketplace_name: &str) -> GitProtocol {
+    match cache.load_known_marketplaces() {
         Ok(entries) => entries
             .into_iter()
             .find(|e| e.name == marketplace_name)
@@ -54,69 +107,95 @@ pub fn run(plugin_ref: &str, skill_filter: Option<&str>, force: bool) -> Result<
             );
             GitProtocol::default()
         }
+    }
+}
+
+/// Resolve the plugin's on-disk directory, printing a progress message so the
+/// user sees something during the clone (which can block on network I/O).
+fn fetch_plugin_dir(
+    svc: &MarketplaceService,
+    entry: &kiro_market_core::marketplace::PluginEntry,
+    marketplace_path: &Path,
+    marketplace_name: &str,
+    plugin_name: &str,
+    protocol: GitProtocol,
+) -> Result<PathBuf> {
+    print!("  Fetching plugin '{plugin_name}'...");
+    let _ = std::io::Write::flush(&mut std::io::stdout());
+    let dir = svc
+        .resolve_plugin_dir(entry, marketplace_path, marketplace_name, protocol)
+        .with_context(|| format!("failed to resolve plugin directory for '{plugin_name}'"))?;
+    println!(" done");
+    debug!(plugin_dir = %dir.display(), "resolved plugin directory");
+    Ok(dir)
+}
+
+#[allow(clippy::too_many_arguments)] // each arg is an independent piece of upstream context
+fn run_skill_install(
+    svc: &MarketplaceService,
+    project: &KiroProject,
+    skill_dirs: &[PathBuf],
+    skill_filter: Option<&str>,
+    mode: InstallMode,
+    marketplace_name: &str,
+    plugin_name: &str,
+    version: Option<&str>,
+) -> InstallSkillsResult {
+    if skill_dirs.is_empty() {
+        return InstallSkillsResult::default();
+    }
+    let filter = match skill_filter {
+        Some(name) => InstallFilter::SingleName(name),
+        None => InstallFilter::All,
     };
-
-    let plugin_entry =
-        super::common::find_plugin_entry(&marketplace_path, plugin_name, marketplace_name)?;
-
-    let plugin_dir = resolve_plugin_dir(
-        &plugin_entry,
-        &marketplace_path,
-        &cache,
+    svc.install_skills(
+        project,
+        skill_dirs,
+        &filter,
+        mode,
         marketplace_name,
-        protocol,
+        plugin_name,
+        version,
     )
-    .with_context(|| format!("failed to resolve plugin directory for '{plugin_name}'"))?;
+}
 
-    debug!(plugin_dir = %plugin_dir.display(), "resolved plugin directory");
+#[allow(clippy::too_many_arguments)] // each arg is an independent piece of upstream context
+fn run_agent_install(
+    svc: &MarketplaceService,
+    project: &KiroProject,
+    plugin_dir: &Path,
+    agent_scan_paths: &[String],
+    skill_filter: Option<&str>,
+    mode: InstallMode,
+    marketplace_name: &str,
+    plugin_name: &str,
+    version: Option<&str>,
+) -> InstallAgentsResult {
+    // A `--skill <name>` filter narrows the install to one skill and never
+    // includes agents.
+    if skill_filter.is_some() {
+        return InstallAgentsResult::default();
+    }
+    svc.install_plugin_agents(
+        project,
+        plugin_dir,
+        agent_scan_paths,
+        mode,
+        marketplace_name,
+        plugin_name,
+        version,
+    )
+}
 
-    let plugin_manifest = load_plugin_manifest(&plugin_dir);
-    let skill_dirs = discover_plugin_skills(&plugin_dir, plugin_manifest.as_ref());
-    let agent_scan_paths = agent_scan_paths(plugin_manifest.as_ref());
-
-    let cwd = std::env::current_dir().context("failed to determine current directory")?;
-    let project = KiroProject::new(cwd);
-    let version = plugin_manifest.as_ref().and_then(|m| m.version.clone());
-
-    // Build a one-off service just to drive the install loops — the CLI only
-    // needs the install calls here, not the full add/update lifecycle.
-    let svc = MarketplaceService::new(cache.clone(), GixCliBackend::default());
-
-    let skill_result = if skill_dirs.is_empty() {
-        InstallSkillsResult::default()
-    } else {
-        let filter = match skill_filter {
-            Some(name) => InstallFilter::SingleName(name),
-            None => InstallFilter::All,
-        };
-        svc.install_skills(
-            &project,
-            &skill_dirs,
-            &filter,
-            force,
-            marketplace_name,
-            plugin_name,
-            version.as_deref(),
-        )
-    };
-    print_install_outcome(plugin_ref, &skill_result);
-
-    // Agents: only run when the user did NOT pass `--skill <name>`. A skill
-    // filter narrows the install to one skill and never includes agents.
-    let agent_result = if skill_filter.is_none() {
-        svc.install_plugin_agents(
-            &project,
-            &plugin_dir,
-            &agent_scan_paths,
-            marketplace_name,
-            plugin_name,
-            version.as_deref(),
-        )
-    } else {
-        InstallAgentsResult::default()
-    };
-    print_agent_outcome(&agent_result);
-
+/// Decide whether the command exits zero or non-zero based on the accumulated
+/// skill + agent results. Any per-item failure becomes a non-zero exit so CI
+/// catches partial-success regressions.
+fn summarize_outcome(
+    plugin_ref: &str,
+    skill_filter: Option<&str>,
+    skill_result: &InstallSkillsResult,
+    agent_result: &InstallAgentsResult,
+) -> Result<()> {
     let nothing_installed = skill_result.installed.is_empty()
         && skill_result.skipped.is_empty()
         && agent_result.installed.is_empty()
@@ -129,21 +208,13 @@ pub fn run(plugin_ref: &str, skill_filter: Option<&str>, force: bool) -> Result<
         };
         bail!("no {kind} were installed from '{plugin_ref}'");
     }
-
-    // Any per-agent or per-skill failure surfaces as a non-zero exit so CI
-    // catches partial-success regressions.
     if !agent_result.failed.is_empty() || !skill_result.failed.is_empty() {
+        let fail_count = agent_result.failed.len() + skill_result.failed.len();
         bail!(
-            "{} item{} failed during install from '{plugin_ref}'",
-            agent_result.failed.len() + skill_result.failed.len(),
-            if agent_result.failed.len() + skill_result.failed.len() == 1 {
-                ""
-            } else {
-                "s"
-            }
+            "{fail_count} item{s} failed during install from '{plugin_ref}'",
+            s = if fail_count == 1 { "" } else { "s" }
         );
     }
-
     Ok(())
 }
 
@@ -251,154 +322,111 @@ fn print_install_outcome(plugin_ref: &str, result: &InstallSkillsResult) {
     }
 }
 
-/// Resolve the on-disk directory for a plugin based on its source.
-fn resolve_plugin_dir(
-    entry: &PluginEntry,
-    marketplace_path: &Path,
-    cache: &CacheDir,
-    marketplace_name: &str,
-    protocol: GitProtocol,
-) -> Result<PathBuf> {
-    match &entry.source {
-        PluginSource::RelativePath(rel) => {
-            let resolved = marketplace_path.join(rel);
-            if !resolved.exists() {
-                bail!("plugin directory does not exist: {}", resolved.display());
-            }
-            Ok(resolved)
-        }
-        PluginSource::Structured(structured) => {
-            resolve_structured_source(structured, cache, marketplace_name, &entry.name, protocol)
-        }
-    }
-}
-
-/// Clone a structured source into the cache plugins directory and return the path.
-fn resolve_structured_source(
-    source: &StructuredSource,
-    cache: &CacheDir,
-    marketplace_name: &str,
-    plugin_name: &str,
-    protocol: GitProtocol,
-) -> Result<PathBuf> {
-    cache
-        .ensure_dirs()
-        .context("failed to create cache directories")?;
-
-    let dest = cache.plugin_path(marketplace_name, plugin_name);
-
-    // Extract the varying parts from each source variant.
-    let (url, subdir, git_ref, sha, label) = match source {
-        StructuredSource::GitHub { repo, git_ref, sha } => (
-            git::github_repo_to_url(repo, protocol),
-            None,
-            git_ref.as_deref(),
-            sha.as_deref(),
-            repo.as_str(),
-        ),
-        StructuredSource::GitUrl { url, git_ref, sha } => (
-            url.clone(),
-            None,
-            git_ref.as_deref(),
-            sha.as_deref(),
-            url.as_str(),
-        ),
-        StructuredSource::GitSubdir {
-            url,
-            path,
-            git_ref,
-            sha,
-        } => (
-            url.clone(),
-            Some(path.as_str()),
-            git_ref.as_deref(),
-            sha.as_deref(),
-            url.as_str(),
-        ),
-    };
-
-    let backend = GixCliBackend::default();
-
-    // If already cloned, reuse — but re-verify SHA so a corrupt or stale
-    // cache (e.g. the manifest's pinned SHA changed) cannot pass silently.
-    if dest.exists() {
-        debug!(dest = %dest.display(), "plugin already cached, reusing");
-        if let Some(expected) = sha {
-            backend.verify_sha(&dest, expected).with_context(|| {
-                format!(
-                    "cached plugin at {} fails SHA verification for '{label}' \
-                     (expected {expected}); delete the cache directory and retry",
-                    dest.display()
-                )
-            })?;
-        }
-        return Ok(match subdir {
-            Some(path) => dest.join(path),
-            None => dest,
-        });
-    }
-
-    debug!(url = %url, dest = %dest.display(), "cloning plugin");
-    print!("  Cloning {label}...");
-    // Validate the manifest-supplied git ref shape before passing to the
-    // backend. Treat failure as a clone-time error since this comes from
-    // untrusted manifest data.
-    let validated_ref = git_ref
-        .map(GitRef::new)
-        .transpose()
-        .with_context(|| format!("invalid git ref in manifest for '{label}'"))?;
-    let opts = CloneOptions {
-        git_ref: validated_ref,
-    };
-    backend
-        .clone_repo(&url, &dest, &opts)
-        .with_context(|| format!("failed to clone plugin from '{label}'"))?;
-    println!(" done");
-
-    if let Some(expected) = sha {
-        backend
-            .verify_sha(&dest, expected)
-            .with_context(|| format!("SHA verification failed for '{label}'"))?;
-    }
-
-    Ok(match subdir {
-        Some(path) => dest.join(path),
-        None => dest,
-    })
-}
-
-/// Load a `plugin.json` from the given directory, returning `None` if missing.
-fn load_plugin_manifest(plugin_dir: &Path) -> Option<PluginManifest> {
+/// Load a `plugin.json` from the given directory.
+///
+/// Returns:
+/// - `Ok(Some(manifest))` on success.
+/// - `Ok(None)` when the file is genuinely absent (`NotFound`) or when it is
+///   a symlink — a symlinked `plugin.json` inside a cloned repo could point
+///   at arbitrary host files, so it is treated as absent with a `warn!`.
+/// - `Err` for every other condition: permission denied, EIO, interrupted,
+///   malformed JSON, etc. Matches the allowlist-style error handling in
+///   `find_plugin_entry` — never mask a broken cache as "missing manifest."
+fn load_plugin_manifest(plugin_dir: &Path) -> Result<Option<PluginManifest>> {
     let manifest_path = plugin_dir.join("plugin.json");
-    match fs::read(&manifest_path) {
-        Ok(bytes) => match PluginManifest::from_json(&bytes) {
-            Ok(manifest) => {
-                debug!(name = %manifest.name, "loaded plugin manifest");
-                Some(manifest)
-            }
-            Err(e) => {
-                warn!(
-                    path = %manifest_path.display(),
-                    error = %e,
-                    "plugin.json is malformed, falling back to defaults"
-                );
-                None
-            }
-        },
+
+    // Refuse to follow symlinks. plugin_dir lives inside a cloned (untrusted)
+    // repository; matches project::copy_dir_recursive and
+    // agent::discover_agents_in_dirs.
+    match fs::symlink_metadata(&manifest_path) {
+        Ok(m) if m.file_type().is_symlink() => {
+            warn!(
+                path = %manifest_path.display(),
+                "plugin.json is a symlink, refusing to follow; treating as missing"
+            );
+            return Ok(None);
+        }
+        Ok(_) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             debug!(
                 path = %manifest_path.display(),
                 "plugin.json not found, using defaults"
             );
-            None
+            return Ok(None);
         }
         Err(e) => {
-            warn!(
-                path = %manifest_path.display(),
-                error = %e,
-                "failed to read plugin.json, falling back to defaults"
-            );
-            None
+            return Err(anyhow::Error::new(e).context(format!(
+                "failed to stat plugin.json at {}",
+                manifest_path.display()
+            )));
         }
+    }
+
+    let bytes = fs::read(&manifest_path)
+        .with_context(|| format!("failed to read plugin.json at {}", manifest_path.display()))?;
+    let manifest = PluginManifest::from_json(&bytes)
+        .with_context(|| format!("plugin.json at {} is malformed", manifest_path.display()))?;
+    debug!(name = %manifest.name, "loaded plugin manifest");
+    Ok(Some(manifest))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn load_plugin_manifest_reads_regular_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(
+            tmp.path().join("plugin.json"),
+            r#"{"name":"ok","version":"1.0.0"}"#,
+        )
+        .unwrap();
+        let m = load_plugin_manifest(tmp.path())
+            .expect("ok result")
+            .expect("some manifest");
+        assert_eq!(m.name, "ok");
+    }
+
+    #[test]
+    fn load_plugin_manifest_returns_ok_none_when_absent() {
+        // Genuine absence is expected — NotFound is part of the contract,
+        // not an error. Regression guard for the allowlist split.
+        let tmp = tempfile::tempdir().unwrap();
+        let result = load_plugin_manifest(tmp.path()).expect("NotFound must be Ok(None)");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn load_plugin_manifest_errors_on_malformed_json() {
+        // Regression: previously malformed plugin.json silently fell back
+        // to defaults. Allowlist-style handling requires it to surface.
+        let tmp = tempfile::tempdir().unwrap();
+        fs::write(tmp.path().join("plugin.json"), b"{ not json").unwrap();
+        let err = load_plugin_manifest(tmp.path()).expect_err("malformed must error");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("malformed") || msg.contains("plugin.json"),
+            "error chain should mention the manifest: {msg}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn load_plugin_manifest_refuses_symlinked_manifest() {
+        // A malicious cloned repo could include a symlink
+        // `plugin.json -> /etc/passwd`. We must not follow it. Symlink is
+        // treated as absent (Ok(None)) with a warn!, not as an error —
+        // the install degrades to "no skills" rather than aborting.
+        let tmp = tempfile::tempdir().unwrap();
+        let target = tmp.path().join("elsewhere.json");
+        fs::write(&target, r#"{"name":"smuggled"}"#).unwrap();
+        std::os::unix::fs::symlink(&target, tmp.path().join("plugin.json")).unwrap();
+
+        let result = load_plugin_manifest(tmp.path()).expect("symlink should not error");
+        assert!(
+            result.is_none(),
+            "symlinked plugin.json must be treated as absent, got: {result:?}"
+        );
     }
 }

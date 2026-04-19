@@ -91,6 +91,13 @@ impl DiscoveredPlugin {
     }
 }
 
+/// Default maximum directory depth for [`discover_plugins`] scans.
+///
+/// Production callers use this value; tests may pass explicit depths to pin
+/// behaviour. A depth of 3 accommodates typical catalog layouts like
+/// `root/plugins/<name>/plugin.json` with one level of nesting to spare.
+pub const DEFAULT_DISCOVERY_MAX_DEPTH: usize = 3;
+
 /// Scan a repository for `plugin.json` files up to `max_depth` levels deep.
 ///
 /// Skips hidden directories (starting with `.`) and common noise directories

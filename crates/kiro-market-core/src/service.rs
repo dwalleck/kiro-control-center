@@ -11,9 +11,9 @@ use serde::Serialize;
 use tracing::{debug, warn};
 
 use crate::cache::{CacheDir, KnownMarketplace, MarketplaceSource};
-use crate::error::{Error, MarketplaceError, error_full_chain};
-use crate::git::{self, CloneOptions, GitBackend, GitProtocol};
-use crate::marketplace::Marketplace;
+use crate::error::{Error, MarketplaceError, PluginError, error_full_chain};
+use crate::git::{self, CloneOptions, GitBackend, GitProtocol, GitRef};
+use crate::marketplace::{Marketplace, PluginEntry, PluginSource, StructuredSource};
 use crate::platform::LinkResult;
 use crate::{platform, validation};
 
@@ -130,6 +130,36 @@ pub enum InstallFilter<'a> {
     All,
     Names(&'a [String]),
     SingleName(&'a str),
+}
+
+/// Whether an install should overwrite existing entries of the same name.
+///
+/// Used by [`MarketplaceService::install_skills`] and
+/// [`MarketplaceService::install_plugin_agents`] to replace the earlier
+/// `force: bool` parameter. Named variants prevent boolean-blindness at
+/// the call site and leave room for future modes (e.g. `DryRun`).
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum InstallMode {
+    /// Default: existing installs are preserved and reported as skipped.
+    New,
+    /// Overwrite any existing install of the same name.
+    Force,
+}
+
+impl InstallMode {
+    /// Returns `true` when the mode is [`InstallMode::Force`].
+    #[must_use]
+    pub fn is_force(self) -> bool {
+        matches!(self, Self::Force)
+    }
+}
+
+impl From<bool> for InstallMode {
+    /// Convenience conversion for CLIs that parse a `--force` boolean flag.
+    /// `true` → `Force`, `false` → `New`.
+    fn from(force: bool) -> Self {
+        if force { Self::Force } else { Self::New }
+    }
 }
 
 /// Outcome of installing a list of skill directories from one plugin.
@@ -311,7 +341,8 @@ impl MarketplaceService {
         // Scan for plugin.json files. A read failure on the repo root is
         // bubbled up as `Error::Io`, so the caller sees the real reason
         // (e.g. permission denied) rather than a misleading "no plugins".
-        let discovered = crate::plugin::discover_plugins(&temp_dir, 3)?;
+        let discovered =
+            crate::plugin::discover_plugins(&temp_dir, crate::plugin::DEFAULT_DISCOVERY_MAX_DEPTH)?;
 
         // Build the merged plugin list and derive the marketplace name.
         let registry_entries = Self::build_registry_entries(manifest.as_ref(), &discovered);
@@ -609,7 +640,7 @@ impl MarketplaceService {
         project: &crate::project::KiroProject,
         skill_dirs: &[PathBuf],
         filter: &InstallFilter<'_>,
-        force: bool,
+        mode: InstallMode,
         marketplace: &str,
         plugin: &str,
         version: Option<&str>,
@@ -655,7 +686,7 @@ impl MarketplaceService {
                 installed_at: chrono::Utc::now(),
             };
 
-            let outcome = if force {
+            let outcome = if mode.is_force() {
                 project.install_skill_from_dir_force(&frontmatter.name, skill_dir, meta)
             } else {
                 project.install_skill_from_dir(&frontmatter.name, skill_dir, meta)
@@ -697,6 +728,127 @@ impl MarketplaceService {
         result
     }
 
+    /// Resolve a plugin's on-disk location from its marketplace entry.
+    ///
+    /// For `PluginSource::RelativePath`, validates the path and verifies the
+    /// directory exists inside the marketplace tree. For `PluginSource::Structured`,
+    /// ensures the plugin's cache directory exists (cloning if necessary),
+    /// optionally verifies a pinned SHA, and returns the final path —
+    /// possibly a sub-directory for `git-subdir` sources.
+    ///
+    /// Shared between frontends (CLI today, Tauri in the future) so the
+    /// `RelativePath` + `Structured` resolution flow isn't duplicated
+    /// per-frontend, matching the project's "domain logic is never duplicated
+    /// between frontends" rule.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Validation`] for malformed relative paths or git refs.
+    /// - [`Error::Plugin`] ([`PluginError::DirectoryMissing`]) if a
+    ///   `RelativePath` source points to a missing directory.
+    /// - [`Error::Git`] for clone or SHA-verification failures.
+    pub fn resolve_plugin_dir(
+        &self,
+        entry: &PluginEntry,
+        marketplace_path: &Path,
+        marketplace_name: &str,
+        protocol: GitProtocol,
+    ) -> Result<PathBuf, Error> {
+        match &entry.source {
+            PluginSource::RelativePath(rel) => {
+                // `rel` is a validated `RelativePath` — no belt-and-braces
+                // check needed; construction through `RelativePath::new`
+                // is the only way to obtain one, and it validates.
+                let resolved = marketplace_path.join(rel);
+                if !resolved.exists() {
+                    return Err(PluginError::DirectoryMissing { path: resolved }.into());
+                }
+                Ok(resolved)
+            }
+            PluginSource::Structured(structured) => {
+                self.resolve_structured_source(structured, marketplace_name, &entry.name, protocol)
+            }
+        }
+    }
+
+    /// Clone a structured source into the cache plugins directory (if not
+    /// already present) and return the resolved path. Used by
+    /// [`resolve_plugin_dir`].
+    fn resolve_structured_source(
+        &self,
+        source: &StructuredSource,
+        marketplace_name: &str,
+        plugin_name: &str,
+        protocol: GitProtocol,
+    ) -> Result<PathBuf, Error> {
+        self.cache.ensure_dirs()?;
+
+        let dest = self.cache.plugin_path(marketplace_name, plugin_name);
+
+        // Extract the varying parts from each source variant.
+        let (url, subdir, git_ref, sha, label) = match source {
+            StructuredSource::GitHub { repo, git_ref, sha } => (
+                git::github_repo_to_url(repo, protocol),
+                None,
+                git_ref.as_deref(),
+                sha.as_deref(),
+                repo.clone(),
+            ),
+            StructuredSource::GitUrl { url, git_ref, sha } => (
+                url.clone(),
+                None,
+                git_ref.as_deref(),
+                sha.as_deref(),
+                url.clone(),
+            ),
+            StructuredSource::GitSubdir {
+                url,
+                path,
+                git_ref,
+                sha,
+            } => (
+                url.clone(),
+                Some(path.as_str()),
+                git_ref.as_deref(),
+                sha.as_deref(),
+                url.clone(),
+            ),
+        };
+
+        // No re-validation needed: `path` is typed as `RelativePath`, which
+        // cannot hold an unvalidated string. Serde and programmatic callers
+        // both go through `RelativePath::new`.
+
+        // If already cloned, reuse — but re-verify SHA so a corrupt or stale
+        // cache (e.g. the manifest's pinned SHA changed) cannot pass silently.
+        if dest.exists() {
+            debug!(dest = %dest.display(), "plugin already cached, reusing");
+            if let Some(expected) = sha {
+                self.git.verify_sha(&dest, expected)?;
+            }
+            return Ok(match subdir {
+                Some(path) => dest.join(path),
+                None => dest,
+            });
+        }
+
+        debug!(url = %url, dest = %dest.display(), label = %label, "cloning plugin");
+        let validated_ref = git_ref.map(GitRef::new).transpose()?;
+        let opts = CloneOptions {
+            git_ref: validated_ref,
+        };
+        self.git.clone_repo(&url, &dest, &opts)?;
+
+        if let Some(expected) = sha {
+            self.git.verify_sha(&dest, expected)?;
+        }
+
+        Ok(match subdir {
+            Some(path) => dest.join(path),
+            None => dest,
+        })
+    }
+
     /// Discover, parse, and install all agents from a plugin directory.
     ///
     /// All per-agent outcomes are collected into the returned
@@ -705,6 +857,11 @@ impl MarketplaceService {
     /// is parsed exactly once; the parsed `AgentDefinition` flows straight
     /// into `project.install_agent` without re-reading the source.
     ///
+    /// When `force` is `true`, existing agents of the same name are
+    /// overwritten (mirrors the CLI `--force` flag for skills). When
+    /// `false`, already-installed agents are left untouched and recorded
+    /// in `skipped`.
+    ///
     /// Returns:
     /// - `installed`: agent names the call wrote to disk.
     /// - `skipped`: agents that were already installed (left untouched).
@@ -712,11 +869,16 @@ impl MarketplaceService {
     ///   error. The CLI surfaces these with a non-zero exit status.
     /// - `warnings`: non-fatal issues (unmapped tools, README-like files
     ///   skipped, missing-name frontmatter).
+    #[allow(clippy::too_many_arguments)] // seven non-self params, each a distinct
+    // input from upstream: project + plugin_dir + scan_paths + force +
+    // marketplace + plugin + version. A builder would add indirection without
+    // reducing arity at the call site.
     pub fn install_plugin_agents(
         &self,
         project: &crate::project::KiroProject,
         plugin_dir: &Path,
         scan_paths: &[String],
+        mode: InstallMode,
         marketplace: &str,
         plugin: &str,
         version: Option<&str>,
@@ -779,7 +941,12 @@ impl MarketplaceService {
                 installed_at: chrono::Utc::now(),
                 dialect: def.dialect,
             };
-            match project.install_agent(&def, &mapped, meta) {
+            let install_result = if mode.is_force() {
+                project.install_agent_force(&def, &mapped, meta)
+            } else {
+                project.install_agent(&def, &mapped, meta)
+            };
+            match install_result {
                 Ok(()) => result.installed.push(def.name),
                 Err(Error::Agent(crate::error::AgentError::AlreadyInstalled { name })) => {
                     result.skipped.push(name);
@@ -849,7 +1016,10 @@ impl MarketplaceService {
                 None
             }
         };
-        let discovered = match crate::plugin::discover_plugins(mp_path, 3) {
+        let discovered = match crate::plugin::discover_plugins(
+            mp_path,
+            crate::plugin::DEFAULT_DISCOVERY_MAX_DEPTH,
+        ) {
             Ok(d) => d,
             Err(e) => {
                 // Best-effort regeneration: an unreadable repo means we
@@ -899,7 +1069,8 @@ impl MarketplaceService {
             .iter()
             .filter_map(|p| match &p.source {
                 crate::marketplace::PluginSource::RelativePath(rel) => Some(
-                    rel.trim_start_matches("./")
+                    rel.as_str()
+                        .trim_start_matches("./")
                         .trim_start_matches(".\\")
                         .trim_end_matches(['/', '\\'])
                         .replace('\\', "/"),
@@ -980,10 +1151,17 @@ fn storage_from_source_and_link(ms: &MarketplaceSource, link: LinkResult) -> Mar
 fn plugin_entry_from_discovered(
     dp: &crate::plugin::DiscoveredPlugin,
 ) -> crate::marketplace::PluginEntry {
+    // `as_relative_path_string` always returns `./<unix-path>` and the
+    // components originate from our own filesystem scan, so validation
+    // cannot legitimately fail here. `expect` documents the invariant:
+    // if it ever panics, discovery has admitted an unsafe name that it
+    // should have rejected upstream.
+    let rel = crate::validation::RelativePath::new(dp.as_relative_path_string())
+        .expect("discovered plugin paths are always valid relative paths");
     crate::marketplace::PluginEntry {
         name: dp.name().to_owned(),
         description: dp.description().map(String::from),
-        source: crate::marketplace::PluginSource::RelativePath(dp.as_relative_path_string()),
+        source: crate::marketplace::PluginSource::RelativePath(rel),
     }
 }
 
@@ -1077,6 +1255,7 @@ mod tests {
             &project,
             plugin_tmp.path(),
             &["./agents/".to_string()],
+            InstallMode::New,
             "mp",
             "plugin-x",
             None,
@@ -1150,6 +1329,7 @@ mod tests {
             &project,
             plugin_tmp.path(),
             &["./agents/".to_string()],
+            InstallMode::New,
             "mp",
             "p",
             None,
@@ -1193,6 +1373,7 @@ mod tests {
             &project,
             plugin_tmp.path(),
             &["./agents/".to_string()],
+            InstallMode::New,
             "mp",
             "p",
             None,
@@ -1243,6 +1424,7 @@ mod tests {
             &project,
             plugin_tmp.path(),
             &["./agents/".to_string()],
+            InstallMode::New,
             "mp",
             "p",
             None,
@@ -1277,6 +1459,7 @@ mod tests {
             &project,
             plugin_tmp.path(),
             &["./agents/".to_string()],
+            InstallMode::New,
             "mp",
             "p",
             None,
@@ -1289,6 +1472,7 @@ mod tests {
             &project,
             plugin_tmp.path(),
             &["./agents/".to_string()],
+            InstallMode::New,
             "mp",
             "p",
             None,
@@ -1296,6 +1480,90 @@ mod tests {
         assert!(r2.installed.is_empty());
         assert_eq!(r2.skipped, vec!["dup".to_string()]);
         assert!(r2.failed.is_empty(), "AlreadyInstalled must not be failed");
+    }
+
+    #[test]
+    fn install_plugin_agents_force_overwrites_already_installed() {
+        // Regression: the CLI --force flag was previously dropped on the
+        // agent path, so re-installing with --force silently routed agents
+        // to `skipped`. Threading force=true through install_plugin_agents
+        // must now put them back into `installed`.
+        use crate::project::KiroProject;
+
+        let (_dir, svc) = temp_service();
+        let plugin_tmp = tempfile::tempdir().unwrap();
+        let agents_dir = plugin_tmp.path().join("agents");
+        fs::create_dir_all(&agents_dir).unwrap();
+        fs::write(
+            agents_dir.join("dup.md"),
+            "---\nname: dup\n---\nfirst body\n",
+        )
+        .unwrap();
+
+        let project_tmp = tempfile::tempdir().unwrap();
+        let project = KiroProject::new(project_tmp.path().to_path_buf());
+
+        let r1 = svc.install_plugin_agents(
+            &project,
+            plugin_tmp.path(),
+            &["./agents/".to_string()],
+            InstallMode::New,
+            "mp",
+            "p",
+            Some("1.0.0"),
+        );
+        assert_eq!(r1.installed, vec!["dup".to_string()]);
+
+        // Update the source, re-install with force=true and a new version —
+        // both the prompt body and the tracking metadata should reflect
+        // the replacement.
+        fs::write(
+            agents_dir.join("dup.md"),
+            "---\nname: dup\n---\nsecond body\n",
+        )
+        .unwrap();
+
+        let r2 = svc.install_plugin_agents(
+            &project,
+            plugin_tmp.path(),
+            &["./agents/".to_string()],
+            InstallMode::Force,
+            "mp",
+            "p",
+            Some("2.0.0"),
+        );
+        assert_eq!(
+            r2.installed,
+            vec!["dup".to_string()],
+            "force install must replace, not skip"
+        );
+        assert!(
+            r2.skipped.is_empty(),
+            "force must not route already-installed to skipped: {:?}",
+            r2.skipped
+        );
+
+        let prompt =
+            fs::read_to_string(project_tmp.path().join(".kiro/agents/prompts/dup.md")).unwrap();
+        assert!(
+            prompt.contains("second body"),
+            "prompt must reflect the replaced source, got: {prompt}"
+        );
+
+        // Tracking JSON must also reflect the overwrite — previously a
+        // refactor could have updated disk files but not tracking, and
+        // this test would still pass without this assertion.
+        let tracking = project.load_installed_agents().expect("load tracking");
+        let meta = tracking
+            .agents
+            .get("dup")
+            .expect("tracking entry for 'dup'");
+        assert_eq!(
+            meta.version.as_deref(),
+            Some("2.0.0"),
+            "tracking metadata must reflect the force-installed version, got: {:?}",
+            meta.version
+        );
     }
 
     #[test]
@@ -1321,6 +1589,7 @@ mod tests {
             &project,
             plugin_tmp.path(),
             &["./agents/".to_string()],
+            InstallMode::New,
             "mp",
             "p",
             None,
@@ -1389,6 +1658,76 @@ mod tests {
         let svc = MarketplaceService::new(cache, MockGitBackend::default());
         (dir, svc)
     }
+
+    // -------------------------------------------------------------------
+    // resolve_plugin_dir
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn resolve_plugin_dir_relative_path_returns_joined_path() {
+        let (dir, svc) = temp_service();
+        let marketplace_path = dir.path().join("marketplace");
+        let plugin_dir_on_disk = marketplace_path.join("plugins/foo");
+        fs::create_dir_all(&plugin_dir_on_disk).expect("create plugin dir");
+
+        let entry = PluginEntry {
+            name: "foo".to_string(),
+            description: None,
+            source: PluginSource::RelativePath(
+                crate::validation::RelativePath::new("./plugins/foo").unwrap(),
+            ),
+        };
+
+        let resolved = svc
+            .resolve_plugin_dir(&entry, &marketplace_path, "mp", GitProtocol::Https)
+            .expect("happy path");
+        assert_eq!(resolved, plugin_dir_on_disk);
+    }
+
+    #[test]
+    fn resolve_plugin_dir_relative_path_missing_returns_directory_missing() {
+        // Regression guard for PluginError::DirectoryMissing — the scan
+        // fallback or a stale manifest can point to a directory that does
+        // not exist on disk, and that must be a typed error.
+        let (dir, svc) = temp_service();
+        let marketplace_path = dir.path().join("marketplace");
+        fs::create_dir_all(&marketplace_path).expect("create marketplace root");
+
+        let entry = PluginEntry {
+            name: "ghost".to_string(),
+            description: None,
+            source: PluginSource::RelativePath(
+                crate::validation::RelativePath::new("./plugins/ghost").unwrap(),
+            ),
+        };
+
+        let err = svc
+            .resolve_plugin_dir(&entry, &marketplace_path, "mp", GitProtocol::Https)
+            .expect_err("missing dir must error");
+        assert!(
+            matches!(err, Error::Plugin(PluginError::DirectoryMissing { .. })),
+            "expected PluginError::DirectoryMissing, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn relative_path_newtype_rejects_traversal_at_construction() {
+        // The newtype closes the programmatic-bypass vector entirely:
+        // `RelativePath::new("../../etc")` fails before a `PluginSource`
+        // can be constructed. This replaces the earlier
+        // `resolve_plugin_dir_rejects_programmatic_*_traversal` tests
+        // that exercised the belt-and-braces use-site checks.
+        assert!(crate::validation::RelativePath::new("../../etc").is_err());
+        assert!(crate::validation::RelativePath::new("/etc/passwd").is_err());
+        assert!(crate::validation::RelativePath::new("\0").is_err());
+        assert!(crate::validation::RelativePath::new("ok/path").is_ok());
+    }
+
+    // No explicit test for "programmatic GitSubdir.path traversal" is
+    // needed: `path: RelativePath` on the struct makes such an attack
+    // uninstantiable in safe Rust. `relative_path_newtype_rejects_traversal_at_construction`
+    // above verifies the single choke-point that used to be duplicated
+    // as belt-and-braces use-site checks.
 
     #[test]
     fn add_marketplace_registers_and_returns_plugins() {

@@ -4,7 +4,13 @@
 //! Each plugin entry may specify its source as either a bare relative path string
 //! or a structured object with provider-specific fields.
 
-use serde::{Deserialize, Serialize};
+use std::fmt;
+
+use serde::de::value::MapAccessDeserializer;
+use serde::de::{self, MapAccess, Visitor};
+use serde::{Deserialize, Deserializer, Serialize};
+
+use crate::validation::RelativePath;
 
 /// Top-level marketplace manifest.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -38,13 +44,62 @@ pub struct PluginEntry {
 /// `#[serde(untagged)]` and rely on variant ordering — `Structured` is tried
 /// first (it expects an object), and `RelativePath` (a plain string) acts as the
 /// fallback.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 #[serde(untagged)]
 pub enum PluginSource {
     /// A structured source descriptor (GitHub, URL, git-subdir).
     Structured(StructuredSource),
-    /// A bare relative path like `"./plugins/dotnet"`.
-    RelativePath(String),
+    /// A bare relative path like `"./plugins/dotnet"`. Holding a
+    /// [`RelativePath`] is a static guarantee the string passed validation.
+    RelativePath(RelativePath),
+}
+
+impl<'de> Deserialize<'de> for PluginSource {
+    // Hand-written to preserve specific validation errors. `#[serde(untagged)]`
+    // swallows inner failures and emits a generic "did not match any variant"
+    // message; our Visitor reports the exact reason a path was rejected.
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        struct PluginSourceVisitor;
+
+        impl<'de> Visitor<'de> for PluginSourceVisitor {
+            type Value = PluginSource;
+
+            fn expecting(&self, f: &mut fmt::Formatter) -> fmt::Result {
+                f.write_str("a relative-path string or a structured source object")
+            }
+
+            fn visit_str<E>(self, s: &str) -> Result<PluginSource, E>
+            where
+                E: de::Error,
+            {
+                RelativePath::new(s)
+                    .map(PluginSource::RelativePath)
+                    .map_err(de::Error::custom)
+            }
+
+            fn visit_string<E>(self, s: String) -> Result<PluginSource, E>
+            where
+                E: de::Error,
+            {
+                RelativePath::new(s)
+                    .map(PluginSource::RelativePath)
+                    .map_err(de::Error::custom)
+            }
+
+            fn visit_map<A>(self, map: A) -> Result<PluginSource, A::Error>
+            where
+                A: MapAccess<'de>,
+            {
+                StructuredSource::deserialize(MapAccessDeserializer::new(map))
+                    .map(PluginSource::Structured)
+            }
+        }
+
+        deserializer.deserialize_any(PluginSourceVisitor)
+    }
 }
 
 /// Provider-specific structured source descriptor, internally tagged on `"source"`.
@@ -71,7 +126,9 @@ pub enum StructuredSource {
     #[serde(rename = "git-subdir")]
     GitSubdir {
         url: String,
-        path: String,
+        /// The subdir is typed as [`RelativePath`] so traversal cannot even
+        /// exist in-memory — `RelativePath::new` is the only way in.
+        path: RelativePath,
         #[serde(rename = "ref")]
         git_ref: Option<String>,
         sha: Option<String>,
@@ -237,6 +294,62 @@ mod tests {
             }
             other => panic!("expected GitUrl source, got {other:?}"),
         }
+    }
+
+    #[rstest]
+    #[case::relative_path_traversal(
+        br#"{
+            "name": "evil",
+            "owner": { "name": "mallory" },
+            "plugins": [
+                { "name": "p", "source": "../../../etc" }
+            ]
+        }"#
+    )]
+    #[case::relative_path_absolute(
+        br#"{
+            "name": "evil",
+            "owner": { "name": "mallory" },
+            "plugins": [
+                { "name": "p", "source": "/etc/passwd" }
+            ]
+        }"#
+    )]
+    #[case::git_subdir_path_traversal(
+        br#"{
+            "name": "evil",
+            "owner": { "name": "mallory" },
+            "plugins": [{
+                "name": "p",
+                "source": {
+                    "source": "git-subdir",
+                    "url": "https://example.com/r.git",
+                    "path": "../../etc"
+                }
+            }]
+        }"#
+    )]
+    #[case::git_subdir_path_absolute(
+        br#"{
+            "name": "evil",
+            "owner": { "name": "mallory" },
+            "plugins": [{
+                "name": "p",
+                "source": {
+                    "source": "git-subdir",
+                    "url": "https://example.com/r.git",
+                    "path": "/etc/passwd"
+                }
+            }]
+        }"#
+    )]
+    fn reject_unsafe_paths(#[case] json: &[u8]) {
+        let err = Marketplace::from_json(json).expect_err("should reject unsafe path");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("..") || msg.contains("absolute"),
+            "error should mention the reason, got: {msg}"
+        );
     }
 
     #[test]

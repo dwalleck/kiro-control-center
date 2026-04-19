@@ -68,6 +68,49 @@ fn marketplace_list_empty() {
 }
 
 #[test]
+fn stdout_has_no_ansi_escapes_when_piped() {
+    // IsTerminal gate must disable colored output when stdout is not a tty.
+    // `marketplace list` on an empty registry normally includes a `.bold()`
+    // hint, which would emit ANSI escapes if colour were on.
+    let dir = TempDir::new().expect("temp dir");
+    let output = run_in_dir(dir.path(), &["marketplace", "list"]);
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+
+    let out = stdout(&output);
+    assert!(
+        !out.contains('\x1b'),
+        "stdout must not contain ANSI escapes when piped:\n{out:?}"
+    );
+}
+
+#[test]
+fn no_color_env_suppresses_ansi_escapes() {
+    // Even if the user has a TTY, NO_COLOR=1 must disable colour per
+    // https://no-color.org. Integration tests always pipe output, so this
+    // primarily regresses the env-var branch of `force_no_color`.
+    use std::process::Command;
+    let dir = TempDir::new().expect("temp dir");
+    let output = Command::new(common::get_binary())
+        .args(["marketplace", "list"])
+        .current_dir(dir.path())
+        .env("KIRO_MARKET_DATA_DIR", dir.path().join(".data"))
+        .env("NO_COLOR", "1")
+        .output()
+        .expect("run kiro-market");
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let out = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        !out.contains('\x1b'),
+        "NO_COLOR=1 must suppress ANSI escapes:\n{out:?}"
+    );
+}
+
+#[test]
 fn list_no_installed_skills() {
     let dir = TempDir::new().expect("temp dir");
     let output = run_in_dir(dir.path(), &["list"]);
@@ -96,6 +139,27 @@ fn install_missing_marketplace_fails() {
     assert!(
         err.contains("not found"),
         "expected 'not found' in stderr:\n{err}"
+    );
+}
+
+#[test]
+fn update_command_exits_nonzero_while_unimplemented() {
+    // Regression: the top-level `update` command is a documented stub
+    // that previously returned Ok(()), so CI couldn't distinguish
+    // "update succeeded" from "update is not implemented." It must now
+    // exit non-zero so automation notices.
+    let dir = TempDir::new().expect("temp dir");
+    let output = run_in_dir(dir.path(), &["update"]);
+    assert!(
+        !output.status.success(),
+        "unimplemented update must exit non-zero: stdout={} stderr={}",
+        stdout(&output),
+        stderr(&output)
+    );
+    let err = stderr(&output);
+    assert!(
+        err.contains("not yet") || err.contains("not implemented"),
+        "stderr should explain the command is unimplemented: {err}"
     );
 }
 

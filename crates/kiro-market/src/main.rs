@@ -3,12 +3,24 @@
 mod cli;
 mod commands;
 
+use std::io::IsTerminal;
+
 use anyhow::Result;
 use clap::Parser;
 use tracing_subscriber::EnvFilter;
 
 fn main() -> Result<()> {
     let cli = cli::Cli::parse();
+
+    // Disable ANSI color codes when stdout is redirected to a file/pipe
+    // (ls > out.log, kiro-market list | less) or when the user has set
+    // NO_COLOR (https://no-color.org/). The `colored` crate does a best
+    // effort itself, but setting this explicitly is less fragile than
+    // relying on auto-detection and keeps behaviour testable.
+    let force_no_color = std::env::var_os("NO_COLOR").is_some() || !std::io::stdout().is_terminal();
+    if force_no_color {
+        colored::control::set_override(false);
+    }
 
     let default_filter = match cli.verbose {
         0 => "kiro_market=info",

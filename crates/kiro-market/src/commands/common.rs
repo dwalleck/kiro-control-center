@@ -20,20 +20,25 @@ pub fn find_plugin_entry(
 ) -> Result<PluginEntry> {
     let manifest_path = marketplace_path.join(kiro_market_core::MARKETPLACE_MANIFEST_PATH);
 
+    // Allowlist: only NotFound means "manifest is absent, scan instead."
+    // Every other io::Error (PermissionDenied, EIO, EISDIR, Interrupted,
+    // ENOSPC...) indicates the cache is broken and must surface — silently
+    // scanning masks a real filesystem problem as "plugin not found."
+    // Malformed JSON similarly surfaces rather than falling back.
     match fs::read(&manifest_path) {
         Ok(bytes) => match Marketplace::from_json(&bytes) {
             Ok(manifest) => {
                 if let Some(entry) = manifest.plugins.into_iter().find(|p| p.name == plugin_name) {
                     return Ok(entry);
                 }
-                // Plugin not in manifest — fall through to scan.
+                // Plugin not in the manifest — fall through to the scan.
+                // The manifest may be out of date with what's on disk.
             }
             Err(e) => {
-                warn!(
-                    path = %manifest_path.display(),
-                    error = %e,
-                    "marketplace.json is malformed, falling back to plugin scan"
-                );
+                return Err(anyhow::Error::new(e).context(format!(
+                    "marketplace.json at {} is malformed",
+                    manifest_path.display()
+                )));
             }
         },
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -43,35 +48,32 @@ pub fn find_plugin_entry(
             );
         }
         Err(e) => {
-            warn!(
-                path = %manifest_path.display(),
-                error = %e,
-                "failed to read marketplace.json, falling back to plugin scan"
-            );
-            // Still fall through to scan -- the manifest may be optional.
-            // But propagate permission errors instead of silently scanning.
-            if e.kind() == std::io::ErrorKind::PermissionDenied {
-                anyhow::bail!("permission denied reading {}: {e}", manifest_path.display());
-            }
+            return Err(anyhow::Error::new(e).context(format!(
+                "failed to read marketplace.json at {}",
+                manifest_path.display()
+            )));
         }
     }
 
     // Fall back to scanning for plugin.json. Surface a read failure as an
     // error rather than masking it as "plugin not found".
-    let discovered =
-        kiro_market_core::plugin::discover_plugins(marketplace_path, 3).with_context(|| {
-            format!(
-                "failed to scan marketplace at {}",
-                marketplace_path.display()
-            )
-        })?;
+    let discovered = kiro_market_core::plugin::discover_plugins(
+        marketplace_path,
+        kiro_market_core::plugin::DEFAULT_DISCOVERY_MAX_DEPTH,
+    )
+    .with_context(|| {
+        format!(
+            "failed to scan marketplace at {}",
+            marketplace_path.display()
+        )
+    })?;
     if let Some(dp) = discovered.into_iter().find(|dp| dp.name() == plugin_name) {
+        let rel = kiro_market_core::validation::RelativePath::new(dp.as_relative_path_string())
+            .expect("discovered plugin paths are always valid relative paths");
         return Ok(PluginEntry {
             name: dp.name().to_owned(),
             description: dp.description().map(String::from),
-            source: kiro_market_core::marketplace::PluginSource::RelativePath(
-                dp.as_relative_path_string(),
-            ),
+            source: kiro_market_core::marketplace::PluginSource::RelativePath(rel),
         });
     }
 
@@ -191,7 +193,7 @@ mod tests {
         assert!(
             matches!(
                 &entry.source,
-                kiro_market_core::marketplace::PluginSource::RelativePath(p) if p.contains("discovered")
+                kiro_market_core::marketplace::PluginSource::RelativePath(p) if p.as_str().contains("discovered")
             ),
             "source should be a RelativePath: {:?}",
             entry.source
@@ -210,6 +212,28 @@ mod tests {
             .expect("should find unlisted via scan");
 
         assert_eq!(entry.name, "unlisted");
+    }
+
+    #[test]
+    fn find_plugin_entry_errors_on_malformed_manifest() {
+        // Regression: previously a malformed marketplace.json would warn!
+        // and silently fall through to a scan, conflating "cache broken"
+        // with "plugin not found." Allowlist-style handling requires
+        // malformed JSON to surface as an error.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+        let mp_dir = root.join(".claude-plugin");
+        fs::create_dir_all(&mp_dir).expect("create .claude-plugin");
+        fs::write(mp_dir.join("marketplace.json"), b"{ not valid json")
+            .expect("write bad manifest");
+
+        let err = find_plugin_entry(root, "anything", "test-market")
+            .expect_err("malformed manifest should error, not fall through");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("malformed") || msg.contains("marketplace.json"),
+            "error chain should mention the manifest: {msg}"
+        );
     }
 
     #[test]

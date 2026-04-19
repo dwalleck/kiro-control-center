@@ -58,6 +58,12 @@ pub enum PluginError {
     /// The plugin declares no skills.
     #[error("plugin `{name}` has no skills")]
     NoSkills { name: String },
+
+    /// The plugin directory referenced by a `RelativePath` source does not
+    /// exist on disk. Typically means the marketplace manifest points at a
+    /// directory that was never committed or was deleted.
+    #[error("plugin directory does not exist: {path}")]
+    DirectoryMissing { path: PathBuf },
 }
 
 // ---------------------------------------------------------------------------

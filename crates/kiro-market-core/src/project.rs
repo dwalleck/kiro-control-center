@@ -410,6 +410,38 @@ impl KiroProject {
         mapped_tools: &[MappedTool],
         meta: InstalledAgentMeta,
     ) -> crate::error::Result<()> {
+        self.install_agent_inner(def, mapped_tools, meta, false)
+    }
+
+    /// Install a parsed agent, overwriting any existing agent of the same
+    /// name. Mirrors [`install_skill_from_dir_force`] for the agent path so
+    /// the CLI's `--force` flag can honor its documented contract.
+    ///
+    /// If an agent with the same name is already tracked, its JSON + prompt
+    /// files are removed before the new ones are renamed into place. Orphaned
+    /// files on disk (no tracking entry) are also removed rather than
+    /// rejected, since the caller has explicitly opted into overwrite.
+    ///
+    /// # Errors
+    ///
+    /// - Validation errors for unsafe names.
+    /// - I/O errors or JSON serialization failures.
+    pub fn install_agent_force(
+        &self,
+        def: &AgentDefinition,
+        mapped_tools: &[MappedTool],
+        meta: InstalledAgentMeta,
+    ) -> crate::error::Result<()> {
+        self.install_agent_inner(def, mapped_tools, meta, true)
+    }
+
+    fn install_agent_inner(
+        &self,
+        def: &AgentDefinition,
+        mapped_tools: &[MappedTool],
+        meta: InstalledAgentMeta,
+        force: bool,
+    ) -> crate::error::Result<()> {
         validation::validate_name(&def.name)?;
 
         // CPU-bound work outside the lock to keep the critical section short.
@@ -420,7 +452,7 @@ impl KiroProject {
             &self.agent_tracking_path(),
             || -> crate::error::Result<()> {
                 let mut installed = self.load_installed_agents()?;
-                if installed.agents.contains_key(&def.name) {
+                if !force && installed.agents.contains_key(&def.name) {
                     return Err(AgentError::AlreadyInstalled {
                         name: def.name.clone(),
                     }
@@ -451,12 +483,24 @@ impl KiroProject {
                 let json_target = self.agents_dir().join(format!("{}.json", def.name));
                 let prompt_target = self.agent_prompts_dir().join(format!("{}.md", def.name));
 
-                // Tracking is authoritative: duplicate detection above rejects
-                // already-installed agents. But a prior crash could leave
-                // orphaned files on disk without a tracking entry. Refuse to
-                // silently clobber — the user should either manually clean up
-                // or a future `install_agent_force` can handle it explicitly.
-                if json_target.exists() || prompt_target.exists() {
+                if force {
+                    // Remove existing targets before rename. Required for
+                    // Windows (rename fails on existing dest) and makes the
+                    // Unix path explicit rather than relying on rename's
+                    // replace-on-Unix behaviour. Missing-file is fine.
+                    for p in [&json_target, &prompt_target] {
+                        if let Err(e) = fs::remove_file(p)
+                            && e.kind() != std::io::ErrorKind::NotFound
+                        {
+                            remove_staging_dir(&staging);
+                            return Err(e.into());
+                        }
+                    }
+                } else if json_target.exists() || prompt_target.exists() {
+                    // Non-force install: a prior crash could leave orphaned
+                    // files on disk without a tracking entry. Refuse to
+                    // silently clobber — the user either manually cleans up
+                    // or re-invokes with `install_agent_force`.
                     remove_staging_dir(&staging);
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::AlreadyExists,
@@ -520,7 +564,7 @@ impl KiroProject {
                     return Err(e);
                 }
 
-                debug!(name = %def.name, "agent installed");
+                debug!(name = %def.name, force, "agent installed");
                 Ok(())
             },
         )
@@ -873,6 +917,95 @@ mod tests {
             err,
             crate::error::Error::Agent(AgentError::AlreadyInstalled { .. })
         ));
+    }
+
+    #[test]
+    fn install_agent_force_overwrites_existing_tracked_agent() {
+        let (_dir, project) = temp_project();
+        let src_tmp = tempfile::tempdir().unwrap();
+        let src_v1 = write_agent(
+            src_tmp.path(),
+            "rev",
+            "---\nname: rev\n---\nversion one body\n",
+        );
+        let (def_v1, mapped_v1) = parse_and_map(&src_v1);
+        project
+            .install_agent(&def_v1, &mapped_v1, sample_agent_meta())
+            .expect("first install");
+
+        let src_v2 = write_agent(
+            src_tmp.path(),
+            "rev2",
+            "---\nname: rev\n---\nversion two body\n",
+        );
+        let (def_v2, mapped_v2) = parse_and_map(&src_v2);
+        project
+            .install_agent_force(&def_v2, &mapped_v2, sample_agent_meta())
+            .expect("force install should overwrite");
+
+        let prompt = fs::read_to_string(project.root.join(".kiro/agents/prompts/rev.md")).unwrap();
+        assert!(
+            prompt.contains("version two body"),
+            "prompt should be replaced with v2, got: {prompt}"
+        );
+    }
+
+    #[test]
+    fn install_agent_force_overwrites_orphaned_files() {
+        // Pre-plant orphan files (no tracking entry) — force install must
+        // clean them up rather than error with AlreadyExists.
+        let (_dir, project) = temp_project();
+        fs::create_dir_all(project.root.join(".kiro/agents/prompts")).unwrap();
+        fs::write(project.root.join(".kiro/agents/orphan.json"), b"{}").unwrap();
+        fs::write(
+            project.root.join(".kiro/agents/prompts/orphan.md"),
+            b"stale prompt",
+        )
+        .unwrap();
+
+        let src_tmp = tempfile::tempdir().unwrap();
+        let src = write_agent(
+            src_tmp.path(),
+            "orphan",
+            "---\nname: orphan\n---\nfresh body\n",
+        );
+        let (def, mapped) = parse_and_map(&src);
+
+        project
+            .install_agent_force(&def, &mapped, sample_agent_meta())
+            .expect("force install should overwrite orphans");
+
+        let prompt =
+            fs::read_to_string(project.root.join(".kiro/agents/prompts/orphan.md")).unwrap();
+        assert!(prompt.contains("fresh body"), "got: {prompt}");
+    }
+
+    #[test]
+    fn install_agent_force_still_rejects_unsafe_name() {
+        // --force is not a bypass for name validation. The parser rejects
+        // unsafe names at frontmatter time, so construct the definition
+        // directly to exercise the validate_name guard inside install_agent_inner.
+        let (_dir, project) = temp_project();
+        let def = AgentDefinition {
+            name: "../escape".to_string(),
+            description: None,
+            prompt_body: "body".to_string(),
+            model: None,
+            source_tools: Vec::new(),
+            mcp_servers: std::collections::BTreeMap::new(),
+            dialect: AgentDialect::Claude,
+        };
+
+        let err = project
+            .install_agent_force(&def, &[], sample_agent_meta())
+            .expect_err("unsafe name must be rejected under force");
+        assert!(
+            matches!(
+                err,
+                crate::error::Error::Validation(crate::error::ValidationError::InvalidName { .. })
+            ),
+            "expected InvalidName, got: {err:?}"
+        );
     }
 
     #[test]

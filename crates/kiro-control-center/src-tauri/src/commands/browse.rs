@@ -11,7 +11,7 @@ use kiro_market_core::git::GixCliBackend;
 use kiro_market_core::marketplace::{PluginEntry, PluginSource, StructuredSource};
 use kiro_market_core::plugin::{discover_skill_dirs, PluginManifest};
 use kiro_market_core::project::KiroProject;
-use kiro_market_core::service::{InstallFilter, MarketplaceService};
+use kiro_market_core::service::{InstallFilter, InstallMode, MarketplaceService};
 use kiro_market_core::skill::parse_frontmatter;
 
 use crate::error::{CommandError, ErrorType};
@@ -267,7 +267,7 @@ pub async fn install_skills(
         &project,
         &skill_dirs,
         &InstallFilter::Names(&skills),
-        force,
+        InstallMode::from(force),
         &marketplace,
         &plugin,
         version.as_deref(),
@@ -514,7 +514,9 @@ mod tests {
 
     #[test]
     fn plugin_source_type_relative_path() {
-        let source = PluginSource::RelativePath("./plugins/dotnet".into());
+        let source = PluginSource::RelativePath(
+            kiro_market_core::validation::RelativePath::new("./plugins/dotnet").unwrap(),
+        );
         assert!(matches!(plugin_source_type(&source), SourceType::Relative));
     }
 
@@ -542,7 +544,7 @@ mod tests {
     fn plugin_source_type_git_subdir() {
         let source = PluginSource::Structured(StructuredSource::GitSubdir {
             url: "https://example.com/repo.git".into(),
-            path: "plugins/foo".into(),
+            path: kiro_market_core::validation::RelativePath::new("plugins/foo").unwrap(),
             git_ref: None,
             sha: None,
         });
@@ -562,7 +564,9 @@ mod tests {
         let entry = PluginEntry {
             name: "my-plugin".into(),
             description: None,
-            source: PluginSource::RelativePath("plugins/my-plugin".into()),
+            source: PluginSource::RelativePath(
+                kiro_market_core::validation::RelativePath::new("plugins/my-plugin").unwrap(),
+            ),
         };
 
         let result = resolve_local_plugin_dir(&entry, tmp.path());
@@ -577,7 +581,9 @@ mod tests {
         let entry = PluginEntry {
             name: "missing-plugin".into(),
             description: None,
-            source: PluginSource::RelativePath("plugins/missing-plugin".into()),
+            source: PluginSource::RelativePath(
+                kiro_market_core::validation::RelativePath::new("plugins/missing-plugin").unwrap(),
+            ),
         };
 
         let result = resolve_local_plugin_dir(&entry, tmp.path());
