@@ -1,6 +1,26 @@
 use std::path::Path;
 use std::process::Command;
 
+/// Run `git <args>` in `dir` with deterministic author identity, asserting
+/// success. Shared between fixture setup and update helpers so we only have
+/// one place that understands the test-git environment.
+fn git_run(dir: &Path, args: &[&str]) {
+    let output = Command::new("git")
+        .args(args)
+        .current_dir(dir)
+        .env("GIT_AUTHOR_NAME", "Test")
+        .env("GIT_AUTHOR_EMAIL", "test@example.com")
+        .env("GIT_COMMITTER_NAME", "Test")
+        .env("GIT_COMMITTER_EMAIL", "test@example.com")
+        .output()
+        .expect("git command should run");
+    assert!(
+        output.status.success(),
+        "git {args:?} failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 /// Create a local git repository containing a valid marketplace manifest
 /// with one plugin that has one skill.
 pub fn create_marketplace_repo(dir: &Path) {
@@ -42,31 +62,18 @@ pub fn create_marketplace_repo(dir: &Path) {
     )
     .expect("write SKILL.md");
 
-    let run = |args: &[&str]| {
-        let output = Command::new("git")
-            .args(args)
-            .current_dir(dir)
-            .env("GIT_AUTHOR_NAME", "Test")
-            .env("GIT_AUTHOR_EMAIL", "test@example.com")
-            .env("GIT_COMMITTER_NAME", "Test")
-            .env("GIT_COMMITTER_EMAIL", "test@example.com")
-            .output()
-            .expect("git command should run");
-        assert!(
-            output.status.success(),
-            "git {args:?} failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-    };
-    run(&["init"]);
-    run(&["add", "."]);
-    run(&[
-        "-c",
-        "commit.gpgsign=false",
-        "commit",
-        "-m",
-        "initial marketplace",
-    ]);
+    git_run(dir, &["init"]);
+    git_run(dir, &["add", "."]);
+    git_run(
+        dir,
+        &[
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-m",
+            "initial marketplace",
+        ],
+    );
 }
 
 /// Add a second commit to an existing marketplace repo to simulate an update.
@@ -78,28 +85,15 @@ pub fn add_marketplace_update(dir: &Path) {
     )
     .expect("write updated SKILL.md");
 
-    let run = |args: &[&str]| {
-        let output = Command::new("git")
-            .args(args)
-            .current_dir(dir)
-            .env("GIT_AUTHOR_NAME", "Test")
-            .env("GIT_AUTHOR_EMAIL", "test@example.com")
-            .env("GIT_COMMITTER_NAME", "Test")
-            .env("GIT_COMMITTER_EMAIL", "test@example.com")
-            .output()
-            .expect("git command should run");
-        assert!(
-            output.status.success(),
-            "git {args:?} failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
-    };
-    run(&["add", "."]);
-    run(&[
-        "-c",
-        "commit.gpgsign=false",
-        "commit",
-        "-m",
-        "update marketplace",
-    ]);
+    git_run(dir, &["add", "."]);
+    git_run(
+        dir,
+        &[
+            "-c",
+            "commit.gpgsign=false",
+            "commit",
+            "-m",
+            "update marketplace",
+        ],
+    );
 }

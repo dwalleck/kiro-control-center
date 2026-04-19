@@ -1,5 +1,7 @@
 //! `marketplace` subcommand: add, list, update, and remove marketplace sources.
 
+use std::io::Write;
+
 use anyhow::{Context, Result};
 use colored::Colorize;
 use kiro_market_core::cache::CacheDir;
@@ -29,6 +31,9 @@ fn add(
     protocol: kiro_market_core::git::GitProtocol,
 ) -> Result<()> {
     print!("  Adding marketplace...");
+    // stdout is line-buffered when attached to a terminal; without flush
+    // the "..." appears only after the clone completes.
+    let _ = std::io::stdout().flush();
     let result = svc
         .add(source, protocol)
         .context("failed to add marketplace")?;

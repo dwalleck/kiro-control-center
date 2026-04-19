@@ -9,7 +9,7 @@ use kiro_market_core::cache::CacheDir;
 use kiro_market_core::marketplace::{Marketplace, PluginSource};
 use kiro_market_core::plugin::discover_skill_dirs;
 use kiro_market_core::skill::{SkillFrontmatter, parse_frontmatter};
-use tracing::debug;
+use tracing::{debug, warn};
 
 /// Run the search command.
 ///
@@ -32,6 +32,7 @@ pub fn run(query: Option<&str>) -> Result<()> {
 
     let query_lower = query.map(str::to_lowercase);
     let mut match_count = 0u32;
+    let mut skipped_marketplaces: Vec<String> = Vec::new();
 
     for entry in &entries {
         let marketplace_path = cache.marketplace_path(&entry.name);
@@ -39,12 +40,24 @@ pub fn run(query: Option<&str>) -> Result<()> {
 
         let manifest_bytes = match fs::read(&manifest_path) {
             Ok(bytes) => bytes,
-            Err(e) => {
+            // Missing manifest is quiet — a newly added marketplace may
+            // legitimately not have one yet. Other io errors are upgraded
+            // to warn and surface to the user so "no results" doesn't
+            // silently mask a broken cache.
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 debug!(
+                    marketplace = %entry.name,
+                    "no marketplace manifest; skipping"
+                );
+                continue;
+            }
+            Err(e) => {
+                warn!(
                     marketplace = %entry.name,
                     error = %e,
                     "failed to read marketplace manifest, skipping"
                 );
+                skipped_marketplaces.push(entry.name.clone());
                 continue;
             }
         };
@@ -52,11 +65,12 @@ pub fn run(query: Option<&str>) -> Result<()> {
         let manifest = match Marketplace::from_json(&manifest_bytes) {
             Ok(m) => m,
             Err(e) => {
-                debug!(
+                warn!(
                     marketplace = %entry.name,
                     error = %e,
                     "failed to parse marketplace manifest, skipping"
                 );
+                skipped_marketplaces.push(entry.name.clone());
                 continue;
             }
         };
@@ -70,6 +84,14 @@ pub fn run(query: Option<&str>) -> Result<()> {
                 match_count,
             );
         }
+    }
+
+    for name in &skipped_marketplaces {
+        eprintln!(
+            "  {} search coverage incomplete: could not read marketplace '{}'",
+            "!".yellow().bold(),
+            name
+        );
     }
 
     if match_count == 0 {

@@ -661,13 +661,15 @@ mod tests {
             crate::marketplace::PluginEntry {
                 name: "dotnet".into(),
                 description: Some("Core .NET skills".into()),
-                source: crate::marketplace::PluginSource::RelativePath("./plugins/dotnet".into()),
+                source: crate::marketplace::PluginSource::RelativePath(
+                    crate::validation::RelativePath::new("./plugins/dotnet").unwrap(),
+                ),
             },
             crate::marketplace::PluginEntry {
                 name: "dotnet-experimental".into(),
                 description: Some("Experimental skills".into()),
                 source: crate::marketplace::PluginSource::RelativePath(
-                    "./plugins/dotnet-experimental".into(),
+                    crate::validation::RelativePath::new("./plugins/dotnet-experimental").unwrap(),
                 ),
             },
         ];
@@ -706,7 +708,9 @@ mod tests {
         let entries = vec![crate::marketplace::PluginEntry {
             name: "dotnet".into(),
             description: Some("Core .NET skills".into()),
-            source: crate::marketplace::PluginSource::RelativePath("./plugins/dotnet".into()),
+            source: crate::marketplace::PluginSource::RelativePath(
+                crate::validation::RelativePath::new("./plugins/dotnet").unwrap(),
+            ),
         }];
 
         cache

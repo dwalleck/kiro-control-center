@@ -4,7 +4,7 @@ use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use tracing::warn;
+use tracing::{debug, warn};
 
 /// Files commonly found in `agents/` directories that are documentation,
 /// not agents. Compared case-insensitively so `readme.md` is also excluded.
@@ -73,7 +73,28 @@ pub fn discover_agents_in_dirs(plugin_dir: &Path, scan_paths: &[String]) -> Vec<
                 }
             };
             let path = entry.path();
-            if !path.is_file() {
+            // Use symlink_metadata (does NOT follow symlinks) so a malicious
+            // plugin cannot smuggle in an agent path that reads arbitrary
+            // files via parse_agent_file. Matches project::copy_dir_recursive.
+            let file_type = match fs::symlink_metadata(&path) {
+                Ok(m) => m.file_type(),
+                Err(e) => {
+                    warn!(
+                        path = %path.display(),
+                        error = %e,
+                        "failed to stat agent candidate; skipping"
+                    );
+                    continue;
+                }
+            };
+            if file_type.is_symlink() {
+                debug!(
+                    path = %path.display(),
+                    "skipping symlink in agent scan directory"
+                );
+                continue;
+            }
+            if !file_type.is_file() {
                 continue;
             }
             let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
@@ -239,6 +260,32 @@ mod tests {
             .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
             .collect();
         assert_eq!(names, vec!["legit.md"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn discover_skips_symlinked_agent_files() {
+        // A malicious plugin could drop a symlink `agents/evil.md -> /etc/passwd`.
+        // discover_agents_in_dirs must refuse to surface it as an agent file.
+        let tmp = tempdir().unwrap();
+        let agents = tmp.path().join("agents");
+        fs::create_dir_all(&agents).unwrap();
+        fs::write(agents.join("legit.md"), "---\nname: ok\n---\n").unwrap();
+
+        let target = tmp.path().join("secret.md");
+        fs::write(&target, "---\nname: secret\n---\nclassified\n").unwrap();
+        std::os::unix::fs::symlink(&target, agents.join("evil.md")).unwrap();
+
+        let found = discover_agents_in_dirs(tmp.path(), &["./agents/".to_string()]);
+        let names: Vec<_> = found
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(
+            names,
+            vec!["legit.md"],
+            "symlinked agent must not appear in discovery output"
+        );
     }
 
     #[test]
