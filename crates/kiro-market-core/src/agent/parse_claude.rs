@@ -29,8 +29,8 @@ struct ClaudeFrontmatter {
 /// path and lifts into `AgentError::ParseFailed`.
 pub fn parse_claude_agent(content: &str) -> Result<AgentDefinition, ParseFailure> {
     let (yaml_block, body) = split_frontmatter(content)?;
-    let fm: ClaudeFrontmatter =
-        serde_yaml::from_str(yaml_block).map_err(|e| ParseFailure::InvalidYaml(e.to_string()))?;
+    let fm: ClaudeFrontmatter = serde_yaml_ng::from_str(yaml_block)
+        .map_err(|e| ParseFailure::InvalidYaml(e.to_string()))?;
 
     let name = fm.name.ok_or(ParseFailure::MissingName)?;
     // Validate the name at parse time so downstream fs operations (and the

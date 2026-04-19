@@ -40,7 +40,7 @@ struct CopilotFrontmatter {
 pub fn parse_copilot_agent(content: &str) -> Result<AgentDefinition, ParseFailure> {
     let (yaml, body) = split_frontmatter(content)?;
     let fm: CopilotFrontmatter =
-        serde_yaml::from_str(yaml).map_err(|e| ParseFailure::InvalidYaml(e.to_string()))?;
+        serde_yaml_ng::from_str(yaml).map_err(|e| ParseFailure::InvalidYaml(e.to_string()))?;
 
     let name = fm.name.ok_or(ParseFailure::MissingName)?;
     // Validate the name at parse time so downstream fs operations (and the

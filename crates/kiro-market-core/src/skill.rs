@@ -63,7 +63,7 @@ pub fn parse_frontmatter(content: &str) -> Result<(SkillFrontmatter, usize), Par
     let yaml_block = &after_open[..close_pos];
 
     let frontmatter: SkillFrontmatter =
-        serde_yaml::from_str(yaml_block).map_err(|e| ParseError::InvalidYaml(e.to_string()))?;
+        serde_yaml_ng::from_str(yaml_block).map_err(|e| ParseError::InvalidYaml(e.to_string()))?;
 
     // Calculate the byte offset where the body starts (after closing `---` and its newline).
     let close_fence_start =
