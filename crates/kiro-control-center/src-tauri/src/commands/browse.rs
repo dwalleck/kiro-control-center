@@ -246,8 +246,13 @@ pub async fn list_all_skills_for_marketplace(
     let project = KiroProject::new(PathBuf::from(&project_path));
     let installed = load_installed_or_error(&project, &project_path)?;
 
-    let mut skills: Vec<SkillInfo> = Vec::new();
-    let mut skipped: Vec<SkippedPlugin> = Vec::new();
+    // Pre-allocate with `plugin_entries.len()` as a baseline — `skills`
+    // typically grows well past that (multiple skills per plugin) and
+    // `skipped` is bounded above by it. A rough capacity avoids the first
+    // few reallocations in the common case; exact-fit isn't possible without
+    // a second pass.
+    let mut skills: Vec<SkillInfo> = Vec::with_capacity(plugin_entries.len());
+    let mut skipped: Vec<SkippedPlugin> = Vec::with_capacity(plugin_entries.len());
 
     for plugin_entry in &plugin_entries {
         match collect_skills_for_plugin(
@@ -424,6 +429,7 @@ fn collect_skills_for_plugin(
     let plugin_manifest =
         load_plugin_manifest(&plugin_dir).map_err(CollectSkillsError::MalformedManifest)?;
     let skill_dirs = discover_skills_for_plugin(&plugin_dir, plugin_manifest.as_ref());
+    out.reserve(skill_dirs.len());
 
     for skill_dir in &skill_dirs {
         let skill_md_path = skill_dir.join("SKILL.md");
