@@ -155,6 +155,83 @@ impl MarketplaceService {
         )?;
         Ok(out)
     }
+
+    /// List every skill across every plugin in a marketplace,
+    /// cross-referenced with the project's installed set.
+    ///
+    /// Plugin-level errors (missing directory, malformed manifest,
+    /// remote source) are folded into [`BulkSkillsResult::skipped`]
+    /// so a single bad plugin doesn't hide its siblings. Per-skill
+    /// errors inside a working plugin are still warned-and-skipped,
+    /// matching [`Self::list_skills_for_plugin`].
+    ///
+    /// The `skills` and `skipped` vectors are pre-allocated with the
+    /// plugin count as a baseline — `skills` usually grows past it
+    /// (multiple skills per plugin) and `skipped` is bounded above
+    /// by it, so this avoids the first few reallocations in the
+    /// common case.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`Error::Marketplace`] / [`Error::Plugin`] from
+    /// [`Self::list_plugin_entries`] when the marketplace is unknown
+    /// or its manifest is corrupt. Non-plugin-level errors during
+    /// iteration propagate; plugin-level errors go to `skipped`.
+    pub fn list_all_skills(
+        &self,
+        marketplace: &str,
+        installed: &InstalledSkills,
+    ) -> Result<BulkSkillsResult, Error> {
+        let marketplace_path = self.marketplace_path(marketplace);
+        let plugin_entries = self.list_plugin_entries(marketplace)?;
+
+        let mut skills: Vec<SkillInfo> = Vec::with_capacity(plugin_entries.len());
+        let mut skipped: Vec<SkippedPlugin> = Vec::with_capacity(plugin_entries.len());
+
+        for plugin_entry in &plugin_entries {
+            match collect_skills_for_plugin_into(
+                self,
+                plugin_entry,
+                &marketplace_path,
+                marketplace,
+                installed,
+                &mut skills,
+            ) {
+                Ok(()) => {}
+                Err(err) if is_plugin_level_skip(&err) => {
+                    let reason = err.to_string();
+                    warn!(
+                        plugin = %plugin_entry.name,
+                        error = %reason,
+                        "skipping plugin in bulk skill listing"
+                    );
+                    skipped.push(SkippedPlugin {
+                        name: plugin_entry.name.clone(),
+                        reason,
+                    });
+                }
+                Err(other) => return Err(other),
+            }
+        }
+
+        Ok(BulkSkillsResult { skills, skipped })
+    }
+}
+
+/// Is this error one that the bulk path should fold into `skipped`
+/// rather than propagate? `true` for plugin-level resolution failures
+/// (missing directory, malformed manifest, remote source); `false`
+/// for anything else — corrupt marketplace state, unexpected I/O
+/// errors, etc., which must surface so callers see them.
+fn is_plugin_level_skip(err: &Error) -> bool {
+    matches!(
+        err,
+        Error::Plugin(
+            PluginError::DirectoryMissing { .. }
+                | PluginError::InvalidManifest { .. }
+                | PluginError::RemoteSourceNotLocal { .. }
+        )
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -532,6 +609,81 @@ mod tests {
         assert!(
             matches!(err, Error::Marketplace(_)),
             "expected Error::Marketplace, got: {err:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // list_all_skills (bulk public API)
+    // -----------------------------------------------------------------------
+
+    /// Build a plugin-registry-backed marketplace so the bulk path can
+    /// enumerate entries without a real `marketplace.json`.
+    ///
+    /// Reconstructs a sibling `CacheDir` pointing at the same root the
+    /// service was built with — `CacheDir` is stateless, so this is a
+    /// safe end-run around the service's private cache field without
+    /// exposing it.
+    fn seed_marketplace_with_registry(
+        cache_root: &Path,
+        svc: &MarketplaceService,
+        marketplace_name: &str,
+        entries: &[PluginEntry],
+    ) -> PathBuf {
+        let marketplace_path = svc.marketplace_path(marketplace_name);
+        fs::create_dir_all(&marketplace_path).expect("create marketplace root");
+        let cache = CacheDir::with_root(cache_root.to_path_buf());
+        cache
+            .write_plugin_registry(marketplace_name, entries)
+            .expect("write plugin registry");
+        marketplace_path
+    }
+
+    #[test]
+    fn list_all_skills_happy_path_enumerates_across_plugins() {
+        let (dir, svc) = temp_service();
+        let entries = vec![
+            relative_path_entry("alpha-plug", "plugins/alpha-plug"),
+            relative_path_entry("beta-plug", "plugins/beta-plug"),
+        ];
+        let marketplace_path = seed_marketplace_with_registry(dir.path(), &svc, "mp1", &entries);
+        make_plugin_with_skills(&marketplace_path, "alpha-plug", &["skill-a1", "skill-a2"]);
+        make_plugin_with_skills(&marketplace_path, "beta-plug", &["skill-b1"]);
+
+        let installed = InstalledSkills::default();
+        let result = svc.list_all_skills("mp1", &installed).expect("happy path");
+
+        assert_eq!(result.skills.len(), 3);
+        assert!(result.skipped.is_empty());
+        assert!(result.skills.iter().any(|s| s.name == "skill-a1"));
+        assert!(result.skills.iter().any(|s| s.name == "skill-a2"));
+        assert!(result.skills.iter().any(|s| s.name == "skill-b1"));
+    }
+
+    #[test]
+    fn list_all_skills_skips_one_broken_plugin_keeps_the_rest() {
+        let (dir, svc) = temp_service();
+        let entries = vec![
+            relative_path_entry("good", "plugins/good"),
+            relative_path_entry("ghost", "plugins/ghost"),
+        ];
+        let marketplace_path = seed_marketplace_with_registry(dir.path(), &svc, "mp1", &entries);
+        make_plugin_with_skills(&marketplace_path, "good", &["alpha"]);
+        // Deliberately do not create `plugins/ghost` — it must land in
+        // `skipped` rather than cause the whole bulk call to fail.
+
+        let installed = InstalledSkills::default();
+        let result = svc
+            .list_all_skills("mp1", &installed)
+            .expect("bulk call must succeed despite one broken plugin");
+
+        assert_eq!(result.skills.len(), 1);
+        assert_eq!(result.skills[0].name, "alpha");
+        assert_eq!(result.skipped.len(), 1);
+        assert_eq!(result.skipped[0].name, "ghost");
+        assert!(
+            result.skipped[0].reason.contains("does not exist"),
+            "skipped reason should name the failure mode, got: {}",
+            result.skipped[0].reason
         );
     }
 }
