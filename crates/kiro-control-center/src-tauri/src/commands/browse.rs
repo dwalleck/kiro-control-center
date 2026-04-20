@@ -230,6 +230,100 @@ pub async fn list_available_skills(
     Ok(results)
 }
 
+/// List all skills across every plugin in a marketplace, cross-referenced
+/// with installed state.
+///
+/// Bulk alternative to calling [`list_available_skills`] per plugin when no
+/// plugin filter is active. Does one `load_installed` up front instead of
+/// N (one per plugin), and folds plugin-level I/O errors (missing directory,
+/// malformed manifest, unreadable `SKILL.md`) into `warn` logs rather than
+/// failing the whole call — the worst case is a partial listing that mirrors
+/// what the per-plugin path would produce if the user walked the grid
+/// manually.
+#[tauri::command]
+#[specta::specta]
+pub async fn list_all_skills_for_marketplace(
+    marketplace: String,
+    project_path: String,
+) -> Result<Vec<SkillInfo>, CommandError> {
+    let svc = make_service()?;
+    let marketplace_path = svc.marketplace_path(&marketplace);
+    let plugin_entries = svc
+        .list_plugin_entries(&marketplace)
+        .map_err(CommandError::from)?;
+
+    let project = KiroProject::new(PathBuf::from(&project_path));
+    let installed = project.load_installed().map_err(CommandError::from)?;
+
+    let mut results: Vec<SkillInfo> = Vec::new();
+
+    for plugin_entry in &plugin_entries {
+        let plugin_dir = match resolve_local_plugin_dir(plugin_entry, &marketplace_path) {
+            Ok(d) => d,
+            Err(e) => {
+                warn!(
+                    plugin = %plugin_entry.name,
+                    error = %e.message,
+                    "skipping plugin in bulk skill listing"
+                );
+                continue;
+            }
+        };
+
+        let plugin_manifest = match load_plugin_manifest(&plugin_dir) {
+            Ok(m) => m,
+            Err(e) => {
+                warn!(
+                    plugin = %plugin_entry.name,
+                    error = %e.message,
+                    "skipping plugin with malformed manifest in bulk skill listing"
+                );
+                continue;
+            }
+        };
+
+        let skill_dirs = discover_skills_for_plugin(&plugin_dir, plugin_manifest.as_ref());
+
+        for skill_dir in &skill_dirs {
+            let skill_md_path = skill_dir.join("SKILL.md");
+            let content = match fs::read_to_string(&skill_md_path) {
+                Ok(c) => c,
+                Err(e) => {
+                    warn!(
+                        path = %skill_md_path.display(),
+                        error = %e,
+                        "failed to read SKILL.md, skipping"
+                    );
+                    continue;
+                }
+            };
+
+            let (frontmatter, _body_offset) = match parse_frontmatter(&content) {
+                Ok(result) => result,
+                Err(e) => {
+                    warn!(
+                        path = %skill_md_path.display(),
+                        error = %e,
+                        "failed to parse SKILL.md frontmatter, skipping"
+                    );
+                    continue;
+                }
+            };
+
+            let is_installed = installed.skills.contains_key(&frontmatter.name);
+            results.push(SkillInfo {
+                name: frontmatter.name,
+                description: frontmatter.description,
+                plugin: plugin_entry.name.clone(),
+                marketplace: marketplace.clone(),
+                installed: is_installed,
+            });
+        }
+    }
+
+    Ok(results)
+}
+
 /// Install specific skills from a plugin into a Kiro project.
 #[tauri::command]
 #[specta::specta]

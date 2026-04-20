@@ -10,6 +10,19 @@ export const commands = {
 	listPlugins: (marketplace: string) => typedError<PluginInfo[], CommandError>(__TAURI_INVOKE("list_plugins", { marketplace })),
 	// List all available skills for a plugin, cross-referenced with installed state.
 	listAvailableSkills: (marketplace: string, plugin: string, projectPath: string) => typedError<SkillInfo[], CommandError>(__TAURI_INVOKE("list_available_skills", { marketplace, plugin, projectPath })),
+	/**
+	 *  List all skills across every plugin in a marketplace, cross-referenced
+	 *  with installed state.
+	 * 
+	 *  Bulk alternative to calling [`list_available_skills`] per plugin when no
+	 *  plugin filter is active. Does one `load_installed` up front instead of
+	 *  N (one per plugin), and folds plugin-level I/O errors (missing directory,
+	 *  malformed manifest, unreadable `SKILL.md`) into `warn` logs rather than
+	 *  failing the whole call — the worst case is a partial listing that mirrors
+	 *  what the per-plugin path would produce if the user walked the grid
+	 *  manually.
+	 */
+	listAllSkillsForMarketplace: (marketplace: string, projectPath: string) => typedError<SkillInfo[], CommandError>(__TAURI_INVOKE("list_all_skills_for_marketplace", { marketplace, projectPath })),
 	// Install specific skills from a plugin into a Kiro project.
 	installSkills: (marketplace: string, plugin: string, skills: string[], force: boolean, projectPath: string) => typedError<InstallResult, CommandError>(__TAURI_INVOKE("install_skills", { marketplace, plugin, skills, force, projectPath })),
 	// Get summary information about a Kiro project directory.

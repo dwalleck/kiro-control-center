@@ -23,16 +23,19 @@
     return { marketplace, plugin, name };
   };
 
-  // Error-source key family. The `plugins\u001f` / `skills\u001f` prefixes
-  // embed DELIM so a marketplace literally named `plugins` or `skills` still
-  // produces a distinct key from the namespace tag.
+  // Error-source key family. The `plugins\u001f` / `skills\u001f` /
+  // `bulk-skills\u001f` prefixes embed DELIM so a marketplace literally
+  // named `plugins` or `skills` still produces a distinct key from the
+  // namespace tag.
   const PLUGINS_ERR_PREFIX = `plugins${DELIM}` as const;
   const SKILLS_ERR_PREFIX = `skills${DELIM}` as const;
+  const BULK_SKILLS_ERR_PREFIX = `bulk-skills${DELIM}` as const;
   const ERR_MARKETPLACES = "marketplaces" as const;
   type ErrorSource =
     | typeof ERR_MARKETPLACES
     | `${typeof PLUGINS_ERR_PREFIX}${string}`
-    | `${typeof SKILLS_ERR_PREFIX}${string}${typeof DELIM}${string}`;
+    | `${typeof SKILLS_ERR_PREFIX}${string}${typeof DELIM}${string}`
+    | `${typeof BULK_SKILLS_ERR_PREFIX}${string}`;
   // Compile-time guard: fails if any `as const` above is removed and the
   // union silently widens back to `string` (which would defeat typo
   // protection on `fetchErrors.get/set/delete` with zero compile errors).
@@ -40,6 +43,7 @@
   const pluginsErrKey = (mp: string): ErrorSource => `${PLUGINS_ERR_PREFIX}${mp}`;
   const skillsErrKey = (mp: string, plugin: string): ErrorSource =>
     `${SKILLS_ERR_PREFIX}${mp}${DELIM}${plugin}`;
+  const bulkSkillsErrKey = (mp: string): ErrorSource => `${BULK_SKILLS_ERR_PREFIX}${mp}`;
 
   // Short source-label for screen-reader aria-label on dismiss buttons. The
   // banner body already holds the full message; the button label just needs
@@ -48,6 +52,9 @@
     if (key === ERR_MARKETPLACES) return "Dismiss marketplaces error";
     if (key.startsWith(PLUGINS_ERR_PREFIX)) {
       return `Dismiss error for ${key.slice(PLUGINS_ERR_PREFIX.length)}`;
+    }
+    if (key.startsWith(BULK_SKILLS_ERR_PREFIX)) {
+      return `Dismiss error for ${key.slice(BULK_SKILLS_ERR_PREFIX.length)}`;
     }
     const { marketplace, plugin } = parsePluginKey(key.slice(SKILLS_ERR_PREFIX.length));
     return `Dismiss error for ${marketplace}/${plugin}`;
@@ -69,6 +76,7 @@
   let loadingMarketplaces: boolean = $state(false);
   let pendingPluginFetches = new SvelteSet<string>();
   let pendingSkillFetches = new SvelteSet<string>();
+  let pendingBulkSkillFetches = new SvelteSet<string>();
   let installing: boolean = $state(false);
 
   // Keyed per-source so a concurrent success for one fetch can't clear
@@ -121,7 +129,10 @@
   // while previously-fetched skills are still on screen.
   let showLoadingSpinner = $derived(
     skills.length === 0 &&
-      (loadingMarketplaces || pendingPluginFetches.size > 0 || pendingSkillFetches.size > 0)
+      (loadingMarketplaces ||
+        pendingPluginFetches.size > 0 ||
+        pendingSkillFetches.size > 0 ||
+        pendingBulkSkillFetches.size > 0)
   );
 
   // Only the initial-marketplaces fetch gates the grid's empty-state UI.
@@ -203,16 +214,77 @@
     }
   }
 
+  // Bulk path: one backend call populates per-plugin cache entries for an
+  // entire marketplace. Used when no plugin filter is active; a marketplace
+  // with 50 plugins would otherwise fire 50 concurrent `listAvailableSkills`
+  // calls on first paint. Plugins with zero skills get empty-array cache
+  // entries so the per-pair guard in `fetchSkillsFor` doesn't re-fetch them
+  // later if the user applies a plugin filter.
+  async function fetchAllSkillsForMarketplace(mp: string, plugins: PluginInfo[]) {
+    if (pendingBulkSkillFetches.has(mp)) return;
+    const allCached = plugins.every(
+      (p) => skillsByPluginPair[pluginKey(mp, p.name)] !== undefined
+    );
+    if (allCached) return;
+
+    pendingBulkSkillFetches.add(mp);
+    const errKey = bulkSkillsErrKey(mp);
+    try {
+      const result = await commands.listAllSkillsForMarketplace(mp, projectPath);
+      if (result.status === "ok") {
+        const byPlugin = new Map<string, SkillInfo[]>();
+        for (const s of result.data) {
+          const arr = byPlugin.get(s.plugin);
+          if (arr) arr.push(s);
+          else byPlugin.set(s.plugin, [s]);
+        }
+        for (const p of plugins) {
+          skillsByPluginPair[pluginKey(mp, p.name)] = byPlugin.get(p.name) ?? [];
+        }
+        fetchErrors.delete(errKey);
+        // The bulk response is authoritative for this marketplace — clear any
+        // stale per-plugin skill errors lingering from a prior filtered path.
+        const stale: ErrorSource[] = [];
+        for (const key of fetchErrors.keys()) {
+          if (key.startsWith(SKILLS_ERR_PREFIX)) {
+            const { marketplace } = parsePluginKey(key.slice(SKILLS_ERR_PREFIX.length));
+            if (marketplace === mp) stale.push(key);
+          }
+        }
+        for (const key of stale) fetchErrors.delete(key);
+      } else {
+        console.error(`[BrowseTab] listAllSkillsForMarketplace(${mp}) returned error`, result.error);
+        fetchErrors.set(errKey, `${mp}: ${result.error.message}`);
+      }
+    } catch (e) {
+      console.error(`[BrowseTab] listAllSkillsForMarketplace(${mp}) threw`, e);
+      const reason = e instanceof Error ? e.message : String(e);
+      fetchErrors.set(errKey, `${mp}: ${reason}`);
+    } finally {
+      pendingBulkSkillFetches.delete(mp);
+    }
+  }
+
   $effect(() => {
     for (const mp of selectedMarketplaces) fetchPluginsFor(mp);
   });
 
+  // When no plugin filter is active, prefer the bulk path — one call per
+  // marketplace instead of one per (mp, plugin). Once a filter narrows the
+  // set, fall back to per-plugin calls which avoid over-fetching skills
+  // the user explicitly hid.
   $effect(() => {
     for (const mp of selectedMarketplaces) {
-      const list = pluginsByMarketplace[mp] ?? [];
-      for (const pl of list) {
-        if (selectedPlugins.size > 0 && !selectedPlugins.has(pluginKey(mp, pl.name))) continue;
-        fetchSkillsFor(mp, pl.name);
+      const plugins = pluginsByMarketplace[mp];
+      if (plugins === undefined) continue;
+
+      if (selectedPlugins.size === 0) {
+        fetchAllSkillsForMarketplace(mp, plugins);
+      } else {
+        for (const pl of plugins) {
+          if (!selectedPlugins.has(pluginKey(mp, pl.name))) continue;
+          fetchSkillsFor(mp, pl.name);
+        }
       }
     }
   });
@@ -230,7 +302,12 @@
       // would re-trigger the effect on each delete.
       const stale: ErrorSource[] = [];
       for (const key of fetchErrors.keys()) {
-        if (key.startsWith(SKILLS_ERR_PREFIX)) stale.push(key);
+        if (
+          key.startsWith(SKILLS_ERR_PREFIX) ||
+          key.startsWith(BULK_SKILLS_ERR_PREFIX)
+        ) {
+          stale.push(key);
+        }
       }
       for (const key of stale) fetchErrors.delete(key);
     }
@@ -251,6 +328,9 @@
       if (key === ERR_MARKETPLACES) continue;
       if (key.startsWith(PLUGINS_ERR_PREFIX)) {
         const mp = key.slice(PLUGINS_ERR_PREFIX.length);
+        if (!selectedMarketplaces.has(mp)) stale.push(key);
+      } else if (key.startsWith(BULK_SKILLS_ERR_PREFIX)) {
+        const mp = key.slice(BULK_SKILLS_ERR_PREFIX.length);
         if (!selectedMarketplaces.has(mp)) stale.push(key);
       } else if (key.startsWith(SKILLS_ERR_PREFIX)) {
         const { marketplace, plugin } = parsePluginKey(key.slice(SKILLS_ERR_PREFIX.length));
