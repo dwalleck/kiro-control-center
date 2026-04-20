@@ -11,7 +11,7 @@ use kiro_market_core::git::GixCliBackend;
 use kiro_market_core::marketplace::{PluginEntry, PluginSource, StructuredSource};
 use kiro_market_core::plugin::{discover_skill_dirs, PluginManifest};
 use kiro_market_core::project::{InstalledSkills, KiroProject};
-use kiro_market_core::service::{InstallFilter, InstallMode, MarketplaceService};
+use kiro_market_core::service::{InstallFilter, InstallMode, MarketplaceService, SkillInfo};
 use kiro_market_core::skill::parse_frontmatter;
 
 use crate::error::{CommandError, ErrorType};
@@ -56,16 +56,6 @@ pub struct PluginInfo {
     pub description: Option<String>,
     pub skill_count: u32,
     pub source_type: SourceType,
-}
-
-/// Information about a single skill, including installation status.
-#[derive(Clone, Debug, Serialize, specta::Type)]
-pub struct SkillInfo {
-    pub name: String,
-    pub description: String,
-    pub plugin: String,
-    pub marketplace: String,
-    pub installed: bool,
 }
 
 /// Result of an install operation across multiple skills.
@@ -185,39 +175,10 @@ pub async fn list_available_skills(
     project_path: String,
 ) -> Result<Vec<SkillInfo>, CommandError> {
     let svc = make_service()?;
-    let marketplace_path = svc.marketplace_path(&marketplace);
-    let plugin_entries = svc
-        .list_plugin_entries(&marketplace)
-        .map_err(CommandError::from)?;
-
-    let plugin_entry = plugin_entries
-        .iter()
-        .find(|p| p.name == plugin)
-        .ok_or_else(|| {
-            CommandError::new(
-                format!("plugin '{plugin}' not found in marketplace '{marketplace}'"),
-                ErrorType::NotFound,
-            )
-        })?;
-
     let project = KiroProject::new(PathBuf::from(&project_path));
     let installed = load_installed_or_error(&project, &project_path)?;
-
-    let mut results: Vec<SkillInfo> = Vec::new();
-    collect_skills_for_plugin(
-        plugin_entry,
-        &marketplace_path,
-        &marketplace,
-        &installed,
-        &mut results,
-    )
-    // Surface the original error — the user selected this plugin and
-    // deserves to know it's broken, not a silent partial result.
-    .map_err(|e| match e {
-        CollectSkillsError::MissingDir(err) | CollectSkillsError::MalformedManifest(err) => err,
-    })?;
-
-    Ok(results)
+    svc.list_skills_for_plugin(&marketplace, &plugin, &installed)
+        .map_err(CommandError::from)
 }
 
 /// List all skills across every plugin in a marketplace, cross-referenced
