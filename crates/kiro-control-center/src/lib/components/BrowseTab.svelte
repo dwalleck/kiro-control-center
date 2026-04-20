@@ -278,11 +278,14 @@
 
       selectedSkills.clear();
 
-      // Force-refresh so `installed` flags reflect new state. Reuses the fetch
-      // lifecycle (try/catch/finally, pending-set) rather than duplicating it.
-      for (const group of groups.values()) {
-        await fetchSkillsFor(group.marketplace, group.plugin, true);
-      }
+      // Force-refresh so `installed` flags reflect new state. Fan out in
+      // parallel — these reads are independent and serializing them delays
+      // the grid refresh in proportion to the number of affected plugins.
+      await Promise.all(
+        Array.from(groups.values(), (group) =>
+          fetchSkillsFor(group.marketplace, group.plugin, true)
+        )
+      );
     } finally {
       installing = false;
     }
