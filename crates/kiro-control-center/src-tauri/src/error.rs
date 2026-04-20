@@ -57,8 +57,10 @@ impl From<CoreError> for CommandError {
             CoreError::Json(_) => ErrorType::ParseError,
             CoreError::Plugin(PluginError::NotFound { .. }) => ErrorType::NotFound,
             CoreError::Plugin(PluginError::ManifestNotFound { .. }) => ErrorType::NotFound,
+            CoreError::Plugin(PluginError::DirectoryMissing { .. }) => ErrorType::NotFound,
             CoreError::Plugin(PluginError::InvalidManifest { .. }) => ErrorType::ParseError,
             CoreError::Plugin(PluginError::NoSkills { .. }) => ErrorType::Validation,
+            CoreError::Plugin(PluginError::RemoteSourceNotLocal { .. }) => ErrorType::Validation,
             CoreError::Plugin(_) => {
                 warn!("unmapped Plugin error variant, defaulting to Unknown");
                 ErrorType::Unknown
@@ -187,6 +189,18 @@ mod tests {
     )]
     #[case::plugin_no_skills(
         CoreError::Plugin(PluginError::NoSkills { name: "empty".into() }),
+        ErrorType::Validation
+    )]
+    #[case::plugin_directory_missing(
+        CoreError::Plugin(PluginError::DirectoryMissing {
+            path: PathBuf::from("/tmp/plugins/ghost"),
+        }),
+        ErrorType::NotFound
+    )]
+    #[case::plugin_remote_source_not_local(
+        CoreError::Plugin(PluginError::RemoteSourceNotLocal {
+            plugin: "acme".into(),
+        }),
         ErrorType::Validation
     )]
     fn core_error_maps_to_error_type(#[case] core_err: CoreError, #[case] expected: ErrorType) {
