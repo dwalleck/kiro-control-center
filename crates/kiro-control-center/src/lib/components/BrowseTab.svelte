@@ -41,8 +41,18 @@
   let pendingSkillFetches = new SvelteSet<string>();
   let installing: boolean = $state(false);
 
-  let error: string | null = $state(null);
+  // Per-source fetch errors, keyed by an origin-tagged string. Successful
+  // fetches only clear their own entry, so concurrent failures from
+  // independent sources don't overwrite each other in a race. Install
+  // failures use their own `installError` because they're user-initiated
+  // and deserve prominent, independent clearing semantics.
+  let fetchErrors: Record<string, string> = $state({});
+  let installError: string | null = $state(null);
   let installMessage: string | null = $state(null);
+
+  const ERR_MARKETPLACES = "marketplaces";
+  const pluginsErrKey = (mp: string) => `plugins:${mp}`;
+  const skillsErrKey = (mp: string, plugin: string) => `skills:${pluginKey(mp, plugin)}`;
 
   let availablePlugins = $derived.by(() => {
     const out: { marketplace: string; plugin: PluginInfo }[] = [];
@@ -92,14 +102,15 @@
   );
 
   let initialLoadFailed = $derived(
-    error !== null && marketplaces.length === 0 && !loadingMarketplaces
+    fetchErrors[ERR_MARKETPLACES] !== undefined &&
+      marketplaces.length === 0 &&
+      !loadingMarketplaces
   );
 
   let selectedCount = $derived(selectedSkills.size);
 
   async function loadMarketplaces() {
     loadingMarketplaces = true;
-    error = null;
     try {
       const result = await commands.listMarketplaces();
       if (result.status === "ok") {
@@ -107,11 +118,12 @@
         if (marketplaces.length > 0 && selectedMarketplaces.size === 0) {
           selectedMarketplaces.add(marketplaces[0].name);
         }
+        delete fetchErrors[ERR_MARKETPLACES];
       } else {
-        error = result.error.message;
+        fetchErrors[ERR_MARKETPLACES] = result.error.message;
       }
     } catch (e) {
-      error = e instanceof Error ? e.message : String(e);
+      fetchErrors[ERR_MARKETPLACES] = e instanceof Error ? e.message : String(e);
     } finally {
       loadingMarketplaces = false;
     }
@@ -120,16 +132,18 @@
   async function fetchPluginsFor(mp: string) {
     if (pendingPluginFetches.has(mp) || pluginsByMarketplace[mp]) return;
     pendingPluginFetches.add(mp);
-    error = null;
+    const errKey = pluginsErrKey(mp);
     try {
       const result = await commands.listPlugins(mp);
       if (result.status === "ok") {
         pluginsByMarketplace[mp] = result.data;
+        delete fetchErrors[errKey];
       } else {
-        error = result.error.message;
+        fetchErrors[errKey] = `${mp}: ${result.error.message}`;
       }
     } catch (e) {
-      error = e instanceof Error ? e.message : String(e);
+      const reason = e instanceof Error ? e.message : String(e);
+      fetchErrors[errKey] = `${mp}: ${reason}`;
     } finally {
       pendingPluginFetches.delete(mp);
     }
@@ -139,16 +153,18 @@
     const key = pluginKey(mp, plugin);
     if (!force && (pendingSkillFetches.has(key) || skillsByPluginPair[key])) return;
     pendingSkillFetches.add(key);
-    error = null;
+    const errKey = skillsErrKey(mp, plugin);
     try {
       const result = await commands.listAvailableSkills(mp, plugin, projectPath);
       if (result.status === "ok") {
         skillsByPluginPair[key] = result.data;
+        delete fetchErrors[errKey];
       } else {
-        error = result.error.message;
+        fetchErrors[errKey] = `${mp}/${plugin}: ${result.error.message}`;
       }
     } catch (e) {
-      error = e instanceof Error ? e.message : String(e);
+      const reason = e instanceof Error ? e.message : String(e);
+      fetchErrors[errKey] = `${mp}/${plugin}: ${reason}`;
     } finally {
       pendingSkillFetches.delete(key);
     }
@@ -215,7 +231,7 @@
   async function installSelected() {
     if (selectedSkills.size === 0) return;
     installing = true;
-    error = null;
+    installError = null;
     installMessage = null;
 
     type Group = { marketplace: string; plugin: string; names: string[] };
@@ -271,7 +287,7 @@
       }
 
       if (!hadSuccess && notAttempted.length > 0 && failedAll.length === 0) {
-        error = `Install failed: ${notAttempted.join("; ")}`;
+        installError = `Install failed: ${notAttempted.join("; ")}`;
       } else if (parts.length > 0) {
         installMessage = parts.join(" | ");
       }
@@ -473,9 +489,39 @@
     </div>
   {/if}
 
-  {#if error}
-    <div class="mx-4 mt-3 px-4 py-3 rounded-md bg-kiro-error/10 border border-kiro-error/30">
-      <p class="text-sm text-kiro-error">{error}</p>
+  {#each Object.entries(fetchErrors) as [key, message] (key)}
+    <div
+      data-testid="fetch-error"
+      class="mx-4 mt-3 px-4 py-3 rounded-md bg-kiro-error/10 border border-kiro-error/30 flex items-start gap-3"
+    >
+      <p class="text-sm text-kiro-error flex-1">{message}</p>
+      <button
+        type="button"
+        onclick={() => {
+          delete fetchErrors[key];
+        }}
+        aria-label="Dismiss error"
+        class="text-kiro-error/70 hover:text-kiro-error text-lg leading-none flex-shrink-0 focus:outline-none focus:ring-2 focus:ring-kiro-accent-500 rounded"
+      >
+        ×
+      </button>
+    </div>
+  {/each}
+
+  {#if installError}
+    <div
+      data-testid="install-error"
+      class="mx-4 mt-3 px-4 py-3 rounded-md bg-kiro-error/10 border border-kiro-error/30 flex items-start gap-3"
+    >
+      <p class="text-sm text-kiro-error flex-1">{installError}</p>
+      <button
+        type="button"
+        onclick={() => (installError = null)}
+        aria-label="Dismiss error"
+        class="text-kiro-error/70 hover:text-kiro-error text-lg leading-none flex-shrink-0 focus:outline-none focus:ring-2 focus:ring-kiro-accent-500 rounded"
+      >
+        ×
+      </button>
     </div>
   {/if}
 
