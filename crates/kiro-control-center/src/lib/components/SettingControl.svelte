@@ -1,6 +1,6 @@
 <script lang="ts">
   import { commands } from "$lib/bindings";
-  import type { SettingEntry, JsonValue } from "$lib/bindings";
+  import type { SettingEntry, SettingValue } from "$lib/bindings";
 
   let { entry, onUpdate }: {
     entry: SettingEntry;
@@ -14,7 +14,7 @@
   let saving = $state(false);
   let error: string | null = $state(null);
 
-  async function handleSet(value: JsonValue) {
+  async function handleSet(value: SettingValue) {
     if (saving) return;
     saving = true;
     error = null;

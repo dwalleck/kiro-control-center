@@ -7,7 +7,7 @@ use kiro_market_core::file_lock::with_file_lock;
 use kiro_market_core::kiro_settings::{
     apply_registered_setting, default_kiro_dir, kiro_settings_path, load_kiro_settings_from,
     registry, remove_nested, resolve_settings, save_kiro_settings_to, LoadSettingsError,
-    SettingEntry,
+    SettingEntry, SettingValue,
 };
 use serde_json::Value as JsonValue;
 
@@ -111,7 +111,10 @@ pub async fn get_kiro_settings() -> Result<Vec<SettingEntry>, CommandError> {
 #[tauri::command]
 #[specta::specta]
 #[allow(clippy::unused_async)]
-pub async fn set_kiro_setting(key: String, value: JsonValue) -> Result<SettingEntry, CommandError> {
+pub async fn set_kiro_setting(
+    key: String,
+    value: SettingValue,
+) -> Result<SettingEntry, CommandError> {
     if key.is_empty() {
         return Err(CommandError::new(
             "setting key must not be empty",
@@ -120,6 +123,11 @@ pub async fn set_kiro_setting(key: String, value: JsonValue) -> Result<SettingEn
     }
 
     let dir = kiro_dir()?;
+    // Convert the typed frontend value to the JSON representation the
+    // registry validates against. `apply_registered_setting` still owns
+    // the "key known? shape matches expected type?" checks so callers
+    // can't bypass either step.
+    let json_value: JsonValue = value.into();
     locked_modify(&dir, |json| {
         // All current reject reasons (unknown key, type mismatch) surface
         // as Validation errors — same severity, same UI treatment. The
@@ -127,7 +135,7 @@ pub async fn set_kiro_setting(key: String, value: JsonValue) -> Result<SettingEn
         // `#[non_exhaustive]`: a future variant added in core (e.g.
         // ReadOnly, Deprecated) compiles here without forcing a frontend
         // edit, and its `Display` impl provides the user-facing string.
-        apply_registered_setting(json, &key, value)
+        apply_registered_setting(json, &key, json_value)
             .map_err(|e| CommandError::new(e.to_string(), ErrorType::Validation))
     })?;
 

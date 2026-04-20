@@ -109,6 +109,75 @@ pub enum SettingValueInfo {
 }
 
 // ---------------------------------------------------------------------------
+// Setting value (typed subset of JSON the frontend can produce)
+// ---------------------------------------------------------------------------
+
+/// Every shape a Kiro CLI setting can hold — the frontend-safe subset of
+/// `serde_json::Value`. Declared as an untagged enum so the wire format is
+/// identical to raw JSON primitives, while giving specta a precise
+/// TypeScript union to emit. `Integer` precedes `Float` in the variant order
+/// so serde's untagged dispatch prefers `i64` for whole-number JSON literals
+/// and only falls through to `f64` for fractional inputs — preserving the
+/// integer/float distinction on round-trip through `settings.json`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
+#[serde(untagged)]
+pub enum SettingValue {
+    Bool(bool),
+    Integer(i64),
+    Float(f64),
+    String(std::string::String),
+    StringArray(Vec<std::string::String>),
+}
+
+impl From<SettingValue> for JsonValue {
+    fn from(v: SettingValue) -> Self {
+        match v {
+            SettingValue::Bool(b) => Self::Bool(b),
+            SettingValue::Integer(i) => Self::from(i),
+            SettingValue::Float(f) => {
+                serde_json::Number::from_f64(f).map_or(Self::Null, Self::Number)
+            }
+            SettingValue::String(s) => Self::String(s),
+            SettingValue::StringArray(a) => Self::Array(a.into_iter().map(Self::String).collect()),
+        }
+    }
+}
+
+impl TryFrom<&JsonValue> for SettingValue {
+    type Error = UnsupportedValueShape;
+
+    fn try_from(v: &JsonValue) -> Result<Self, Self::Error> {
+        match v {
+            JsonValue::Bool(b) => Ok(Self::Bool(*b)),
+            JsonValue::Number(n) => n
+                .as_i64()
+                .map(Self::Integer)
+                .or_else(|| n.as_f64().map(Self::Float))
+                .ok_or(UnsupportedValueShape),
+            JsonValue::String(s) => Ok(Self::String(s.clone())),
+            JsonValue::Array(arr) => arr
+                .iter()
+                .map(|item| {
+                    item.as_str()
+                        .map(str::to_owned)
+                        .ok_or(UnsupportedValueShape)
+                })
+                .collect::<Result<Vec<_>, _>>()
+                .map(Self::StringArray),
+            JsonValue::Null | JsonValue::Object(_) => Err(UnsupportedValueShape),
+        }
+    }
+}
+
+/// Returned when a stored JSON value does not fit any [`SettingValue`] variant
+/// (e.g. a nested object, or an array containing non-string elements). The
+/// setting is exposed to the frontend as "no current value" rather than
+/// surfacing a partial or misleading shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UnsupportedValueShape;
+
+// ---------------------------------------------------------------------------
 // Setting definition (internal registry entry)
 // ---------------------------------------------------------------------------
 
@@ -148,9 +217,16 @@ pub struct SettingEntry {
     pub category_label: std::string::String,
     /// Value type and type-specific metadata (discriminated union on the frontend).
     pub value_type: SettingValueInfo,
-    /// Default value as a JSON value. `None` when no default is known.
+    /// Default value. `None` when no default is known.
+    ///
+    /// Stored internally as a `serde_json::Value` to preserve round-trip
+    /// fidelity with `settings.json`. Emitted to specta as `SettingValue` so
+    /// the frontend sees a precise TypeScript union instead of an opaque
+    /// recursive JSON type.
+    #[cfg_attr(feature = "specta", specta(type = Option<SettingValue>))]
     pub default_value: Option<JsonValue>,
     /// Current value from the user's settings file. `None` means key absent (using default).
+    #[cfg_attr(feature = "specta", specta(type = Option<SettingValue>))]
     pub current_value: Option<JsonValue>,
 }
 
