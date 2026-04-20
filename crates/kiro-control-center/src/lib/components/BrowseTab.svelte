@@ -23,19 +23,35 @@
     return { marketplace, plugin, name };
   };
 
-  // Error-source key family. Shares DELIM with the composite-key helpers so
-  // `plugins\u001f${mp}` and `skills\u001f${pluginKey(mp, p)}` can't collide
-  // with a marketplace literally named "plugins:foo".
+  // Error-source key family. The `plugins\u001f` / `skills\u001f` prefixes
+  // embed DELIM so a marketplace literally named `plugins` or `skills` still
+  // produces a distinct key from the namespace tag.
   const PLUGINS_ERR_PREFIX = `plugins${DELIM}` as const;
   const SKILLS_ERR_PREFIX = `skills${DELIM}` as const;
   const ERR_MARKETPLACES = "marketplaces" as const;
   type ErrorSource =
     | typeof ERR_MARKETPLACES
     | `${typeof PLUGINS_ERR_PREFIX}${string}`
-    | `${typeof SKILLS_ERR_PREFIX}${string}`;
+    | `${typeof SKILLS_ERR_PREFIX}${string}${typeof DELIM}${string}`;
+  // Compile-time guard: fails if any `as const` above is removed and the
+  // union silently widens back to `string` (which would defeat typo
+  // protection on `fetchErrors.get/set/delete` with zero compile errors).
+  type _AssertNarrow = string extends ErrorSource ? never : ErrorSource;
   const pluginsErrKey = (mp: string): ErrorSource => `${PLUGINS_ERR_PREFIX}${mp}`;
   const skillsErrKey = (mp: string, plugin: string): ErrorSource =>
-    `${SKILLS_ERR_PREFIX}${pluginKey(mp, plugin)}`;
+    `${SKILLS_ERR_PREFIX}${mp}${DELIM}${plugin}`;
+
+  // Short source-label for screen-reader aria-label on dismiss buttons. The
+  // banner body already holds the full message; the button label just needs
+  // enough context to disambiguate N stacked identical-looking controls.
+  function errLabel(key: ErrorSource): string {
+    if (key === ERR_MARKETPLACES) return "Dismiss marketplaces error";
+    if (key.startsWith(PLUGINS_ERR_PREFIX)) {
+      return `Dismiss error for ${key.slice(PLUGINS_ERR_PREFIX.length)}`;
+    }
+    const { marketplace, plugin } = parsePluginKey(key.slice(SKILLS_ERR_PREFIX.length));
+    return `Dismiss error for ${marketplace}/${plugin}`;
+  }
 
   let marketplaces: MarketplaceInfo[] = $state([]);
   let pluginsByMarketplace: Record<string, PluginInfo[]> = $state({});
@@ -131,9 +147,11 @@
         }
         fetchErrors.delete(ERR_MARKETPLACES);
       } else {
+        console.error("[BrowseTab] listMarketplaces returned error", result.error);
         fetchErrors.set(ERR_MARKETPLACES, result.error.message);
       }
     } catch (e) {
+      console.error("[BrowseTab] listMarketplaces threw", e);
       fetchErrors.set(ERR_MARKETPLACES, e instanceof Error ? e.message : String(e));
     } finally {
       loadingMarketplaces = false;
@@ -150,9 +168,11 @@
         pluginsByMarketplace[mp] = result.data;
         fetchErrors.delete(errKey);
       } else {
+        console.error(`[BrowseTab] listPlugins(${mp}) returned error`, result.error);
         fetchErrors.set(errKey, `${mp}: ${result.error.message}`);
       }
     } catch (e) {
+      console.error(`[BrowseTab] listPlugins(${mp}) threw`, e);
       const reason = e instanceof Error ? e.message : String(e);
       fetchErrors.set(errKey, `${mp}: ${reason}`);
     } finally {
@@ -171,9 +191,11 @@
         skillsByPluginPair[key] = result.data;
         fetchErrors.delete(errKey);
       } else {
+        console.error(`[BrowseTab] listAvailableSkills(${mp}, ${plugin}) returned error`, result.error);
         fetchErrors.set(errKey, `${mp}/${plugin}: ${result.error.message}`);
       }
     } catch (e) {
+      console.error(`[BrowseTab] listAvailableSkills(${mp}, ${plugin}) threw`, e);
       const reason = e instanceof Error ? e.message : String(e);
       fetchErrors.set(errKey, `${mp}/${plugin}: ${reason}`);
     } finally {
@@ -204,38 +226,41 @@
     if (priorProjectPath !== null && priorProjectPath !== projectPath) {
       skillsByPluginPair = {};
       selectedSkills.clear();
+      // Snapshot first — deleting during `for (const key of fetchErrors.keys())`
+      // would re-trigger the effect on each delete.
+      const stale: ErrorSource[] = [];
       for (const key of fetchErrors.keys()) {
-        if (key.startsWith(SKILLS_ERR_PREFIX)) fetchErrors.delete(key);
+        if (key.startsWith(SKILLS_ERR_PREFIX)) stale.push(key);
       }
+      for (const key of stale) fetchErrors.delete(key);
     }
     priorProjectPath = projectPath;
   });
 
-  // Drop stale selections and stale error banners when the underlying filter
-  // set narrows. A deselected marketplace (or a plugin filter that excludes a
-  // pair) means the user can no longer see or act on that source — leaving its
-  // banner up would misattribute responsibility to a filter the user set
-  // intentionally. Marketplace-listing errors are always kept: they gate the
-  // initial-load empty state and aren't scoped to any selection.
+  // Drop stale selections and banners when the filter set narrows — leaving a
+  // banner for a deselected source misattributes responsibility to a filter
+  // the user set intentionally. Marketplace-listing errors always survive.
   $effect(() => {
     const valid = new Set(skills.map((s) => skillKey(s.marketplace, s.plugin, s.name)));
     for (const key of selectedSkills) {
       if (!valid.has(key)) selectedSkills.delete(key);
     }
 
+    const stale: ErrorSource[] = [];
     for (const key of fetchErrors.keys()) {
       if (key === ERR_MARKETPLACES) continue;
       if (key.startsWith(PLUGINS_ERR_PREFIX)) {
         const mp = key.slice(PLUGINS_ERR_PREFIX.length);
-        if (!selectedMarketplaces.has(mp)) fetchErrors.delete(key);
+        if (!selectedMarketplaces.has(mp)) stale.push(key);
       } else if (key.startsWith(SKILLS_ERR_PREFIX)) {
         const { marketplace, plugin } = parsePluginKey(key.slice(SKILLS_ERR_PREFIX.length));
         const stillSelected =
           selectedMarketplaces.has(marketplace) &&
           (selectedPlugins.size === 0 || selectedPlugins.has(pluginKey(marketplace, plugin)));
-        if (!stillSelected) fetchErrors.delete(key);
+        if (!stillSelected) stale.push(key);
       }
     }
+    for (const key of stale) fetchErrors.delete(key);
   });
 
   function toggleMarketplace(name: string) {
@@ -331,11 +356,21 @@
       // Force-refresh so `installed` flags reflect new state. Fan out in
       // parallel — these reads are independent and serializing them delays
       // the grid refresh in proportion to the number of affected plugins.
-      await Promise.all(
-        Array.from(groups.values(), (group) =>
-          fetchSkillsFor(group.marketplace, group.plugin, true)
-        )
-      );
+      // fetchSkillsFor never rejects externally (its own try/catch surfaces
+      // failures via fetchErrors), so this Promise.all should resolve. The
+      // outer try/catch is defense-in-depth against a future regression in
+      // that invariant that would otherwise strand `installing = true`.
+      try {
+        await Promise.all(
+          Array.from(groups.values(), (group) =>
+            fetchSkillsFor(group.marketplace, group.plugin, true)
+          )
+        );
+      } catch (e) {
+        console.error("[BrowseTab] post-install refresh rejected unexpectedly", e);
+        const reason = e instanceof Error ? e.message : String(e);
+        installError = `Post-install refresh failed: ${reason}`;
+      }
     } finally {
       installing = false;
     }
@@ -523,7 +558,10 @@
     </div>
   {/if}
 
-  {#each fetchErrors as [key, message] (key)}
+  <!-- Banners render newest-first (reverse insertion order) and cap at 3 so
+       a storm of broken plugins doesn't push the grid off-screen. Dismissing
+       a banner or resolving its source surfaces the next-newest below. -->
+  {#each [...fetchErrors].reverse().slice(0, 3) as [key, message] (key)}
     <div
       data-testid="fetch-error"
       class="mx-4 mt-3 px-4 py-3 rounded-md bg-kiro-error/10 border border-kiro-error/30 flex items-start gap-3"
@@ -532,13 +570,21 @@
       <button
         type="button"
         onclick={() => fetchErrors.delete(key)}
-        aria-label={`Dismiss ${message}`}
+        aria-label={errLabel(key)}
         class="text-kiro-error/70 hover:text-kiro-error text-lg leading-none flex-shrink-0 focus:outline-none focus:ring-2 focus:ring-kiro-accent-500 rounded"
       >
         ×
       </button>
     </div>
   {/each}
+  {#if fetchErrors.size > 3}
+    <div
+      data-testid="fetch-error-overflow"
+      class="mx-4 mt-3 px-4 py-2 text-xs text-kiro-subtle text-center border border-kiro-muted/50 rounded-md bg-kiro-surface/30"
+    >
+      +{fetchErrors.size - 3} more {fetchErrors.size - 3 === 1 ? "error" : "errors"} — dismiss or resolve above to see the rest
+    </div>
+  {/if}
 
   {#if installError}
     <div
@@ -549,7 +595,7 @@
       <button
         type="button"
         onclick={() => (installError = null)}
-        aria-label={`Dismiss ${installError}`}
+        aria-label="Dismiss install error"
         class="text-kiro-error/70 hover:text-kiro-error text-lg leading-none flex-shrink-0 focus:outline-none focus:ring-2 focus:ring-kiro-accent-500 rounded"
       >
         ×
@@ -587,7 +633,13 @@
             d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" />
         </svg>
         <p class="text-sm">
-          {filterText ? "No skills match the filter" : "No skills available"}
+          {#if filterText}
+            No skills match the filter
+          {:else if fetchErrors.size > 0}
+            Skills unavailable due to errors above
+          {:else}
+            No skills available
+          {/if}
         </p>
       </div>
     {:else}
