@@ -26,41 +26,10 @@ static PENDING_COUNTER: AtomicU64 = AtomicU64::new(0);
 // Temp directory cleanup guard
 // ---------------------------------------------------------------------------
 
-/// RAII guard that removes a temp directory on drop unless defused.
-/// Prevents orphaned `_pending_*` directories when `add()` fails.
-struct TempDirGuard {
-    path: PathBuf,
-    defused: bool,
-}
-
-impl TempDirGuard {
-    fn new(path: PathBuf) -> Self {
-        Self {
-            path,
-            defused: false,
-        }
-    }
-
-    /// Prevent cleanup on drop (call after successful rename).
-    fn defuse(&mut self) {
-        self.defused = true;
-    }
-}
-
-impl Drop for TempDirGuard {
-    fn drop(&mut self) {
-        if !self.defused
-            && let Err(e) = fs::remove_dir_all(&self.path)
-            && e.kind() != std::io::ErrorKind::NotFound
-        {
-            warn!(
-                path = %self.path.display(),
-                error = %e,
-                "failed to clean up temp directory — remove it manually"
-            );
-        }
-    }
-}
+// `TempDirGuard` was extracted into the shared `crate::raii::DirCleanupGuard`
+// — same shape, same Drop semantics, same retarget+defuse API. The
+// platform.rs Windows StagingGuard now uses the same primitive, so
+// future fixes to cleanup ordering or warn severity apply once.
 
 // ---------------------------------------------------------------------------
 // Result types
@@ -130,6 +99,91 @@ pub enum InstallFilter<'a> {
     All,
     Names(&'a [String]),
     SingleName(&'a str),
+}
+
+/// Whether `http://` marketplace URLs are permitted. Replaces a `bool`
+/// field that read identically at struct-literal call sites and could
+/// be silently flipped by a typo (`allow_insecure_http: true` looks no
+/// different from `allow_insecure_http: false` in a code review). The
+/// enum variants name the security posture explicitly.
+///
+/// `#[non_exhaustive]` so a future tightening (e.g. `AllowOnLocalhost`)
+/// is an additive change.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum InsecureHttpPolicy {
+    /// Refuse `http://` URLs. The strict default — plaintext HTTP is
+    /// unauthenticated and a network attacker can substitute the entire
+    /// marketplace contents, gaining persistent code execution via
+    /// skills/agents/MCP servers that the cache then keeps around.
+    #[default]
+    Reject,
+    /// Allow `http://` URLs. Only flip this when TLS truly isn't
+    /// available on the source's network — the resulting marketplace
+    /// install is trust-on-first-use against any MITM during the clone
+    /// window.
+    Allow,
+}
+
+/// Options controlling [`MarketplaceService::add`].
+///
+/// `#[non_exhaustive]` so adding future fields (`require_sha`,
+/// `allow_self_signed_tls`, …) is an additive change. External callers
+/// must therefore use the builder methods rather than struct-expression
+/// construction:
+///
+/// ```ignore
+/// MarketplaceAddOptions::new(GitProtocol::Https)
+///     .allow_insecure_http()
+/// ```
+///
+/// The `From<GitProtocol>` impl preserves the convenience of passing a
+/// bare protocol — `svc.add(source, GitProtocol::Https)` still compiles
+/// against the strict defaults.
+#[derive(Clone, Copy, Debug, Default)]
+#[non_exhaustive]
+pub struct MarketplaceAddOptions {
+    /// Git protocol used for GitHub `owner/repo` shorthand sources.
+    pub protocol: GitProtocol,
+    /// Policy for plaintext `http://` source URLs. See
+    /// [`InsecureHttpPolicy`] for the per-variant rationale.
+    pub insecure_http: InsecureHttpPolicy,
+}
+
+impl MarketplaceAddOptions {
+    /// Construct an options bag with the given git protocol and the
+    /// strict default for every other field. Builder methods follow.
+    #[must_use]
+    pub fn new(protocol: GitProtocol) -> Self {
+        Self {
+            protocol,
+            insecure_http: InsecureHttpPolicy::Reject,
+        }
+    }
+
+    /// Set the [`InsecureHttpPolicy`] explicitly. Useful when the
+    /// caller has the policy as a value already (e.g. mapped from a
+    /// CLI bool flag).
+    #[must_use]
+    pub fn with_insecure_http(mut self, policy: InsecureHttpPolicy) -> Self {
+        self.insecure_http = policy;
+        self
+    }
+
+    /// Shorthand for `with_insecure_http(InsecureHttpPolicy::Allow)`.
+    /// Reads naturally at call sites that decide statically to opt in.
+    #[must_use]
+    pub fn allow_insecure_http(self) -> Self {
+        self.with_insecure_http(InsecureHttpPolicy::Allow)
+    }
+}
+
+impl From<GitProtocol> for MarketplaceAddOptions {
+    /// Convenience for callers that only need to choose a protocol and
+    /// accept the strict defaults for everything else.
+    fn from(protocol: GitProtocol) -> Self {
+        Self::new(protocol)
+    }
 }
 
 /// Whether an install should overwrite existing entries of the same name.
@@ -234,6 +288,17 @@ pub enum InstallWarning {
         path: PathBuf,
         failure: crate::agent::ParseFailure,
     },
+    /// An agent declares MCP servers but the install was not opted in
+    /// to MCP. The agent was skipped — its prompt would otherwise
+    /// install with a `mcpServers` block that runs subprocesses or
+    /// opens network connections without the user's explicit consent.
+    /// Listed transports help the user see the risk surface (e.g.
+    /// `["stdio", "stdio", "http"]`) before they re-run with the
+    /// `--accept-mcp` opt-in.
+    McpServersRequireOptIn {
+        agent: String,
+        transports: Vec<String>,
+    },
 }
 
 impl std::fmt::Display for InstallWarning {
@@ -253,6 +318,15 @@ impl std::fmt::Display for InstallWarning {
             }
             InstallWarning::AgentParseFailed { path, failure } => {
                 write!(f, "skipped agent at {}: {failure}", path.display())
+            }
+            InstallWarning::McpServersRequireOptIn { agent, transports } => {
+                write!(
+                    f,
+                    "agent `{agent}` brings {} MCP server{} ({}); skipped — re-run with `--accept-mcp` to install",
+                    transports.len(),
+                    if transports.len() == 1 { "" } else { "s" },
+                    transports.join(", ")
+                )
             }
         }
     }
@@ -299,10 +373,30 @@ impl MarketplaceService {
     /// manifest nor scan), the marketplace name fails validation, or a
     /// marketplace with the same name is already registered.
     #[allow(clippy::too_many_lines)]
-    pub fn add(&self, source: &str, protocol: GitProtocol) -> Result<MarketplaceAddResult, Error> {
+    pub fn add(
+        &self,
+        source: &str,
+        opts: impl Into<MarketplaceAddOptions>,
+    ) -> Result<MarketplaceAddResult, Error> {
         use std::sync::atomic::Ordering;
 
+        let opts = opts.into();
+        let protocol = opts.protocol;
+
         let ms = MarketplaceSource::detect(source);
+
+        // Refuse plaintext HTTP unless the caller's policy allows it.
+        // Matching against the raw source string (not the parsed
+        // MarketplaceSource::GitUrl) is enough because GitHub shorthands
+        // and local paths can never carry an http scheme. The
+        // remediation message names the caller-facing knob.
+        if matches!(opts.insecure_http, InsecureHttpPolicy::Reject)
+            && let MarketplaceSource::GitUrl { url } = &ms
+            && url.starts_with("http://")
+        {
+            return Err(MarketplaceError::InsecureSource { url: url.clone() }.into());
+        }
+
         self.cache.ensure_dirs()?;
 
         let pending_seq = PENDING_COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -323,7 +417,8 @@ impl MarketplaceService {
             }
         }
 
-        let mut guard = TempDirGuard::new(temp_dir.clone());
+        let mut guard =
+            crate::raii::DirCleanupGuard::new(temp_dir.clone(), "marketplace temp directory");
 
         let link_result = self.clone_or_link(&ms, protocol, &temp_dir)?;
         let storage = storage_from_source_and_link(&ms, link_result);
@@ -381,50 +476,80 @@ impl MarketplaceService {
         validation::validate_name(&name)?;
 
         let final_dir = self.cache.marketplace_path(&name);
-        if final_dir.exists() {
-            return Err(MarketplaceError::AlreadyRegistered { name: name.clone() }.into());
-        }
 
-        fs::rename(&temp_dir, &final_dir)?;
-        // Point the guard at the renamed location so its Drop targets the
-        // right path if we bail out before defusing.
-        guard.path.clone_from(&final_dir);
-
+        // Take the registry lock once for the whole "claim the name +
+        // rename + register" sequence. Without this single lock, two
+        // concurrent `add` calls for the same name could both pass the
+        // `final_dir.exists()` check, then race the rename (one wins, one
+        // fails with a confusing IO error or — worse on some platforms —
+        // both succeed and clobber each other's content).
+        //
+        // `register_known_marketplace_unlocked` is the inner counterpart
+        // to `add_known_marketplace` that assumes the caller already holds
+        // the lock. Calling the locking variant here would self-contend
+        // — the second acquire opens a fresh fd whose `try_lock_exclusive`
+        // can't succeed until the outer fd is dropped, so the polling
+        // loop in `with_file_lock` would stall for `LOCK_TIMEOUT` (10s)
+        // and surface `ErrorKind::TimedOut`.
         let entry = KnownMarketplace {
             name: name.clone(),
             source: ms,
             protocol: Some(protocol),
             added_at: chrono::Utc::now(),
         };
-        if let Err(e) = self.cache.add_known_marketplace(entry) {
-            warn!(
-                path = %final_dir.display(),
-                error = %e,
-                "registry write failed after rename; rolling back"
-            );
-            if let Err(rb) = fs::remove_dir_all(&final_dir) {
+
+        crate::file_lock::with_file_lock(&self.cache.registry_path(), || -> Result<(), Error> {
+            if final_dir.exists() {
+                return Err(MarketplaceError::AlreadyRegistered { name: name.clone() }.into());
+            }
+
+            fs::rename(&temp_dir, &final_dir)?;
+            // The temp dir no longer exists under its old name; from
+            // here on, any cleanup-on-failure must target `final_dir`.
+            guard.retarget(final_dir.clone());
+
+            if let Err(e) = self.cache.register_known_marketplace_unlocked(entry) {
                 warn!(
                     path = %final_dir.display(),
-                    rollback_error = %rb,
-                    "failed to roll back renamed directory — remove it manually"
+                    error = %e,
+                    "registry write failed after rename; rolling back"
+                );
+                if let Err(rb) = fs::remove_dir_all(&final_dir) {
+                    warn!(
+                        path = %final_dir.display(),
+                        rollback_error = %rb,
+                        "failed to roll back renamed directory — remove it manually"
+                    );
+                }
+                // Defuse so the guard doesn't try to remove what we
+                // already attempted to remove (or log a spurious
+                // warning if the rollback succeeded).
+                guard.defuse();
+                return Err(e);
+            }
+
+            // Persist the merged plugin list INSIDE the registry
+            // lock. Outside it, a concurrent `remove(name)` could
+            // complete (deleting plugin_registry_path) between our
+            // register call and this write, leaving an orphaned
+            // `registries/<name>.json` for an unregistered
+            // marketplace. Holding the lock makes the
+            // register-and-write sequence atomic from the
+            // marketplace registry's perspective. A write failure is
+            // still a soft fail — the user can re-run `update <name>`
+            // to regenerate — so we warn rather than roll back the
+            // marketplace registration.
+            if let Err(e) = self.cache.write_plugin_registry(&name, &registry_entries) {
+                warn!(
+                    marketplace = %name,
+                    error = %e,
+                    "failed to write plugin registry — run 'update {name}' to regenerate"
                 );
             }
-            // Defuse so the guard doesn't attempt a second removal of the
-            // same path (or log a spurious warning if rollback succeeded).
-            guard.defuse();
-            return Err(e);
-        }
-        guard.defuse();
 
-        // Persist the merged plugin list so browse/install commands don't
-        // need to re-scan the repo on every access.
-        if let Err(e) = self.cache.write_plugin_registry(&name, &registry_entries) {
-            warn!(
-                marketplace = %name,
-                error = %e,
-                "failed to write plugin registry — run 'update {name}' to regenerate"
-            );
-        }
+            guard.defuse();
+            Ok(())
+        })?;
 
         debug!(marketplace = %name, "marketplace added");
 
@@ -756,11 +881,19 @@ impl MarketplaceService {
     ) -> Result<PathBuf, Error> {
         match &entry.source {
             PluginSource::RelativePath(rel) => {
-                // `rel` is a validated `RelativePath` — no belt-and-braces
-                // check needed; construction through `RelativePath::new`
-                // is the only way to obtain one, and it validates.
+                // `rel` is a validated `RelativePath` — no traversal check
+                // needed; construction through `RelativePath::new` is the
+                // only way to obtain one, and it validates.
                 let resolved = marketplace_path.join(rel);
-                if !resolved.exists() {
+                // Use symlink_metadata (does NOT follow symlinks) so a
+                // malicious marketplace cannot point `rel` at a symlink
+                // that resolves outside the marketplace tree. Matches the
+                // symlink-refuse policy in project::copy_dir_recursive,
+                // agent::discover_agents_in_dirs, and load_plugin_manifest.
+                let is_real_dir = fs::symlink_metadata(&resolved)
+                    .map(|m| m.is_dir())
+                    .unwrap_or(false);
+                if !is_real_dir {
                     return Err(PluginError::DirectoryMissing { path: resolved }.into());
                 }
                 Ok(resolved)
@@ -819,33 +952,49 @@ impl MarketplaceService {
         // cannot hold an unvalidated string. Serde and programmatic callers
         // both go through `RelativePath::new`.
 
-        // If already cloned, reuse — but re-verify SHA so a corrupt or stale
-        // cache (e.g. the manifest's pinned SHA changed) cannot pass silently.
-        if dest.exists() {
-            debug!(dest = %dest.display(), "plugin already cached, reusing");
+        // Serialize concurrent callers on the same cache path. Without this,
+        // two processes racing on `kiro-market install foo@bar` for a
+        // not-yet-cached plugin would both see `!dest.exists()` and both
+        // attempt `clone_repo`, one clobbering the other. The lock also
+        // lets us recover from a partially-cloned directory left behind by
+        // a prior interrupted attempt (detected via missing `.git/`).
+        crate::file_lock::with_file_lock(&dest, || -> Result<PathBuf, Error> {
+            if dest.exists() {
+                // A complete clone leaves `.git/` behind. Its absence means
+                // the directory is partial (prior crash, interrupted clone)
+                // and must be removed before a retry can succeed.
+                if dest.join(".git").exists() {
+                    debug!(dest = %dest.display(), "plugin already cached, reusing");
+                    if let Some(expected) = sha {
+                        self.git.verify_sha(&dest, expected)?;
+                    }
+                    return Ok(match subdir {
+                        Some(path) => dest.join(path),
+                        None => dest.clone(),
+                    });
+                }
+                warn!(
+                    dest = %dest.display(),
+                    "removing partial plugin clone from prior interrupted attempt"
+                );
+                fs::remove_dir_all(&dest)?;
+            }
+
+            debug!(url = %url, dest = %dest.display(), label = %label, "cloning plugin");
+            let validated_ref = git_ref.map(GitRef::new).transpose()?;
+            let opts = CloneOptions {
+                git_ref: validated_ref,
+            };
+            self.git.clone_repo(&url, &dest, &opts)?;
+
             if let Some(expected) = sha {
                 self.git.verify_sha(&dest, expected)?;
             }
-            return Ok(match subdir {
+
+            Ok(match subdir {
                 Some(path) => dest.join(path),
-                None => dest,
-            });
-        }
-
-        debug!(url = %url, dest = %dest.display(), label = %label, "cloning plugin");
-        let validated_ref = git_ref.map(GitRef::new).transpose()?;
-        let opts = CloneOptions {
-            git_ref: validated_ref,
-        };
-        self.git.clone_repo(&url, &dest, &opts)?;
-
-        if let Some(expected) = sha {
-            self.git.verify_sha(&dest, expected)?;
-        }
-
-        Ok(match subdir {
-            Some(path) => dest.join(path),
-            None => dest,
+                None => dest.clone(),
+            })
         })
     }
 
@@ -869,16 +1018,17 @@ impl MarketplaceService {
     ///   error. The CLI surfaces these with a non-zero exit status.
     /// - `warnings`: non-fatal issues (unmapped tools, README-like files
     ///   skipped, missing-name frontmatter).
-    #[allow(clippy::too_many_arguments)] // seven non-self params, each a distinct
-    // input from upstream: project + plugin_dir + scan_paths + force +
-    // marketplace + plugin + version. A builder would add indirection without
-    // reducing arity at the call site.
+    #[allow(clippy::too_many_arguments)] // eight non-self params, each a distinct
+    // input from upstream: project + plugin_dir + scan_paths + mode +
+    // accept_mcp + marketplace + plugin + version. A builder would add
+    // indirection without reducing arity at the call site.
     pub fn install_plugin_agents(
         &self,
         project: &crate::project::KiroProject,
         plugin_dir: &Path,
         scan_paths: &[String],
         mode: InstallMode,
+        accept_mcp: bool,
         marketplace: &str,
         plugin: &str,
         version: Option<&str>,
@@ -917,6 +1067,27 @@ impl MarketplaceService {
                     continue;
                 }
             };
+
+            // MCP opt-in gate. An agent that brings MCP servers can run
+            // arbitrary subprocesses (Stdio) or open network connections
+            // (Http/Sse) on the user's host. The cache persists, so a
+            // one-time install is a long-lived foothold. Default policy:
+            // skip + warn so the user sees the risk surface; re-running
+            // with `--accept-mcp` flips the gate.
+            if !accept_mcp && !def.mcp_servers.is_empty() {
+                let transports: Vec<String> = def
+                    .mcp_servers
+                    .values()
+                    .map(|cfg| cfg.transport_label().to_owned())
+                    .collect();
+                result
+                    .warnings
+                    .push(InstallWarning::McpServersRequireOptIn {
+                        agent: def.name.clone(),
+                        transports,
+                    });
+                continue;
+            }
 
             let (mapped, unmapped) = match def.dialect {
                 crate::agent::AgentDialect::Claude => {
@@ -1256,6 +1427,7 @@ mod tests {
             plugin_tmp.path(),
             &["./agents/".to_string()],
             InstallMode::New,
+            false, // accept_mcp: existing fixtures don't carry MCP servers
             "mp",
             "plugin-x",
             None,
@@ -1287,7 +1459,8 @@ mod tests {
             .iter()
             .filter_map(|w| match w {
                 InstallWarning::UnmappedTool { tool, reason, .. } => Some((tool.as_str(), *reason)),
-                InstallWarning::AgentParseFailed { .. } => None,
+                InstallWarning::AgentParseFailed { .. }
+                | InstallWarning::McpServersRequireOptIn { .. } => None,
             })
             .collect();
         assert!(
@@ -1330,6 +1503,7 @@ mod tests {
             plugin_tmp.path(),
             &["./agents/".to_string()],
             InstallMode::New,
+            false, // accept_mcp: existing fixtures don't carry MCP servers
             "mp",
             "p",
             None,
@@ -1374,6 +1548,7 @@ mod tests {
             plugin_tmp.path(),
             &["./agents/".to_string()],
             InstallMode::New,
+            false, // accept_mcp: existing fixtures don't carry MCP servers
             "mp",
             "p",
             None,
@@ -1425,6 +1600,7 @@ mod tests {
             plugin_tmp.path(),
             &["./agents/".to_string()],
             InstallMode::New,
+            false, // accept_mcp: existing fixtures don't carry MCP servers
             "mp",
             "p",
             None,
@@ -1438,6 +1614,225 @@ mod tests {
                 .any(|w| matches!(w, InstallWarning::AgentParseFailed { .. })),
             "missing-fence non-README file must be demoted silently, got: {:?}",
             result.warnings
+        );
+    }
+
+    #[test]
+    fn install_plugin_agents_skips_mcp_agents_without_opt_in() {
+        // An agent declaring an MCP server must NOT be installed when
+        // accept_mcp is false. Default safety: a passing-by user shouldn't
+        // accidentally accept arbitrary subprocess execution. The skip
+        // surfaces as a McpServersRequireOptIn warning so the user can
+        // see what got skipped and how to opt in.
+        use crate::project::KiroProject;
+
+        let (_dir, svc) = temp_service();
+        let plugin_tmp = tempfile::tempdir().unwrap();
+        let agents_dir = plugin_tmp.path().join("agents");
+        fs::create_dir_all(&agents_dir).unwrap();
+
+        // Copilot-style .agent.md with one stdio MCP entry.
+        fs::write(
+            agents_dir.join("terraformer.agent.md"),
+            "---\nname: terraformer\ndescription: TF\nmcp-servers:\n  tf:\n    type: 'local'\n    command: 'docker'\n    args: ['run', '-i']\n---\nbody\n",
+        )
+        .unwrap();
+
+        let project_tmp = tempfile::tempdir().unwrap();
+        let project = KiroProject::new(project_tmp.path().to_path_buf());
+
+        let result = svc.install_plugin_agents(
+            &project,
+            plugin_tmp.path(),
+            &["./agents/".to_string()],
+            InstallMode::New,
+            false, // accept_mcp = false → gate must fire
+            "mp",
+            "p",
+            None,
+        );
+
+        assert!(
+            result.installed.is_empty(),
+            "MCP agent must not be installed without opt-in: {:?}",
+            result.installed
+        );
+        assert!(
+            result.warnings.iter().any(
+                |w| matches!(w, InstallWarning::McpServersRequireOptIn { agent, transports }
+                    if agent == "terraformer" && transports == &vec!["stdio".to_string()])
+            ),
+            "expected McpServersRequireOptIn warning naming the agent and stdio transport, got {:?}",
+            result.warnings
+        );
+        // No JSON written for the skipped agent.
+        assert!(
+            !project_tmp
+                .path()
+                .join(".kiro/agents/terraformer.json")
+                .exists()
+        );
+    }
+
+    #[test]
+    fn install_plugin_agents_installs_mcp_agents_when_opted_in() {
+        // accept_mcp = true unlocks installation, including the
+        // mcpServers block in the emitted JSON.
+        use crate::project::KiroProject;
+
+        let (_dir, svc) = temp_service();
+        let plugin_tmp = tempfile::tempdir().unwrap();
+        let agents_dir = plugin_tmp.path().join("agents");
+        fs::create_dir_all(&agents_dir).unwrap();
+        fs::write(
+            agents_dir.join("terraformer.agent.md"),
+            "---\nname: terraformer\ndescription: TF\nmcp-servers:\n  tf:\n    type: 'local'\n    command: 'docker'\n    args: ['run', '-i']\n---\nbody\n",
+        )
+        .unwrap();
+
+        let project_tmp = tempfile::tempdir().unwrap();
+        let project = KiroProject::new(project_tmp.path().to_path_buf());
+
+        let result = svc.install_plugin_agents(
+            &project,
+            plugin_tmp.path(),
+            &["./agents/".to_string()],
+            InstallMode::New,
+            true, // accept_mcp = true → gate is bypassed
+            "mp",
+            "p",
+            None,
+        );
+
+        assert_eq!(result.installed, vec!["terraformer".to_string()]);
+        assert!(
+            !result
+                .warnings
+                .iter()
+                .any(|w| matches!(w, InstallWarning::McpServersRequireOptIn { .. })),
+            "no MCP-opt-in warning when opted in: {:?}",
+            result.warnings
+        );
+
+        // The emitted JSON contains the typed-and-normalized mcpServers block:
+        // `type: 'local'` came in via the Copilot alias and is emitted as `stdio`.
+        let json_path = project_tmp.path().join(".kiro/agents/terraformer.json");
+        let json: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&json_path).unwrap()).unwrap();
+        assert_eq!(json["mcpServers"]["tf"]["type"], "stdio");
+        assert_eq!(json["mcpServers"]["tf"]["command"], "docker");
+    }
+
+    #[test]
+    fn install_plugin_agents_lists_all_mcp_transports_in_warning() {
+        // An agent with multiple MCP servers of different transports
+        // should surface ALL of them in the warning's `transports` vec.
+        // A regression where only one transport gates the install (or
+        // only one is reported) would leave the user blind to part of
+        // the risk surface.
+        use crate::project::KiroProject;
+
+        let (_dir, svc) = temp_service();
+        let plugin_tmp = tempfile::tempdir().unwrap();
+        let agents_dir = plugin_tmp.path().join("agents");
+        fs::create_dir_all(&agents_dir).unwrap();
+        fs::write(
+            agents_dir.join("multi.agent.md"),
+            "---\n\
+             name: multi\n\
+             description: \"Multiple MCP transports\"\n\
+             mcp-servers:\n  \
+               local_tool:\n    \
+                 type: 'local'\n    \
+                 command: 'docker'\n  \
+               http_tool:\n    \
+                 type: http\n    \
+                 url: https://mcp.example.com\n  \
+               another_local:\n    \
+                 type: stdio\n    \
+                 command: 'node'\n\
+             ---\n\
+             body\n",
+        )
+        .unwrap();
+
+        let project_tmp = tempfile::tempdir().unwrap();
+        let project = KiroProject::new(project_tmp.path().to_path_buf());
+
+        let result = svc.install_plugin_agents(
+            &project,
+            plugin_tmp.path(),
+            &["./agents/".to_string()],
+            InstallMode::New,
+            false,
+            "mp",
+            "p",
+            None,
+        );
+        assert!(result.installed.is_empty(), "MCP agent must be skipped");
+
+        let mcp_warning = result
+            .warnings
+            .iter()
+            .find_map(|w| match w {
+                InstallWarning::McpServersRequireOptIn { agent, transports } => {
+                    Some((agent, transports))
+                }
+                _ => None,
+            })
+            .expect("expected McpServersRequireOptIn warning");
+        assert_eq!(mcp_warning.0, "multi");
+        // Transports come out in BTreeMap iteration order on the agent's
+        // `mcp_servers` keys (alphabetical): another_local, http_tool, local_tool.
+        assert_eq!(
+            mcp_warning.1,
+            &vec!["stdio".to_string(), "http".to_string(), "stdio".to_string()],
+            "all transports must appear in the warning so the user sees the full risk surface"
+        );
+    }
+
+    #[test]
+    fn install_plugin_agents_force_does_not_bypass_mcp_gate() {
+        // Regression guard: a future change that wires `mode == Force`
+        // to skip the MCP opt-in check would silently install
+        // subprocess-spawning agents. The gate must fire even under
+        // --force; --accept-mcp is the only opt-in.
+        use crate::project::KiroProject;
+
+        let (_dir, svc) = temp_service();
+        let plugin_tmp = tempfile::tempdir().unwrap();
+        let agents_dir = plugin_tmp.path().join("agents");
+        fs::create_dir_all(&agents_dir).unwrap();
+        fs::write(
+            agents_dir.join("force-test.agent.md"),
+            "---\nname: forcetest\nmcp-servers:\n  s:\n    type: 'local'\n    command: 'docker'\n---\nbody\n",
+        )
+        .unwrap();
+
+        let project_tmp = tempfile::tempdir().unwrap();
+        let project = KiroProject::new(project_tmp.path().to_path_buf());
+
+        let result = svc.install_plugin_agents(
+            &project,
+            plugin_tmp.path(),
+            &["./agents/".to_string()],
+            InstallMode::Force, // <-- force, but...
+            false,              // <-- accept_mcp = false should still gate
+            "mp",
+            "p",
+            None,
+        );
+        assert!(
+            result.installed.is_empty(),
+            "force MUST NOT bypass the MCP opt-in: {:?}",
+            result.installed
+        );
+        assert!(
+            result
+                .warnings
+                .iter()
+                .any(|w| matches!(w, InstallWarning::McpServersRequireOptIn { .. })),
+            "MCP warning still expected under force when accept_mcp is false"
         );
     }
 
@@ -1460,6 +1855,7 @@ mod tests {
             plugin_tmp.path(),
             &["./agents/".to_string()],
             InstallMode::New,
+            false, // accept_mcp: existing fixtures don't carry MCP servers
             "mp",
             "p",
             None,
@@ -1473,6 +1869,7 @@ mod tests {
             plugin_tmp.path(),
             &["./agents/".to_string()],
             InstallMode::New,
+            false, // accept_mcp: existing fixtures don't carry MCP servers
             "mp",
             "p",
             None,
@@ -1508,6 +1905,7 @@ mod tests {
             plugin_tmp.path(),
             &["./agents/".to_string()],
             InstallMode::New,
+            false, // accept_mcp: existing fixtures don't carry MCP servers
             "mp",
             "p",
             Some("1.0.0"),
@@ -1528,6 +1926,7 @@ mod tests {
             plugin_tmp.path(),
             &["./agents/".to_string()],
             InstallMode::Force,
+            false, // accept_mcp: this fixture's agents have no MCP entries
             "mp",
             "p",
             Some("2.0.0"),
@@ -1590,6 +1989,7 @@ mod tests {
             plugin_tmp.path(),
             &["./agents/".to_string()],
             InstallMode::New,
+            false, // accept_mcp: existing fixtures don't carry MCP servers
             "mp",
             "p",
             None,
@@ -1627,7 +2027,9 @@ mod tests {
     impl GitBackend for MockGitBackend {
         fn clone_repo(&self, url: &str, dest: &Path, _opts: &CloneOptions) -> Result<(), GitError> {
             self.calls.lock().unwrap().push(format!("clone:{url}"));
-            // Create dest with a minimal marketplace manifest.
+            // Create dest with a minimal marketplace manifest and a
+            // `.git/HEAD` marker that `resolve_structured_source` checks
+            // to distinguish a complete clone from a partial one.
             let mp_dir = dest.join(".claude-plugin");
             fs::create_dir_all(&mp_dir).unwrap();
             fs::write(
@@ -1635,6 +2037,9 @@ mod tests {
                 r#"{"name":"mock-market","owner":{"name":"Test"},"plugins":[{"name":"mock-plugin","description":"A mock plugin","source":"./plugins/mock"}]}"#,
             )
             .unwrap();
+            let git_dir = dest.join(".git");
+            fs::create_dir_all(&git_dir).unwrap();
+            fs::write(git_dir.join("HEAD"), b"ref: refs/heads/main\n").unwrap();
             Ok(())
         }
 
@@ -1720,7 +2125,123 @@ mod tests {
         assert!(crate::validation::RelativePath::new("../../etc").is_err());
         assert!(crate::validation::RelativePath::new("/etc/passwd").is_err());
         assert!(crate::validation::RelativePath::new("\0").is_err());
+        assert!(crate::validation::RelativePath::new("sub\\..\\etc").is_err());
         assert!(crate::validation::RelativePath::new("ok/path").is_ok());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resolve_plugin_dir_refuses_symlinked_relative_path() {
+        // Regression: a malicious marketplace could drop a symlink at
+        // `plugins/foo -> /etc` and, because `Path::exists()` follows
+        // symlinks, an earlier resolve_plugin_dir would return the
+        // resolved symlink target — letting the install pull files
+        // from outside the marketplace tree. The fix uses
+        // `fs::symlink_metadata` and refuses any symlinked path as
+        // "directory missing."
+        let (dir, svc) = temp_service();
+        let marketplace_path = dir.path().join("marketplace");
+        fs::create_dir_all(&marketplace_path).expect("create marketplace root");
+
+        let target = dir.path().join("outside");
+        fs::create_dir_all(&target).expect("create target dir");
+        std::os::unix::fs::symlink(&target, marketplace_path.join("plugins"))
+            .expect("create symlink");
+
+        let entry = PluginEntry {
+            name: "foo".to_string(),
+            description: None,
+            source: PluginSource::RelativePath(
+                crate::validation::RelativePath::new("./plugins").unwrap(),
+            ),
+        };
+
+        let err = svc
+            .resolve_plugin_dir(&entry, &marketplace_path, "mp", GitProtocol::Https)
+            .expect_err("symlink must be refused");
+        assert!(
+            matches!(err, Error::Plugin(PluginError::DirectoryMissing { .. })),
+            "expected DirectoryMissing for symlinked path, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn resolve_structured_source_recovers_from_partial_clone() {
+        // Regression: if a prior clone crashed mid-way, `dest` exists
+        // but `.git/` is missing — earlier code treated the partial
+        // directory as a valid cached clone and returned it without
+        // re-cloning, so the install would proceed with whatever
+        // half-fetched files happened to be on disk. The resolver must
+        // detect the partial state via `.git/` absence, wipe it, and
+        // re-clone.
+        let (_dir, svc) = temp_service();
+        svc.cache.ensure_dirs().unwrap();
+
+        let dest = svc.cache.plugin_path("mp", "mock-plugin");
+        fs::create_dir_all(&dest).unwrap();
+        fs::write(dest.join("stale.txt"), b"left over from crash").unwrap();
+        assert!(
+            !dest.join(".git").exists(),
+            "fixture: pre-partial-clone dir must not contain .git/"
+        );
+
+        let entry = PluginEntry {
+            name: "mock-plugin".to_string(),
+            description: None,
+            source: PluginSource::Structured(StructuredSource::GitHub {
+                repo: "owner/repo".to_string(),
+                git_ref: None,
+                sha: None,
+            }),
+        };
+
+        let resolved = svc
+            .resolve_plugin_dir(&entry, Path::new("/unused"), "mp", GitProtocol::Https)
+            .expect("partial clone should be recovered and cloned fresh");
+
+        assert_eq!(resolved, dest);
+        assert!(
+            resolved.join(".git/HEAD").exists(),
+            "fresh clone must have replaced partial dir"
+        );
+        assert!(
+            !resolved.join("stale.txt").exists(),
+            "stale file from partial clone must be removed"
+        );
+    }
+
+    #[test]
+    fn resolve_structured_source_reuses_complete_clone() {
+        // Sanity check: a directory with `.git/` is treated as a valid
+        // cached clone and re-used without re-calling clone_repo.
+        let (_dir, svc) = temp_service();
+        svc.cache.ensure_dirs().unwrap();
+
+        let entry = PluginEntry {
+            name: "mock-plugin".to_string(),
+            description: None,
+            source: PluginSource::Structured(StructuredSource::GitHub {
+                repo: "owner/repo".to_string(),
+                git_ref: None,
+                sha: None,
+            }),
+        };
+
+        // First call triggers a clone.
+        svc.resolve_plugin_dir(&entry, Path::new("/unused"), "mp", GitProtocol::Https)
+            .expect("first resolve");
+        // Mark a distinguishing file so we can assert it survives the
+        // second call (i.e. no re-clone happened).
+        let dest = svc.cache.plugin_path("mp", "mock-plugin");
+        fs::write(dest.join("sentinel.txt"), b"should survive").unwrap();
+
+        svc.resolve_plugin_dir(&entry, Path::new("/unused"), "mp", GitProtocol::Https)
+            .expect("second resolve");
+
+        assert!(
+            dest.join("sentinel.txt").exists(),
+            "complete clone must be reused, not re-cloned"
+        );
     }
 
     // No explicit test for "programmatic GitSubdir.path traversal" is
@@ -1908,6 +2429,150 @@ mod tests {
     }
 
     #[test]
+    fn add_serializes_concurrent_same_name_adds() {
+        // Many threads racing to add the same marketplace name. Without
+        // the outer registry lock spanning existence-check + rename +
+        // register, multiple threads could pass `final_dir.exists()` and
+        // race the rename — leaving losers with confusing IO errors and
+        // potentially clobbered final_dir content. With the lock, exactly
+        // one thread wins with Ok and every other gets AlreadyRegistered.
+        //
+        // Fanout 8 (was 2): a broken lock that just happens to win the
+        // race on a 2-thread fight passes the smaller test. Eight
+        // contenders make the failure mode visible.
+        const FANOUT: usize = 8;
+        let (_dir, svc) = temp_service();
+        let svc = std::sync::Arc::new(svc);
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(FANOUT));
+
+        let handles: Vec<_> = (0..FANOUT)
+            .map(|_| {
+                let svc = std::sync::Arc::clone(&svc);
+                let barrier = std::sync::Arc::clone(&barrier);
+                std::thread::spawn(move || {
+                    barrier.wait();
+                    svc.add("owner/repo", GitProtocol::Https)
+                })
+            })
+            .collect();
+
+        let results: Vec<_> = handles.into_iter().map(|h| h.join().unwrap()).collect();
+        let ok_count = results.iter().filter(|r| r.is_ok()).count();
+        let already_count = results
+            .iter()
+            .filter(|r| {
+                matches!(
+                    r,
+                    Err(Error::Marketplace(
+                        MarketplaceError::AlreadyRegistered { .. }
+                    ))
+                )
+            })
+            .count();
+        assert_eq!(ok_count, 1, "exactly one concurrent add should succeed");
+        assert_eq!(
+            already_count,
+            FANOUT - 1,
+            "every loser must surface AlreadyRegistered, not a generic IO error: {:?}",
+            results
+                .iter()
+                .filter_map(|r| r.as_ref().err().map(ToString::to_string))
+                .collect::<Vec<_>>()
+        );
+
+        // No `_pending_*` staging dirs may leak. Both threads create their
+        // own pid+seq-suffixed temp dir; the loser's dir must be cleaned up
+        // by the DirCleanupGuard before its add() returns.
+        let marketplaces_dir = svc.cache.marketplaces_dir();
+        let leftovers: Vec<_> = fs::read_dir(&marketplaces_dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| e.file_name().to_string_lossy().starts_with("_pending_"))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "no _pending_ staging dirs should remain after a concurrent add race"
+        );
+
+        // The winner's marketplace is registered exactly once.
+        let known = svc.list().expect("list");
+        assert_eq!(known.len(), 1);
+        assert_eq!(known[0].name, "mock-market");
+    }
+
+    #[test]
+    fn add_and_remove_race_leaves_consistent_state() {
+        // Concurrent add(mock-market) + remove(mock-market). The two
+        // operations both take the registry lock — they must serialise
+        // without leaving the cache half-deleted, half-registered. Either:
+        //   - add wins first, then remove succeeds (registry empty, dir gone)
+        //   - remove runs first (NotFound), then add succeeds (registry has 1)
+        // Importantly: never both registered AND directory deleted.
+        let (_dir, svc) = temp_service();
+        let svc = std::sync::Arc::new(svc);
+        // Pre-add so remove has something to race against.
+        svc.add("owner/repo", GitProtocol::Https)
+            .expect("seed marketplace");
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let svc_a = std::sync::Arc::clone(&svc);
+        let bar_a = std::sync::Arc::clone(&barrier);
+        let svc_r = std::sync::Arc::clone(&svc);
+        let bar_r = std::sync::Arc::clone(&barrier);
+
+        // Thread A: re-add (collides with the existing entry → AlreadyRegistered
+        // unless remove runs first → succeeds).
+        let h_add = std::thread::spawn(move || {
+            bar_a.wait();
+            svc_a.add("owner/repo", GitProtocol::Https)
+        });
+        // Thread R: remove (succeeds unless add hasn't completed yet, in
+        // which case... well, the seed already ran, so it must succeed).
+        let h_rm = std::thread::spawn(move || {
+            bar_r.wait();
+            svc_r.remove("mock-market")
+        });
+
+        let add_result = h_add.join().unwrap();
+        let rm_result = h_rm.join().unwrap();
+
+        // After serialisation, the registry must be in one of the two
+        // valid steady states:
+        //   - empty (remove won the race): add returned AlreadyRegistered
+        //     IF it ran before remove, OR succeeded if it ran after.
+        //   - has the marketplace (add re-added after remove): remove
+        //     succeeded, then add succeeded.
+        let known = svc.list().expect("list");
+        match known.len() {
+            0 => {
+                // Remove ran last. Add must have returned AlreadyRegistered
+                // (which it did before remove). Either result is acceptable.
+                assert!(
+                    rm_result.is_ok(),
+                    "remove must have succeeded: {rm_result:?}"
+                );
+            }
+            1 => {
+                // Add ran last → registered marketplace dir must exist.
+                assert_eq!(known[0].name, "mock-market");
+                assert!(
+                    svc.cache.marketplace_path("mock-market").exists(),
+                    "registered marketplace must have its on-disk dir"
+                );
+                assert!(
+                    add_result.is_ok(),
+                    "add must have succeeded: {add_result:?}"
+                );
+            }
+            n => panic!(
+                "registry must end with 0 or 1 entries after add/remove race, got {n}: \
+                 add={add_result:?}, rm={rm_result:?}"
+            ),
+        }
+    }
+
+    #[test]
     fn remove_marketplace_cleans_up() {
         let (_dir, svc) = temp_service();
         svc.add("owner/repo", GitProtocol::Https).expect("add");
@@ -1952,6 +2617,60 @@ mod tests {
         let known = svc.list().expect("list");
 
         assert!(known.is_empty());
+    }
+
+    #[test]
+    fn add_rejects_http_url_by_default() {
+        // Plaintext HTTP is unauthenticated. Without TLS a network
+        // attacker can swap the marketplace contents and gain
+        // long-lived code execution via skills/agents/MCP servers
+        // that the cache then keeps. The default rejects with
+        // InsecureSource so users have to explicitly opt in.
+        let (_dir, svc) = temp_service();
+        let err = svc
+            .add("http://example.com/repo.git", GitProtocol::Https)
+            .expect_err("http:// must be rejected by default");
+        assert!(
+            matches!(
+                err,
+                Error::Marketplace(MarketplaceError::InsecureSource { .. })
+            ),
+            "expected InsecureSource, got {err:?}"
+        );
+        // The error names the opt-in knob so the user knows the workaround.
+        let msg = err.to_string();
+        assert!(
+            msg.contains("http://") && msg.contains("allow-insecure-http"),
+            "error must point at the remediation: {msg}"
+        );
+    }
+
+    #[test]
+    fn add_accepts_http_url_when_explicitly_opted_in() {
+        // Setting InsecureHttpPolicy::Allow MUST let http:// proceed.
+        // Plumbed end-to-end so a CLI flag like --allow-insecure-http or
+        // a Tauri checkbox can flip it.
+        let (_dir, svc) = temp_service();
+        let result = svc.add(
+            "http://example.com/repo.git",
+            MarketplaceAddOptions::new(GitProtocol::Https).allow_insecure_http(),
+        );
+        // The mock backend will succeed regardless of URL scheme; we're
+        // proving here that the http guard does not fire when opted in.
+        assert!(
+            result.is_ok(),
+            "opted-in http:// add should succeed against the mock, got {result:?}"
+        );
+    }
+
+    #[test]
+    fn add_accepts_https_url_without_opt_in() {
+        // The strict default must NOT reject `https://`; only `http://`
+        // is gated. Otherwise we'd block the common case (a private git
+        // server with a TLS cert).
+        let (_dir, svc) = temp_service();
+        svc.add("https://example.com/repo.git", GitProtocol::Https)
+            .expect("https:// is the safe path and must work without opt-in");
     }
 
     // -----------------------------------------------------------------------
@@ -2439,7 +3158,7 @@ mod tests {
             "expected validation error, got: {err}"
         );
 
-        // Verify no directory was left behind (TempDirGuard should clean up).
+        // Verify no directory was left behind (DirCleanupGuard should clean up).
         let marketplaces_dir = dir.path().join("marketplaces");
         if marketplaces_dir.exists() {
             let entries: Vec<_> = fs::read_dir(&marketplaces_dir)

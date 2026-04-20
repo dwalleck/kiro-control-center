@@ -93,10 +93,43 @@ impl<'de> Deserialize<'de> for RelativePath {
     }
 }
 
-/// Validate that a name is safe to use as a single directory component.
+/// Names reserved by Windows for legacy device handles. Trying to create
+/// a file or directory with one of these names (with or without extension)
+/// fails on Windows in interesting ways: the OS short-circuits the path to
+/// the device, so opening `CON.txt` returns a console handle, and a folder
+/// called `NUL/` is unwritable. Reject them at the validator regardless of
+/// platform so the cache layout works the same on every host.
+const WINDOWS_RESERVED_NAMES: &[&str] = &[
+    "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
+    "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+];
+
+/// Validate that a name is safe to use as a single directory component on
+/// every platform we support.
 ///
-/// Rejects names that are empty, contain path separators (`/`, `\`),
-/// contain `..` sequences, or are exactly `.`.
+/// Rejects names that:
+/// - are empty
+/// - contain a path separator (`/`, `\`) — would split into multiple components
+/// - contain `..` — `Path::components` would surface a parent-dir component
+/// - are exactly `.` — refers to the current directory
+/// - contain a NUL byte — truncates C-string conversions in syscalls
+/// - contain any other ASCII control character (0x01..=0x1F, 0x7F) — these
+///   render as garbled or invisible bytes in logs and shells, and several
+///   filesystems reject them outright
+/// - have leading or trailing ASCII whitespace — leading whitespace makes
+///   the directory look empty in shell listings; trailing whitespace and
+///   trailing dots are silently stripped by NTFS, which would alias two
+///   apparently distinct names to the same on-disk directory
+/// - match a Windows reserved device name (CON, PRN, AUX, NUL, COM1-9,
+///   LPT1-9), comparison case-insensitive and applied to both the bare
+///   name and the stem-before-extension. The OS reserves these regardless
+///   of extension, so `nul.txt` is rejected too. This matters even on
+///   Unix because the marketplace cache may be mounted/synced to a
+///   Windows host.
+///
+/// Internal whitespace (e.g. `Terraform Agent`) is permitted because real
+/// Copilot agents use it; only the leading and trailing positions are
+/// rejected.
 ///
 /// # Errors
 ///
@@ -130,6 +163,73 @@ pub fn validate_name(name: &str) -> Result<(), ValidationError> {
         });
     }
 
+    // Control character rejection. NUL is called out separately for a
+    // clearer error message; everything else (BEL, BS, VT, ESC, DEL, …)
+    // collapses into the generic case so the user knows the byte index.
+    if let Some((idx, ch)) = name
+        .char_indices()
+        .find(|&(_, c)| c == '\0' || c.is_control())
+    {
+        let reason = if ch == '\0' {
+            "contains NUL byte".to_owned()
+        } else {
+            format!(
+                "contains control character U+{:04X} at byte {idx}",
+                ch as u32
+            )
+        };
+        return Err(ValidationError::InvalidName {
+            name: name.to_owned(),
+            reason,
+        });
+    }
+
+    if name.chars().next().is_some_and(|c| c.is_ascii_whitespace()) {
+        return Err(ValidationError::InvalidName {
+            name: name.to_owned(),
+            reason: "must not start with whitespace".into(),
+        });
+    }
+    if name
+        .chars()
+        .next_back()
+        .is_some_and(|c| c.is_ascii_whitespace())
+    {
+        return Err(ValidationError::InvalidName {
+            name: name.to_owned(),
+            reason: "must not end with whitespace".into(),
+        });
+    }
+
+    // NTFS strips trailing dots when creating files, which would silently
+    // alias `foo.` and `foo` to the same on-disk directory. Reject so the
+    // cache layout is unambiguous across platforms.
+    if name.ends_with('.') && name != "." {
+        return Err(ValidationError::InvalidName {
+            name: name.to_owned(),
+            reason: "must not end with `.`".into(),
+        });
+    }
+
+    // Windows-reserved device names. Compare both the bare name and the
+    // stem-before-first-`.` so `CON`, `con`, `Con.txt`, `con.tar.gz` are
+    // all rejected. Case-insensitive on ASCII because the reserved table
+    // is ASCII.
+    let stem = name.split('.').next().unwrap_or(name);
+    let is_reserved = |candidate: &str| {
+        WINDOWS_RESERVED_NAMES
+            .iter()
+            .any(|reserved| reserved.eq_ignore_ascii_case(candidate))
+    };
+    if is_reserved(name) || is_reserved(stem) {
+        return Err(ValidationError::InvalidName {
+            name: name.to_owned(),
+            reason: format!(
+                "matches a Windows reserved device name (`{stem}`); rename to avoid conflicts"
+            ),
+        });
+    }
+
     Ok(())
 }
 
@@ -152,6 +252,19 @@ pub fn validate_relative_path(path: &str) -> Result<(), ValidationError> {
         return Err(ValidationError::InvalidRelativePath {
             path: path.to_owned(),
             reason: "must not be an absolute path".into(),
+        });
+    }
+
+    // Reject any backslash anywhere in the path. `Path::components` treats
+    // `\` as a literal on Unix but as a separator on Windows, so a string
+    // like `sub\..\..\etc` would pass the `..` check on Unix yet traverse
+    // on Windows. Rejecting `\` at the boundary makes validation
+    // platform-independent. Legitimate relative paths in this codebase use
+    // forward slashes (see `DiscoveredPlugin::as_relative_path_string`).
+    if path.contains('\\') {
+        return Err(ValidationError::InvalidRelativePath {
+            path: path.to_owned(),
+            reason: "contains backslash (use `/` as a separator)".into(),
         });
     }
 
@@ -249,6 +362,93 @@ mod tests {
         assert!(validate_name(".hidden").is_ok());
     }
 
+    #[test]
+    fn validate_name_accepts_internal_whitespace() {
+        // "Terraform Agent" is a real Copilot agent name. Internal spaces
+        // must keep working even though leading/trailing whitespace is
+        // rejected — otherwise we'd break every Copilot multi-word agent.
+        assert!(validate_name("Terraform Agent").is_ok());
+    }
+
+    #[test]
+    fn validate_name_rejects_nul_byte() {
+        let err = validate_name("foo\0bar").unwrap_err();
+        assert!(
+            matches!(&err, ValidationError::InvalidName { reason, .. } if reason.contains("NUL")),
+            "expected NUL-specific reason, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn validate_name_rejects_other_control_characters() {
+        for raw in ["foo\nbar", "alert\x07", "tab\there", "del\x7Fend"] {
+            let err = validate_name(raw).unwrap_err();
+            assert!(
+                matches!(&err, ValidationError::InvalidName { reason, .. } if reason.contains("control character")),
+                "expected control-character reason for {raw:?}, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_name_rejects_leading_and_trailing_space() {
+        // Leading whitespace creates folders that look empty in `ls`.
+        // Trailing whitespace is silently stripped by NTFS, aliasing two
+        // distinct names to the same on-disk directory. Tab / newline are
+        // covered by the control-character check, which fires first; the
+        // remaining ASCII-whitespace cases are leading/trailing space.
+        for raw in [" leading", "trailing "] {
+            let err = validate_name(raw).unwrap_err();
+            assert!(
+                matches!(&err, ValidationError::InvalidName { reason, .. } if reason.contains("whitespace")),
+                "expected whitespace rejection for {raw:?}, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_name_rejects_trailing_dot() {
+        // NTFS strips trailing dots — "foo." and "foo" would alias.
+        let err = validate_name("foo.").unwrap_err();
+        assert!(
+            matches!(&err, ValidationError::InvalidName { reason, .. } if reason.contains("end with `.`")),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn validate_name_rejects_windows_reserved_names() {
+        for reserved in [
+            "CON",
+            "con",
+            "PRN",
+            "AUX",
+            "NUL",
+            "nul",
+            "COM1",
+            "lpt9",
+            "Con.txt",
+            "nul.tar.gz",
+        ] {
+            let err = validate_name(reserved).unwrap_err();
+            assert!(
+                matches!(&err, ValidationError::InvalidName { reason, .. } if reason.contains("Windows reserved")),
+                "expected Windows-reserved rejection for {reserved:?}, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_name_accepts_names_that_merely_share_prefix_with_reserved() {
+        // "console", "auxiliary", "command" are NOT Windows reserved —
+        // only the exact device names CON, AUX, COM1 etc. are. Don't
+        // over-reject.
+        assert!(validate_name("console").is_ok());
+        assert!(validate_name("auxiliary").is_ok());
+        assert!(validate_name("command-runner").is_ok());
+        assert!(validate_name("nullable").is_ok());
+    }
+
     // -----------------------------------------------------------------------
     // validate_relative_path
     // -----------------------------------------------------------------------
@@ -300,6 +500,24 @@ mod tests {
         assert!(
             matches!(err, ValidationError::InvalidRelativePath { .. }),
             "expected InvalidRelativePath, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn validate_relative_path_rejects_embedded_backslash() {
+        // Regression for a Unix/Windows asymmetry: `Path::components` treats
+        // `\` as a literal on Unix, so without explicit rejection a string
+        // like `sub\..\..\etc` would pass the `..` check on Unix but
+        // traverse on Windows or in a shell. The validator must reject any
+        // embedded backslash regardless of platform.
+        let err = validate_relative_path("sub\\..\\..\\etc").unwrap_err();
+        assert!(
+            matches!(err, ValidationError::InvalidRelativePath { .. }),
+            "expected InvalidRelativePath, got {err:?}"
+        );
+        assert!(
+            err.to_string().contains("backslash"),
+            "error should mention backslash: {err}"
         );
     }
 

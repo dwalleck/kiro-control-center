@@ -20,8 +20,17 @@ use crate::cli;
 /// Run the install command.
 ///
 /// Resolves `plugin_ref` to a plugin, discovers skills, copies skill
-/// directories, and installs into the current Kiro project.
-pub fn run(plugin_ref: &str, skill_filter: Option<&str>, force: bool) -> Result<()> {
+/// directories, and installs into the current Kiro project. `accept_mcp`
+/// gates installation of agents that bring MCP servers — without the
+/// opt-in flag, those agents are skipped with a warning so the user can
+/// see the risk surface (subprocess execution / external network calls)
+/// before re-running with `--accept-mcp`.
+pub fn run(
+    plugin_ref: &str,
+    skill_filter: Option<&str>,
+    force: bool,
+    accept_mcp: bool,
+) -> Result<()> {
     let mode = InstallMode::from(force);
     let (plugin_name, marketplace_name) = cli::parse_plugin_ref(plugin_ref).with_context(|| {
         format!("invalid plugin reference '{plugin_ref}': expected plugin@marketplace")
@@ -81,6 +90,7 @@ pub fn run(plugin_ref: &str, skill_filter: Option<&str>, force: bool) -> Result<
         &agent_scan_paths,
         skill_filter,
         mode,
+        accept_mcp,
         marketplace_name,
         plugin_name,
         version.as_deref(),
@@ -167,6 +177,7 @@ fn run_agent_install(
     agent_scan_paths: &[String],
     skill_filter: Option<&str>,
     mode: InstallMode,
+    accept_mcp: bool,
     marketplace_name: &str,
     plugin_name: &str,
     version: Option<&str>,
@@ -181,6 +192,7 @@ fn run_agent_install(
         plugin_dir,
         agent_scan_paths,
         mode,
+        accept_mcp,
         marketplace_name,
         plugin_name,
         version,

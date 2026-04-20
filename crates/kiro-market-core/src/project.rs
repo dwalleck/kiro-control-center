@@ -99,9 +99,21 @@ fn remove_staging_dir(staging: &Path) {
 /// Recursively copy a directory tree from `src` to `dest`.
 ///
 /// Creates `dest` and all intermediate directories. Files are copied
-/// preserving the relative directory structure. **Symlinks are skipped**
-/// to prevent path traversal attacks where a malicious skill package
-/// could include symlinks pointing to sensitive host files.
+/// preserving the relative directory structure.
+///
+/// **Symlinks are skipped** to prevent path traversal attacks where a
+/// malicious skill package could include symlinks pointing to sensitive
+/// host files.
+///
+/// **Hardlinks (nlink > 1) are skipped on Unix** because the entry could
+/// share an inode with a sensitive file outside the source tree (e.g.
+/// `~/.ssh/id_rsa`). Symlinks expose the same risk via the kernel's
+/// resolution; hardlinks expose it via the inode itself, so they need
+/// the same treatment. The skip is logged at `warn` so a user wondering
+/// "why is `LICENSE` missing from my install?" gets a clear signal.
+/// Inside a cloned git repo this never fires (git can't store hardlinks);
+/// it matters for `LocalPath` marketplaces where the user-pointed
+/// directory may have been crafted to expose data via hardlinks.
 ///
 /// # Errors
 ///
@@ -130,6 +142,26 @@ fn copy_dir_recursive(src: &Path, dest: &Path) -> std::io::Result<()> {
                 "skipping symlink in skill directory"
             );
             continue;
+        }
+        // Hardlink check (Unix only). Files with nlink > 1 share an inode
+        // with at least one other path; we cannot tell from here whether
+        // the other path is benign (a dedup tool's twin) or malicious
+        // (linked into ~/.ssh). Refuse rather than guess. Windows / NTFS
+        // also supports hardlinks (CreateHardLink) but lacks a portable
+        // nlink accessor in std; the platform.rs Windows copy path mirrors
+        // this posture by skipping reparse points instead.
+        #[cfg(unix)]
+        if metadata.is_file() {
+            use std::os::unix::fs::MetadataExt;
+            if metadata.nlink() > 1 {
+                warn!(
+                    path = %entry.path().display(),
+                    nlink = metadata.nlink(),
+                    "skipping hardlinked file in skill source; cannot prove its inode \
+                     is not also linked to a sensitive file outside the source tree"
+                );
+                continue;
+            }
         }
         if metadata.is_dir() {
             copy_dir_recursive(&entry.path(), &target)?;
@@ -1682,6 +1714,48 @@ mod tests {
         assert!(
             !dest_path.join("evil-link").exists(),
             "symlinks should be skipped during copy"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn copy_dir_recursive_skips_hardlinks() {
+        // A malicious LocalPath marketplace creates a hardlink inside the
+        // skill source pointing at a sensitive file (here we use a
+        // sentinel within the same temp tree to avoid touching real host
+        // files, but the threat is `~/.ssh/id_rsa`-class). The copy must
+        // skip the hardlink so the installed skill does not expose the
+        // sensitive content.
+        let src = tempfile::tempdir().expect("tempdir");
+        let dest = tempfile::tempdir().expect("tempdir");
+        let dest_path = dest.path().join("output");
+
+        // Two regular files in the source.
+        fs::write(src.path().join("SKILL.md"), "skill content").expect("write");
+
+        // A "secret" file outside the skill dir.
+        let secret_dir = tempfile::tempdir().expect("tempdir");
+        let secret_path = secret_dir.path().join("secret.txt");
+        fs::write(&secret_path, "TOP SECRET").expect("write secret");
+
+        // Hardlink the secret into the skill dir as a benign-looking name.
+        std::fs::hard_link(&secret_path, src.path().join("notes.md")).expect("hardlink");
+
+        copy_dir_recursive(src.path(), &dest_path).expect("copy should succeed");
+
+        // The regular file is copied as expected.
+        assert!(dest_path.join("SKILL.md").exists());
+        // The hardlink must NOT be copied — its content (the secret) must
+        // never reach the install destination.
+        assert!(
+            !dest_path.join("notes.md").exists(),
+            "hardlinked file must be skipped during copy"
+        );
+        // The original secret file is untouched.
+        assert_eq!(
+            fs::read_to_string(&secret_path).unwrap(),
+            "TOP SECRET",
+            "skipping must not delete or modify the source"
         );
     }
 

@@ -13,6 +13,7 @@ pub mod marketplace;
 pub mod platform;
 pub mod plugin;
 pub mod project;
+pub(crate) mod raii;
 pub mod service;
 pub mod skill;
 #[cfg(any(test, feature = "test-support"))]

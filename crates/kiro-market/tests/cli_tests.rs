@@ -143,6 +143,83 @@ fn install_missing_marketplace_fails() {
 }
 
 #[test]
+fn marketplace_add_rejects_http_url_by_default() {
+    // End-to-end coverage of the http:// gate: the CLI must surface the
+    // InsecureSource error without needing the --allow-insecure-http
+    // flag. Without this test, only the service-layer gate is verified
+    // — a regression that drops the CLI plumbing wouldn't be caught.
+    let dir = TempDir::new().expect("temp dir");
+    let output = run_in_dir(
+        dir.path(),
+        &["marketplace", "add", "http://example.com/repo.git"],
+    );
+
+    assert!(
+        !output.status.success(),
+        "http:// add must fail without opt-in"
+    );
+    let err = stderr(&output);
+    assert!(
+        err.contains("http://") && err.contains("allow-insecure-http"),
+        "error must mention http:// and the remediation flag, got:\n{err}"
+    );
+}
+
+#[test]
+fn marketplace_add_help_documents_allow_insecure_http_flag() {
+    // Documentation regression: if the --allow-insecure-http flag is
+    // ever renamed or removed, this test catches it via clap's auto-
+    // generated help. The error message in the gate above references
+    // this flag by name; the two MUST stay in sync.
+    let dir = TempDir::new().expect("temp dir");
+    let output = run_in_dir(dir.path(), &["marketplace", "add", "--help"]);
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+
+    let out = stdout(&output);
+    assert!(
+        out.contains("--allow-insecure-http"),
+        "marketplace add --help must document --allow-insecure-http:\n{out}"
+    );
+}
+
+#[test]
+fn install_help_documents_accept_mcp_flag() {
+    // Same regression guard for the MCP opt-in: the install help must
+    // document --accept-mcp because the InstallWarning::McpServersRequireOptIn
+    // message references it by name.
+    let dir = TempDir::new().expect("temp dir");
+    let output = run_in_dir(dir.path(), &["install", "--help"]);
+    assert!(output.status.success(), "stderr: {}", stderr(&output));
+
+    let out = stdout(&output);
+    assert!(
+        out.contains("--accept-mcp"),
+        "install --help must document --accept-mcp:\n{out}"
+    );
+}
+
+#[test]
+fn cache_prune_dry_run_on_clean_cache_succeeds() {
+    // Smoke test for the new `cache prune` command: even on an empty
+    // cache (no marketplaces ever added) it must exit zero and report
+    // "no orphans". A regression that mishandles missing dirs would
+    // surface here.
+    let dir = TempDir::new().expect("temp dir");
+    let output = run_in_dir(dir.path(), &["cache", "prune", "--dry-run"]);
+
+    assert!(
+        output.status.success(),
+        "cache prune on a fresh dir must succeed: {}",
+        stderr(&output)
+    );
+    let out = stdout(&output);
+    assert!(
+        out.contains("clean"),
+        "expected 'cache is clean' wording, got:\n{out}"
+    );
+}
+
+#[test]
 fn update_command_exits_nonzero_while_unimplemented() {
     // Regression: the top-level `update` command is a documented stub
     // that previously returned Ok(()), so CI couldn't distinguish

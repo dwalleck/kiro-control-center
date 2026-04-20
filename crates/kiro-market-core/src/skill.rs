@@ -21,6 +21,14 @@ pub enum ParseError {
     /// The YAML between the fences could not be parsed.
     #[error("invalid YAML in frontmatter: {0}")]
     InvalidYaml(String),
+
+    /// The frontmatter parsed but the `name` field failed
+    /// [`crate::validation::validate_name`]. Reported at parse time so a
+    /// malformed SKILL.md cannot pass discovery / scanning and only fail
+    /// later when `install_skill_from_dir` re-validates: the early reject
+    /// surfaces typos and traversal attempts before any I/O is wasted.
+    #[error("invalid `name` in SKILL.md frontmatter: {0}")]
+    InvalidName(String),
 }
 
 /// Parsed YAML frontmatter from a `SKILL.md` file.
@@ -64,6 +72,19 @@ pub fn parse_frontmatter(content: &str) -> Result<(SkillFrontmatter, usize), Par
 
     let frontmatter: SkillFrontmatter =
         serde_yaml_ng::from_str(yaml_block).map_err(|e| ParseError::InvalidYaml(e.to_string()))?;
+
+    // Validate the name at parse time so downstream filesystem operations
+    // (`KiroProject::install_skill_from_dir`, `cache.write_plugin_registry`,
+    // etc.) can trust the value without re-checking — and so a SKILL.md with
+    // a traversal name fails as soon as it's read, not after a directory
+    // copy has already been started. Mirrors `parse_claude_agent` /
+    // `parse_copilot_agent`, which both validate at the same boundary.
+    crate::validation::validate_name(&frontmatter.name).map_err(|e| match e {
+        crate::error::ValidationError::InvalidName { reason, .. } => {
+            ParseError::InvalidName(reason)
+        }
+        other => ParseError::InvalidName(other.to_string()),
+    })?;
 
     // Calculate the byte offset where the body starts (after closing `---` and its newline).
     let close_fence_start =
@@ -179,5 +200,35 @@ mod tests {
             matches!(err, ParseError::InvalidYaml(_)),
             "expected InvalidYaml, got {err:?}"
         );
+    }
+
+    #[test]
+    fn parse_rejects_path_traversal_in_name() {
+        // A malicious SKILL.md cannot smuggle a `../` into the install
+        // path even before reaching install_skill_from_dir. This mirrors
+        // parse_claude_agent / parse_copilot_agent which both already
+        // validate at the parse boundary.
+        let content = "---\nname: ../escape\ndescription: bad\n---\nbody\n";
+        let err = parse_frontmatter(content).expect_err("traversal must be rejected");
+        assert!(
+            matches!(err, ParseError::InvalidName(_)),
+            "expected InvalidName for traversal, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn parse_rejects_path_separator_in_name() {
+        let content = "---\nname: sub/dir\ndescription: bad\n---\nbody\n";
+        let err = parse_frontmatter(content).expect_err("separator must be rejected");
+        assert!(matches!(err, ParseError::InvalidName(_)));
+    }
+
+    #[test]
+    fn parse_rejects_windows_reserved_name() {
+        // Belt-and-braces: even if a SKILL.md sneaks `con` past the
+        // author's review, the validator catches it at parse time.
+        let content = "---\nname: con\ndescription: bad\n---\nbody\n";
+        let err = parse_frontmatter(content).expect_err("reserved name must be rejected");
+        assert!(matches!(err, ParseError::InvalidName(_)));
     }
 }

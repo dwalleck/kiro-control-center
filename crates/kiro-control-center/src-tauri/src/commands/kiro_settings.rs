@@ -5,8 +5,9 @@ use std::sync::Mutex;
 
 use kiro_market_core::file_lock::with_file_lock;
 use kiro_market_core::kiro_settings::{
-    default_kiro_dir, kiro_settings_path, load_kiro_settings_from, registry, remove_nested,
-    resolve_settings, save_kiro_settings_to, set_nested, LoadSettingsError, SettingEntry,
+    apply_registered_setting, default_kiro_dir, kiro_settings_path, load_kiro_settings_from,
+    registry, remove_nested, resolve_settings, save_kiro_settings_to, LoadSettingsError,
+    SettingEntry,
 };
 use serde_json::Value as JsonValue;
 
@@ -99,37 +100,42 @@ pub async fn get_kiro_settings() -> Result<Vec<SettingEntry>, CommandError> {
 }
 
 /// Update a single Kiro CLI setting by key and return the updated entry.
+///
+/// All validation runs inside `apply_registered_setting` so the
+/// "key in registry?" / "value type matches?" / "write" triple stays
+/// atomic at the source of truth (kiro-market-core). Earlier this
+/// command did the registry check here and the type check inline,
+/// then handed the validated triple to the unchecked `set_nested`;
+/// the new helper keeps the three steps inseparable so a future
+/// caller can't drop one by accident.
 #[tauri::command]
 #[specta::specta]
 #[allow(clippy::unused_async)]
 pub async fn set_kiro_setting(key: String, value: JsonValue) -> Result<SettingEntry, CommandError> {
-    let reg_idx = validate_key(&key)?;
-
-    let reg = registry();
-    let def = &reg[reg_idx];
-    if !def.value_type.is_compatible_value(&value) {
+    if key.is_empty() {
         return Err(CommandError::new(
-            format!(
-                "invalid value for '{}': expected {}, got {}",
-                key,
-                def.value_type.type_name(),
-                value_type_label(&value),
-            ),
+            "setting key must not be empty",
             ErrorType::Validation,
         ));
     }
 
     let dir = kiro_dir()?;
     locked_modify(&dir, |json| {
-        set_nested(json, &key, value);
-        Ok(())
+        // All current reject reasons (unknown key, type mismatch) surface
+        // as Validation errors — same severity, same UI treatment. The
+        // catch-all is required because ApplySettingError is
+        // `#[non_exhaustive]`: a future variant added in core (e.g.
+        // ReadOnly, Deprecated) compiles here without forcing a frontend
+        // edit, and its `Display` impl provides the user-facing string.
+        apply_registered_setting(json, &key, value)
+            .map_err(|e| CommandError::new(e.to_string(), ErrorType::Validation))
     })?;
 
     let json = load_settings(&dir)?;
     let entry = resolve_settings(&json)
         .into_iter()
         .find(|e| e.key == key)
-        .expect("key was validated against registry above");
+        .expect("key was validated against registry inside apply_registered_setting");
 
     Ok(entry)
 }
@@ -165,25 +171,14 @@ fn locked_modify(
     })
 }
 
-// ---------------------------------------------------------------------------
-// Utilities
-// ---------------------------------------------------------------------------
-
-/// Human-readable label for a JSON value's type, used in validation errors.
-fn value_type_label(value: &JsonValue) -> &'static str {
-    match value {
-        JsonValue::Null => "null",
-        JsonValue::Bool(_) => "boolean",
-        JsonValue::Number(_) => "number",
-        JsonValue::String(_) => "string",
-        JsonValue::Array(_) => "array",
-        JsonValue::Object(_) => "object",
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Tests reach into set_nested to seed the file directly without
+    // going through the registry-validation path that the production
+    // command uses. Imported in the test module only so it doesn't
+    // appear unused in non-test builds.
+    use kiro_market_core::kiro_settings::set_nested;
 
     #[test]
     fn validate_key_rejects_empty_key() {
@@ -277,18 +272,5 @@ mod tests {
 
         // Should succeed (and not panic) even though the mutex is poisoned.
         let _guard = acquire_settings_lock();
-    }
-
-    #[test]
-    fn value_type_label_covers_all_json_kinds() {
-        assert_eq!(value_type_label(&JsonValue::Null), "null");
-        assert_eq!(value_type_label(&JsonValue::Bool(true)), "boolean");
-        assert_eq!(value_type_label(&JsonValue::from(1)), "number");
-        assert_eq!(value_type_label(&JsonValue::from("s")), "string");
-        assert_eq!(value_type_label(&JsonValue::Array(Vec::new())), "array");
-        assert_eq!(
-            value_type_label(&JsonValue::Object(serde_json::Map::new())),
-            "object"
-        );
     }
 }

@@ -541,6 +541,17 @@ pub fn get_nested<'a>(value: &'a JsonValue, path: &str) -> Option<&'a JsonValue>
 /// A path of `""` is treated as a single empty segment ("" is what
 /// `"".split('.').collect::<Vec<_>>()` produces).
 ///
+/// # Trust contract
+///
+/// `set_nested` does **not** look up the key in [`registry()`] or check
+/// the value's type. Callers handling untrusted input MUST validate
+/// against the registry first — use [`apply_registered_setting`] for
+/// the combined "validate against registry, then write" flow. The
+/// command-layer wrapper in `crates/kiro-control-center/src-tauri`
+/// already does both validations; this raw helper exists only because
+/// some callers (test fixtures, future migrations) need to write
+/// arbitrary keys without registry coupling.
+///
 /// # Panics
 ///
 /// The internal `expect` calls assert post-conditions established by the
@@ -593,6 +604,73 @@ pub fn set_nested(value: &mut JsonValue, path: &str, val: JsonValue) {
         .as_object_mut()
         .expect("just ensured current is an object")
         .insert((*last).to_owned(), val);
+}
+
+/// Reasons an [`apply_registered_setting`] call can reject the input.
+///
+/// Marked `#[non_exhaustive]` so future variants (e.g. `ReadOnly`,
+/// `Deprecated`, `OutOfRange`) are additive without breaking matches in
+/// downstream crates. Pattern matches in any caller MUST include a
+/// catch-all `_ =>` arm.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum ApplySettingError {
+    /// The dotted key is not present in [`registry()`]. A typo or a key
+    /// from a future schema; refusing to write avoids polluting the
+    /// settings file with junk that the UI would never show.
+    #[error("unknown setting key: {key}")]
+    UnknownKey { key: String },
+
+    /// The value's JSON type does not match the registered
+    /// [`SettingType`] for the key. Catches `chat.defaultModel = true`
+    /// (string slot, bool value) before it reaches disk.
+    #[error("invalid value for `{key}`: expected {expected}, got {actual}")]
+    TypeMismatch {
+        key: String,
+        expected: &'static str,
+        actual: &'static str,
+    },
+}
+
+/// Write a value at a registered Kiro CLI setting key, validating both
+/// the key and the value type against [`registry()`].
+///
+/// Use this from any caller that handles externally-supplied input —
+/// CLI flags, Tauri command arguments, future plugin/IPC messages.
+/// `set_nested` alone has no registry coupling and would happily write
+/// `weird.unknown.path = 12` into the user's settings file, which the
+/// UI then can't render. This wrapper combines the previously inline
+/// `validate_key` + type-compatibility check + `set_nested` triple so
+/// every call site gets the same defense-in-depth.
+///
+/// # Errors
+///
+/// - [`ApplySettingError::UnknownKey`] if `key` is not in the registry.
+/// - [`ApplySettingError::TypeMismatch`] if `val` is not a valid value
+///   for the registered [`SettingType`].
+pub fn apply_registered_setting(
+    json: &mut JsonValue,
+    key: &str,
+    val: JsonValue,
+) -> Result<(), ApplySettingError> {
+    let def =
+        registry()
+            .iter()
+            .find(|d| d.key == key)
+            .ok_or_else(|| ApplySettingError::UnknownKey {
+                key: key.to_owned(),
+            })?;
+
+    if !def.value_type.is_compatible_value(&val) {
+        return Err(ApplySettingError::TypeMismatch {
+            key: key.to_owned(),
+            expected: def.value_type.type_name(),
+            actual: json_kind(&val),
+        });
+    }
+
+    set_nested(json, key, val);
+    Ok(())
 }
 
 /// Human-readable label for a JSON value's variant, used in `set_nested` warnings.
@@ -982,6 +1060,71 @@ mod tests {
         assert_eq!(
             get_nested(&json, "chat.defaultModel"),
             Some(&JsonValue::String("opus".into()))
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // apply_registered_setting
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn apply_registered_setting_writes_known_key() {
+        // chat.defaultModel is a known registered string setting.
+        let mut json = serde_json::json!({});
+        apply_registered_setting(
+            &mut json,
+            "chat.defaultModel",
+            JsonValue::from("claude-sonnet-4-6"),
+        )
+        .expect("known string key should accept a string value");
+        assert_eq!(
+            get_nested(&json, "chat.defaultModel"),
+            Some(&JsonValue::from("claude-sonnet-4-6"))
+        );
+    }
+
+    #[test]
+    fn apply_registered_setting_rejects_unknown_key() {
+        // A path that is not in the registry must be refused so junk
+        // settings cannot accumulate. Critical for the Tauri command
+        // boundary which receives keys from the renderer process.
+        let mut json = serde_json::json!({});
+        let err =
+            apply_registered_setting(&mut json, "totally.unknown.setting", JsonValue::from(true))
+                .expect_err("unknown key must be rejected");
+        assert!(
+            matches!(err, ApplySettingError::UnknownKey { ref key }
+                if key == "totally.unknown.setting"),
+            "expected UnknownKey, got {err:?}"
+        );
+        // The write must NOT have happened.
+        assert_eq!(get_nested(&json, "totally.unknown.setting"), None);
+    }
+
+    #[test]
+    fn apply_registered_setting_rejects_type_mismatch() {
+        // chat.defaultModel is a string slot — a bool is the wrong type.
+        let mut json = serde_json::json!({});
+        let err = apply_registered_setting(&mut json, "chat.defaultModel", JsonValue::from(true))
+            .expect_err("bool into string slot must be rejected");
+        assert!(
+            matches!(err, ApplySettingError::TypeMismatch { ref key, .. }
+                if key == "chat.defaultModel"),
+            "expected TypeMismatch, got {err:?}"
+        );
+        // The write must NOT have happened.
+        assert_eq!(get_nested(&json, "chat.defaultModel"), None);
+    }
+
+    #[test]
+    fn apply_registered_setting_accepts_compatible_bool() {
+        // telemetry.enabled is a bool slot; passing a bool must succeed.
+        let mut json = serde_json::json!({});
+        apply_registered_setting(&mut json, "telemetry.enabled", JsonValue::from(false))
+            .expect("bool into bool slot");
+        assert_eq!(
+            get_nested(&json, "telemetry.enabled"),
+            Some(&JsonValue::from(false))
         );
     }
 

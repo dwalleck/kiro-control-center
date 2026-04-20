@@ -6,7 +6,7 @@ use anyhow::{Context, Result};
 use colored::Colorize;
 use kiro_market_core::cache::CacheDir;
 use kiro_market_core::git::GixCliBackend;
-use kiro_market_core::service::MarketplaceService;
+use kiro_market_core::service::{InsecureHttpPolicy, MarketplaceAddOptions, MarketplaceService};
 
 use crate::cli::MarketplaceAction;
 
@@ -18,25 +18,35 @@ pub fn run(action: &MarketplaceAction) -> Result<()> {
     let svc = MarketplaceService::new(cache, git);
 
     match action {
-        MarketplaceAction::Add { source, protocol } => add(&svc, source, *protocol),
+        MarketplaceAction::Add {
+            source,
+            protocol,
+            allow_insecure_http,
+        } => add(
+            &svc,
+            source,
+            // Builder construction so adding future fields to
+            // MarketplaceAddOptions (it's `#[non_exhaustive]`) is an
+            // additive change — this call site picks up new strict
+            // defaults automatically.
+            MarketplaceAddOptions::new(*protocol).with_insecure_http(if *allow_insecure_http {
+                InsecureHttpPolicy::Allow
+            } else {
+                InsecureHttpPolicy::Reject
+            }),
+        ),
         MarketplaceAction::List => list(&svc),
         MarketplaceAction::Update { name } => update(&svc, name.as_deref()),
         MarketplaceAction::Remove { name } => remove(&svc, name),
     }
 }
 
-fn add(
-    svc: &MarketplaceService,
-    source: &str,
-    protocol: kiro_market_core::git::GitProtocol,
-) -> Result<()> {
+fn add(svc: &MarketplaceService, source: &str, opts: MarketplaceAddOptions) -> Result<()> {
     print!("  Adding marketplace...");
     // stdout is line-buffered when attached to a terminal; without flush
     // the "..." appears only after the clone completes.
     let _ = std::io::stdout().flush();
-    let result = svc
-        .add(source, protocol)
-        .context("failed to add marketplace")?;
+    let result = svc.add(source, opts).context("failed to add marketplace")?;
 
     println!(
         " {} Added {} ({} plugin{})",

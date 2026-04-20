@@ -26,6 +26,16 @@ chrono = { workspace = true }
 fs4 = { workspace = true }
 clap = { workspace = true, optional = true }
 specta = { version = "2.0.0-rc.24", optional = true, features = ["derive", "serde_json"] }
+# Feature-unification activator: the workspace declares
+# `curl = { features = ["ssl"] }`, but a `[workspace.dependencies]` entry
+# is inert until at least one workspace member takes it as an actual
+# dependency. Without this line, `cargo metadata` shows curl-sys with NO
+# features, and the only reason HTTPS clones work today is that system
+# libcurl happens to ship with TLS — a static-libcurl build (Windows
+# minimal, vendored CI) would silently fall back to plaintext. CI asserts
+# the resolved feature list contains `ssl` so this regression cannot
+# return unnoticed.
+curl = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 junction = { workspace = true }

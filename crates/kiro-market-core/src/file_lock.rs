@@ -2,6 +2,35 @@
 //!
 //! Uses [`fs4`] exclusive advisory locks to serialise read-modify-write cycles
 //! on shared JSON files (`installed-skills.json`, `known_marketplaces.json`, etc.).
+//!
+//! # Filesystem caveats
+//!
+//! `fs4` is a thin wrapper over `flock(2)` (Unix) and `LockFileEx` (Windows).
+//! Both APIs degrade silently on the following filesystems:
+//!
+//! - **NFS:** advisory-lock semantics depend on protocol version and mount
+//!   options. `NFSv4` with `local_lock=none` (the default on modern Linux)
+//!   does forward locks to the server via the protocol's lock state, so
+//!   cross-host mutual exclusion can work. But `local_lock=flock`,
+//!   `local_lock=all`, or `NFSv3` without `lockd` falls back to per-client
+//!   locking, and two clients can hold the same "exclusive" lock without
+//!   knowing. Don't assume cross-host serialisation unless you've
+//!   verified the mount.
+//! - **Some overlay/union filesystems** (Docker overlayfs upper-dir
+//!   propagation, fuse-overlayfs in some configurations) accept the lock
+//!   syscall but apply it to a per-layer file rather than the merged view.
+//!   The lock then has no effect across processes that see the file via
+//!   different mounts. If the cache root lives inside an overlay, prefer
+//!   binding it to a real filesystem (`docker run -v ...`).
+//! - **SMB/CIFS:** behavior depends on mount options and server-side
+//!   support; `flock(2)` may be a no-op. Same-machine SMB shares should
+//!   not be used for the cache root.
+//!
+//! The lock is honored on local ext4/xfs/btrfs/APFS/NTFS, and on remote
+//! filesystems only when they implement byte-range locking against the
+//! server (rare for advisory locks). Callers that need cross-host
+//! coordination must layer their own mechanism on top — this module is
+//! single-machine only.
 
 use std::fs::{self, OpenOptions};
 use std::io;

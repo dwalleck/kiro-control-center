@@ -31,14 +31,19 @@ clap = { version = "4", features = ["derive"] }
 
 # Git
 gix = { version = "0.81", default-features = true, features = ["blocking-network-client", "blocking-http-transport-curl"] }
-# Feature-unification shim: NO crate in this workspace depends on `curl`
-# directly. The entry exists solely so Cargo unifies the `ssl` feature into
-# the transitive `curl-sys` pulled by `gix-transport` — without this,
-# curl-sys builds libcurl with no TLS backend and HTTPS clones fail on
-# Windows (and anywhere else OpenSSL isn't pre-installed). DO NOT remove
-# this dep without first verifying `cargo tree -e features -i curl-sys`
-# still shows `+ssl`. If `gix-transport` is upgraded and the feature flow
-# changes, this entry may also need to be updated or moved to `curl-sys`.
+# Feature-unification activator. kiro-market-core takes this entry as a
+# direct dep (`curl = { workspace = true }`) so Cargo flows the `ssl`
+# feature onto the transitive `curl-sys` pulled by gix-transport.
+#
+# IMPORTANT: a `[workspace.dependencies]` entry alone does NOTHING — it
+# has to be activated by at least one workspace member or the features
+# never propagate. Without that activation, curl-sys builds with no TLS
+# backend and HTTPS clones can silently fall back to plaintext on builds
+# with static libcurl (Windows minimal, vendored CI). The CI job
+# `assert-curl-tls` greps the resolved feature tree for `curl-sys feature
+# "ssl"` so this regression cannot return unnoticed. If `gix-transport`
+# is upgraded and the feature flow changes, this entry may need to depend
+# on `curl-sys` directly instead.
 curl = { version = "0.4", features = ["ssl"] }
 
 # Console
