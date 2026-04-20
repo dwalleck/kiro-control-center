@@ -108,4 +108,28 @@ test.describe("Marketplace workflow", () => {
     await page.getByRole("button", { name: "Installed", exact: true }).click();
     await expect(page.getByText(/test-skill/i).first()).toBeVisible();
   });
+
+  test("broken marketplace surfaces dismissible banner that clears on deselect", async ({ page }) => {
+    const brokenPath = process.env.FIXTURE_BROKEN_MARKETPLACE_PATH;
+    if (!brokenPath) {
+      test.skip(true, "FIXTURE_BROKEN_MARKETPLACE_PATH not set");
+      return;
+    }
+
+    await page.goto("/");
+    await page.getByRole("button", { name: "Marketplaces", exact: true }).click();
+
+    await page.getByPlaceholder(/source|url|path/i).fill(brokenPath);
+    await page.getByRole("button", { name: /add/i }).click();
+
+    // Switch to Browse — the plugin-fetch error should surface as a banner.
+    await page.getByRole("button", { name: "Browse", exact: true }).click();
+
+    const errorBanner = page.locator('[data-testid="fetch-error"]').first();
+    await expect(errorBanner).toBeVisible({ timeout: 10_000 });
+
+    // Dismiss via the contextual aria-label (e.g. "Dismiss error for <mp>").
+    await errorBanner.getByRole("button", { name: /^Dismiss error for/ }).click();
+    await expect(errorBanner).not.toBeVisible();
+  });
 });
