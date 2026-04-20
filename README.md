@@ -76,7 +76,6 @@ kiro-market list
 | `install <plugin@marketplace>` | Install skills and agents (`--skill <name>` for one, `--force` to overwrite, `--accept-mcp` for MCP agents) |
 | `info <plugin@marketplace>` | Show plugin details and available skills |
 | `list` | List installed skills in the current project |
-| `update [plugin_ref]` | Update installed plugins (or a specific one) |
 | `remove <skill-name>` | Remove an installed skill |
 | `cache prune [--dry-run]` | Remove orphaned marketplace clones and stale staging dirs |
 
@@ -113,7 +112,8 @@ your-project/
         SKILL.md
     agents/
       my-agent.json          # Agent configuration
-      my-agent.prompt.md     # Agent prompt content
+      prompts/
+        my-agent.md          # Agent prompt content
 ```
 
 ## Requirements
