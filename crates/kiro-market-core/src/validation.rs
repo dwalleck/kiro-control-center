@@ -311,6 +311,8 @@ where
 
 #[cfg(test)]
 mod tests {
+    use rstest::rstest;
+
     use super::*;
 
     // -----------------------------------------------------------------------
@@ -379,31 +381,33 @@ mod tests {
         );
     }
 
-    #[test]
-    fn validate_name_rejects_other_control_characters() {
-        for raw in ["foo\nbar", "alert\x07", "tab\there", "del\x7Fend"] {
-            let err = validate_name(raw).unwrap_err();
-            assert!(
-                matches!(&err, ValidationError::InvalidName { reason, .. } if reason.contains("control character")),
-                "expected control-character reason for {raw:?}, got {err:?}"
-            );
-        }
+    #[rstest]
+    #[case::newline("foo\nbar")]
+    #[case::bell("alert\x07")]
+    #[case::tab("tab\there")]
+    #[case::del("del\x7Fend")]
+    fn validate_name_rejects_other_control_characters(#[case] raw: &str) {
+        let err = validate_name(raw).unwrap_err();
+        assert!(
+            matches!(&err, ValidationError::InvalidName { reason, .. } if reason.contains("control character")),
+            "expected control-character reason for {raw:?}, got {err:?}"
+        );
     }
 
-    #[test]
-    fn validate_name_rejects_leading_and_trailing_space() {
-        // Leading whitespace creates folders that look empty in `ls`.
-        // Trailing whitespace is silently stripped by NTFS, aliasing two
-        // distinct names to the same on-disk directory. Tab / newline are
-        // covered by the control-character check, which fires first; the
-        // remaining ASCII-whitespace cases are leading/trailing space.
-        for raw in [" leading", "trailing "] {
-            let err = validate_name(raw).unwrap_err();
-            assert!(
-                matches!(&err, ValidationError::InvalidName { reason, .. } if reason.contains("whitespace")),
-                "expected whitespace rejection for {raw:?}, got {err:?}"
-            );
-        }
+    #[rstest]
+    // Leading whitespace creates folders that look empty in `ls`.
+    // Trailing whitespace is silently stripped by NTFS, aliasing two
+    // distinct names to the same on-disk directory. Tab / newline are
+    // covered by the control-character check, which fires first; the
+    // remaining ASCII-whitespace cases are leading/trailing space.
+    #[case::leading(" leading")]
+    #[case::trailing("trailing ")]
+    fn validate_name_rejects_leading_and_trailing_space(#[case] raw: &str) {
+        let err = validate_name(raw).unwrap_err();
+        assert!(
+            matches!(&err, ValidationError::InvalidName { reason, .. } if reason.contains("whitespace")),
+            "expected whitespace rejection for {raw:?}, got {err:?}"
+        );
     }
 
     #[test]
@@ -416,26 +420,23 @@ mod tests {
         );
     }
 
-    #[test]
-    fn validate_name_rejects_windows_reserved_names() {
-        for reserved in [
-            "CON",
-            "con",
-            "PRN",
-            "AUX",
-            "NUL",
-            "nul",
-            "COM1",
-            "lpt9",
-            "Con.txt",
-            "nul.tar.gz",
-        ] {
-            let err = validate_name(reserved).unwrap_err();
-            assert!(
-                matches!(&err, ValidationError::InvalidName { reason, .. } if reason.contains("Windows reserved")),
-                "expected Windows-reserved rejection for {reserved:?}, got {err:?}"
-            );
-        }
+    #[rstest]
+    #[case::con_upper("CON")]
+    #[case::con_lower("con")]
+    #[case::prn("PRN")]
+    #[case::aux("AUX")]
+    #[case::nul_upper("NUL")]
+    #[case::nul_lower("nul")]
+    #[case::com1("COM1")]
+    #[case::lpt9_lower("lpt9")]
+    #[case::con_with_ext("Con.txt")]
+    #[case::nul_double_ext("nul.tar.gz")]
+    fn validate_name_rejects_windows_reserved_names(#[case] reserved: &str) {
+        let err = validate_name(reserved).unwrap_err();
+        assert!(
+            matches!(&err, ValidationError::InvalidName { reason, .. } if reason.contains("Windows reserved")),
+            "expected Windows-reserved rejection for {reserved:?}, got {err:?}"
+        );
     }
 
     #[test]

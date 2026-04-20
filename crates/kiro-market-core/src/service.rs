@@ -890,9 +890,7 @@ impl MarketplaceService {
                 // that resolves outside the marketplace tree. Matches the
                 // symlink-refuse policy in project::copy_dir_recursive,
                 // agent::discover_agents_in_dirs, and load_plugin_manifest.
-                let is_real_dir = fs::symlink_metadata(&resolved)
-                    .map(|m| m.is_dir())
-                    .unwrap_or(false);
+                let is_real_dir = fs::symlink_metadata(&resolved).is_ok_and(|m| m.is_dir());
                 if !is_real_dir {
                     return Err(PluginError::DirectoryMissing { path: resolved }.into());
                 }
