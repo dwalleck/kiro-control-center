@@ -1,7 +1,11 @@
 <script lang="ts">
   import { onMount } from "svelte";
+  import { SvelteMap } from "svelte/reactivity";
   import { store, initialize } from "$lib/stores/project.svelte";
-  import TabBar from "$lib/components/TabBar.svelte";
+  import { commands } from "$lib/bindings";
+  import type { SettingEntry } from "$lib/bindings";
+  import type { Tab, SettingCategory } from "$lib/types";
+  import NavRail from "$lib/components/NavRail.svelte";
   import BrowseTab from "$lib/components/BrowseTab.svelte";
   import InstalledTab from "$lib/components/InstalledTab.svelte";
   import MarketplacesTab from "$lib/components/MarketplacesTab.svelte";
@@ -10,19 +14,66 @@
   import ScanRootsPanel from "$lib/components/ScanRootsPanel.svelte";
   import SettingsView from "$lib/components/SettingsView.svelte";
 
-  const tabs = ["Browse", "Installed", "Marketplaces"];
-  let activeTab: string = $state("Browse");
+  let activeTab: Tab = $state("Browse");
+  let settingsCategory: string | null = $state(null);
   let showManageRoots = $state(false);
-  let showSettings = $state(false);
+
+  let allEntries: SettingEntry[] = $state([]);
+  let settingsLoading: boolean = $state(true);
+  let settingsLoadError: string | null = $state(null);
+
+  let categories: SettingCategory[] = $derived.by(() => {
+    const seen = new SvelteMap<string, SettingCategory>();
+    for (const entry of allEntries) {
+      const existing = seen.get(entry.category);
+      if (existing) {
+        existing.count += 1;
+      } else {
+        seen.set(entry.category, { key: entry.category, label: entry.category_label, count: 1 });
+      }
+    }
+    return Array.from(seen.values());
+  });
+
+  // Seed or repair the active category: pick the first when unset, or when the
+  // prior selection is no longer in the loaded set (backend category removed).
+  $effect(() => {
+    if (categories.length === 0) return;
+    const keep = settingsCategory !== null && categories.some((c) => c.key === settingsCategory);
+    if (!keep) settingsCategory = categories[0].key;
+  });
+
+  function handleSettingsUpdate(updated: SettingEntry) {
+    allEntries = allEntries.map((e) => (e.key === updated.key ? updated : e));
+  }
+
+  async function loadKiroSettings() {
+    try {
+      const result = await commands.getKiroSettings();
+      if (result.status === "ok") {
+        allEntries = result.data;
+      } else {
+        settingsLoadError = result.error.message;
+      }
+    } catch (e) {
+      settingsLoadError = e instanceof Error
+        ? `Failed to load settings: ${e.message}`
+        : "Failed to load settings due to an unexpected error.";
+    } finally {
+      settingsLoading = false;
+    }
+  }
 
   // Initialize once on mount. Uses onMount (not $effect) because initialize()
   // is a one-shot async function that should not re-trigger on state changes.
   onMount(() => {
     initialize().catch((e) => {
       console.error("Initialization failed:", e);
-      store.projectError = "Application failed to initialize. Please restart.";
+      const reason = e instanceof Error ? e.message : String(e);
+      store.projectError = `Application failed to initialize: ${reason}`;
       store.loading = false;
     });
+    loadKiroSettings();
   });
 </script>
 
@@ -33,29 +84,18 @@
 {:else if store.projectPath}
   <div class="flex flex-col h-screen bg-kiro-base text-kiro-text">
     <header class="flex items-center justify-between px-6 py-3 bg-kiro-surface border-b-2 border-kiro-accent-700 shadow-sm">
-      <div class="flex items-center gap-3">
-        <h1 class="text-lg font-semibold">Kiro Control Center</h1>
-        <button
-          type="button"
-          aria-label="Open settings"
-          onclick={() => (showSettings = true)}
-          class="p-1.5 rounded-md text-kiro-subtle hover:text-kiro-text-secondary hover:bg-kiro-overlay transition-colors"
-        >
-          <svg class="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
-            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M10.325 4.317c.426-1.756 2.924-1.756 3.35 0a1.724 1.724 0 002.573 1.066c1.543-.94 3.31.826 2.37 2.37a1.724 1.724 0 001.066 2.573c1.756.426 1.756 2.924 0 3.35a1.724 1.724 0 00-1.066 2.573c.94 1.543-.826 3.31-2.37 2.37a1.724 1.724 0 00-2.573 1.066c-.426 1.756-2.924 1.756-3.35 0a1.724 1.724 0 00-2.573-1.066c-1.543.94-3.31-.826-2.37-2.37a1.724 1.724 0 00-1.066-2.573c-1.756-.426-1.756-2.924 0-3.35a1.724 1.724 0 001.066-2.573c-.94-1.543.826-3.31 2.37-2.37.996.608 2.296.07 2.572-1.065z" />
-            <path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
-          </svg>
-        </button>
-      </div>
-      {#if !showSettings}
-        <ProjectDropdown onManageRoots={() => (showManageRoots = true)} />
-      {/if}
+      <h1 class="text-lg font-semibold">Kiro Control Center</h1>
+      <ProjectDropdown onManageRoots={() => (showManageRoots = true)} />
     </header>
 
-    {#if showSettings}
-      <SettingsView onClose={() => (showSettings = false)} />
-    {:else}
-      <TabBar {tabs} {activeTab} onTabChange={(tab) => (activeTab = tab)} />
+    <div class="flex flex-1 min-h-0 overflow-hidden">
+      <NavRail
+        {activeTab}
+        onTabChange={(t) => (activeTab = t)}
+        {settingsCategory}
+        onSettingsCategoryChange={(k) => (settingsCategory = k)}
+        {categories}
+      />
 
       <main class="flex-1 overflow-hidden">
         {#if activeTab === "Browse"}
@@ -64,9 +104,17 @@
           <InstalledTab projectPath={store.projectPath} />
         {:else if activeTab === "Marketplaces"}
           <MarketplacesTab />
+        {:else if activeTab === "Kiro Settings"}
+          <SettingsView
+            {allEntries}
+            loading={settingsLoading}
+            loadError={settingsLoadError}
+            activeCategory={settingsCategory}
+            onUpdate={handleSettingsUpdate}
+          />
         {/if}
       </main>
-    {/if}
+    </div>
   </div>
 {:else}
   <ProjectPicker />

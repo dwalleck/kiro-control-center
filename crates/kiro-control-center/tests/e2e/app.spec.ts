@@ -1,31 +1,71 @@
 import { test, expect } from "@playwright/test";
 
 test.describe("Kiro Control Center", () => {
-  test("app loads and shows all tabs", async ({ page }) => {
+  test("app loads and shows all nav destinations", async ({ page }) => {
     await page.goto("/");
 
-    // Wait for the app to mount.
     await expect(page.locator("body")).toBeVisible();
 
-    // Verify all three tabs are present.
-    await expect(page.getByRole("tab", { name: /browse/i })).toBeVisible();
-    await expect(page.getByRole("tab", { name: /installed/i })).toBeVisible();
-    await expect(
-      page.getByRole("tab", { name: /marketplace/i })
-    ).toBeVisible();
+    await expect(page.getByRole("button", { name: "Browse", exact: true })).toBeVisible();
+    await expect(page.getByRole("button", { name: "Installed", exact: true })).toBeVisible();
+    await expect(page.getByRole("button", { name: "Marketplaces", exact: true })).toBeVisible();
+    await expect(page.getByRole("button", { name: "Kiro Settings", exact: true })).toBeVisible();
+  });
+
+  test("header has no settings gear button", async ({ page }) => {
+    await page.goto("/");
+    await expect(page.getByRole("button", { name: /open settings/i })).toHaveCount(0);
+  });
+
+  test("active rail destination gets aria-current=page", async ({ page }) => {
+    await page.goto("/");
+
+    const browseButton = page.getByRole("button", { name: "Browse", exact: true });
+    await expect(browseButton).toHaveAttribute("aria-current", "page");
+
+    const installedButton = page.getByRole("button", { name: "Installed", exact: true });
+    await installedButton.click();
+    await expect(installedButton).toHaveAttribute("aria-current", "page");
+    await expect(browseButton).not.toHaveAttribute("aria-current", "page");
+  });
+});
+
+test.describe("Browse tab filters", () => {
+  test("filters popover opens and escape closes it", async ({ page }) => {
+    await page.goto("/");
+    await page.getByRole("button", { name: "Browse", exact: true }).click();
+
+    const filtersButton = page.getByRole("button", { name: /^Filters/ });
+    await expect(filtersButton).toHaveAttribute("aria-expanded", "false");
+
+    await filtersButton.click();
+    await expect(filtersButton).toHaveAttribute("aria-expanded", "true");
+
+    await expect(page.getByText("Marketplace", { exact: true })).toBeVisible();
+
+    await page.keyboard.press("Escape");
+    await expect(filtersButton).toHaveAttribute("aria-expanded", "false");
+  });
+
+  test("outside click closes the filters popover", async ({ page }) => {
+    await page.goto("/");
+    await page.getByRole("button", { name: "Browse", exact: true }).click();
+
+    const filtersButton = page.getByRole("button", { name: /^Filters/ });
+    await filtersButton.click();
+    await expect(filtersButton).toHaveAttribute("aria-expanded", "true");
+
+    await page.getByPlaceholder(/filter skills by name/i).click();
+    await expect(filtersButton).toHaveAttribute("aria-expanded", "false");
   });
 });
 
 test.describe("Marketplace workflow", () => {
-  test("add local marketplace and browse plugins", async ({ page }) => {
+  test("add local marketplace and see its skills in Browse", async ({ page }) => {
     await page.goto("/");
 
-    // Navigate to Marketplaces tab.
-    await page.getByRole("tab", { name: /marketplace/i }).click();
+    await page.getByRole("button", { name: "Marketplaces", exact: true }).click();
 
-    // Add a marketplace using a local path.
-    // NOTE: This test requires a pre-built marketplace fixture.
-    // For CI, set FIXTURE_MARKETPLACE_PATH env var.
     const fixturePath = process.env.FIXTURE_MARKETPLACE_PATH;
     if (!fixturePath) {
       test.skip(true, "FIXTURE_MARKETPLACE_PATH not set");
@@ -38,42 +78,34 @@ test.describe("Marketplace workflow", () => {
     const addButton = page.getByRole("button", { name: /add/i });
     await addButton.click();
 
-    // Wait for success feedback.
-    await expect(page.getByText(/added|success/i)).toBeVisible({
-      timeout: 30_000,
-    });
+    await expect(page.getByText(/added|success/i)).toBeVisible({ timeout: 30_000 });
 
-    // Switch to Browse tab and verify plugin appears.
-    await page.getByRole("tab", { name: /browse/i }).click();
-    await expect(page.getByText(/test-plugin/i)).toBeVisible();
+    // Browse grid auto-populates from the first marketplace on load; no sidebar
+    // navigation required.
+    await page.getByRole("button", { name: "Browse", exact: true }).click();
+    await expect(page.getByText(/test-plugin|test-skill/i).first()).toBeVisible({
+      timeout: 10_000,
+    });
   });
 
   test("install skill from browse tab", async ({ page }) => {
     await page.goto("/");
+    await page.getByRole("button", { name: "Browse", exact: true }).click();
 
-    // This test assumes a marketplace is already added (from previous test
-    // or fixture setup). If no marketplace exists, skip.
-    await page.getByRole("tab", { name: /browse/i }).click();
-
-    const pluginLink = page.getByText(/test-plugin/i);
-    if (!(await pluginLink.isVisible({ timeout: 5_000 }).catch(() => false))) {
-      test.skip(true, "No marketplace with test-plugin available");
+    const testSkill = page.getByText(/test-skill/i).first();
+    if (!(await testSkill.isVisible({ timeout: 5_000 }).catch(() => false))) {
+      test.skip(true, "No marketplace with test-skill available");
       return;
     }
 
-    await pluginLink.click();
+    await testSkill.click();
 
-    // Find and click install on a skill.
-    const installButton = page.getByRole("button", { name: /install/i });
-    await installButton.first().click();
+    const installButton = page.getByRole("button", { name: /install \d+ selected/i });
+    await installButton.click();
 
-    // Verify success.
-    await expect(page.getByText(/installed|success/i)).toBeVisible({
-      timeout: 30_000,
-    });
+    await expect(page.getByText(/installed|success/i)).toBeVisible({ timeout: 30_000 });
 
-    // Switch to Installed tab and verify skill appears.
-    await page.getByRole("tab", { name: /installed/i }).click();
-    await expect(page.getByText(/test-skill/i)).toBeVisible();
+    await page.getByRole("button", { name: "Installed", exact: true }).click();
+    await expect(page.getByText(/test-skill/i).first()).toBeVisible();
   });
 });
