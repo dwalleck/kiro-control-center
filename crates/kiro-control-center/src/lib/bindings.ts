@@ -16,13 +16,14 @@ export const commands = {
 	 * 
 	 *  Bulk alternative to calling [`list_available_skills`] per plugin when no
 	 *  plugin filter is active. Does one `load_installed` up front instead of
-	 *  N (one per plugin), and folds plugin-level I/O errors (missing directory,
-	 *  malformed manifest, unreadable `SKILL.md`) into `warn` logs rather than
-	 *  failing the whole call — the worst case is a partial listing that mirrors
-	 *  what the per-plugin path would produce if the user walked the grid
-	 *  manually.
+	 *  N (one per plugin), and returns a [`BulkSkillsResult`] whose `skipped`
+	 *  field carries plugin-level errors (missing directory, malformed manifest)
+	 *  so the frontend can surface a partial-listing warning. Per-skill errors
+	 *  inside a working plugin (unreadable `SKILL.md`, bad frontmatter) are
+	 *  always skipped silently with a `warn` — same behavior as the per-plugin
+	 *  path.
 	 */
-	listAllSkillsForMarketplace: (marketplace: string, projectPath: string) => typedError<SkillInfo[], CommandError>(__TAURI_INVOKE("list_all_skills_for_marketplace", { marketplace, projectPath })),
+	listAllSkillsForMarketplace: (marketplace: string, projectPath: string) => typedError<BulkSkillsResult, CommandError>(__TAURI_INVOKE("list_all_skills_for_marketplace", { marketplace, projectPath })),
 	// Install specific skills from a plugin into a Kiro project.
 	installSkills: (marketplace: string, plugin: string, skills: string[], force: boolean, projectPath: string) => typedError<InstallResult, CommandError>(__TAURI_INVOKE("install_skills", { marketplace, plugin, skills, force, projectPath })),
 	// Get summary information about a Kiro project directory.
@@ -72,6 +73,17 @@ export const commands = {
 };
 
 /* Types */
+/**
+ *  Response for [`list_all_skills_for_marketplace`]. `skipped` carries the
+ *  plugins whose directory or manifest errored — the bulk path continues past
+ *  such errors to preserve the partial listing, but the frontend needs to
+ *  know which plugins were silently dropped so it can surface a warning.
+ */
+export type BulkSkillsResult = {
+	skills: SkillInfo[],
+	skipped: SkippedPlugin[],
+};
+
 /**
  *  Structured error response for Tauri commands.
  * 
@@ -264,6 +276,12 @@ export type SkillInfo = {
 	plugin: string,
 	marketplace: string,
 	installed: boolean,
+};
+
+// A plugin that was excluded from a bulk skills listing, with the reason.
+export type SkippedPlugin = {
+	name: string,
+	reason: string,
 };
 
 /**
