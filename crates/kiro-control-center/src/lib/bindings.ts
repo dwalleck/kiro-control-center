@@ -15,13 +15,9 @@ export const commands = {
 	 *  with installed state.
 	 * 
 	 *  Bulk alternative to calling [`list_available_skills`] per plugin when no
-	 *  plugin filter is active. Does one `load_installed` up front instead of
-	 *  N (one per plugin), and returns a [`BulkSkillsResult`] whose `skipped`
-	 *  field carries plugin-level errors (missing directory, malformed manifest)
-	 *  so the frontend can surface a partial-listing warning. Per-skill errors
-	 *  inside a working plugin (unreadable `SKILL.md`, bad frontmatter) are
-	 *  always skipped silently with a `warn` — same behavior as the per-plugin
-	 *  path.
+	 *  plugin filter is active. The returned [`BulkSkillsResult::skipped`]
+	 *  carries plugin-level errors (missing directory, malformed manifest,
+	 *  remote source) so the frontend can surface a partial-listing warning.
 	 */
 	listAllSkillsForMarketplace: (marketplace: string, projectPath: string) => typedError<BulkSkillsResult, CommandError>(__TAURI_INVOKE("list_all_skills_for_marketplace", { marketplace, projectPath })),
 	// Install specific skills from a plugin into a Kiro project.
@@ -74,10 +70,10 @@ export const commands = {
 
 /* Types */
 /**
- *  Response for [`list_all_skills_for_marketplace`]. `skipped` carries the
- *  plugins whose directory or manifest errored — the bulk path continues past
- *  such errors to preserve the partial listing, but the frontend needs to
- *  know which plugins were silently dropped so it can surface a warning.
+ *  Result of a marketplace-wide skill listing. The bulk path continues
+ *  past per-plugin errors (missing directory, malformed manifest) to
+ *  preserve the partial listing; `skipped` records those errors so the
+ *  frontend can show a warning rather than silently dropping plugins.
  */
 export type BulkSkillsResult = {
 	skills: SkillInfo[],
@@ -269,7 +265,14 @@ export type Settings = {
 	last_project?: string | null,
 };
 
-// Information about a single skill, including installation status.
+/**
+ *  Information about a single skill, cross-referenced with the target
+ *  project's installed set.
+ * 
+ *  `installed` is a point-in-time snapshot — the project's
+ *  `.kiro/installed.json` at the moment the listing was built. Callers
+ *  that want a live view must re-query.
+ */
 export type SkillInfo = {
 	name: string,
 	description: string,
@@ -278,7 +281,7 @@ export type SkillInfo = {
 	installed: boolean,
 };
 
-// A plugin that was excluded from a bulk skills listing, with the reason.
+// A plugin that was excluded from a bulk listing, with the reason.
 export type SkippedPlugin = {
 	name: string,
 	reason: string,
