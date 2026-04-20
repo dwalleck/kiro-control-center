@@ -68,8 +68,8 @@ pub fn build_kiro_json(
 
     if !def.mcp_servers.is_empty() {
         let mut servers = Map::new();
-        for (name, raw) in &def.mcp_servers {
-            servers.insert(name.clone(), normalize_mcp_server(raw));
+        for (name, cfg) in &def.mcp_servers {
+            servers.insert(name.clone(), serde_json::to_value(cfg)?);
         }
         obj.insert("mcpServers".into(), Value::Object(servers));
     }
@@ -97,37 +97,19 @@ fn percent_encode_path_segment(s: &str) -> String {
     out
 }
 
-/// Normalize a Copilot MCP server entry toward Kiro's `CustomToolConfig` shape.
-///
-/// Rules:
-/// - `type: "local"` → `type: "stdio"` (Copilot's `local` means "spawn
-///   this as a subprocess"; Kiro's equivalent vocabulary is `stdio`).
-/// - inner `tools` allowlist → dropped. Kiro has no per-server allowlist
-///   field on the server config itself; the outer `tools` array already
-///   handles whole-server access via `@name` references.
-fn normalize_mcp_server(raw: &Value) -> Value {
-    let Some(obj) = raw.as_object() else {
-        return raw.clone();
-    };
-    let mut out = Map::new();
-    for (k, v) in obj {
-        if k == "tools" {
-            continue;
-        }
-        if k == "type" && v.as_str() == Some("local") {
-            out.insert("type".into(), Value::String("stdio".into()));
-            continue;
-        }
-        out.insert(k.clone(), v.clone());
-    }
-    Value::Object(out)
-}
+// `normalize_mcp_server` was deleted with the move to typed
+// `McpServerConfig`. Its two old responsibilities are now handled at
+// the schema level: `type: local` is accepted via `serde(alias = "local")`
+// and emitted as `stdio` via the snake_case discriminator; the Copilot-
+// specific inner `tools: ["*"]` allowlist isn't a field on the typed
+// schema and is silently ignored at parse time. See
+// `agent::types::McpServerConfig`.
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::agent::tools::MappedTool;
-    use crate::agent::types::{AgentDefinition, AgentDialect};
+    use crate::agent::types::{AgentDefinition, AgentDialect, McpServerConfig};
     use std::collections::BTreeMap;
 
     fn sample_claude_def() -> AgentDefinition {
@@ -249,21 +231,28 @@ mod tests {
 
     #[test]
     fn emit_normalizes_mcp_server_type_local_to_stdio() {
+        // The typed schema accepts `type: local` (Copilot vocabulary) via
+        // `serde(alias = "local")` on the Stdio variant. The emitter's
+        // serialize side uses the canonical `stdio` discriminator. The
+        // inner `tools: ["*"]` allowlist that Copilot files often carry is
+        // not a field on the schema — deserialize ignores it, so it
+        // never reaches the emit JSON.
         let mut def = sample_claude_def();
-        def.mcp_servers.insert(
-            "terraform".into(),
-            serde_json::json!({
-                "type": "local",
-                "command": "docker",
-                "args": ["run", "-i"],
-                "tools": ["*"]
-            }),
-        );
+        let mcp: McpServerConfig = serde_json::from_value(serde_json::json!({
+            "type": "local",
+            "command": "docker",
+            "args": ["run", "-i"],
+            "tools": ["*"]
+        }))
+        .expect("parse copilot-style local entry");
+        def.mcp_servers.insert("terraform".into(), mcp);
+
         let out = build_kiro_json(&def, &[]).unwrap();
         let tf = &out["mcpServers"]["terraform"];
         assert_eq!(tf["type"], "stdio");
-        // Inner `tools: ["*"]` allowlist is stripped — Kiro has no equivalent
-        // and @{server} already covers "all tools".
+        assert_eq!(tf["command"], "docker");
+        // Inner `tools: ["*"]` allowlist is stripped — not part of the
+        // typed schema and Kiro has no equivalent.
         assert!(tf.get("tools").is_none());
     }
 
@@ -311,13 +300,13 @@ mod tests {
     #[test]
     fn emit_preserves_non_local_mcp_server_type() {
         let mut def = sample_claude_def();
-        def.mcp_servers.insert(
-            "hosted".into(),
-            serde_json::json!({
-                "type": "http",
-                "url": "https://example.com/mcp",
-            }),
-        );
+        let mcp: McpServerConfig = serde_json::from_value(serde_json::json!({
+            "type": "http",
+            "url": "https://example.com/mcp",
+        }))
+        .expect("parse http entry");
+        def.mcp_servers.insert("hosted".into(), mcp);
+
         let out = build_kiro_json(&def, &[]).unwrap();
         assert_eq!(out["mcpServers"]["hosted"]["type"], "http");
         assert_eq!(

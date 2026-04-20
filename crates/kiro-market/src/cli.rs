@@ -38,6 +38,14 @@ pub enum Command {
         /// Overwrite existing skills without prompting.
         #[arg(long)]
         force: bool,
+        /// Install agents that bring MCP servers. MCP servers run
+        /// arbitrary subprocesses (`stdio` transport) or open external
+        /// network connections (`http`/`sse`); without this opt-in
+        /// flag, MCP-bearing agents are skipped with a warning so the
+        /// user sees the risk surface before accepting it. Only set this
+        /// when you trust the agent's source and intent.
+        #[arg(long)]
+        accept_mcp: bool,
     },
     /// List all installed skills in the current project.
     List,
@@ -56,6 +64,24 @@ pub enum Command {
         /// Plugin reference in the form `plugin@marketplace`.
         plugin_ref: String,
     },
+    /// Inspect or clean up the on-disk cache.
+    Cache {
+        #[command(subcommand)]
+        action: CacheAction,
+    },
+}
+
+/// Subcommands for the `cache` command.
+#[derive(Subcommand, Debug)]
+pub enum CacheAction {
+    /// Remove cached marketplace and plugin clones whose marketplace is
+    /// no longer registered. Also sweeps any `_pending_*` staging
+    /// directories left behind by an interrupted `add`.
+    Prune {
+        /// Show what would be removed without actually deleting anything.
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 /// Subcommands for `marketplace` management.
@@ -68,6 +94,14 @@ pub enum MarketplaceAction {
         /// Git protocol for GitHub sources (https or ssh). Defaults to https.
         #[arg(long, value_enum, default_value_t = GitProtocol::Https)]
         protocol: GitProtocol,
+        /// Allow `http://` source URLs. Off by default — plaintext HTTP
+        /// is unauthenticated and a network attacker who substitutes the
+        /// marketplace contents gains long-lived code execution via
+        /// skills/agents/MCP servers, since the cached clone persists
+        /// after the MITM window. Pass this only on a trusted internal
+        /// network where TLS truly is not available.
+        #[arg(long)]
+        allow_insecure_http: bool,
     },
     /// List all registered marketplaces.
     List,

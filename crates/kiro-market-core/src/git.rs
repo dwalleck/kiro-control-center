@@ -9,7 +9,7 @@
 
 use std::num::NonZeroU32;
 use std::path::Path;
-use std::process::Command;
+use std::process::{Command, Stdio};
 use std::sync::atomic::AtomicBool;
 
 use gix::progress::Discard;
@@ -156,6 +156,69 @@ impl Default for GixCliBackend {
 /// configs) untouched.
 const SSH_CONNECT_TIMEOUT_SECS: u32 = 30;
 
+/// Minimum length of a SHA prefix accepted by [`GixCliBackend::verify_sha`].
+/// Matches `git`'s default short-SHA length and rules out trivial 1-3 char
+/// prefixes that would collide with most repos.
+pub const MIN_SHA_PREFIX_LEN: usize = 7;
+
+/// Maximum length of a SHA prefix. SHA-1 is 40 hex chars; SHA-256 is 64
+/// hex chars. Allow up to 64 so the validator does not have to know which
+/// hash algorithm a given repository uses.
+pub const MAX_SHA_PREFIX_LEN: usize = 64;
+
+/// Validate the structural shape of a user-supplied SHA prefix.
+///
+/// Defense in depth: serde-level validation can be added later via a
+/// `Sha` newtype on [`crate::marketplace::StructuredSource`], but until
+/// then this guard at the consumer ensures every `verify_sha` call rejects
+/// a typo (`"deadbef"`, `"abc"`, `"git"`) before we ask `gix` to compare
+/// it against the real HEAD.
+///
+/// The threat is two-shaped:
+///   * **Accidental match**: a randomly-chosen 1-char hex prefix
+///     coincides with the actual HEAD ~1 time in 16 — small but not
+///     zero, large enough to silently mask a wrong commit.
+///   * **Adversarial match**: an attacker who can choose the prefix
+///     (e.g. by influencing the marketplace JSON) gets a *guaranteed*
+///     match every time, since they pick whichever first nibble HEAD
+///     happens to have. The minimum-length guard turns this from
+///     "trivially forgeable" into "needs a 7+-char hex collision."
+///
+/// # Errors
+///
+/// Returns [`GitError::InvalidSha`] if `s` is shorter than
+/// [`MIN_SHA_PREFIX_LEN`], longer than [`MAX_SHA_PREFIX_LEN`], or
+/// contains a character outside `[0-9a-fA-F]`.
+fn validate_sha_prefix(s: &str) -> Result<(), GitError> {
+    use crate::error::InvalidShaReason;
+
+    if s.len() < MIN_SHA_PREFIX_LEN {
+        return Err(GitError::InvalidSha {
+            value: s.to_owned(),
+            reason: InvalidShaReason::TooShort {
+                actual: s.len(),
+                min: MIN_SHA_PREFIX_LEN,
+            },
+        });
+    }
+    if s.len() > MAX_SHA_PREFIX_LEN {
+        return Err(GitError::InvalidSha {
+            value: s.to_owned(),
+            reason: InvalidShaReason::TooLong {
+                actual: s.len(),
+                max: MAX_SHA_PREFIX_LEN,
+            },
+        });
+    }
+    if let Some((idx, bad)) = s.bytes().enumerate().find(|(_, b)| !b.is_ascii_hexdigit()) {
+        return Err(GitError::InvalidSha {
+            value: s.to_owned(),
+            reason: InvalidShaReason::NonHex { at: idx, byte: bad },
+        });
+    }
+    Ok(())
+}
+
 impl GixCliBackend {
     /// Run a `git` command with SSH connect-timeout protection.
     ///
@@ -166,7 +229,15 @@ impl GixCliBackend {
         let mut cmd = Command::new("git");
         cmd.args(args)
             .current_dir(dir)
-            .env("GIT_TERMINAL_PROMPT", "0");
+            .env("GIT_TERMINAL_PROMPT", "0")
+            // GIT_TERMINAL_PROMPT=0 disables `git`'s own prompts, but a
+            // credential helper, GPG smartcard, or askpass binary that git
+            // shells out to will still happily read from an inherited TTY.
+            // Closing stdin makes those prompts fail fast with EOF instead
+            // of stalling the entire process indefinitely (the symptom we
+            // saw on CI when an SSH key needed a passphrase). stdout/stderr
+            // are still captured by `Command::output`.
+            .stdin(Stdio::null());
 
         // Only set SSH timeout when no custom SSH configuration exists.
         // GIT_SSH_COMMAND takes precedence over GIT_SSH in git's resolution;
@@ -250,7 +321,7 @@ impl GixCliBackend {
             let detail = git_error_detail(&output);
             // `git clone` may have created a partial dest before failing.
             cleanup_failed_clone_dest(dest);
-            return Err(clone_failed(url, detail));
+            return Err(translate_git_error(url, &detail));
         }
 
         // Checkout failure leaves the cloned tree in `dest`; remove it so a
@@ -344,6 +415,40 @@ fn cleanup_failed_clone_dest(dest: &Path) {
     }
 }
 
+/// Map a git CLI failure detail string to a typed [`GitError`].
+///
+/// `Stdio::null()` on the child stdin (set in [`GixCliBackend::run_git`]
+/// to prevent CI hangs on credential prompts) makes git surface
+/// authentication failures as raw libcurl/git messages — "fatal: could
+/// not read Username for ...: No such device or address",
+/// "Authentication failed", "fatal: Authentication failed for ...".
+/// None of those tell the user what to do. Catch the family here and
+/// return [`GitError::AuthenticationRequired`] with a remediation hint
+/// in its message instead. Anything else falls through to a generic
+/// `CloneFailed { source: detail }` so the original git output is still
+/// preserved verbatim for diagnosis.
+fn translate_git_error(url: &str, detail: &str) -> GitError {
+    // Lowercase the haystack once; `git`/`libcurl` capitalize differently
+    // across versions and locales (`fatal: Authentication failed` vs
+    // `fatal: authentication failed`). Match a small allowlist of phrases
+    // — broad enough to catch HTTPS prompts and SSH key rejections, narrow
+    // enough that a "could not read" file error doesn't get mistranslated.
+    let lower = detail.to_lowercase();
+    let auth_phrases = [
+        "could not read username",
+        "could not read password",
+        "authentication failed",
+        "permission denied (publickey)",
+        "terminal prompts disabled",
+    ];
+    if auth_phrases.iter().any(|p| lower.contains(p)) {
+        return GitError::AuthenticationRequired {
+            url: url.to_owned(),
+        };
+    }
+    clone_failed(url, detail.to_owned())
+}
+
 /// Extract a useful error message from a failed git command.
 ///
 /// Prefers stderr, falls back to stdout, and ultimately includes the exit
@@ -428,12 +533,13 @@ impl GitBackend for GixCliBackend {
     }
 
     fn verify_sha(&self, path: &Path, expected_sha: &str) -> Result<(), GitError> {
-        if expected_sha.is_empty() {
-            return Err(GitError::ShaMismatch {
-                expected: "(empty)".to_owned(),
-                actual: "(not checked)".to_owned(),
-            });
-        }
+        // Structural validation first — distinguishes "you typed a bad SHA"
+        // (InvalidSha) from "the repository is at a different commit"
+        // (ShaMismatch). Without this, an attacker who can write the
+        // expected SHA (e.g. via the marketplace JSON) gets a guaranteed
+        // match by picking the first hex char of the actual HEAD. See
+        // [`validate_sha_prefix`] for the full threat model.
+        validate_sha_prefix(expected_sha)?;
 
         let repo = gix::open(path).map_err(|e| GitError::OpenFailed {
             path: path.to_path_buf(),
@@ -447,7 +553,15 @@ impl GitBackend for GixCliBackend {
 
         let actual_sha = head_id.to_string();
 
-        if actual_sha.starts_with(expected_sha) {
+        // Case-insensitive compare so `ABC123…` and `abc123…` both match
+        // — git itself prints lowercase but humans paste either casing.
+        if actual_sha.len() >= expected_sha.len()
+            && actual_sha
+                .as_bytes()
+                .iter()
+                .zip(expected_sha.as_bytes())
+                .all(|(a, b)| a.eq_ignore_ascii_case(b))
+        {
             Ok(())
         } else {
             Err(GitError::ShaMismatch {
@@ -881,10 +995,117 @@ mod tests {
             .verify_sha(dir.path(), "")
             .expect_err("should reject empty SHA");
 
+        // Empty is now caught as InvalidSha (length < MIN), distinct from
+        // ShaMismatch which means "the repo is at a different commit".
         assert!(
-            matches!(err, GitError::ShaMismatch { .. }),
-            "expected ShaMismatch, got {err:?}"
+            matches!(err, GitError::InvalidSha { .. }),
+            "expected InvalidSha for empty input, got {err:?}"
         );
+    }
+
+    #[test]
+    fn verify_sha_rejects_prefix_below_min_length() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        create_local_repo(dir.path());
+        let git = GixCliBackend::default();
+
+        // 6 chars is one short of MIN_SHA_PREFIX_LEN (7). The guard's
+        // job is twofold: against random SHAs a 6-char accidental
+        // collision is ~1 in 16M (small but not zero); against an
+        // attacker who can pick the prefix (marketplace JSON), any
+        // length below the per-repo collision floor is trivially
+        // forgeable. 7 chars matches git's own short-SHA convention.
+        let err = git
+            .verify_sha(dir.path(), "abcdef")
+            .expect_err("6-char prefix must be rejected");
+        assert!(
+            matches!(err, GitError::InvalidSha { .. }),
+            "expected InvalidSha for too-short prefix, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn verify_sha_rejects_non_hex_characters() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        create_local_repo(dir.path());
+        let git = GixCliBackend::default();
+
+        // "deadXXXX" is 8 chars (passes length) but contains non-hex
+        // characters. Without the hex guard, `starts_with` could still
+        // accept e.g. "git" if the head somehow contained those literal
+        // bytes (impossible for SHA-1, but a robust validator catches it).
+        let err = git
+            .verify_sha(dir.path(), "deadXXXX")
+            .expect_err("non-hex prefix must be rejected");
+        assert!(
+            matches!(err, GitError::InvalidSha { .. }),
+            "expected InvalidSha for non-hex, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn invalid_sha_reason_is_branchable_per_cause() {
+        // The whole point of typed reasons is that callers (CLI, Tauri
+        // UI, future MCP gate) can match on cause rather than parsing
+        // the rendered string. Pin each variant's payload here so a
+        // future refactor can't silently degrade the typed contract back
+        // to a String reason.
+        use crate::error::InvalidShaReason;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        create_local_repo(dir.path());
+        let git = GixCliBackend::default();
+
+        let too_short = git.verify_sha(dir.path(), "abc").expect_err("too short");
+        let GitError::InvalidSha {
+            reason: InvalidShaReason::TooShort { actual, min },
+            ..
+        } = too_short
+        else {
+            panic!("expected TooShort, got {too_short:?}");
+        };
+        assert_eq!(actual, 3);
+        assert_eq!(min, MIN_SHA_PREFIX_LEN);
+
+        let bad_char = git.verify_sha(dir.path(), "deadXXXX").expect_err("non-hex");
+        let GitError::InvalidSha {
+            reason: InvalidShaReason::NonHex { at, byte },
+            ..
+        } = bad_char
+        else {
+            panic!("expected NonHex, got {bad_char:?}");
+        };
+        assert_eq!(at, 4, "first non-hex byte is at offset 4 in `deadXXXX`");
+        assert_eq!(byte, b'X');
+
+        // 65 chars exceeds MAX_SHA_PREFIX_LEN (64).
+        let huge = "a".repeat(MAX_SHA_PREFIX_LEN + 1);
+        let too_long = git.verify_sha(dir.path(), &huge).expect_err("too long");
+        let GitError::InvalidSha {
+            reason: InvalidShaReason::TooLong { actual, max },
+            ..
+        } = too_long
+        else {
+            panic!("expected TooLong, got {too_long:?}");
+        };
+        assert_eq!(actual, MAX_SHA_PREFIX_LEN + 1);
+        assert_eq!(max, MAX_SHA_PREFIX_LEN);
+    }
+
+    #[test]
+    fn verify_sha_accepts_uppercase_prefix() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        create_local_repo(dir.path());
+
+        let repo = gix::open(dir.path()).expect("open repo");
+        let head_sha = repo.head_id().expect("head_id").to_string();
+        let upper: String = head_sha[..7].to_uppercase();
+
+        let git = GixCliBackend::default();
+        // Humans paste either casing; gix returns lowercase but the
+        // comparison should be case-insensitive on hex characters.
+        git.verify_sha(dir.path(), &upper)
+            .expect("uppercase prefix should match the same commit");
     }
 
     #[test]
@@ -895,8 +1116,12 @@ mod tests {
         let repo = gix::open(dir.path()).expect("open repo");
         let head_sha = repo.head_id().expect("head_id").to_string();
 
-        // Append extra characters to the actual SHA so it can never be a valid prefix.
-        let too_long = format!("{head_sha}extra");
+        // Append hex characters to the actual SHA so the structural
+        // validator passes (length still <= MAX_SHA_PREFIX_LEN, all hex)
+        // and the test exercises the "expected longer than actual" branch
+        // of the comparison rather than the structural validator. Using
+        // non-hex would short-circuit as InvalidSha and miss the case.
+        let too_long = format!("{head_sha}abcdef");
         let git = GixCliBackend::default();
         let err = git
             .verify_sha(dir.path(), &too_long)
@@ -905,6 +1130,62 @@ mod tests {
         assert!(
             matches!(err, GitError::ShaMismatch { .. }),
             "expected ShaMismatch, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn translate_git_error_recognises_credential_helper_failures() {
+        // The Stdio::null() on git child stdin causes credential helpers
+        // to fail with this exact phrase on most platforms. We must
+        // surface AuthenticationRequired so the user gets remediation
+        // rather than a libc-error-shaped message.
+        let url = "https://example.com/private.git";
+        let detail = "fatal: could not read Username for 'https://example.com': \
+                      No such device or address";
+        match translate_git_error(url, detail) {
+            GitError::AuthenticationRequired { url: u } => assert_eq!(u, url),
+            other => panic!("expected AuthenticationRequired, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn translate_git_error_recognises_authentication_failed() {
+        // Mixed-case variant — ensures the lowercase comparison catches it.
+        let url = "https://example.com/private.git";
+        let detail = "remote: Invalid credentials\nfatal: Authentication failed for 'https://example.com/private.git/'";
+        assert!(matches!(
+            translate_git_error(url, detail),
+            GitError::AuthenticationRequired { .. }
+        ));
+    }
+
+    #[test]
+    fn translate_git_error_recognises_ssh_publickey_failure() {
+        let url = "git@github.com:owner/repo.git";
+        let detail = "git@github.com: Permission denied (publickey).\nfatal: Could not read from remote repository.";
+        assert!(matches!(
+            translate_git_error(url, detail),
+            GitError::AuthenticationRequired { .. }
+        ));
+    }
+
+    #[test]
+    fn translate_git_error_passes_through_non_auth_errors() {
+        // Generic transport errors must NOT be translated as auth — that
+        // would mislead the user into setting up a credential helper for
+        // an unrelated network problem.
+        let url = "https://example.com/repo.git";
+        let detail = "fatal: unable to access 'https://example.com/repo.git/': Could not resolve host: example.com";
+        let translated = translate_git_error(url, detail);
+        assert!(
+            matches!(translated, GitError::CloneFailed { .. }),
+            "expected CloneFailed for DNS error, got {translated:?}"
+        );
+        // The original detail must be preserved in the source chain.
+        let rendered = crate::error::error_full_chain(&translated);
+        assert!(
+            rendered.contains("Could not resolve host"),
+            "original detail must round-trip: {rendered}"
         );
     }
 

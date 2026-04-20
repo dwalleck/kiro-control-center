@@ -289,6 +289,39 @@ jobs:
           command: check
           arguments: --all-features
 
+  # Verify curl-sys is built with the `ssl` feature so HTTPS clones use
+  # TLS even when curl-sys builds its own libcurl (static / Windows
+  # minimal). The workspace Cargo.toml's `curl = { features = ["ssl"] }`
+  # entry is INERT unless a workspace crate activates it via
+  # `curl = { workspace = true }`; this job catches the regression where
+  # someone removes that activator and HTTPS silently falls back to
+  # plaintext on certain build configurations.
+  assert-curl-tls:
+    name: Assert curl-sys +ssl feature
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Setup Rust cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Inspect curl-sys feature flags
+        run: |
+          set -euo pipefail
+          # cargo tree -e features prints lines like `curl-sys feature "ssl"`
+          # for every active feature on every consumer of curl-sys. If `ssl`
+          # is not active, the dep graph won't contain that line.
+          if ! cargo tree -e features -i curl-sys | grep -F 'curl-sys feature "ssl"'; then
+            echo "::error::curl-sys is missing the 'ssl' feature; HTTPS clones may silently fall back to plaintext on builds with static libcurl. Re-add `curl = { workspace = true }` to a workspace crate, or wire the ssl feature on curl-sys directly."
+            echo "Full feature tree:"
+            cargo tree -e features -i curl-sys
+            exit 1
+          fi
+          echo "OK: curl-sys is built with TLS (ssl feature active)"
+
   # Code coverage for Rust crates
   coverage:
     name: Code Coverage
@@ -331,7 +364,19 @@ jobs:
   ci-success:
     name: CI Success
     if: always()
-    needs: [commitlint, format, lint, test, frontend, build-cli, build-tauri, cargo-deny, coverage]
+    needs:
+      [
+        commitlint,
+        format,
+        lint,
+        test,
+        frontend,
+        build-cli,
+        build-tauri,
+        cargo-deny,
+        assert-curl-tls,
+        coverage,
+      ]
     runs-on: ubuntu-latest
     steps:
       - name: Check all jobs
@@ -349,6 +394,7 @@ jobs:
              [[ "${{ needs.build-cli.result }}" != "success" ]] || \
              [[ "${{ needs.build-tauri.result }}" != "success" ]] || \
              [[ "${{ needs.cargo-deny.result }}" != "success" ]] || \
+             [[ "${{ needs.assert-curl-tls.result }}" != "success" ]] || \
              [[ "${{ needs.coverage.result }}" != "success" ]]; then
             echo "One or more CI jobs failed"
             exit 1

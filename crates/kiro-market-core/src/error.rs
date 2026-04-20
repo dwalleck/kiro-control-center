@@ -33,6 +33,21 @@ pub enum MarketplaceError {
     /// No `marketplace.json` and no `plugin.json` files found via scan.
     #[error("no plugins found in {path}")]
     NoPluginsFound { path: PathBuf },
+
+    /// The user supplied an `http://` URL but the
+    /// [`crate::service::InsecureHttpPolicy`] is set to `Reject`
+    /// (the default). http traffic is unauthenticated and trivially
+    /// MITM'd; a network attacker who substitutes the marketplace
+    /// contents gets arbitrary code execution via skills, agents, and
+    /// MCP servers, and the cache persists so a one-time MITM is a
+    /// long-term backdoor. The error names the caller-facing knob
+    /// (the `--allow-insecure-http` CLI flag, mapping to the `Allow`
+    /// variant) so the remediation is discoverable from the message.
+    #[error(
+        "refusing to add insecure http:// marketplace `{url}`; \
+         use https:// (or pass --allow-insecure-http to opt in to MITM risk)"
+    )]
+    InsecureSource { url: String },
 }
 
 // ---------------------------------------------------------------------------
@@ -150,6 +165,19 @@ pub enum GitError {
     #[error("SHA mismatch: expected {expected}, got {actual}")]
     ShaMismatch { expected: String, actual: String },
 
+    /// A pinned-SHA value supplied by the user (e.g. via the marketplace
+    /// manifest's `sha` field) is structurally invalid. Caught at the
+    /// boundary so a typo never reaches `git` only to silently match a
+    /// short-prefix collision. The typed [`InvalidShaReason`] lets
+    /// callers branch on cause (e.g. "too short → suggest 7+ chars" vs
+    /// "non-hex → highlight the bad character") rather than parsing the
+    /// rendered message.
+    #[error("invalid SHA `{value}`: {reason}")]
+    InvalidSha {
+        value: String,
+        reason: InvalidShaReason,
+    },
+
     /// The `git` command-line tool was not found in `$PATH`.
     #[error("the 'git' command-line tool is required but was not found in PATH")]
     GitNotFound,
@@ -161,6 +189,62 @@ pub enum GitError {
         #[source]
         source: Box<dyn std::error::Error + Send + Sync>,
     },
+
+    /// A `git` subprocess could not authenticate to the remote. Almost
+    /// always means an HTTPS clone needs credentials (a credential
+    /// helper, a personal access token, or an SSH switch). Translated
+    /// from the `fatal: could not read Username/Password ...` family of
+    /// libcurl/git errors so users see "the repo needs auth" instead
+    /// of "no such device or address" — those raw errors are the result
+    /// of the deliberate `Stdio::null()` we set on the child to prevent
+    /// credential prompts from stalling CI.
+    #[error(
+        "authentication required for `{url}` — configure a credential \
+         helper (`git config --global credential.helper ...`), provide a \
+         personal access token in the URL, or switch to SSH"
+    )]
+    AuthenticationRequired { url: String },
+}
+
+/// Why a user-supplied SHA prefix failed structural validation. Carried
+/// by [`GitError::InvalidSha`]; consumers can `match` on the cause
+/// (rather than substring-match the rendered message) to surface
+/// targeted remediation in the UI.
+///
+/// `#[non_exhaustive]` so a future stricter rule (e.g. "looks like a
+/// branch name") is additive.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum InvalidShaReason {
+    /// Shorter than the minimum acceptable prefix length. Carries the
+    /// observed length and the minimum so the UI can render
+    /// "needs at least N hex chars".
+    TooShort { actual: usize, min: usize },
+    /// Longer than any known SHA hash output (40 chars for SHA-1,
+    /// 64 chars for SHA-256). Probably a paste mistake, not a real SHA.
+    TooLong { actual: usize, max: usize },
+    /// Contains a character outside `[0-9a-fA-F]`. Carries the byte
+    /// offset of the first offending character so the UI can underline
+    /// the typo.
+    NonHex { at: usize, byte: u8 },
+}
+
+impl std::fmt::Display for InvalidShaReason {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TooShort { actual, min } => write!(
+                f,
+                "SHA prefix must be at least {min} hex characters (got {actual})"
+            ),
+            Self::TooLong { actual, max } => write!(
+                f,
+                "SHA prefix must be at most {max} hex characters (got {actual})"
+            ),
+            Self::NonHex { byte, .. } => {
+                write!(f, "non-hex character `{}`", *byte as char)
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
