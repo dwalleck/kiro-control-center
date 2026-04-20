@@ -62,9 +62,12 @@ pub enum PluginError {
     #[error("plugin `{plugin}` not found in marketplace `{marketplace}`")]
     NotFound { plugin: String, marketplace: String },
 
-    /// The plugin manifest could not be parsed.
-    #[error("invalid plugin manifest: {reason}")]
-    InvalidManifest { reason: String },
+    /// The plugin manifest could not be parsed. Carries `path` so error
+    /// rendering names the offending file — without it, bulk listings
+    /// over many plugins reduce to "invalid plugin manifest: missing name"
+    /// with no way to tell which plugin is broken.
+    #[error("invalid plugin manifest at {path}: {reason}")]
+    InvalidManifest { path: PathBuf, reason: String },
 
     /// No `plugin.json` exists at the expected location.
     #[error("plugin manifest not found at {path}")]
@@ -79,6 +82,18 @@ pub enum PluginError {
     /// directory that was never committed or was deleted.
     #[error("plugin directory does not exist: {path}")]
     DirectoryMissing { path: PathBuf },
+
+    /// A caller asked for a local filesystem path to a plugin whose source
+    /// is remote (GitHub / Git URL / Git subdir). Resolving it would
+    /// require a clone, which the caller explicitly did not request.
+    /// Distinct from [`Self::DirectoryMissing`] so the UI can offer the
+    /// right remediation ("clone this remote plugin" vs "the local copy
+    /// is broken").
+    #[error(
+        "plugin `{plugin}` uses a remote source and is not available \
+         locally; use the CLI to clone it first"
+    )]
+    RemoteSourceNotLocal { plugin: String },
 }
 
 // ---------------------------------------------------------------------------
@@ -378,8 +393,11 @@ mod tests {
         "plugin `dotnet` not found in marketplace `ms`"
     )]
     #[case::plugin_invalid_manifest(
-        PluginError::InvalidManifest { reason: "missing name".into() },
-        "invalid plugin manifest: missing name"
+        PluginError::InvalidManifest {
+            path: PathBuf::from("/tmp/plugin.json"),
+            reason: "missing name".into(),
+        },
+        "invalid plugin manifest at /tmp/plugin.json: missing name"
     )]
     #[case::plugin_manifest_not_found(
         PluginError::ManifestNotFound { path: PathBuf::from("/tmp/plugin.json") },
@@ -388,6 +406,15 @@ mod tests {
     #[case::plugin_no_skills(
         PluginError::NoSkills { name: "empty".into() },
         "plugin `empty` has no skills"
+    )]
+    #[case::plugin_directory_missing(
+        PluginError::DirectoryMissing { path: PathBuf::from("/tmp/plugins/x") },
+        "plugin directory does not exist: /tmp/plugins/x"
+    )]
+    #[case::plugin_remote_source_not_local(
+        PluginError::RemoteSourceNotLocal { plugin: "acme".into() },
+        "plugin `acme` uses a remote source and is not available \
+         locally; use the CLI to clone it first"
     )]
     fn plugin_error_display(#[case] err: PluginError, #[case] expected: &str) {
         assert_eq!(err.to_string(), expected);

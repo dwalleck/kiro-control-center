@@ -180,6 +180,7 @@ mod tests {
     )]
     #[case::plugin_invalid_manifest(
         CoreError::Plugin(PluginError::InvalidManifest {
+            path: PathBuf::from("/tmp/plugin.json"),
             reason: "missing name".into(),
         }),
         ErrorType::ParseError
