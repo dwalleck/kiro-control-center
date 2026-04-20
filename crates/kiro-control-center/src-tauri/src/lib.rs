@@ -18,6 +18,7 @@ fn create_builder() -> Builder<tauri::Wry> {
         commands::browse::list_marketplaces,
         commands::browse::list_plugins,
         commands::browse::list_available_skills,
+        commands::browse::list_all_skills_for_marketplace,
         commands::browse::install_skills,
         commands::browse::get_project_info,
         commands::installed::list_installed_skills,
