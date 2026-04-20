@@ -1,6 +1,6 @@
 <script lang="ts">
   import { onMount } from "svelte";
-  import { SvelteSet } from "svelte/reactivity";
+  import { SvelteMap, SvelteSet } from "svelte/reactivity";
   import { commands } from "$lib/bindings";
   import type { MarketplaceInfo, PluginInfo, SkillInfo } from "$lib/bindings";
   import SkillCard from "./SkillCard.svelte";
@@ -23,6 +23,20 @@
     return { marketplace, plugin, name };
   };
 
+  // Error-source key family. Shares DELIM with the composite-key helpers so
+  // `plugins\u001f${mp}` and `skills\u001f${pluginKey(mp, p)}` can't collide
+  // with a marketplace literally named "plugins:foo".
+  const PLUGINS_ERR_PREFIX = `plugins${DELIM}` as const;
+  const SKILLS_ERR_PREFIX = `skills${DELIM}` as const;
+  const ERR_MARKETPLACES = "marketplaces" as const;
+  type ErrorSource =
+    | typeof ERR_MARKETPLACES
+    | `${typeof PLUGINS_ERR_PREFIX}${string}`
+    | `${typeof SKILLS_ERR_PREFIX}${string}`;
+  const pluginsErrKey = (mp: string): ErrorSource => `${PLUGINS_ERR_PREFIX}${mp}`;
+  const skillsErrKey = (mp: string, plugin: string): ErrorSource =>
+    `${SKILLS_ERR_PREFIX}${pluginKey(mp, plugin)}`;
+
   let marketplaces: MarketplaceInfo[] = $state([]);
   let pluginsByMarketplace: Record<string, PluginInfo[]> = $state({});
   let skillsByPluginPair: Record<string, SkillInfo[]> = $state({});
@@ -41,18 +55,11 @@
   let pendingSkillFetches = new SvelteSet<string>();
   let installing: boolean = $state(false);
 
-  // Per-source fetch errors, keyed by an origin-tagged string. Successful
-  // fetches only clear their own entry, so concurrent failures from
-  // independent sources don't overwrite each other in a race. Install
-  // failures use their own `installError` because they're user-initiated
-  // and deserve prominent, independent clearing semantics.
-  let fetchErrors: Record<string, string> = $state({});
+  // Keyed per-source so a concurrent success for one fetch can't clear
+  // another source's failure mid-race.
+  let fetchErrors = new SvelteMap<ErrorSource, string>();
   let installError: string | null = $state(null);
   let installMessage: string | null = $state(null);
-
-  const ERR_MARKETPLACES = "marketplaces";
-  const pluginsErrKey = (mp: string) => `plugins:${mp}`;
-  const skillsErrKey = (mp: string, plugin: string) => `skills:${pluginKey(mp, plugin)}`;
 
   let availablePlugins = $derived.by(() => {
     const out: { marketplace: string; plugin: PluginInfo }[] = [];
@@ -101,8 +108,12 @@
       (loadingMarketplaces || pendingPluginFetches.size > 0 || pendingSkillFetches.size > 0)
   );
 
+  // Only the initial-marketplaces fetch gates the grid's empty-state UI.
+  // Plugin and skill fetch errors surface as their own banners but don't
+  // imply an empty grid — a selected marketplace can have a mix of working
+  // and broken plugins and still render successful pairs' skills.
   let initialLoadFailed = $derived(
-    fetchErrors[ERR_MARKETPLACES] !== undefined &&
+    fetchErrors.has(ERR_MARKETPLACES) &&
       marketplaces.length === 0 &&
       !loadingMarketplaces
   );
@@ -118,12 +129,12 @@
         if (marketplaces.length > 0 && selectedMarketplaces.size === 0) {
           selectedMarketplaces.add(marketplaces[0].name);
         }
-        delete fetchErrors[ERR_MARKETPLACES];
+        fetchErrors.delete(ERR_MARKETPLACES);
       } else {
-        fetchErrors[ERR_MARKETPLACES] = result.error.message;
+        fetchErrors.set(ERR_MARKETPLACES, result.error.message);
       }
     } catch (e) {
-      fetchErrors[ERR_MARKETPLACES] = e instanceof Error ? e.message : String(e);
+      fetchErrors.set(ERR_MARKETPLACES, e instanceof Error ? e.message : String(e));
     } finally {
       loadingMarketplaces = false;
     }
@@ -137,13 +148,13 @@
       const result = await commands.listPlugins(mp);
       if (result.status === "ok") {
         pluginsByMarketplace[mp] = result.data;
-        delete fetchErrors[errKey];
+        fetchErrors.delete(errKey);
       } else {
-        fetchErrors[errKey] = `${mp}: ${result.error.message}`;
+        fetchErrors.set(errKey, `${mp}: ${result.error.message}`);
       }
     } catch (e) {
       const reason = e instanceof Error ? e.message : String(e);
-      fetchErrors[errKey] = `${mp}: ${reason}`;
+      fetchErrors.set(errKey, `${mp}: ${reason}`);
     } finally {
       pendingPluginFetches.delete(mp);
     }
@@ -158,13 +169,13 @@
       const result = await commands.listAvailableSkills(mp, plugin, projectPath);
       if (result.status === "ok") {
         skillsByPluginPair[key] = result.data;
-        delete fetchErrors[errKey];
+        fetchErrors.delete(errKey);
       } else {
-        fetchErrors[errKey] = `${mp}/${plugin}: ${result.error.message}`;
+        fetchErrors.set(errKey, `${mp}/${plugin}: ${result.error.message}`);
       }
     } catch (e) {
       const reason = e instanceof Error ? e.message : String(e);
-      fetchErrors[errKey] = `${mp}/${plugin}: ${reason}`;
+      fetchErrors.set(errKey, `${mp}/${plugin}: ${reason}`);
     } finally {
       pendingSkillFetches.delete(key);
     }
@@ -184,23 +195,46 @@
     }
   });
 
-  // Skill caches are project-scoped — `installed` flags flip meaning when
-  // projectPath changes, so invalidate everything and drop pending selections.
+  // Skill caches and skill-fetch errors are both project-scoped — `installed`
+  // flags flip and error messages cite paths under the previous project — so
+  // invalidate the lot when projectPath changes. Plugin-fetch and marketplace
+  // errors are project-agnostic and survive.
   let priorProjectPath: string | null = null;
   $effect(() => {
     if (priorProjectPath !== null && priorProjectPath !== projectPath) {
       skillsByPluginPair = {};
       selectedSkills.clear();
+      for (const key of fetchErrors.keys()) {
+        if (key.startsWith(SKILLS_ERR_PREFIX)) fetchErrors.delete(key);
+      }
     }
     priorProjectPath = projectPath;
   });
 
-  // Drop selected-skill keys that no longer refer to a visible skill — happens
-  // when the user deselects a marketplace that contained the selected skills.
+  // Drop stale selections and stale error banners when the underlying filter
+  // set narrows. A deselected marketplace (or a plugin filter that excludes a
+  // pair) means the user can no longer see or act on that source — leaving its
+  // banner up would misattribute responsibility to a filter the user set
+  // intentionally. Marketplace-listing errors are always kept: they gate the
+  // initial-load empty state and aren't scoped to any selection.
   $effect(() => {
     const valid = new Set(skills.map((s) => skillKey(s.marketplace, s.plugin, s.name)));
     for (const key of selectedSkills) {
       if (!valid.has(key)) selectedSkills.delete(key);
+    }
+
+    for (const key of fetchErrors.keys()) {
+      if (key === ERR_MARKETPLACES) continue;
+      if (key.startsWith(PLUGINS_ERR_PREFIX)) {
+        const mp = key.slice(PLUGINS_ERR_PREFIX.length);
+        if (!selectedMarketplaces.has(mp)) fetchErrors.delete(key);
+      } else if (key.startsWith(SKILLS_ERR_PREFIX)) {
+        const { marketplace, plugin } = parsePluginKey(key.slice(SKILLS_ERR_PREFIX.length));
+        const stillSelected =
+          selectedMarketplaces.has(marketplace) &&
+          (selectedPlugins.size === 0 || selectedPlugins.has(pluginKey(marketplace, plugin)));
+        if (!stillSelected) fetchErrors.delete(key);
+      }
     }
   });
 
@@ -489,7 +523,7 @@
     </div>
   {/if}
 
-  {#each Object.entries(fetchErrors) as [key, message] (key)}
+  {#each fetchErrors as [key, message] (key)}
     <div
       data-testid="fetch-error"
       class="mx-4 mt-3 px-4 py-3 rounded-md bg-kiro-error/10 border border-kiro-error/30 flex items-start gap-3"
@@ -497,10 +531,8 @@
       <p class="text-sm text-kiro-error flex-1">{message}</p>
       <button
         type="button"
-        onclick={() => {
-          delete fetchErrors[key];
-        }}
-        aria-label="Dismiss error"
+        onclick={() => fetchErrors.delete(key)}
+        aria-label={`Dismiss ${message}`}
         class="text-kiro-error/70 hover:text-kiro-error text-lg leading-none flex-shrink-0 focus:outline-none focus:ring-2 focus:ring-kiro-accent-500 rounded"
       >
         ×
@@ -517,7 +549,7 @@
       <button
         type="button"
         onclick={() => (installError = null)}
-        aria-label="Dismiss error"
+        aria-label={`Dismiss ${installError}`}
         class="text-kiro-error/70 hover:text-kiro-error text-lg leading-none flex-shrink-0 focus:outline-none focus:ring-2 focus:ring-kiro-accent-500 rounded"
       >
         ×
