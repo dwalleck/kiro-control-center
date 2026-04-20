@@ -111,7 +111,7 @@ pub async fn list_marketplaces() -> Result<Vec<MarketplaceInfo>, CommandError> {
     for entry in &known {
         let source_type = marketplace_source_type(&entry.source);
         let (plugin_count, load_error) = match svc.list_plugin_entries(&entry.name) {
-            Ok(entries) => (entries.len() as u32, None),
+            Ok(entries) => (u32::try_from(entries.len()).unwrap_or(u32::MAX), None),
             Err(e) => (0, Some(e.to_string())),
         };
         results.push(MarketplaceInfo {
@@ -142,7 +142,7 @@ pub async fn list_plugins(marketplace: String) -> Result<Vec<PluginInfo>, Comman
         results.push(PluginInfo {
             name: plugin.name.clone(),
             description: plugin.description.clone(),
-            skill_count: skill_count as u32,
+            skill_count: u32::try_from(skill_count).unwrap_or(u32::MAX),
             source_type,
         });
     }
@@ -253,7 +253,7 @@ pub async fn get_project_info(project_path: String) -> Result<ProjectInfo, Comma
     let project = KiroProject::new(path);
     let installed_skill_count = project
         .load_installed()
-        .map(|i| i.skills.len() as u32)
+        .map(|i| u32::try_from(i.skills.len()).unwrap_or(u32::MAX))
         .map_err(|e| {
             warn!(path = %project_path, error = %e, "failed to load installed skills");
             CommandError::new(
@@ -331,13 +331,29 @@ fn discover_skills_for_plugin(
 
 /// Load a `plugin.json` from the given directory.
 ///
-/// Returns `Ok(None)` if the file is genuinely missing (not an error) and
-/// `Err` if the file exists but could not be read or parsed (corruption /
-/// permission issues).
+/// Returns `Ok(None)` if the file is genuinely absent, or if it is a
+/// symlink — a symlinked `plugin.json` inside an untrusted cloned
+/// repository could leak host file contents through the parse-error
+/// path, so it is treated as absent with a `warn!`. Matches the
+/// hardening in `kiro_market_core::service::browse::load_plugin_manifest`
+/// and `kiro_market::commands::install::load_plugin_manifest`. Returns
+/// `Err` if the file exists but could not be read or parsed (corruption
+/// or permission issues).
 fn load_plugin_manifest(plugin_dir: &Path) -> Result<Option<PluginManifest>, CommandError> {
     let manifest_path = plugin_dir.join("plugin.json");
-    let bytes = match fs::read(&manifest_path) {
-        Ok(b) => b,
+
+    // Refuse to follow symlinks. Matches the core-side and CLI-side
+    // load_plugin_manifest implementations; a symlinked plugin.json
+    // inside a cloned repo could point at arbitrary host files.
+    match fs::symlink_metadata(&manifest_path) {
+        Ok(m) if m.file_type().is_symlink() => {
+            warn!(
+                path = %manifest_path.display(),
+                "plugin.json is a symlink, refusing to follow; treating as missing"
+            );
+            return Ok(None);
+        }
+        Ok(_) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             debug!(
                 path = %manifest_path.display(),
@@ -345,6 +361,24 @@ fn load_plugin_manifest(plugin_dir: &Path) -> Result<Option<PluginManifest>, Com
             );
             return Ok(None);
         }
+        Err(e) => {
+            warn!(
+                path = %manifest_path.display(),
+                error = %e,
+                "failed to stat plugin.json"
+            );
+            return Err(CommandError::new(
+                format!(
+                    "failed to stat plugin.json at {}: {e}",
+                    manifest_path.display()
+                ),
+                ErrorType::IoError,
+            ));
+        }
+    }
+
+    let bytes = match fs::read(&manifest_path) {
+        Ok(b) => b,
         Err(e) => {
             warn!(
                 path = %manifest_path.display(),

@@ -78,6 +78,9 @@ impl MarketplaceService {
     ///
     /// - [`Error::Plugin`] ([`PluginError::DirectoryMissing`]) if a
     ///   `RelativePath` points to a missing directory.
+    /// - [`Error::Plugin`] ([`PluginError::DirectoryUnreadable`]) if
+    ///   the path exists but is not a directory, or stat'ing it fails
+    ///   (permission denied, I/O error, etc.).
     /// - [`Error::Plugin`] ([`PluginError::RemoteSourceNotLocal`]) if
     ///   the source is structured (GitHub / Git URL / Git subdir).
     pub fn resolve_local_plugin_dir(
@@ -90,13 +93,28 @@ impl MarketplaceService {
                 // `rel` is a validated `RelativePath` — no traversal
                 // check needed. `symlink_metadata` refuses to follow
                 // symlinks, matching the hardening in
-                // `resolve_plugin_dir`.
+                // `resolve_plugin_dir`. Non-`NotFound` errors are
+                // surfaced as `DirectoryUnreadable` rather than
+                // collapsed into "missing," so a permissions problem
+                // shows up as "could not access" instead of a
+                // misleading "does not exist."
                 let resolved = marketplace_path.join(rel);
-                let is_real_dir = fs::symlink_metadata(&resolved).is_ok_and(|m| m.is_dir());
-                if !is_real_dir {
-                    return Err(PluginError::DirectoryMissing { path: resolved }.into());
+                match fs::symlink_metadata(&resolved) {
+                    Ok(m) if m.is_dir() => Ok(resolved),
+                    Ok(_) => Err(PluginError::DirectoryUnreadable {
+                        path: resolved,
+                        reason: "path exists but is not a directory".into(),
+                    }
+                    .into()),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        Err(PluginError::DirectoryMissing { path: resolved }.into())
+                    }
+                    Err(e) => Err(PluginError::DirectoryUnreadable {
+                        path: resolved,
+                        reason: e.to_string(),
+                    }
+                    .into()),
                 }
-                Ok(resolved)
             }
             PluginSource::Structured(_) => Err(PluginError::RemoteSourceNotLocal {
                 plugin: entry.name.clone(),
@@ -116,13 +134,15 @@ impl MarketplaceService {
     ///
     /// # Errors
     ///
-    /// - [`Error::Marketplace`] / [`Error::Plugin`] from
-    ///   [`Self::list_plugin_entries`] (unknown marketplace,
-    ///   corrupt manifest).
+    /// - [`Error::Marketplace`] / [`Error::Plugin`] / [`Error::Io`] /
+    ///   [`Error::Json`] from [`Self::list_plugin_entries`] (unknown
+    ///   marketplace, corrupt or unreadable registry).
     /// - [`Error::Plugin`] ([`PluginError::NotFound`]) if `plugin`
     ///   does not appear in the marketplace.
     /// - [`Error::Plugin`] ([`PluginError::DirectoryMissing`] /
+    ///   [`PluginError::DirectoryUnreadable`] /
     ///   [`PluginError::InvalidManifest`] /
+    ///   [`PluginError::ManifestReadFailed`] /
     ///   [`PluginError::RemoteSourceNotLocal`]) for plugin-level
     ///   resolution failures.
     pub fn list_skills_for_plugin(
@@ -173,10 +193,12 @@ impl MarketplaceService {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Marketplace`] / [`Error::Plugin`] from
+    /// Returns [`Error::Marketplace`] / [`Error::Plugin`] /
+    /// [`Error::Io`] / [`Error::Json`] from
     /// [`Self::list_plugin_entries`] when the marketplace is unknown
-    /// or its manifest is corrupt. Non-plugin-level errors during
-    /// iteration propagate; plugin-level errors go to `skipped`.
+    /// or its registry is corrupt / unreadable. Non-plugin-level
+    /// errors during iteration propagate; plugin-level errors (see
+    /// [`is_plugin_level_skip`]) go to `skipped`.
     pub fn list_all_skills(
         &self,
         marketplace: &str,
@@ -220,15 +242,18 @@ impl MarketplaceService {
 
 /// Is this error one that the bulk path should fold into `skipped`
 /// rather than propagate? `true` for plugin-level resolution failures
-/// (missing directory, malformed manifest, remote source); `false`
-/// for anything else — corrupt marketplace state, unexpected I/O
-/// errors, etc., which must surface so callers see them.
+/// (missing or unreadable directory, malformed or unreadable manifest,
+/// remote source); `false` for anything else — corrupt marketplace
+/// state, unexpected I/O errors outside the per-plugin scope, etc.,
+/// which must surface so callers see them.
 fn is_plugin_level_skip(err: &Error) -> bool {
     matches!(
         err,
         Error::Plugin(
             PluginError::DirectoryMissing { .. }
+                | PluginError::DirectoryUnreadable { .. }
                 | PluginError::InvalidManifest { .. }
+                | PluginError::ManifestReadFailed { .. }
                 | PluginError::RemoteSourceNotLocal { .. }
         )
     )
@@ -246,7 +271,7 @@ fn is_plugin_level_skip(err: &Error) -> bool {
 /// Shared between the per-plugin and bulk public entry points so the
 /// per-skill skip philosophy and plugin-level error classification live
 /// in exactly one place.
-pub(super) fn collect_skills_for_plugin_into(
+fn collect_skills_for_plugin_into(
     service: &MarketplaceService,
     plugin_entry: &PluginEntry,
     marketplace_path: &Path,
@@ -265,6 +290,8 @@ pub(super) fn collect_skills_for_plugin_into(
             Ok(c) => c,
             Err(e) => {
                 warn!(
+                    marketplace = %marketplace_name,
+                    plugin = %plugin_entry.name,
                     path = %skill_md_path.display(),
                     error = %e,
                     "failed to read SKILL.md, skipping"
@@ -277,6 +304,8 @@ pub(super) fn collect_skills_for_plugin_into(
             Ok(result) => result,
             Err(e) => {
                 warn!(
+                    marketplace = %marketplace_name,
+                    plugin = %plugin_entry.name,
                     path = %skill_md_path.display(),
                     error = %e,
                     "failed to parse SKILL.md frontmatter, skipping"
@@ -318,14 +347,34 @@ fn discover_skills_for_plugin(
 
 /// Load a `plugin.json` from the given directory.
 ///
-/// Returns `Ok(None)` if the file is genuinely missing (not an error —
-/// the plugin uses defaults) and `Err(PluginError::InvalidManifest)` if
-/// the file exists but could not be parsed. I/O errors other than
-/// `NotFound` propagate as [`Error::Io`].
+/// Returns:
+/// - `Ok(Some(manifest))` on success.
+/// - `Ok(None)` when the file is genuinely absent (`NotFound`) or when
+///   it is a symlink — a symlinked `plugin.json` inside an untrusted
+///   cloned repository could point at arbitrary host files, so it is
+///   treated as absent with a `warn!`. Matches the hardening in
+///   `crate::commands::install::load_plugin_manifest` in the CLI crate.
+/// - `Err(PluginError::InvalidManifest)` if the file exists but could
+///   not be parsed.
+/// - `Err(PluginError::ManifestReadFailed)` for any other read or stat
+///   failure (permission denied, transient I/O, etc.). Classified as
+///   plugin-level so bulk listings skip the plugin rather than aborting.
 fn load_plugin_manifest(plugin_dir: &Path) -> Result<Option<PluginManifest>, Error> {
     let manifest_path = plugin_dir.join("plugin.json");
-    let bytes = match fs::read(&manifest_path) {
-        Ok(b) => b,
+
+    // Refuse to follow symlinks. plugin_dir lives inside a cloned
+    // (untrusted) repository; a symlinked plugin.json could leak host
+    // file contents through the InvalidManifest error path's `reason`
+    // field (which includes serde's parse error over the target bytes).
+    match fs::symlink_metadata(&manifest_path) {
+        Ok(m) if m.file_type().is_symlink() => {
+            warn!(
+                path = %manifest_path.display(),
+                "plugin.json is a symlink, refusing to follow; treating as missing"
+            );
+            return Ok(None);
+        }
+        Ok(_) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             debug!(
                 path = %manifest_path.display(),
@@ -337,9 +386,29 @@ fn load_plugin_manifest(plugin_dir: &Path) -> Result<Option<PluginManifest>, Err
             warn!(
                 path = %manifest_path.display(),
                 error = %e,
+                "failed to stat plugin.json"
+            );
+            return Err(PluginError::ManifestReadFailed {
+                path: manifest_path,
+                reason: e.to_string(),
+            }
+            .into());
+        }
+    }
+
+    let bytes = match fs::read(&manifest_path) {
+        Ok(b) => b,
+        Err(e) => {
+            warn!(
+                path = %manifest_path.display(),
+                error = %e,
                 "failed to read plugin.json"
             );
-            return Err(Error::Io(e));
+            return Err(PluginError::ManifestReadFailed {
+                path: manifest_path,
+                reason: e.to_string(),
+            }
+            .into());
         }
     };
 
@@ -685,5 +754,316 @@ mod tests {
             "skipped reason should name the failure mode, got: {}",
             result.skipped[0].reason
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Symlink-refusal regression tests (plugin dir + plugin.json)
+    // -----------------------------------------------------------------------
+
+    /// Regression guard: `resolve_local_plugin_dir` uses
+    /// `symlink_metadata` combined with `is_dir()` rather than
+    /// `Path::exists()` to refuse symlinks that could escape the
+    /// marketplace tree. Mirrors
+    /// `resolve_plugin_dir_refuses_symlinked_relative_path` for the
+    /// cloning sibling on `service/mod.rs`; a future "simplify to
+    /// `Path::exists()`" must not silently re-open the traversal hole.
+    #[cfg(unix)]
+    #[test]
+    fn resolve_local_plugin_dir_refuses_symlinked_relative_path() {
+        let (dir, svc) = temp_service();
+        let marketplace_path = dir.path().join("marketplace");
+        fs::create_dir_all(&marketplace_path).expect("create marketplace root");
+
+        let outside = dir.path().join("outside-marketplace");
+        fs::create_dir_all(&outside).expect("create outside target");
+
+        let link_path = marketplace_path.join("plugins").join("escape");
+        fs::create_dir_all(link_path.parent().unwrap()).expect("create plugins dir");
+        std::os::unix::fs::symlink(&outside, &link_path).expect("create symlink");
+
+        let entry = relative_path_entry("escape", "plugins/escape");
+        let err = svc
+            .resolve_local_plugin_dir(&entry, &marketplace_path)
+            .expect_err("symlinked plugin directory must be refused");
+        // symlink_metadata returns the link's own metadata, which is not
+        // a directory, so the classification is DirectoryUnreadable.
+        assert!(
+            matches!(err, Error::Plugin(PluginError::DirectoryUnreadable { .. })),
+            "expected DirectoryUnreadable for symlink, got: {err:?}"
+        );
+    }
+
+    /// Regression guard: `load_plugin_manifest` treats a symlinked
+    /// `plugin.json` as absent (matching the CLI-side
+    /// `kiro_market::commands::install::load_plugin_manifest` and the
+    /// agent discovery hardening). A symlinked manifest inside a cloned
+    /// repo could leak host file contents through the `InvalidManifest`
+    /// error path, which embeds the serde parse error over the target
+    /// bytes.
+    #[cfg(unix)]
+    #[test]
+    fn load_plugin_manifest_refuses_symlinked_manifest() {
+        let tmp = tempdir().expect("tempdir");
+        let plugin_dir = tmp.path().join("plugin");
+        fs::create_dir_all(&plugin_dir).expect("create plugin dir");
+
+        // A "sensitive" target with valid-looking JSON so we can tell
+        // absence from "parsed but wrong."
+        let sensitive = tmp.path().join("secrets.json");
+        fs::write(&sensitive, br#"{"name":"leaked","version":"1.0"}"#).expect("write target");
+
+        std::os::unix::fs::symlink(&sensitive, plugin_dir.join("plugin.json"))
+            .expect("create symlink");
+
+        let result = load_plugin_manifest(&plugin_dir).expect("symlink must be Ok(None)");
+        assert!(
+            result.is_none(),
+            "symlinked plugin.json must be treated as absent, got: {result:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // resolve_local_plugin_dir: Unreadable vs Missing classification
+    // -----------------------------------------------------------------------
+
+    /// Regression guard: the path exists as a regular file (not a
+    /// directory). Previously this collapsed into `DirectoryMissing`
+    /// via the `is_ok_and(|m| m.is_dir())` guard; now it returns the
+    /// distinct `DirectoryUnreadable` so users see "path exists but is
+    /// not a directory" rather than a misleading "does not exist."
+    #[test]
+    fn resolve_local_plugin_dir_file_path_returns_unreadable() {
+        let (dir, svc) = temp_service();
+        let marketplace_path = dir.path().join("marketplace");
+        fs::create_dir_all(marketplace_path.join("plugins")).expect("create plugins dir");
+        fs::write(
+            marketplace_path.join("plugins").join("not-a-dir"),
+            b"this is a regular file",
+        )
+        .expect("write file");
+
+        let entry = relative_path_entry("not-a-dir", "plugins/not-a-dir");
+        let err = svc
+            .resolve_local_plugin_dir(&entry, &marketplace_path)
+            .expect_err("regular file must not resolve as a plugin directory");
+        assert!(
+            matches!(err, Error::Plugin(PluginError::DirectoryUnreadable { .. })),
+            "expected DirectoryUnreadable for non-directory, got: {err:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // is_plugin_level_skip covers the new plugin-level variants
+    // -----------------------------------------------------------------------
+
+    /// Regression guard: the bulk path relies on this classifier to
+    /// decide skip-vs-propagate. Before the fix, `ManifestReadFailed`
+    /// propagated as an `Error::Io` that slipped past the `matches!`,
+    /// aborting the entire listing on one unreadable `plugin.json`.
+    #[rstest::rstest]
+    #[case::directory_missing(Error::Plugin(PluginError::DirectoryMissing {
+        path: "/tmp/x".into(),
+    }))]
+    #[case::directory_unreadable(Error::Plugin(PluginError::DirectoryUnreadable {
+        path: "/tmp/x".into(),
+        reason: "permission denied".into(),
+    }))]
+    #[case::invalid_manifest(Error::Plugin(PluginError::InvalidManifest {
+        path: "/tmp/x/plugin.json".into(),
+        reason: "missing name".into(),
+    }))]
+    #[case::manifest_read_failed(Error::Plugin(PluginError::ManifestReadFailed {
+        path: "/tmp/x/plugin.json".into(),
+        reason: "permission denied".into(),
+    }))]
+    #[case::remote_source_not_local(Error::Plugin(PluginError::RemoteSourceNotLocal {
+        plugin: "remote-plug".into(),
+    }))]
+    fn is_plugin_level_skip_accepts_plugin_level_variants(#[case] err: Error) {
+        assert!(
+            is_plugin_level_skip(&err),
+            "expected bulk-path skip for: {err:?}"
+        );
+    }
+
+    #[test]
+    fn is_plugin_level_skip_rejects_non_plugin_errors() {
+        let io_err = Error::Io(std::io::Error::other("disk full"));
+        assert!(
+            !is_plugin_level_skip(&io_err),
+            "generic I/O errors must propagate, not skip"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // list_skills_for_plugin: happy path + NotFound branch + installed
+    // -----------------------------------------------------------------------
+
+    /// Single installed-skill fixture so the cross-reference branch
+    /// `installed.skills.contains_key(&frontmatter.name) == true` gets
+    /// exercised. All production `SkillInfo.installed` consumers depend
+    /// on this being correct; historically every test used
+    /// `InstalledSkills::default()`, so only the `false` branch was
+    /// covered.
+    fn installed_with(skill_name: &str, plugin: &str, marketplace: &str) -> InstalledSkills {
+        use std::collections::HashMap;
+
+        use chrono::Utc;
+
+        use crate::project::InstalledSkillMeta;
+
+        let mut skills = HashMap::new();
+        skills.insert(
+            skill_name.to_owned(),
+            InstalledSkillMeta {
+                marketplace: marketplace.to_owned(),
+                plugin: plugin.to_owned(),
+                version: None,
+                installed_at: Utc::now(),
+            },
+        );
+        InstalledSkills { skills }
+    }
+
+    #[test]
+    fn list_skills_for_plugin_happy_path() {
+        let (dir, svc) = temp_service();
+        let entries = vec![relative_path_entry("alpha", "plugins/alpha")];
+        let marketplace_path = seed_marketplace_with_registry(dir.path(), &svc, "mp1", &entries);
+        make_plugin_with_skills(&marketplace_path, "alpha", &["skill-a"]);
+
+        let installed = InstalledSkills::default();
+        let skills = svc
+            .list_skills_for_plugin("mp1", "alpha", &installed)
+            .expect("happy path");
+
+        assert_eq!(skills.len(), 1);
+        assert_eq!(skills[0].name, "skill-a");
+        assert_eq!(skills[0].plugin, "alpha");
+        assert_eq!(skills[0].marketplace, "mp1");
+        assert!(!skills[0].installed);
+    }
+
+    #[test]
+    fn list_skills_for_plugin_unknown_plugin_errors() {
+        let (dir, svc) = temp_service();
+        let entries = vec![relative_path_entry("alpha", "plugins/alpha")];
+        let marketplace_path = seed_marketplace_with_registry(dir.path(), &svc, "mp1", &entries);
+        make_plugin_with_skills(&marketplace_path, "alpha", &["skill-a"]);
+
+        let installed = InstalledSkills::default();
+        let err = svc
+            .list_skills_for_plugin("mp1", "does-not-exist", &installed)
+            .expect_err("unknown plugin must error");
+
+        assert!(
+            matches!(
+                err,
+                Error::Plugin(PluginError::NotFound { ref plugin, .. })
+                    if plugin == "does-not-exist"
+            ),
+            "expected PluginError::NotFound, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn list_skills_for_plugin_marks_installed_skills_true() {
+        let (dir, svc) = temp_service();
+        let entries = vec![relative_path_entry("alpha", "plugins/alpha")];
+        let marketplace_path = seed_marketplace_with_registry(dir.path(), &svc, "mp1", &entries);
+        make_plugin_with_skills(&marketplace_path, "alpha", &["already-installed", "fresh"]);
+
+        let installed = installed_with("already-installed", "alpha", "mp1");
+        let skills = svc
+            .list_skills_for_plugin("mp1", "alpha", &installed)
+            .expect("happy path");
+
+        let marked_installed: Vec<_> = skills.iter().filter(|s| s.installed).collect();
+        assert_eq!(marked_installed.len(), 1);
+        assert_eq!(marked_installed[0].name, "already-installed");
+        assert!(
+            skills.iter().any(|s| s.name == "fresh" && !s.installed),
+            "fresh skill should not be marked installed"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // list_all_skills: additional skip branches + installed cross-ref
+    // -----------------------------------------------------------------------
+
+    /// Bulk path must fold a plugin with an unparseable `plugin.json`
+    /// into `skipped`. Previously only the `DirectoryMissing` skip
+    /// branch was covered; a narrowed classifier could pass CI without
+    /// this.
+    #[test]
+    fn list_all_skills_skips_plugin_with_invalid_manifest() {
+        let (dir, svc) = temp_service();
+        let entries = vec![
+            relative_path_entry("good", "plugins/good"),
+            relative_path_entry("broken", "plugins/broken"),
+        ];
+        let marketplace_path = seed_marketplace_with_registry(dir.path(), &svc, "mp1", &entries);
+        make_plugin_with_skills(&marketplace_path, "good", &["alpha"]);
+        let broken_dir = marketplace_path.join("plugins").join("broken");
+        fs::create_dir_all(&broken_dir).expect("create broken plugin dir");
+        fs::write(broken_dir.join("plugin.json"), "{ not valid json")
+            .expect("write malformed manifest");
+
+        let installed = InstalledSkills::default();
+        let result = svc
+            .list_all_skills("mp1", &installed)
+            .expect("bulk call must succeed with one broken plugin");
+
+        assert_eq!(result.skills.len(), 1);
+        assert_eq!(result.skills[0].name, "alpha");
+        assert_eq!(result.skipped.len(), 1);
+        assert_eq!(result.skipped[0].name, "broken");
+    }
+
+    /// Bulk path must fold a plugin whose source is remote into
+    /// `skipped`, not propagate. Without this, listing a marketplace
+    /// that mixes local and remote plugins would abort on the first
+    /// remote entry.
+    #[test]
+    fn list_all_skills_skips_plugin_with_remote_source() {
+        let (dir, svc) = temp_service();
+        let local = relative_path_entry("local", "plugins/local");
+        let remote = PluginEntry {
+            name: "remote".into(),
+            description: None,
+            source: PluginSource::Structured(StructuredSource::GitHub {
+                repo: "owner/repo".into(),
+                git_ref: None,
+                sha: None,
+            }),
+        };
+        let marketplace_path =
+            seed_marketplace_with_registry(dir.path(), &svc, "mp1", &[local, remote]);
+        make_plugin_with_skills(&marketplace_path, "local", &["local-skill"]);
+
+        let installed = InstalledSkills::default();
+        let result = svc
+            .list_all_skills("mp1", &installed)
+            .expect("bulk call must succeed with one remote plugin");
+
+        assert_eq!(result.skills.len(), 1);
+        assert_eq!(result.skills[0].name, "local-skill");
+        assert_eq!(result.skipped.len(), 1);
+        assert_eq!(result.skipped[0].name, "remote");
+    }
+
+    #[test]
+    fn list_all_skills_marks_installed_skills_true() {
+        let (dir, svc) = temp_service();
+        let entries = vec![relative_path_entry("alpha", "plugins/alpha")];
+        let marketplace_path = seed_marketplace_with_registry(dir.path(), &svc, "mp1", &entries);
+        make_plugin_with_skills(&marketplace_path, "alpha", &["installed", "fresh"]);
+
+        let installed = installed_with("installed", "alpha", "mp1");
+        let result = svc.list_all_skills("mp1", &installed).expect("happy path");
+
+        let marked: Vec<_> = result.skills.iter().filter(|s| s.installed).collect();
+        assert_eq!(marked.len(), 1);
+        assert_eq!(marked[0].name, "installed");
     }
 }

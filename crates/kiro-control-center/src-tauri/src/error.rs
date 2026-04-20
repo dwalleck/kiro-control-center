@@ -58,7 +58,9 @@ impl From<CoreError> for CommandError {
             CoreError::Plugin(PluginError::NotFound { .. }) => ErrorType::NotFound,
             CoreError::Plugin(PluginError::ManifestNotFound { .. }) => ErrorType::NotFound,
             CoreError::Plugin(PluginError::DirectoryMissing { .. }) => ErrorType::NotFound,
+            CoreError::Plugin(PluginError::DirectoryUnreadable { .. }) => ErrorType::IoError,
             CoreError::Plugin(PluginError::InvalidManifest { .. }) => ErrorType::ParseError,
+            CoreError::Plugin(PluginError::ManifestReadFailed { .. }) => ErrorType::IoError,
             CoreError::Plugin(PluginError::NoSkills { .. }) => ErrorType::Validation,
             CoreError::Plugin(PluginError::RemoteSourceNotLocal { .. }) => ErrorType::Validation,
             CoreError::Plugin(_) => {
@@ -196,6 +198,20 @@ mod tests {
             path: PathBuf::from("/tmp/plugins/ghost"),
         }),
         ErrorType::NotFound
+    )]
+    #[case::plugin_directory_unreadable(
+        CoreError::Plugin(PluginError::DirectoryUnreadable {
+            path: PathBuf::from("/tmp/plugins/noaccess"),
+            reason: "permission denied".into(),
+        }),
+        ErrorType::IoError
+    )]
+    #[case::plugin_manifest_read_failed(
+        CoreError::Plugin(PluginError::ManifestReadFailed {
+            path: PathBuf::from("/tmp/plugins/x/plugin.json"),
+            reason: "permission denied".into(),
+        }),
+        ErrorType::IoError
     )]
     #[case::plugin_remote_source_not_local(
         CoreError::Plugin(PluginError::RemoteSourceNotLocal {

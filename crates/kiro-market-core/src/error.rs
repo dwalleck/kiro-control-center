@@ -83,6 +83,24 @@ pub enum PluginError {
     #[error("plugin directory does not exist: {path}")]
     DirectoryMissing { path: PathBuf },
 
+    /// The plugin directory exists but could not be stat'd or is not a
+    /// directory (permission denied, I/O error, a regular file, etc.).
+    /// Distinct from [`Self::DirectoryMissing`] so users see the actual
+    /// failure mode rather than a misleading "does not exist" message.
+    /// Classified as plugin-level so bulk listings skip this plugin
+    /// rather than aborting the whole listing.
+    #[error("could not access plugin directory at {path}: {reason}")]
+    DirectoryUnreadable { path: PathBuf, reason: String },
+
+    /// The plugin manifest file exists but could not be read (permission
+    /// denied, transient I/O error, etc.). Distinct from
+    /// [`Self::InvalidManifest`] (file exists but can't be parsed) and
+    /// [`Self::ManifestNotFound`] (file doesn't exist at all). Classified
+    /// as plugin-level so bulk listings skip this plugin rather than
+    /// aborting the whole listing on a single bad `plugin.json`.
+    #[error("could not read plugin manifest at {path}: {reason}")]
+    ManifestReadFailed { path: PathBuf, reason: String },
+
     /// A caller asked for a local filesystem path to a plugin whose source
     /// is remote (GitHub / Git URL / Git subdir). Resolving it would
     /// require a clone, which the caller explicitly did not request.
@@ -410,6 +428,20 @@ mod tests {
     #[case::plugin_directory_missing(
         PluginError::DirectoryMissing { path: PathBuf::from("/tmp/plugins/x") },
         "plugin directory does not exist: /tmp/plugins/x"
+    )]
+    #[case::plugin_directory_unreadable(
+        PluginError::DirectoryUnreadable {
+            path: PathBuf::from("/tmp/plugins/x"),
+            reason: "permission denied".into(),
+        },
+        "could not access plugin directory at /tmp/plugins/x: permission denied"
+    )]
+    #[case::plugin_manifest_read_failed(
+        PluginError::ManifestReadFailed {
+            path: PathBuf::from("/tmp/plugins/x/plugin.json"),
+            reason: "permission denied".into(),
+        },
+        "could not read plugin manifest at /tmp/plugins/x/plugin.json: permission denied"
     )]
     #[case::plugin_remote_source_not_local(
         PluginError::RemoteSourceNotLocal { plugin: "acme".into() },
