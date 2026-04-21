@@ -194,7 +194,10 @@ mod tests {
         ErrorType::ParseError
     )]
     #[case::plugin_no_skills(
-        CoreError::Plugin(PluginError::NoSkills { name: "empty".into() }),
+        CoreError::Plugin(PluginError::NoSkills {
+            name: "empty".into(),
+            path: PathBuf::from("/tmp/plugins/empty"),
+        }),
         ErrorType::Validation
     )]
     #[case::plugin_directory_missing(
@@ -232,6 +235,11 @@ mod tests {
     #[case::plugin_remote_source_not_local(
         CoreError::Plugin(PluginError::RemoteSourceNotLocal {
             plugin: "acme".into(),
+            plugin_source: kiro_market_core::marketplace::StructuredSource::GitHub {
+                repo: "owner/repo".into(),
+                git_ref: None,
+                sha: None,
+            },
         }),
         ErrorType::Validation
     )]

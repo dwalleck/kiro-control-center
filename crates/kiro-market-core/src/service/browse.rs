@@ -13,7 +13,7 @@ use serde::Serialize;
 use tracing::{debug, warn};
 
 use crate::error::{Error, PluginError};
-use crate::marketplace::{PluginEntry, PluginSource};
+use crate::marketplace::{PluginEntry, PluginSource, StructuredSource};
 use crate::plugin::{PluginManifest, discover_skill_dirs};
 use crate::project::InstalledSkills;
 use crate::service::MarketplaceService;
@@ -41,21 +41,246 @@ pub struct SkillInfo {
 
 /// Result of a marketplace-wide skill listing. The bulk path continues
 /// past per-plugin errors (missing directory, malformed manifest) to
-/// preserve the partial listing; `skipped` records those errors so the
-/// frontend can show a warning rather than silently dropping plugins.
+/// preserve the partial listing; `skipped` records plugin-level drops
+/// and `skipped_skills` records per-skill drops inside otherwise-working
+/// plugins, so the frontend can show a warning rather than silently
+/// shrinking the count.
 #[derive(Clone, Debug, Serialize)]
 #[cfg_attr(feature = "specta", derive(specta::Type))]
 pub struct BulkSkillsResult {
     pub skills: Vec<SkillInfo>,
     pub skipped: Vec<SkippedPlugin>,
+    pub skipped_skills: Vec<SkippedSkill>,
 }
 
-/// A plugin that was excluded from a bulk listing, with the reason.
+/// A plugin that was excluded from a bulk listing. Carries both a
+/// human-readable `reason` (the error's rendered Display, suitable for
+/// direct UI rendering or log lines) and a structured `kind` that
+/// frontends match on for variant-specific affordances (e.g. a "clone"
+/// button for [`SkippedReason::RemoteSourceNotLocal`]). The two are
+/// deliberately redundant: `reason` is free-form text that may rephrase
+/// over time, while `kind` is the stable programmatic contract.
+///
+/// Fields are `pub(crate)` so external callers cannot desync the two
+/// — construction routes exclusively through
+/// [`SkippedPlugin::from_plugin_error`], which derives both from a
+/// single source error. Read access from outside the crate happens via
+/// the Serde/specta boundary (the generated TypeScript type still
+/// exposes all three fields, because Serde ignores Rust visibility).
 #[derive(Clone, Debug, Serialize)]
 #[cfg_attr(feature = "specta", derive(specta::Type))]
 pub struct SkippedPlugin {
-    pub name: String,
-    pub reason: String,
+    pub(crate) name: String,
+    pub(crate) reason: String,
+    pub(crate) kind: SkippedReason,
+}
+
+impl SkippedPlugin {
+    /// Construct a [`SkippedPlugin`] from the plugin's name and the
+    /// [`Error`] that caused it to be skipped, keeping `reason` (the
+    /// error's rendered Display) and `kind` (the programmatic
+    /// projection) in lockstep. Returns `None` when the error is not a
+    /// plugin-level skip — callers must propagate such errors instead
+    /// of folding them into the response.
+    ///
+    /// This is the ONLY way to build a [`SkippedPlugin`] outside the
+    /// service module (fields are `pub(crate)`), so `reason` and `kind`
+    /// cannot drift from the underlying error. Subsumes the previous
+    /// free helper `plugin_skip_reason(&Error) -> Option<SkippedReason>`
+    /// — callers that only need the kind still have
+    /// [`SkippedReason::from_plugin_error`].
+    #[must_use]
+    pub(crate) fn from_plugin_error(name: String, err: &Error) -> Option<Self> {
+        let Error::Plugin(pe) = err else { return None };
+        let kind = SkippedReason::from_plugin_error(pe)?;
+        Some(Self {
+            name,
+            reason: err.to_string(),
+            kind,
+        })
+    }
+
+    /// Name of the plugin that was skipped. Public accessor so tests
+    /// and (future) crate-external code that only reads the value can
+    /// stay out of the wire-format derivation. The equivalent read via
+    /// the Serde-generated TypeScript type is `SkippedPlugin.name`.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Human-readable failure message (the source error's rendered
+    /// Display). Use [`Self::kind`] for programmatic matching; use
+    /// this for log lines and simple UI labels.
+    #[must_use]
+    pub fn reason(&self) -> &str {
+        &self.reason
+    }
+
+    /// Structured classification of the skip reason. Stable contract
+    /// for frontends that render variant-specific affordances.
+    #[must_use]
+    pub fn kind(&self) -> &SkippedReason {
+        &self.kind
+    }
+}
+
+impl SkippedReason {
+    /// Project a [`PluginError`] into its [`SkippedReason`] counterpart
+    /// if — and only if — the variant represents a plugin-level skip
+    /// that the bulk/listing paths should fold into the response rather
+    /// than propagate as an `Err`. Returns `None` for non-plugin-level
+    /// variants (e.g. [`PluginError::NotFound`], which is a "caller
+    /// asked for the wrong thing" bug, not a damaged plugin).
+    ///
+    /// This is the single source of truth for both the classification
+    /// (which variants skip vs. propagate) and the wire-format projection
+    /// (how each variant maps to a frontend-serializable shape). Keeping
+    /// them in one function means a new plugin-level variant on
+    /// [`PluginError`] either lands here (and is automatically surfaced
+    /// to the frontend) or does not (and will propagate as an error) —
+    /// the two classifications cannot drift.
+    #[must_use]
+    pub fn from_plugin_error(err: &PluginError) -> Option<Self> {
+        match err {
+            PluginError::DirectoryMissing { path } => {
+                Some(Self::DirectoryMissing { path: path.clone() })
+            }
+            PluginError::NotADirectory { path } => Some(Self::NotADirectory { path: path.clone() }),
+            PluginError::SymlinkRefused { path } => {
+                Some(Self::SymlinkRefused { path: path.clone() })
+            }
+            PluginError::DirectoryUnreadable { path, source } => Some(Self::DirectoryUnreadable {
+                path: path.clone(),
+                reason: source.to_string(),
+            }),
+            PluginError::InvalidManifest { path, reason } => Some(Self::InvalidManifest {
+                path: path.clone(),
+                reason: reason.clone(),
+            }),
+            PluginError::ManifestReadFailed { path, source } => Some(Self::ManifestReadFailed {
+                path: path.clone(),
+                reason: source.to_string(),
+            }),
+            PluginError::RemoteSourceNotLocal {
+                plugin,
+                plugin_source,
+            } => Some(Self::RemoteSourceNotLocal {
+                plugin: plugin.clone(),
+                source: plugin_source.clone(),
+            }),
+            // Explicit match on non-skip variants rather than `_ => None`
+            // so adding a new PluginError variant triggers a compiler
+            // error until the author decides whether it's plugin-level.
+            PluginError::NotFound { .. }
+            | PluginError::ManifestNotFound { .. }
+            | PluginError::NoSkills { .. } => None,
+        }
+    }
+}
+
+/// Why a plugin was excluded from a bulk listing. Structured counterpart
+/// to [`SkippedPlugin::reason`] so frontends can match on the cause
+/// (rendering variant-specific UI like a "clone" button for
+/// [`Self::RemoteSourceNotLocal`]) instead of substring-matching a
+/// rendered error message.
+///
+/// Mirrors the plugin-level subset of [`PluginError`] — exactly the
+/// variants the bulk path folds into `skipped` rather than propagating.
+/// Kept as a distinct type because [`PluginError`] is a Display-oriented
+/// error carrying non-`Clone` `io::Error` chains, while `SkippedReason`
+/// is `Serialize + specta::Type` data that crosses the FFI boundary.
+/// Translating one to the other is the service layer's job, performed in
+/// a single place so the projection stays consistent with the error
+/// classifier.
+#[derive(Clone, Debug, Serialize)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
+#[serde(tag = "kind", rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum SkippedReason {
+    DirectoryMissing {
+        path: PathBuf,
+    },
+    NotADirectory {
+        path: PathBuf,
+    },
+    SymlinkRefused {
+        path: PathBuf,
+    },
+    DirectoryUnreadable {
+        path: PathBuf,
+        reason: String,
+    },
+    InvalidManifest {
+        path: PathBuf,
+        reason: String,
+    },
+    ManifestReadFailed {
+        path: PathBuf,
+        reason: String,
+    },
+    RemoteSourceNotLocal {
+        plugin: String,
+        source: StructuredSource,
+    },
+}
+
+/// A skill that was excluded from a listing because its `SKILL.md` or
+/// frontmatter could not be read. Surfaces what previously vanished
+/// into `warn!`-then-`continue` so the frontend can render "N skills
+/// failed to load" with a drill-down rather than silently shrinking the
+/// listed count.
+#[derive(Clone, Debug, Serialize)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
+pub struct SkippedSkill {
+    /// Name of the plugin this skill was being enumerated under. The
+    /// bulk path [`MarketplaceService::list_all_skills`] accumulates
+    /// `SkippedSkill`s across every plugin in a marketplace, so without
+    /// this attribution the frontend would have no way to group "N
+    /// skills failed to load in plugin X" — making the structured
+    /// surface strictly less useful than the per-plugin `warn!` it
+    /// replaced. Per-plugin callers already have the plugin context
+    /// but carry it anyway so both code paths produce identical shapes.
+    pub plugin: String,
+    /// Directory name of the skill as a best-effort label. Not a
+    /// guarantee the skill *would* have had this name — the frontmatter
+    /// `name` is authoritative, and parsing it is precisely what failed.
+    /// `None` when `Path::file_name()` cannot extract a component
+    /// (empty path, root, or a path terminating in `..`). Encoded as
+    /// `Option<String>` rather than a sentinel empty string so the
+    /// frontend's type system forces the "no label available" branch
+    /// to be handled explicitly — specta renders it as `string | null`.
+    pub name_hint: Option<String>,
+    /// Path to the `SKILL.md` file that could not be consumed.
+    pub path: PathBuf,
+    pub reason: SkippedSkillReason,
+}
+
+/// Why an individual skill was excluded from a listing. Both variants
+/// describe a working plugin with a single broken skill file — a
+/// plugin-level failure surfaces as [`SkippedPlugin`] / [`SkippedReason`]
+/// instead.
+#[derive(Clone, Debug, Serialize)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
+#[serde(tag = "kind", rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum SkippedSkillReason {
+    /// Reading `SKILL.md` failed (permission denied, I/O error, invalid
+    /// UTF-8, etc.). `reason` carries the underlying error's Display.
+    ReadFailed { reason: String },
+    /// `SKILL.md` read successfully but the frontmatter could not be
+    /// parsed (missing fences, malformed YAML, missing `name`, etc.).
+    FrontmatterInvalid { reason: String },
+}
+
+/// Result of [`MarketplaceService::list_skills_for_plugin`]. Mirrors
+/// [`BulkSkillsResult`] for the single-plugin case so per-skill read
+/// failures surface structurally rather than only via `warn!` logs.
+#[derive(Clone, Debug, Serialize)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
+pub struct PluginSkillsResult {
+    pub skills: Vec<SkillInfo>,
+    pub skipped_skills: Vec<SkippedSkill>,
 }
 
 // ---------------------------------------------------------------------------
@@ -124,8 +349,9 @@ impl MarketplaceService {
                     .into()),
                 }
             }
-            PluginSource::Structured(_) => Err(PluginError::RemoteSourceNotLocal {
+            PluginSource::Structured(s) => Err(PluginError::RemoteSourceNotLocal {
                 plugin: entry.name.clone(),
+                plugin_source: s.clone(),
             }
             .into()),
         }
@@ -135,10 +361,12 @@ impl MarketplaceService {
     /// with the project's installed set.
     ///
     /// Per-skill errors inside a working plugin (unreadable `SKILL.md`,
-    /// malformed frontmatter) are skipped silently with a `warn`. A
-    /// plugin-level error (missing directory, malformed manifest,
-    /// remote source) propagates — callers who selected this plugin
-    /// explicitly should see a real error rather than an empty list.
+    /// malformed frontmatter) land in [`PluginSkillsResult::skipped_skills`]
+    /// so they surface structurally rather than vanishing into a `warn!`.
+    /// A plugin-level error (missing directory, malformed manifest,
+    /// remote source) propagates as `Err` — callers who selected this
+    /// plugin explicitly should see a real error rather than an empty
+    /// list.
     ///
     /// # Errors
     ///
@@ -158,7 +386,7 @@ impl MarketplaceService {
         marketplace: &str,
         plugin: &str,
         installed: &InstalledSkills,
-    ) -> Result<Vec<SkillInfo>, Error> {
+    ) -> Result<PluginSkillsResult, Error> {
         let marketplace_path = self.marketplace_path(marketplace);
         let plugin_entries = self.list_plugin_entries(marketplace)?;
 
@@ -172,16 +400,21 @@ impl MarketplaceService {
                 })
             })?;
 
-        let mut out: Vec<SkillInfo> = Vec::new();
+        let mut skills: Vec<SkillInfo> = Vec::new();
+        let mut skipped_skills: Vec<SkippedSkill> = Vec::new();
         collect_skills_for_plugin_into(
             self,
             plugin_entry,
             &marketplace_path,
             marketplace,
             installed,
-            &mut out,
+            &mut skills,
+            &mut skipped_skills,
         )?;
-        Ok(out)
+        Ok(PluginSkillsResult {
+            skills,
+            skipped_skills,
+        })
     }
 
     /// List every skill across every plugin in a marketplace,
@@ -190,14 +423,17 @@ impl MarketplaceService {
     /// Plugin-level errors (missing directory, malformed manifest,
     /// remote source) are folded into [`BulkSkillsResult::skipped`]
     /// so a single bad plugin doesn't hide its siblings. Per-skill
-    /// errors inside a working plugin are still warned-and-skipped,
-    /// matching [`Self::list_skills_for_plugin`].
+    /// errors inside a working plugin go to
+    /// [`BulkSkillsResult::skipped_skills`], matching
+    /// [`Self::list_skills_for_plugin`]'s contract.
     ///
     /// The `skills` and `skipped` vectors are pre-allocated with the
     /// plugin count as a baseline — `skills` usually grows past it
     /// (multiple skills per plugin) and `skipped` is bounded above
     /// by it, so this avoids the first few reallocations in the
-    /// common case.
+    /// common case. `skipped_skills` stays at default capacity because
+    /// the common case is zero per-skill failures; paying for an
+    /// allocation that usually goes unused is the wrong default.
     ///
     /// # Errors
     ///
@@ -205,8 +441,8 @@ impl MarketplaceService {
     /// [`Error::Io`] / [`Error::Json`] from
     /// [`Self::list_plugin_entries`] when the marketplace is unknown
     /// or its registry is corrupt / unreadable. Non-plugin-level
-    /// errors during iteration propagate; plugin-level errors (see
-    /// [`is_plugin_level_skip`]) go to `skipped`.
+    /// errors during iteration propagate; plugin-level errors
+    /// (see [`SkippedReason::from_plugin_error`]) go to `skipped`.
     pub fn list_all_skills(
         &self,
         marketplace: &str,
@@ -217,6 +453,7 @@ impl MarketplaceService {
 
         let mut skills: Vec<SkillInfo> = Vec::with_capacity(plugin_entries.len());
         let mut skipped: Vec<SkippedPlugin> = Vec::with_capacity(plugin_entries.len());
+        let mut skipped_skills: Vec<SkippedSkill> = Vec::new();
 
         for plugin_entry in &plugin_entries {
             match collect_skills_for_plugin_into(
@@ -226,58 +463,43 @@ impl MarketplaceService {
                 marketplace,
                 installed,
                 &mut skills,
+                &mut skipped_skills,
             ) {
                 Ok(()) => {}
-                Err(err) if is_plugin_level_skip(&err) => {
-                    let reason = err.to_string();
-                    warn!(
-                        plugin = %plugin_entry.name,
-                        error = %reason,
-                        "skipping plugin in bulk skill listing"
-                    );
-                    skipped.push(SkippedPlugin {
-                        name: plugin_entry.name.clone(),
-                        reason,
-                    });
+                Err(err) => {
+                    match SkippedPlugin::from_plugin_error(plugin_entry.name.clone(), &err) {
+                        Some(sp) => {
+                            warn!(
+                                plugin = %plugin_entry.name,
+                                error = %sp.reason,
+                                "skipping plugin in bulk skill listing"
+                            );
+                            skipped.push(sp);
+                        }
+                        None => return Err(err),
+                    }
                 }
-                Err(other) => return Err(other),
             }
         }
 
-        Ok(BulkSkillsResult { skills, skipped })
+        Ok(BulkSkillsResult {
+            skills,
+            skipped,
+            skipped_skills,
+        })
     }
-}
-
-/// Is this error one that the bulk path should fold into `skipped`
-/// rather than propagate? `true` for plugin-level resolution failures
-/// (missing, not-a-directory, symlinked, or unreadable directory;
-/// malformed or unreadable manifest; remote source); `false` for
-/// anything else — corrupt marketplace state, unexpected I/O errors
-/// outside the per-plugin scope, etc., which must surface so callers
-/// see them.
-fn is_plugin_level_skip(err: &Error) -> bool {
-    matches!(
-        err,
-        Error::Plugin(
-            PluginError::DirectoryMissing { .. }
-                | PluginError::NotADirectory { .. }
-                | PluginError::SymlinkRefused { .. }
-                | PluginError::DirectoryUnreadable { .. }
-                | PluginError::InvalidManifest { .. }
-                | PluginError::ManifestReadFailed { .. }
-                | PluginError::RemoteSourceNotLocal { .. }
-        )
-    )
 }
 
 // ---------------------------------------------------------------------------
 // Private helpers
 // ---------------------------------------------------------------------------
 
-/// Append every skill defined by `plugin_entry` to `out`, cross-referenced
-/// against `installed`. Plugin-level errors (missing dir, malformed
-/// manifest, remote source) propagate as `Err`; per-skill errors
-/// (unreadable `SKILL.md`, malformed frontmatter) are logged and skipped.
+/// Append every readable skill defined by `plugin_entry` to `out`,
+/// cross-referenced against `installed`. Plugin-level errors (missing
+/// dir, malformed manifest, remote source) propagate as `Err`; per-skill
+/// errors (unreadable `SKILL.md`, malformed frontmatter) are appended to
+/// `skipped_skills` as structured [`SkippedSkill`] entries so the bulk
+/// and per-plugin public entry points both surface them to the caller.
 ///
 /// Shared between the per-plugin and bulk public entry points so the
 /// per-skill skip philosophy and plugin-level error classification live
@@ -289,6 +511,7 @@ fn collect_skills_for_plugin_into(
     marketplace_name: &str,
     installed: &InstalledSkills,
     out: &mut Vec<SkillInfo>,
+    skipped_skills: &mut Vec<SkippedSkill>,
 ) -> Result<(), Error> {
     let plugin_dir = service.resolve_local_plugin_dir(plugin_entry, marketplace_path)?;
     let plugin_manifest = load_plugin_manifest(&plugin_dir)?;
@@ -307,6 +530,14 @@ fn collect_skills_for_plugin_into(
                     error = %e,
                     "failed to read SKILL.md, skipping"
                 );
+                skipped_skills.push(SkippedSkill {
+                    plugin: plugin_entry.name.clone(),
+                    name_hint: name_hint_from_skill_dir(skill_dir),
+                    path: skill_md_path,
+                    reason: SkippedSkillReason::ReadFailed {
+                        reason: e.to_string(),
+                    },
+                });
                 continue;
             }
         };
@@ -321,6 +552,14 @@ fn collect_skills_for_plugin_into(
                     error = %e,
                     "failed to parse SKILL.md frontmatter, skipping"
                 );
+                skipped_skills.push(SkippedSkill {
+                    plugin: plugin_entry.name.clone(),
+                    name_hint: name_hint_from_skill_dir(skill_dir),
+                    path: skill_md_path,
+                    reason: SkippedSkillReason::FrontmatterInvalid {
+                        reason: e.to_string(),
+                    },
+                });
                 continue;
             }
         };
@@ -336,6 +575,24 @@ fn collect_skills_for_plugin_into(
     }
 
     Ok(())
+}
+
+/// Best-effort label for a skill whose real (frontmatter) name is
+/// unreachable — used as [`SkippedSkill::name_hint`]. Returns `None`
+/// when [`Path::file_name`] cannot extract a final component (degenerate
+/// inputs: empty path, root `/`, or a path terminating in `..`); in
+/// practice `skill_dir` always comes from [`discover_skill_dirs`] so
+/// the `None` arm is defensive rather than expected.
+///
+/// `pub(crate)` so the install path in [`super::MarketplaceService::install_skills`]
+/// can populate [`SkippedSkill::name_hint`] consistently with the
+/// listing path — the two codepaths used to both reach for
+/// `skill_dir.file_name()` inline; sharing the helper means a future
+/// tweak (e.g. normalising Unicode) lands once.
+pub(crate) fn name_hint_from_skill_dir(skill_dir: &Path) -> Option<String> {
+    skill_dir
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
 }
 
 /// Resolve the skill-discovery paths for a plugin. Uses
@@ -590,9 +847,18 @@ mod tests {
         let entry = relative_path_entry("good", "plugins/good");
 
         let mut out: Vec<SkillInfo> = Vec::new();
+        let mut skipped_skills: Vec<SkippedSkill> = Vec::new();
         let installed = InstalledSkills::default();
-        collect_skills_for_plugin_into(&svc, &entry, dir.path(), "mp1", &installed, &mut out)
-            .expect("happy path");
+        collect_skills_for_plugin_into(
+            &svc,
+            &entry,
+            dir.path(),
+            "mp1",
+            &installed,
+            &mut out,
+            &mut skipped_skills,
+        )
+        .expect("happy path");
 
         assert_eq!(out.len(), 2);
         assert!(out.iter().any(|s| s.name == "alpha"));
@@ -602,6 +868,10 @@ mod tests {
                 .all(|s| s.plugin == "good" && s.marketplace == "mp1")
         );
         assert!(out.iter().all(|s| !s.installed));
+        assert!(
+            skipped_skills.is_empty(),
+            "happy path must not skip any skills, got: {skipped_skills:?}"
+        );
     }
 
     #[test]
@@ -610,16 +880,25 @@ mod tests {
         let entry = relative_path_entry("ghost", "plugins/ghost");
 
         let mut out: Vec<SkillInfo> = Vec::new();
+        let mut skipped_skills: Vec<SkippedSkill> = Vec::new();
         let installed = InstalledSkills::default();
-        let err =
-            collect_skills_for_plugin_into(&svc, &entry, dir.path(), "mp1", &installed, &mut out)
-                .expect_err("missing dir must propagate");
+        let err = collect_skills_for_plugin_into(
+            &svc,
+            &entry,
+            dir.path(),
+            "mp1",
+            &installed,
+            &mut out,
+            &mut skipped_skills,
+        )
+        .expect_err("missing dir must propagate");
 
         assert!(
             matches!(err, Error::Plugin(PluginError::DirectoryMissing { .. })),
             "expected DirectoryMissing, got: {err:?}"
         );
         assert!(out.is_empty());
+        assert!(skipped_skills.is_empty());
     }
 
     #[test]
@@ -631,20 +910,29 @@ mod tests {
         let entry = relative_path_entry("broken", "plugins/broken");
 
         let mut out: Vec<SkillInfo> = Vec::new();
+        let mut skipped_skills: Vec<SkippedSkill> = Vec::new();
         let installed = InstalledSkills::default();
-        let err =
-            collect_skills_for_plugin_into(&svc, &entry, dir.path(), "mp1", &installed, &mut out)
-                .expect_err("malformed manifest must propagate");
+        let err = collect_skills_for_plugin_into(
+            &svc,
+            &entry,
+            dir.path(),
+            "mp1",
+            &installed,
+            &mut out,
+            &mut skipped_skills,
+        )
+        .expect_err("malformed manifest must propagate");
 
         assert!(
             matches!(err, Error::Plugin(PluginError::InvalidManifest { .. })),
             "expected InvalidManifest, got: {err:?}"
         );
         assert!(out.is_empty());
+        assert!(skipped_skills.is_empty());
     }
 
     #[test]
-    fn collect_skills_for_plugin_into_skips_bad_frontmatter_and_continues() {
+    fn collect_skills_for_plugin_into_surfaces_bad_frontmatter_as_skipped_skill() {
         let (dir, svc) = temp_service();
         let skills_dir = dir.path().join("plugins").join("mixed").join("skills");
         fs::create_dir_all(skills_dir.join("good-skill")).expect("create skill dir");
@@ -663,12 +951,38 @@ mod tests {
         let entry = relative_path_entry("mixed", "plugins/mixed");
 
         let mut out: Vec<SkillInfo> = Vec::new();
+        let mut skipped_skills: Vec<SkippedSkill> = Vec::new();
         let installed = InstalledSkills::default();
-        collect_skills_for_plugin_into(&svc, &entry, dir.path(), "mp1", &installed, &mut out)
-            .expect("per-skill errors should not propagate");
+        collect_skills_for_plugin_into(
+            &svc,
+            &entry,
+            dir.path(),
+            "mp1",
+            &installed,
+            &mut out,
+            &mut skipped_skills,
+        )
+        .expect("per-skill errors should not propagate");
 
-        assert_eq!(out.len(), 1, "bad frontmatter should be skipped, good kept");
+        // Regression for #30: previously the bad frontmatter vanished into
+        // a warn! log. Now it must surface as a structured SkippedSkill.
+        assert_eq!(out.len(), 1, "bad frontmatter should not be in skills");
         assert_eq!(out[0].name, "good-skill");
+        assert_eq!(skipped_skills.len(), 1, "bad frontmatter must be skipped");
+        assert_eq!(skipped_skills[0].name_hint.as_deref(), Some("bad-skill"));
+        assert_eq!(
+            skipped_skills[0].plugin, "mixed",
+            "per-skill skips must carry plugin attribution so bulk callers \
+             can group failures by plugin"
+        );
+        assert!(
+            matches!(
+                skipped_skills[0].reason,
+                SkippedSkillReason::FrontmatterInvalid { .. }
+            ),
+            "expected FrontmatterInvalid, got: {:?}",
+            skipped_skills[0].reason
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -868,7 +1182,7 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // is_plugin_level_skip covers the new plugin-level variants
+    // SkippedPlugin::from_plugin_error covers the new plugin-level variants
     // -----------------------------------------------------------------------
 
     /// Regression guard: the bulk path relies on this classifier to
@@ -899,20 +1213,51 @@ mod tests {
     }))]
     #[case::remote_source_not_local(Error::Plugin(PluginError::RemoteSourceNotLocal {
         plugin: "remote-plug".into(),
+        plugin_source: StructuredSource::GitHub {
+            repo: "owner/repo".into(),
+            git_ref: None,
+            sha: None,
+        },
     }))]
-    fn is_plugin_level_skip_accepts_plugin_level_variants(#[case] err: Error) {
-        assert!(
-            is_plugin_level_skip(&err),
-            "expected bulk-path skip for: {err:?}"
+    fn skipped_plugin_from_plugin_error_accepts_plugin_level_variants(#[case] err: Error) {
+        let sp = SkippedPlugin::from_plugin_error("test-plug".into(), &err);
+        assert!(sp.is_some(), "expected bulk-path skip for: {err:?}");
+        let sp = sp.expect("just checked");
+        assert_eq!(
+            sp.name, "test-plug",
+            "constructor must preserve the name argument"
+        );
+        assert_eq!(
+            sp.reason,
+            err.to_string(),
+            "reason must equal the source error's Display so it stays in \
+             lockstep with kind"
         );
     }
 
     #[test]
-    fn is_plugin_level_skip_rejects_non_plugin_errors() {
+    fn skipped_plugin_from_plugin_error_rejects_non_plugin_errors() {
         let io_err = Error::Io(std::io::Error::other("disk full"));
         assert!(
-            !is_plugin_level_skip(&io_err),
+            SkippedPlugin::from_plugin_error("x".into(), &io_err).is_none(),
             "generic I/O errors must propagate, not skip"
+        );
+    }
+
+    /// Regression guard: [`PluginError::NotFound`] represents a caller
+    /// asking for a plugin the marketplace doesn't list — a user-input
+    /// bug, not a damaged plugin. It must propagate rather than fold
+    /// into `skipped`, or bulk listings would silently hide lookup
+    /// errors too.
+    #[test]
+    fn skipped_plugin_from_plugin_error_rejects_plugin_not_found() {
+        let err = Error::Plugin(PluginError::NotFound {
+            plugin: "ghost".into(),
+            marketplace: "mp1".into(),
+        });
+        assert!(
+            SkippedPlugin::from_plugin_error("x".into(), &err).is_none(),
+            "NotFound must propagate, not skip (it's a caller bug, not a broken plugin)"
         );
     }
 
@@ -954,15 +1299,16 @@ mod tests {
         make_plugin_with_skills(&marketplace_path, "alpha", &["skill-a"]);
 
         let installed = InstalledSkills::default();
-        let skills = svc
+        let result = svc
             .list_skills_for_plugin("mp1", "alpha", &installed)
             .expect("happy path");
 
-        assert_eq!(skills.len(), 1);
-        assert_eq!(skills[0].name, "skill-a");
-        assert_eq!(skills[0].plugin, "alpha");
-        assert_eq!(skills[0].marketplace, "mp1");
-        assert!(!skills[0].installed);
+        assert_eq!(result.skills.len(), 1);
+        assert_eq!(result.skills[0].name, "skill-a");
+        assert_eq!(result.skills[0].plugin, "alpha");
+        assert_eq!(result.skills[0].marketplace, "mp1");
+        assert!(!result.skills[0].installed);
+        assert!(result.skipped_skills.is_empty());
     }
 
     #[test]
@@ -995,15 +1341,18 @@ mod tests {
         make_plugin_with_skills(&marketplace_path, "alpha", &["already-installed", "fresh"]);
 
         let installed = installed_with("already-installed", "alpha", "mp1");
-        let skills = svc
+        let result = svc
             .list_skills_for_plugin("mp1", "alpha", &installed)
             .expect("happy path");
 
-        let marked_installed: Vec<_> = skills.iter().filter(|s| s.installed).collect();
+        let marked_installed: Vec<_> = result.skills.iter().filter(|s| s.installed).collect();
         assert_eq!(marked_installed.len(), 1);
         assert_eq!(marked_installed[0].name, "already-installed");
         assert!(
-            skills.iter().any(|s| s.name == "fresh" && !s.installed),
+            result
+                .skills
+                .iter()
+                .any(|s| s.name == "fresh" && !s.installed),
             "fresh skill should not be marked installed"
         );
     }
@@ -1039,13 +1388,18 @@ mod tests {
         assert_eq!(result.skills[0].name, "alpha");
         assert_eq!(result.skipped.len(), 1);
         assert_eq!(result.skipped[0].name, "broken");
-        // TODO(#30): replace substring match with a pattern match on a
-        // typed SkippedPlugin.reason enum once that refactor lands. The
-        // current Display-string assertion is fragile to rewording.
+        // The structured `kind` is the programmatic contract; the
+        // `reason` Display-string is a human-readable convenience and
+        // may rephrase freely. Previously this test substring-matched
+        // on `reason` (the TODO(#30) it replaced); the `matches!` below
+        // survives any Display rewording.
         assert!(
-            result.skipped[0].reason.contains("invalid plugin manifest"),
-            "skipped reason should name the manifest failure, got: {}",
-            result.skipped[0].reason
+            matches!(
+                result.skipped[0].kind,
+                SkippedReason::InvalidManifest { .. }
+            ),
+            "skipped kind should be InvalidManifest, got: {:?}",
+            result.skipped[0].kind
         );
     }
 
@@ -1079,13 +1433,260 @@ mod tests {
         assert_eq!(result.skills[0].name, "local-skill");
         assert_eq!(result.skipped.len(), 1);
         assert_eq!(result.skipped[0].name, "remote");
-        // TODO(#30): replace substring match with a pattern match on a
-        // typed SkippedPlugin.reason enum once that refactor lands. The
-        // current Display-string assertion is fragile to rewording.
+        // Structured `kind` doubles as a guard that the embedded
+        // `StructuredSource` payload made it through the Error →
+        // SkippedReason projection. If `plugin_source` ever got dropped
+        // from the projection, the `source: StructuredSource::GitHub`
+        // arm below would fail to match.
+        match &result.skipped[0].kind {
+            SkippedReason::RemoteSourceNotLocal { plugin, source } => {
+                assert_eq!(plugin, "remote");
+                assert!(
+                    matches!(
+                        source,
+                        StructuredSource::GitHub { repo, .. } if repo == "owner/repo"
+                    ),
+                    "expected GitHub source round-tripped through projection, got: {source:?}"
+                );
+            }
+            other => panic!("expected SkippedReason::RemoteSourceNotLocal, got: {other:?}"),
+        }
+    }
+
+    /// Regression guard: a regular file sitting at the plugin path must
+    /// fold into `skipped` with `kind = NotADirectory`, not propagate
+    /// or mis-classify as `DirectoryMissing`. Pre-#30 this class was
+    /// only covered at the `resolve_local_plugin_dir` unit layer; the
+    /// e2e assertion catches a regression where the bulk loop gets
+    /// narrowed to a subset of plugin-level variants.
+    #[test]
+    fn list_all_skills_skips_plugin_with_regular_file_at_path() {
+        let (dir, svc) = temp_service();
+        let entries = vec![
+            relative_path_entry("good", "plugins/good"),
+            relative_path_entry("not-a-dir", "plugins/not-a-dir"),
+        ];
+        let marketplace_path = seed_marketplace_with_registry(dir.path(), &svc, "mp1", &entries);
+        make_plugin_with_skills(&marketplace_path, "good", &["alpha"]);
+        // A regular file where the plugin directory should be.
+        fs::create_dir_all(marketplace_path.join("plugins")).expect("plugins dir");
+        fs::write(
+            marketplace_path.join("plugins").join("not-a-dir"),
+            b"file, not a directory",
+        )
+        .expect("write blocker file");
+
+        let installed = InstalledSkills::default();
+        let result = svc
+            .list_all_skills("mp1", &installed)
+            .expect("bulk call must succeed past the misshapen plugin path");
+
+        assert_eq!(result.skills.len(), 1);
+        assert_eq!(result.skipped.len(), 1);
+        assert_eq!(result.skipped[0].name, "not-a-dir");
         assert!(
-            result.skipped[0].reason.contains("remote source"),
-            "skipped reason should name the remote-source failure, got: {}",
-            result.skipped[0].reason
+            matches!(result.skipped[0].kind, SkippedReason::NotADirectory { .. }),
+            "expected NotADirectory, got: {:?}",
+            result.skipped[0].kind
+        );
+    }
+
+    /// Regression guard: a symlink at the plugin path must classify as
+    /// `SymlinkRefused` end-to-end. Before #30 only the
+    /// `resolve_local_plugin_dir` unit test covered this; the bulk
+    /// classifier could regress silently (symlink falls through to a
+    /// different variant).
+    #[cfg(unix)]
+    #[test]
+    fn list_all_skills_skips_plugin_with_symlinked_path() {
+        let (dir, svc) = temp_service();
+        let entries = vec![
+            relative_path_entry("good", "plugins/good"),
+            relative_path_entry("escape", "plugins/escape"),
+        ];
+        let marketplace_path = seed_marketplace_with_registry(dir.path(), &svc, "mp1", &entries);
+        make_plugin_with_skills(&marketplace_path, "good", &["alpha"]);
+        // Create a symlink at plugins/escape pointing outside the
+        // marketplace tree. The service must refuse to follow it.
+        let outside = dir.path().join("outside");
+        fs::create_dir_all(&outside).expect("create outside");
+        fs::create_dir_all(marketplace_path.join("plugins")).expect("plugins dir");
+        std::os::unix::fs::symlink(&outside, marketplace_path.join("plugins").join("escape"))
+            .expect("create symlink");
+
+        let installed = InstalledSkills::default();
+        let result = svc
+            .list_all_skills("mp1", &installed)
+            .expect("bulk call must succeed past the symlinked plugin path");
+
+        assert_eq!(result.skills.len(), 1);
+        assert_eq!(result.skipped.len(), 1);
+        assert_eq!(result.skipped[0].name, "escape");
+        assert!(
+            matches!(result.skipped[0].kind, SkippedReason::SymlinkRefused { .. }),
+            "expected SymlinkRefused, got: {:?}",
+            result.skipped[0].kind
+        );
+    }
+
+    /// Regression guard: a plugin directory whose stat fails (e.g.
+    /// chmod 000 on the parent) must classify as `DirectoryUnreadable`
+    /// rather than `DirectoryMissing`. The distinction matters for UI
+    /// remediation: "permission denied" is a different user action
+    /// from "directory deleted."
+    #[cfg(unix)]
+    #[test]
+    fn list_all_skills_skips_plugin_with_unreadable_directory() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (dir, svc) = temp_service();
+        let entries = vec![
+            relative_path_entry("good", "plugins/good"),
+            relative_path_entry("locked", "plugins/locked"),
+        ];
+        let marketplace_path = seed_marketplace_with_registry(dir.path(), &svc, "mp1", &entries);
+        make_plugin_with_skills(&marketplace_path, "good", &["alpha"]);
+        // Create `plugins/locked/` as a directory, then chmod its
+        // PARENT (`plugins/`) so stat'ing `plugins/locked` fails with
+        // EACCES rather than ENOENT. Chmodding the leaf itself would
+        // let stat succeed (read-bit on parent is what syscalls need).
+        let plugins_dir = marketplace_path.join("plugins");
+        fs::create_dir_all(plugins_dir.join("locked")).expect("create locked plugin");
+        fs::set_permissions(&plugins_dir, fs::Permissions::from_mode(0o000))
+            .expect("chmod 000 on plugins dir");
+
+        let installed = InstalledSkills::default();
+        let result = svc.list_all_skills("mp1", &installed);
+        // Restore permissions BEFORE assertions so tempdir cleanup can
+        // delete the directory even if an assertion panics.
+        fs::set_permissions(&plugins_dir, fs::Permissions::from_mode(0o755))
+            .expect("restore perms");
+
+        let result = result.expect("bulk call must succeed past the unreadable plugin path");
+
+        // With the plugins/ directory chmod-0'd, the "good" plugin
+        // ALSO becomes unstat-able — both plugins land in `skipped`
+        // with DirectoryUnreadable. That's the correct behavior: the
+        // classifier preserves semantics over every plugin-level arm,
+        // not just the one we're targeting.
+        assert_eq!(
+            result.skipped.len(),
+            2,
+            "both plugins should be unreadable when their parent is chmod-0"
+        );
+        for sp in &result.skipped {
+            assert!(
+                matches!(sp.kind, SkippedReason::DirectoryUnreadable { .. }),
+                "expected DirectoryUnreadable for plugin `{}`, got: {:?}",
+                sp.name,
+                sp.kind
+            );
+        }
+    }
+
+    /// Before #30, a single malformed `SKILL.md` inside an otherwise-
+    /// working plugin vanished into `warn!` + `continue`, leaving the
+    /// frontend to guess why the skill count shrank. The bulk path now
+    /// folds it into [`BulkSkillsResult::skipped_skills`] as a
+    /// structured entry.
+    #[test]
+    fn list_all_skills_surfaces_malformed_skill_as_skipped_skill() {
+        let (dir, svc) = temp_service();
+        let entries = vec![relative_path_entry("mixed", "plugins/mixed")];
+        let marketplace_path = seed_marketplace_with_registry(dir.path(), &svc, "mp1", &entries);
+        let skills_dir = marketplace_path
+            .join("plugins")
+            .join("mixed")
+            .join("skills");
+        fs::create_dir_all(skills_dir.join("ok")).expect("create ok skill dir");
+        fs::create_dir_all(skills_dir.join("malformed")).expect("create malformed skill dir");
+        fs::write(
+            skills_dir.join("ok").join("SKILL.md"),
+            "---\nname: ok\ndescription: works\n---\n",
+        )
+        .expect("write ok skill");
+        // Missing closing `---`: frontmatter parser fails.
+        fs::write(
+            skills_dir.join("malformed").join("SKILL.md"),
+            "---\nname: malformed\n",
+        )
+        .expect("write malformed skill");
+
+        let installed = InstalledSkills::default();
+        let result = svc.list_all_skills("mp1", &installed).expect("bulk ok");
+
+        assert_eq!(result.skills.len(), 1);
+        assert_eq!(result.skills[0].name, "ok");
+        assert!(
+            result.skipped.is_empty(),
+            "plugin-level skipped must be empty when only a skill is bad"
+        );
+        assert_eq!(result.skipped_skills.len(), 1);
+        assert_eq!(
+            result.skipped_skills[0].name_hint.as_deref(),
+            Some("malformed")
+        );
+        assert_eq!(
+            result.skipped_skills[0].plugin, "mixed",
+            "bulk-path per-skill skips must carry plugin attribution so \
+             the frontend can group by plugin"
+        );
+        assert!(
+            matches!(
+                result.skipped_skills[0].reason,
+                SkippedSkillReason::FrontmatterInvalid { .. }
+            ),
+            "expected FrontmatterInvalid, got: {:?}",
+            result.skipped_skills[0].reason
+        );
+    }
+
+    /// Regression guard (Unix-only because chmod is the tool): an
+    /// unreadable `SKILL.md` must surface via
+    /// [`SkippedSkillReason::ReadFailed`] rather than vanish. On Windows
+    /// the equivalent case (access-denied via ACLs) exists but isn't
+    /// exercised here — we have UNIX coverage for the classification.
+    #[cfg(unix)]
+    #[test]
+    fn list_all_skills_surfaces_unreadable_skill_md_as_skipped_skill() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let (dir, svc) = temp_service();
+        let entries = vec![relative_path_entry("locked", "plugins/locked")];
+        let marketplace_path = seed_marketplace_with_registry(dir.path(), &svc, "mp1", &entries);
+        let skill_dir = marketplace_path
+            .join("plugins")
+            .join("locked")
+            .join("skills")
+            .join("vault");
+        fs::create_dir_all(&skill_dir).expect("create skill dir");
+        let skill_md = skill_dir.join("SKILL.md");
+        fs::write(&skill_md, "---\nname: vault\ndescription: locked\n---\n")
+            .expect("write SKILL.md");
+        // Remove all permissions so read_to_string fails with EACCES.
+        fs::set_permissions(&skill_md, fs::Permissions::from_mode(0o000))
+            .expect("chmod 000 SKILL.md");
+
+        let installed = InstalledSkills::default();
+        let result = svc.list_all_skills("mp1", &installed).expect("bulk ok");
+        // Restore permissions so tempdir cleanup can delete the file.
+        // Placed before assertions so a panic still cleans up.
+        fs::set_permissions(&skill_md, fs::Permissions::from_mode(0o644)).expect("restore perms");
+
+        assert!(
+            result.skills.is_empty(),
+            "no skills should land in happy path, got: {:?}",
+            result.skills
+        );
+        assert_eq!(result.skipped_skills.len(), 1);
+        assert_eq!(result.skipped_skills[0].name_hint.as_deref(), Some("vault"));
+        assert!(
+            matches!(
+                result.skipped_skills[0].reason,
+                SkippedSkillReason::ReadFailed { .. }
+            ),
+            "expected ReadFailed, got: {:?}",
+            result.skipped_skills[0].reason
         );
     }
 
@@ -1102,5 +1703,147 @@ mod tests {
         let marked: Vec<_> = result.skills.iter().filter(|s| s.installed).collect();
         assert_eq!(marked.len(), 1);
         assert_eq!(marked[0].name, "installed");
+    }
+
+    // -----------------------------------------------------------------------
+    // SkippedReason / SkippedSkillReason wire-format regression guards
+    // -----------------------------------------------------------------------
+    //
+    // These types cross the Tauri FFI and land in TypeScript via specta, so
+    // their JSON shape is a public contract — a silent serde-tag rename or
+    // variant-casing change would ripple into a frontend parse error that
+    // fires at runtime, not compile time. Pin the exact wire representation
+    // here so any such change surfaces as a failing unit test in this crate
+    // before a bindings.ts regeneration ever reaches the UI.
+
+    /// Regression guard: `name_hint_from_skill_dir` must return `None`
+    /// (not an empty string) for degenerate paths so the
+    /// `SkippedSkill.name_hint: Option<String>` contract is honored end
+    /// to end. Before this was an `Option` it was a sentinel empty
+    /// string and the two cases were indistinguishable at the wire.
+    #[test]
+    fn name_hint_from_skill_dir_returns_none_for_degenerate_paths() {
+        assert_eq!(name_hint_from_skill_dir(Path::new("")), None);
+        assert_eq!(name_hint_from_skill_dir(Path::new("foo/..")), None);
+        // A normal skill directory yields Some(file_name).
+        assert_eq!(
+            name_hint_from_skill_dir(Path::new("/plugins/acme/skills/alpha")).as_deref(),
+            Some("alpha")
+        );
+    }
+
+    /// Wire-format pin for every path-shaped `SkippedReason` variant
+    /// (the five that carry only `path`, plus the three that add a
+    /// `reason` string). `RemoteSourceNotLocal` is covered by a
+    /// dedicated test because it embeds a `StructuredSource` payload
+    /// that needs its own round-trip guard.
+    ///
+    /// Parametric to keep the cost of adding a future path-shaped
+    /// variant low — one new `#[case]` line pins its JSON shape.
+    #[rstest::rstest]
+    #[case::directory_missing(
+        SkippedReason::DirectoryMissing { path: PathBuf::from("/tmp/plugins/ghost") },
+        serde_json::json!({ "kind": "directory_missing", "path": "/tmp/plugins/ghost" })
+    )]
+    #[case::not_a_directory(
+        SkippedReason::NotADirectory { path: PathBuf::from("/tmp/plugins/file") },
+        serde_json::json!({ "kind": "not_a_directory", "path": "/tmp/plugins/file" })
+    )]
+    #[case::symlink_refused(
+        SkippedReason::SymlinkRefused { path: PathBuf::from("/tmp/plugins/link") },
+        serde_json::json!({ "kind": "symlink_refused", "path": "/tmp/plugins/link" })
+    )]
+    #[case::directory_unreadable(
+        SkippedReason::DirectoryUnreadable {
+            path: PathBuf::from("/tmp/plugins/noaccess"),
+            reason: "permission denied".into(),
+        },
+        serde_json::json!({
+            "kind": "directory_unreadable",
+            "path": "/tmp/plugins/noaccess",
+            "reason": "permission denied",
+        })
+    )]
+    #[case::invalid_manifest(
+        SkippedReason::InvalidManifest {
+            path: PathBuf::from("/tmp/plugins/x/plugin.json"),
+            reason: "missing name".into(),
+        },
+        serde_json::json!({
+            "kind": "invalid_manifest",
+            "path": "/tmp/plugins/x/plugin.json",
+            "reason": "missing name",
+        })
+    )]
+    #[case::manifest_read_failed(
+        SkippedReason::ManifestReadFailed {
+            path: PathBuf::from("/tmp/plugins/x/plugin.json"),
+            reason: "permission denied".into(),
+        },
+        serde_json::json!({
+            "kind": "manifest_read_failed",
+            "path": "/tmp/plugins/x/plugin.json",
+            "reason": "permission denied",
+        })
+    )]
+    fn skipped_reason_path_variants_json_shape(
+        #[case] reason: SkippedReason,
+        #[case] expected: serde_json::Value,
+    ) {
+        let json = serde_json::to_value(&reason).expect("serialize");
+        assert_eq!(json, expected);
+    }
+
+    #[test]
+    fn skipped_reason_remote_source_not_local_embeds_structured_source() {
+        let reason = SkippedReason::RemoteSourceNotLocal {
+            plugin: "acme".into(),
+            source: StructuredSource::GitHub {
+                repo: "owner/repo".into(),
+                git_ref: Some("main".into()),
+                sha: None,
+            },
+        };
+        let json = serde_json::to_value(&reason).expect("serialize");
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "kind": "remote_source_not_local",
+                "plugin": "acme",
+                "source": {
+                    "source": "github",
+                    "repo": "owner/repo",
+                    "ref": "main",
+                    "sha": null,
+                },
+            }),
+            "StructuredSource must round-trip via its existing serde tag \
+             (`source`) inside the SkippedReason envelope"
+        );
+    }
+
+    #[test]
+    fn skipped_skill_reason_json_shapes() {
+        let read_failed = SkippedSkillReason::ReadFailed {
+            reason: "permission denied".into(),
+        };
+        assert_eq!(
+            serde_json::to_value(&read_failed).expect("serialize"),
+            serde_json::json!({
+                "kind": "read_failed",
+                "reason": "permission denied",
+            })
+        );
+
+        let frontmatter_invalid = SkippedSkillReason::FrontmatterInvalid {
+            reason: "missing closing ---".into(),
+        };
+        assert_eq!(
+            serde_json::to_value(&frontmatter_invalid).expect("serialize"),
+            serde_json::json!({
+                "kind": "frontmatter_invalid",
+                "reason": "missing closing ---",
+            })
+        );
     }
 }

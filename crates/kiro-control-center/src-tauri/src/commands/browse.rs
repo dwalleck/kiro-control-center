@@ -13,7 +13,8 @@ use kiro_market_core::marketplace::{PluginEntry, PluginSource, StructuredSource}
 use kiro_market_core::plugin::{discover_skill_dirs, PluginManifest};
 use kiro_market_core::project::{InstalledSkills, KiroProject};
 use kiro_market_core::service::{
-    BulkSkillsResult, InstallFilter, InstallMode, MarketplaceService, SkillInfo,
+    BulkSkillsResult, InstallFilter, InstallMode, InstallSkillsResult, MarketplaceService,
+    PluginSkillsResult,
 };
 
 use crate::error::{CommandError, ErrorType};
@@ -58,21 +59,6 @@ pub struct PluginInfo {
     pub description: Option<String>,
     pub skill_count: u32,
     pub source_type: SourceType,
-}
-
-/// Result of an install operation across multiple skills.
-#[derive(Clone, Debug, Serialize, specta::Type)]
-pub struct InstallResult {
-    pub installed: Vec<String>,
-    pub skipped: Vec<String>,
-    pub failed: Vec<FailedSkill>,
-}
-
-/// A skill that failed to install, with the reason.
-#[derive(Clone, Debug, Serialize, specta::Type)]
-pub struct FailedSkill {
-    pub name: String,
-    pub error: String,
 }
 
 /// Summary information about a Kiro project directory.
@@ -160,13 +146,20 @@ pub async fn list_plugins(marketplace: String) -> Result<Vec<PluginInfo>, Comman
 }
 
 /// List all available skills for a plugin, cross-referenced with installed state.
+///
+/// Returns a [`PluginSkillsResult`] carrying both the happy-path skill list
+/// and any per-skill read failures (unreadable `SKILL.md`, malformed
+/// frontmatter) as [`PluginSkillsResult::skipped_skills`]. Previously these
+/// per-skill failures vanished into `warn!` logs, leaving the frontend to
+/// wonder why the count shrank; surfacing them structurally lets the UI
+/// show "N skills failed to load" with a drill-down.
 #[tauri::command]
 #[specta::specta]
 pub async fn list_available_skills(
     marketplace: String,
     plugin: String,
     project_path: String,
-) -> Result<Vec<SkillInfo>, CommandError> {
+) -> Result<PluginSkillsResult, CommandError> {
     let svc = make_service()?;
     let project = KiroProject::new(PathBuf::from(&project_path));
     let installed = load_installed_or_error(&project, &project_path)?;
@@ -195,6 +188,13 @@ pub async fn list_all_skills_for_marketplace(
 }
 
 /// Install specific skills from a plugin into a Kiro project.
+///
+/// Returns the core [`InstallSkillsResult`] directly rather than through a
+/// Tauri-local wrapper — the previous wrapper was a field-by-field copy
+/// and risked drifting away from the core shape (e.g. losing the
+/// `FailedSkill::kind` and `skipped_skills` fields introduced in #30).
+/// Using the core type keeps the wire format lockstep with what the
+/// service emits.
 #[tauri::command]
 #[specta::specta]
 pub async fn install_skills(
@@ -203,7 +203,7 @@ pub async fn install_skills(
     skills: Vec<String>,
     force: bool,
     project_path: String,
-) -> Result<InstallResult, CommandError> {
+) -> Result<InstallSkillsResult, CommandError> {
     let svc = make_service()?;
     let marketplace_path = svc.marketplace_path(&marketplace);
     let plugin_entries = svc
@@ -229,7 +229,7 @@ pub async fn install_skills(
     let skill_dirs = discover_skills_for_plugin(&plugin_dir, plugin_manifest.as_ref());
 
     let project = KiroProject::new(PathBuf::from(&project_path));
-    let svc_result = svc.install_skills(
+    Ok(svc.install_skills(
         &project,
         &skill_dirs,
         &InstallFilter::Names(&skills),
@@ -237,20 +237,7 @@ pub async fn install_skills(
         &marketplace,
         &plugin,
         version.as_deref(),
-    );
-
-    Ok(InstallResult {
-        installed: svc_result.installed,
-        skipped: svc_result.skipped,
-        failed: svc_result
-            .failed
-            .into_iter()
-            .map(|f| FailedSkill {
-                name: f.name,
-                error: f.error,
-            })
-            .collect(),
-    })
+    ))
 }
 
 /// Get summary information about a Kiro project directory.

@@ -2,8 +2,54 @@
   import { onMount } from "svelte";
   import { SvelteMap, SvelteSet } from "svelte/reactivity";
   import { commands } from "$lib/bindings";
-  import type { MarketplaceInfo, PluginInfo, SkillInfo } from "$lib/bindings";
+  import type {
+    MarketplaceInfo,
+    PluginInfo,
+    SkillInfo,
+    SkippedSkill,
+  } from "$lib/bindings";
   import SkillCard from "./SkillCard.svelte";
+
+  // Render a structured SkippedSkill as a one-line label for warning
+  // banners. Uses name_hint (Option<String> in core → string | null on
+  // the wire) with "<unnamed>" fallback so a skill whose directory name
+  // could not be extracted still shows up in the UI rather than being
+  // silently dropped — that silent drop is exactly the class of bug #30
+  // is fighting across all three call sites that consume SkippedSkill.
+  function formatSkippedSkill(s: SkippedSkill): string {
+    const label = s.name_hint ?? "<unnamed>";
+    // SkippedSkillReason is a discriminated union on `kind`. A future
+    // variant would land here as an unknown kind with a generic
+    // "unreadable" label rather than a compile error — consistent with
+    // the Rust #[non_exhaustive] attribute on the enum.
+    let reason: string;
+    switch (s.reason.kind) {
+      case "read_failed":
+        reason = `could not read SKILL.md: ${s.reason.reason}`;
+        break;
+      case "frontmatter_invalid":
+        reason = `malformed frontmatter: ${s.reason.reason}`;
+        break;
+      default:
+        reason = "unreadable";
+    }
+    return `${label}: ${reason}`;
+  }
+
+  function formatSkippedSkillsForPlugin(list: readonly SkippedSkill[]): string {
+    // Caller already filtered to entries for one plugin; compose a
+    // compact single-line banner body. Truncate at MAX entries and
+    // surface the remainder as a "+N more" count — a plugin with
+    // dozens of malformed SKILL.md files is a real failure mode, but
+    // the banner isn't the right place to dump the whole list.
+    const MAX = 5;
+    const parts = list.slice(0, MAX).map(formatSkippedSkill);
+    const overflow = list.length - parts.length;
+    const joined = parts.join("; ");
+    return overflow > 0
+      ? `${list.length} skill(s) failed to load — ${joined}; +${overflow} more`
+      : `${list.length} skill(s) failed to load — ${joined}`;
+  }
 
   let { projectPath }: { projectPath: string } = $props();
 
@@ -216,7 +262,21 @@
       `${mp}/${plugin}`,
       () => commands.listAvailableSkills(mp, plugin, projectPath),
       (data) => {
-        skillsByPluginPair[cacheKey] = data;
+        // data is PluginSkillsResult (#30): { skills, skipped_skills }.
+        // Happy-path skills populate the card grid; per-skill read
+        // failures surface via the same per-plugin fetchErrors banner
+        // stream used by plugin-level skips (from the bulk path), so a
+        // user who sees "plugin X" in the warning list can also see
+        // "plugin Y has 2 skills that failed to load" on the same
+        // panel. Dropping skipped_skills on the floor was the silent
+        // regression flagged in the review.
+        skillsByPluginPair[cacheKey] = data.skills;
+        if (data.skipped_skills.length > 0) {
+          fetchErrors.set(
+            skillsErrKey(mp, plugin),
+            `${mp}/${plugin}: ${formatSkippedSkillsForPlugin(data.skipped_skills)}`
+          );
+        }
       }
     );
   }
@@ -244,7 +304,7 @@
       key,
       mp,
       () => commands.listAllSkillsForMarketplace(mp, projectPath),
-      ({ skills: skillList, skipped }) => {
+      ({ skills: skillList, skipped, skipped_skills }) => {
         const byPlugin = new Map<string, SkillInfo[]>();
         for (const s of skillList) {
           const arr = byPlugin.get(s.plugin);
@@ -252,6 +312,19 @@
           else byPlugin.set(s.plugin, [s]);
         }
         const skippedNames = new Set(skipped.map((s) => s.name));
+
+        // Group per-skill skips by plugin so each plugin gets one
+        // warning banner regardless of how many of its skills failed.
+        // Per-skill and plugin-level skips are disjoint (a plugin whose
+        // directory fails to resolve never reaches the per-skill loop),
+        // so the two banner streams don't collide on the same key.
+        const skippedSkillsByPlugin = new Map<string, SkippedSkill[]>();
+        for (const s of skipped_skills) {
+          const arr = skippedSkillsByPlugin.get(s.plugin);
+          if (arr) arr.push(s);
+          else skippedSkillsByPlugin.set(s.plugin, [s]);
+        }
+
         for (const p of plugins) {
           // Skipped plugins get NO cache entry so the per-plugin path can
           // still be tried if the user narrows to them — a retry might
@@ -264,17 +337,29 @@
         for (const s of skipped) {
           fetchErrors.set(skillsErrKey(mp, s.name), `${mp}/${s.name}: ${s.reason}`);
         }
+        // Record per-plugin error banners for plugins with per-skill
+        // read/parse failures — previously dropped silently (the exact
+        // regression the code-review called out for the bulk path).
+        for (const [plugin, list] of skippedSkillsByPlugin) {
+          fetchErrors.set(
+            skillsErrKey(mp, plugin),
+            `${mp}/${plugin}: ${formatSkippedSkillsForPlugin(list)}`
+          );
+        }
 
         // The bulk response is authoritative for working plugins — clear
         // stale per-plugin skill errors for THIS mp EXCEPT for pairs whose
         // fetch is still in flight (racing write could clobber us) and
-        // EXCEPT entries we just set above for skipped plugins.
+        // EXCEPT entries we just set above for skipped plugins OR plugins
+        // with surfaced per-skill failures (both populate the same
+        // banner key and must survive the post-bulk cleanup).
         const stale: ErrorSource[] = [];
         for (const k of fetchErrors.keys()) {
           if (!k.startsWith(SKILLS_ERR_PREFIX)) continue;
           const { marketplace, plugin } = parsePluginKey(k.slice(SKILLS_ERR_PREFIX.length));
           if (marketplace !== mp) continue;
           if (skippedNames.has(plugin)) continue;
+          if (skippedSkillsByPlugin.has(plugin)) continue;
           if (pendingFetches.has(skillsErrKey(marketplace, plugin))) continue;
           stale.push(k);
         }
@@ -408,6 +493,7 @@
     const installedAll: string[] = [];
     const skippedAll: string[] = [];
     const failedAll: { name: string; error: string }[] = [];
+    const unreadableAll: SkippedSkill[] = [];
     const notAttempted: string[] = [];
 
     try {
@@ -424,6 +510,11 @@
             installedAll.push(...result.data.installed);
             skippedAll.push(...result.data.skipped);
             failedAll.push(...result.data.failed);
+            // Per-skill read/parse failures surface separately from
+            // `failed` (which is install-time errors only). Previously
+            // these vanished into `warn!` logs and the user saw a
+            // shorter "installed N" count with no explanation.
+            unreadableAll.push(...result.data.skipped_skills);
           } else {
             notAttempted.push(`${group.marketplace}/${group.plugin} (${result.error.message})`);
           }
@@ -439,6 +530,11 @@
       if (skippedAll.length > 0) parts.push(`Skipped: ${skippedAll.join(", ")}`);
       if (failedAll.length > 0) {
         parts.push(`Failed: ${failedAll.map((f) => `${f.name} (${f.error})`).join(", ")}`);
+      }
+      if (unreadableAll.length > 0) {
+        parts.push(
+          `Unreadable: ${unreadableAll.map(formatSkippedSkill).join(", ")}`
+        );
       }
       if (notAttempted.length > 0) {
         parts.push(`Not attempted: ${notAttempted.join("; ")}`);
