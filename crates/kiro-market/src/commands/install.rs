@@ -331,8 +331,10 @@ fn print_install_outcome(plugin_ref: &str, result: &InstallSkillsResult) {
             other => format!("unreadable: {other:?}"),
         };
         // `name_hint` is None when the skill directory's file_name()
-        // can't be extracted (degenerate path) — fall back to the
-        // directory path itself so the user still has a locator.
+        // can't be extracted (degenerate path — empty, root, or `..`-
+        // terminated). Fall back to a `<unnamed>` placeholder; the
+        // skill's file path is still printed on the same line below,
+        // so the user retains a locator even when the label is empty.
         let label = sk.name_hint.as_deref().unwrap_or("<unnamed>");
         eprintln!(
             "  {} Skipped unreadable skill '{label}' ({}): {reason}",
