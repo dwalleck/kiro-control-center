@@ -4,6 +4,7 @@
 //! [`PluginError`], [`SkillError`], [`AgentError`], [`GitError`]) and a
 //! top-level [`Error`] enum that unifies them via `From` conversions.
 
+use std::io;
 use std::path::PathBuf;
 
 use thiserror::Error;
@@ -83,23 +84,55 @@ pub enum PluginError {
     #[error("plugin directory does not exist: {path}")]
     DirectoryMissing { path: PathBuf },
 
-    /// The plugin directory exists but could not be stat'd or is not a
-    /// directory (permission denied, I/O error, a regular file, etc.).
-    /// Distinct from [`Self::DirectoryMissing`] so users see the actual
-    /// failure mode rather than a misleading "does not exist" message.
-    /// Classified as plugin-level so bulk listings skip this plugin
-    /// rather than aborting the whole listing.
-    #[error("could not access plugin directory at {path}: {reason}")]
-    DirectoryUnreadable { path: PathBuf, reason: String },
+    /// A plugin path exists on disk but is not a directory — e.g. a regular
+    /// file sitting at the expected location. Distinct from
+    /// [`Self::DirectoryMissing`] (path doesn't exist) and
+    /// [`Self::DirectoryUnreadable`] (stat itself failed) so callers can
+    /// branch on the semantic rather than substring-matching a reason
+    /// string. Classified as plugin-level so bulk listings skip this
+    /// plugin rather than aborting the whole listing.
+    #[error("plugin path exists but is not a directory: {path}")]
+    NotADirectory { path: PathBuf },
+
+    /// A plugin path is a symbolic link. Following it could escape the
+    /// marketplace tree or point at arbitrary host files inside an
+    /// untrusted cloned repository, so it is refused rather than
+    /// traversed. Distinct from [`Self::NotADirectory`] on semantic
+    /// grounds (security refusal vs shape mismatch) — both currently
+    /// map to `ErrorType::Validation` at the Tauri boundary, but the
+    /// split lets security-audit logs and future UI surfaces
+    /// distinguish the two. Classified as plugin-level.
+    #[error("refusing to follow symlinked plugin path: {path}")]
+    SymlinkRefused { path: PathBuf },
+
+    /// The plugin directory exists but stat'ing it failed (permission
+    /// denied, I/O error, etc.). Distinct from [`Self::DirectoryMissing`]
+    /// (path doesn't exist), [`Self::NotADirectory`] (path exists but is
+    /// not a directory), and [`Self::SymlinkRefused`] (security refusal).
+    /// The underlying [`io::Error`] is carried via `#[source]`, so
+    /// [`io::ErrorKind`] is preserved and `error_full_chain` surfaces it
+    /// in terminal output. Classified as plugin-level.
+    #[error("could not access plugin directory at {path}")]
+    DirectoryUnreadable {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
 
     /// The plugin manifest file exists but could not be read (permission
-    /// denied, transient I/O error, etc.). Distinct from
+    /// denied, transient I/O, stat failure, etc.). Distinct from
     /// [`Self::InvalidManifest`] (file exists but can't be parsed) and
-    /// [`Self::ManifestNotFound`] (file doesn't exist at all). Classified
-    /// as plugin-level so bulk listings skip this plugin rather than
-    /// aborting the whole listing on a single bad `plugin.json`.
-    #[error("could not read plugin manifest at {path}: {reason}")]
-    ManifestReadFailed { path: PathBuf, reason: String },
+    /// [`Self::ManifestNotFound`] (file doesn't exist at all). Carries
+    /// the underlying [`io::Error`] via `#[source]` so [`io::ErrorKind`]
+    /// is preserved for callers that want to branch on the failure mode.
+    /// Classified as plugin-level so bulk listings skip this plugin
+    /// rather than aborting on a single bad `plugin.json`.
+    #[error("could not read plugin manifest at {path}")]
+    ManifestReadFailed {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
 
     /// A caller asked for a local filesystem path to a plugin whose source
     /// is remote (GitHub / Git URL / Git subdir). Resolving it would
@@ -429,19 +462,27 @@ mod tests {
         PluginError::DirectoryMissing { path: PathBuf::from("/tmp/plugins/x") },
         "plugin directory does not exist: /tmp/plugins/x"
     )]
+    #[case::plugin_not_a_directory(
+        PluginError::NotADirectory { path: PathBuf::from("/tmp/plugins/x") },
+        "plugin path exists but is not a directory: /tmp/plugins/x"
+    )]
+    #[case::plugin_symlink_refused(
+        PluginError::SymlinkRefused { path: PathBuf::from("/tmp/plugins/escape") },
+        "refusing to follow symlinked plugin path: /tmp/plugins/escape"
+    )]
     #[case::plugin_directory_unreadable(
         PluginError::DirectoryUnreadable {
             path: PathBuf::from("/tmp/plugins/x"),
-            reason: "permission denied".into(),
+            source: io::Error::from(io::ErrorKind::PermissionDenied),
         },
-        "could not access plugin directory at /tmp/plugins/x: permission denied"
+        "could not access plugin directory at /tmp/plugins/x"
     )]
     #[case::plugin_manifest_read_failed(
         PluginError::ManifestReadFailed {
             path: PathBuf::from("/tmp/plugins/x/plugin.json"),
-            reason: "permission denied".into(),
+            source: io::Error::from(io::ErrorKind::PermissionDenied),
         },
-        "could not read plugin manifest at /tmp/plugins/x/plugin.json: permission denied"
+        "could not read plugin manifest at /tmp/plugins/x/plugin.json"
     )]
     #[case::plugin_remote_source_not_local(
         PluginError::RemoteSourceNotLocal { plugin: "acme".into() },
@@ -799,5 +840,49 @@ mod tests {
         let chain = error_source_chain(&outer);
         assert!(chain.contains("failed to pull"), "chain: {chain}");
         assert!(chain.contains("permission denied"), "chain: {chain}");
+    }
+
+    /// Regression guard: `#[source] source: io::Error` on `DirectoryUnreadable`
+    /// and `ManifestReadFailed` must survive wrapping through
+    /// `Error::Plugin(#[error(transparent)])` so `error_full_chain` at the
+    /// Tauri boundary renders the variant Display AND the underlying
+    /// `io::Error`. The Round 2 refactor shortened these variants' Display
+    /// to drop the reason suffix on the premise that the source chain
+    /// carries it — this test pins that contract. If `#[source]` is dropped
+    /// or `Error::Plugin` loses `#[error(transparent)]`, this fails before
+    /// the Tauri layer does.
+    #[rstest]
+    #[case::directory_unreadable(
+        PluginError::DirectoryUnreadable {
+            path: PathBuf::from("/tmp/plugins/x"),
+            source: io::Error::from(io::ErrorKind::PermissionDenied),
+        },
+        "could not access plugin directory at /tmp/plugins/x"
+    )]
+    #[case::manifest_read_failed(
+        PluginError::ManifestReadFailed {
+            path: PathBuf::from("/tmp/plugins/x/plugin.json"),
+            source: io::Error::from(io::ErrorKind::PermissionDenied),
+        },
+        "could not read plugin manifest at /tmp/plugins/x/plugin.json"
+    )]
+    fn plugin_error_full_chain_preserves_io_source_through_wrapping(
+        #[case] variant: PluginError,
+        #[case] expected_display: &str,
+    ) {
+        let err: Error = variant.into();
+        let chain = error_full_chain(&err);
+        assert!(
+            chain.contains(expected_display),
+            "chain missing variant Display: {chain}"
+        );
+        assert!(
+            chain.contains("permission denied"),
+            "chain missing io::Error source: {chain}"
+        );
+        assert!(
+            chain.contains(&format!("{expected_display}: permission denied")),
+            "chain must have Display + source joined by `: `: {chain}"
+        );
     }
 }

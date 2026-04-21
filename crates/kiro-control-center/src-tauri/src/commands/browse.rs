@@ -7,6 +7,7 @@ use serde::Serialize;
 use tracing::{debug, warn};
 
 use kiro_market_core::cache::{CacheDir, MarketplaceSource};
+use kiro_market_core::error::error_full_chain;
 use kiro_market_core::git::GixCliBackend;
 use kiro_market_core::marketplace::{PluginEntry, PluginSource, StructuredSource};
 use kiro_market_core::plugin::{discover_skill_dirs, PluginManifest};
@@ -111,8 +112,16 @@ pub async fn list_marketplaces() -> Result<Vec<MarketplaceInfo>, CommandError> {
     for entry in &known {
         let source_type = marketplace_source_type(&entry.source);
         let (plugin_count, load_error) = match svc.list_plugin_entries(&entry.name) {
-            Ok(entries) => (u32::try_from(entries.len()).unwrap_or(u32::MAX), None),
-            Err(e) => (0, Some(e.to_string())),
+            Ok(entries) => (saturate_to_u32(entries.len(), "plugin_count"), None),
+            Err(e) => {
+                let detail = error_full_chain(&e);
+                warn!(
+                    marketplace = %entry.name,
+                    error = %detail,
+                    "failed to list plugin entries for marketplace summary"
+                );
+                (0, Some(detail))
+            }
         };
         results.push(MarketplaceInfo {
             name: entry.name.clone(),
@@ -142,7 +151,7 @@ pub async fn list_plugins(marketplace: String) -> Result<Vec<PluginInfo>, Comman
         results.push(PluginInfo {
             name: plugin.name.clone(),
             description: plugin.description.clone(),
-            skill_count: u32::try_from(skill_count).unwrap_or(u32::MAX),
+            skill_count: saturate_to_u32(skill_count, "skill_count"),
             source_type,
         });
     }
@@ -253,7 +262,7 @@ pub async fn get_project_info(project_path: String) -> Result<ProjectInfo, Comma
     let project = KiroProject::new(path);
     let installed_skill_count = project
         .load_installed()
-        .map(|i| u32::try_from(i.skills.len()).unwrap_or(u32::MAX))
+        .map(|i| saturate_to_u32(i.skills.len(), "installed_skill_count"))
         .map_err(|e| {
             warn!(path = %project_path, error = %e, "failed to load installed skills");
             CommandError::new(
@@ -291,6 +300,25 @@ fn load_installed_or_error(
             ErrorType::IoError,
         )
     })
+}
+
+/// Narrow a `usize` count into a `u32` for the serialized frontend
+/// response, saturating at `u32::MAX` if the count overflows.
+///
+/// A count above `u32::MAX` means registry corruption or runaway
+/// discovery, not a legitimate value — so the overflow arm logs
+/// the original `usize` with the `field` name that overflowed, rather
+/// than silently pegging the UI at `4294967295` with no trace.
+fn saturate_to_u32(count: usize, field: &'static str) -> u32 {
+    u32::try_from(count)
+        .inspect_err(|_| {
+            warn!(
+                field,
+                original = count,
+                "count exceeds u32::MAX, saturating"
+            );
+        })
+        .unwrap_or(u32::MAX)
 }
 
 /// Map a `MarketplaceSource` to a `SourceType`.
@@ -528,5 +556,26 @@ mod tests {
             sha: None,
         });
         assert!(matches!(plugin_source_type(&source), SourceType::GitSubdir));
+    }
+
+    // -----------------------------------------------------------------------
+    // saturate_to_u32
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn saturate_to_u32_passes_through_in_range_values() {
+        assert_eq!(saturate_to_u32(0, "test"), 0);
+        assert_eq!(saturate_to_u32(42, "test"), 42);
+        assert_eq!(saturate_to_u32(u32::MAX as usize, "test"), u32::MAX);
+    }
+
+    /// On 32-bit targets `usize::MAX == u32::MAX` so `try_from` never fails
+    /// and the overflow arm is unreachable. Gate the overflow test to 64-bit
+    /// where the arm is actually exercised.
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn saturate_to_u32_clamps_values_above_u32_max() {
+        assert_eq!(saturate_to_u32((u32::MAX as usize) + 1, "test"), u32::MAX);
+        assert_eq!(saturate_to_u32(usize::MAX, "test"), u32::MAX);
     }
 }

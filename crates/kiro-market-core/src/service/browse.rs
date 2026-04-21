@@ -78,9 +78,13 @@ impl MarketplaceService {
     ///
     /// - [`Error::Plugin`] ([`PluginError::DirectoryMissing`]) if a
     ///   `RelativePath` points to a missing directory.
+    /// - [`Error::Plugin`] ([`PluginError::NotADirectory`]) if the path
+    ///   exists but is a regular file (or other non-directory).
+    /// - [`Error::Plugin`] ([`PluginError::SymlinkRefused`]) if the path
+    ///   is a symlink — refused rather than followed as a security
+    ///   measure.
     /// - [`Error::Plugin`] ([`PluginError::DirectoryUnreadable`]) if
-    ///   the path exists but is not a directory, or stat'ing it fails
-    ///   (permission denied, I/O error, etc.).
+    ///   stat'ing the path fails (permission denied, I/O error, etc.).
     /// - [`Error::Plugin`] ([`PluginError::RemoteSourceNotLocal`]) if
     ///   the source is structured (GitHub / Git URL / Git subdir).
     pub fn resolve_local_plugin_dir(
@@ -93,25 +97,29 @@ impl MarketplaceService {
                 // `rel` is a validated `RelativePath` — no traversal
                 // check needed. `symlink_metadata` refuses to follow
                 // symlinks, matching the hardening in
-                // `resolve_plugin_dir`. Non-`NotFound` errors are
-                // surfaced as `DirectoryUnreadable` rather than
-                // collapsed into "missing," so a permissions problem
-                // shows up as "could not access" instead of a
-                // misleading "does not exist."
+                // `resolve_plugin_dir`. Metadata outcomes split into
+                // five arms: is_dir success, symlink → SymlinkRefused
+                // (security refusal), non-directory → NotADirectory
+                // (shape mismatch), NotFound → DirectoryMissing, and
+                // other I/O → DirectoryUnreadable carrying the
+                // underlying io::Error via #[source]. Splitting
+                // NotFound from the catch-all ensures a permissions
+                // problem surfaces as "could not access" with
+                // ErrorKind preserved, not as a misleading "does not
+                // exist."
                 let resolved = marketplace_path.join(rel);
                 match fs::symlink_metadata(&resolved) {
-                    Ok(m) if m.is_dir() => Ok(resolved),
-                    Ok(_) => Err(PluginError::DirectoryUnreadable {
-                        path: resolved,
-                        reason: "path exists but is not a directory".into(),
+                    Ok(m) if m.file_type().is_symlink() => {
+                        Err(PluginError::SymlinkRefused { path: resolved }.into())
                     }
-                    .into()),
+                    Ok(m) if m.is_dir() => Ok(resolved),
+                    Ok(_) => Err(PluginError::NotADirectory { path: resolved }.into()),
                     Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                         Err(PluginError::DirectoryMissing { path: resolved }.into())
                     }
                     Err(e) => Err(PluginError::DirectoryUnreadable {
                         path: resolved,
-                        reason: e.to_string(),
+                        source: e,
                     }
                     .into()),
                 }
@@ -242,15 +250,18 @@ impl MarketplaceService {
 
 /// Is this error one that the bulk path should fold into `skipped`
 /// rather than propagate? `true` for plugin-level resolution failures
-/// (missing or unreadable directory, malformed or unreadable manifest,
-/// remote source); `false` for anything else — corrupt marketplace
-/// state, unexpected I/O errors outside the per-plugin scope, etc.,
-/// which must surface so callers see them.
+/// (missing, not-a-directory, symlinked, or unreadable directory;
+/// malformed or unreadable manifest; remote source); `false` for
+/// anything else — corrupt marketplace state, unexpected I/O errors
+/// outside the per-plugin scope, etc., which must surface so callers
+/// see them.
 fn is_plugin_level_skip(err: &Error) -> bool {
     matches!(
         err,
         Error::Plugin(
             PluginError::DirectoryMissing { .. }
+                | PluginError::NotADirectory { .. }
+                | PluginError::SymlinkRefused { .. }
                 | PluginError::DirectoryUnreadable { .. }
                 | PluginError::InvalidManifest { .. }
                 | PluginError::ManifestReadFailed { .. }
@@ -390,7 +401,7 @@ fn load_plugin_manifest(plugin_dir: &Path) -> Result<Option<PluginManifest>, Err
             );
             return Err(PluginError::ManifestReadFailed {
                 path: manifest_path,
-                reason: e.to_string(),
+                source: e,
             }
             .into());
         }
@@ -406,7 +417,7 @@ fn load_plugin_manifest(plugin_dir: &Path) -> Result<Option<PluginManifest>, Err
             );
             return Err(PluginError::ManifestReadFailed {
                 path: manifest_path,
-                reason: e.to_string(),
+                source: e,
             }
             .into());
         }
@@ -761,12 +772,15 @@ mod tests {
     // -----------------------------------------------------------------------
 
     /// Regression guard: `resolve_local_plugin_dir` uses
-    /// `symlink_metadata` combined with `is_dir()` rather than
-    /// `Path::exists()` to refuse symlinks that could escape the
-    /// marketplace tree. Mirrors
-    /// `resolve_plugin_dir_refuses_symlinked_relative_path` for the
-    /// cloning sibling on `service/mod.rs`; a future "simplify to
-    /// `Path::exists()`" must not silently re-open the traversal hole.
+    /// `symlink_metadata` combined with an explicit `is_symlink()`
+    /// check rather than `Path::exists()`, so a symlink at the plugin
+    /// path is classified as [`PluginError::SymlinkRefused`] rather
+    /// than traversed. This test fails if the symlink arm is replaced
+    /// by `Path::exists()` (which would follow the link) or by a
+    /// weaker shape check (which would let the symlink fall through
+    /// to [`PluginError::NotADirectory`] and hide the security
+    /// semantic). Mirrors `resolve_plugin_dir_refuses_symlinked_relative_path`
+    /// for the cloning sibling in `service/mod.rs`.
     #[cfg(unix)]
     #[test]
     fn resolve_local_plugin_dir_refuses_symlinked_relative_path() {
@@ -778,18 +792,17 @@ mod tests {
         fs::create_dir_all(&outside).expect("create outside target");
 
         let link_path = marketplace_path.join("plugins").join("escape");
-        fs::create_dir_all(link_path.parent().unwrap()).expect("create plugins dir");
+        fs::create_dir_all(link_path.parent().expect("plugins dir parent"))
+            .expect("create plugins dir");
         std::os::unix::fs::symlink(&outside, &link_path).expect("create symlink");
 
         let entry = relative_path_entry("escape", "plugins/escape");
         let err = svc
             .resolve_local_plugin_dir(&entry, &marketplace_path)
             .expect_err("symlinked plugin directory must be refused");
-        // symlink_metadata returns the link's own metadata, which is not
-        // a directory, so the classification is DirectoryUnreadable.
         assert!(
-            matches!(err, Error::Plugin(PluginError::DirectoryUnreadable { .. })),
-            "expected DirectoryUnreadable for symlink, got: {err:?}"
+            matches!(err, Error::Plugin(PluginError::SymlinkRefused { .. })),
+            "expected SymlinkRefused for symlink, got: {err:?}"
         );
     }
 
@@ -826,13 +839,15 @@ mod tests {
     // resolve_local_plugin_dir: Unreadable vs Missing classification
     // -----------------------------------------------------------------------
 
-    /// Regression guard: the path exists as a regular file (not a
-    /// directory). Previously this collapsed into `DirectoryMissing`
-    /// via the `is_ok_and(|m| m.is_dir())` guard; now it returns the
-    /// distinct `DirectoryUnreadable` so users see "path exists but is
-    /// not a directory" rather than a misleading "does not exist."
+    /// Regression guard: a regular file sitting at the plugin path
+    /// must classify as [`PluginError::NotADirectory`] rather than
+    /// [`PluginError::DirectoryMissing`] (which would mislead users
+    /// into thinking the path is absent) or
+    /// [`PluginError::DirectoryUnreadable`] (which implies an I/O
+    /// failure and loses the structural semantic). Pins the four-way
+    /// split on `resolve_local_plugin_dir`.
     #[test]
-    fn resolve_local_plugin_dir_file_path_returns_unreadable() {
+    fn resolve_local_plugin_dir_file_path_returns_not_a_directory() {
         let (dir, svc) = temp_service();
         let marketplace_path = dir.path().join("marketplace");
         fs::create_dir_all(marketplace_path.join("plugins")).expect("create plugins dir");
@@ -847,8 +862,8 @@ mod tests {
             .resolve_local_plugin_dir(&entry, &marketplace_path)
             .expect_err("regular file must not resolve as a plugin directory");
         assert!(
-            matches!(err, Error::Plugin(PluginError::DirectoryUnreadable { .. })),
-            "expected DirectoryUnreadable for non-directory, got: {err:?}"
+            matches!(err, Error::Plugin(PluginError::NotADirectory { .. })),
+            "expected NotADirectory for non-directory, got: {err:?}"
         );
     }
 
@@ -864,9 +879,15 @@ mod tests {
     #[case::directory_missing(Error::Plugin(PluginError::DirectoryMissing {
         path: "/tmp/x".into(),
     }))]
+    #[case::not_a_directory(Error::Plugin(PluginError::NotADirectory {
+        path: "/tmp/x".into(),
+    }))]
+    #[case::symlink_refused(Error::Plugin(PluginError::SymlinkRefused {
+        path: "/tmp/x".into(),
+    }))]
     #[case::directory_unreadable(Error::Plugin(PluginError::DirectoryUnreadable {
         path: "/tmp/x".into(),
-        reason: "permission denied".into(),
+        source: std::io::Error::from(std::io::ErrorKind::PermissionDenied),
     }))]
     #[case::invalid_manifest(Error::Plugin(PluginError::InvalidManifest {
         path: "/tmp/x/plugin.json".into(),
@@ -874,7 +895,7 @@ mod tests {
     }))]
     #[case::manifest_read_failed(Error::Plugin(PluginError::ManifestReadFailed {
         path: "/tmp/x/plugin.json".into(),
-        reason: "permission denied".into(),
+        source: std::io::Error::from(std::io::ErrorKind::PermissionDenied),
     }))]
     #[case::remote_source_not_local(Error::Plugin(PluginError::RemoteSourceNotLocal {
         plugin: "remote-plug".into(),
@@ -1018,6 +1039,14 @@ mod tests {
         assert_eq!(result.skills[0].name, "alpha");
         assert_eq!(result.skipped.len(), 1);
         assert_eq!(result.skipped[0].name, "broken");
+        // TODO(#30): replace substring match with a pattern match on a
+        // typed SkippedPlugin.reason enum once that refactor lands. The
+        // current Display-string assertion is fragile to rewording.
+        assert!(
+            result.skipped[0].reason.contains("invalid plugin manifest"),
+            "skipped reason should name the manifest failure, got: {}",
+            result.skipped[0].reason
+        );
     }
 
     /// Bulk path must fold a plugin whose source is remote into
@@ -1050,6 +1079,14 @@ mod tests {
         assert_eq!(result.skills[0].name, "local-skill");
         assert_eq!(result.skipped.len(), 1);
         assert_eq!(result.skipped[0].name, "remote");
+        // TODO(#30): replace substring match with a pattern match on a
+        // typed SkippedPlugin.reason enum once that refactor lands. The
+        // current Display-string assertion is fragile to rewording.
+        assert!(
+            result.skipped[0].reason.contains("remote source"),
+            "skipped reason should name the remote-source failure, got: {}",
+            result.skipped[0].reason
+        );
     }
 
     #[test]
