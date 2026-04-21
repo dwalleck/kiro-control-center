@@ -3,6 +3,10 @@
 //! [`MarketplaceService`] centralizes add/remove/update/list logic so that
 //! CLI and Tauri frontends remain thin presentation wrappers.
 
+pub mod browse;
+
+pub use browse::{BulkSkillsResult, SkillInfo, SkippedPlugin};
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicU64;

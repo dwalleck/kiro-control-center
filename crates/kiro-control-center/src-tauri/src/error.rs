@@ -1,4 +1,6 @@
-use kiro_market_core::error::{Error as CoreError, MarketplaceError, PluginError, SkillError};
+use kiro_market_core::error::{
+    error_full_chain, Error as CoreError, MarketplaceError, PluginError, SkillError,
+};
 use serde::Serialize;
 use tracing::warn;
 
@@ -57,8 +59,14 @@ impl From<CoreError> for CommandError {
             CoreError::Json(_) => ErrorType::ParseError,
             CoreError::Plugin(PluginError::NotFound { .. }) => ErrorType::NotFound,
             CoreError::Plugin(PluginError::ManifestNotFound { .. }) => ErrorType::NotFound,
+            CoreError::Plugin(PluginError::DirectoryMissing { .. }) => ErrorType::NotFound,
+            CoreError::Plugin(PluginError::NotADirectory { .. }) => ErrorType::Validation,
+            CoreError::Plugin(PluginError::SymlinkRefused { .. }) => ErrorType::Validation,
+            CoreError::Plugin(PluginError::DirectoryUnreadable { .. }) => ErrorType::IoError,
             CoreError::Plugin(PluginError::InvalidManifest { .. }) => ErrorType::ParseError,
+            CoreError::Plugin(PluginError::ManifestReadFailed { .. }) => ErrorType::IoError,
             CoreError::Plugin(PluginError::NoSkills { .. }) => ErrorType::Validation,
+            CoreError::Plugin(PluginError::RemoteSourceNotLocal { .. }) => ErrorType::Validation,
             CoreError::Plugin(_) => {
                 warn!("unmapped Plugin error variant, defaulting to Unknown");
                 ErrorType::Unknown
@@ -69,7 +77,7 @@ impl From<CoreError> for CommandError {
             }
         };
 
-        let message = err.to_string();
+        let message = error_full_chain(&err);
         warn!(
             error_type = ?error_type,
             error = %message,
@@ -99,7 +107,7 @@ impl From<String> for CommandError {
 impl From<std::io::Error> for CommandError {
     fn from(e: std::io::Error) -> Self {
         Self {
-            message: e.to_string(),
+            message: error_full_chain(&e),
             error_type: ErrorType::IoError,
         }
     }
@@ -180,12 +188,51 @@ mod tests {
     )]
     #[case::plugin_invalid_manifest(
         CoreError::Plugin(PluginError::InvalidManifest {
+            path: PathBuf::from("/tmp/plugin.json"),
             reason: "missing name".into(),
         }),
         ErrorType::ParseError
     )]
     #[case::plugin_no_skills(
         CoreError::Plugin(PluginError::NoSkills { name: "empty".into() }),
+        ErrorType::Validation
+    )]
+    #[case::plugin_directory_missing(
+        CoreError::Plugin(PluginError::DirectoryMissing {
+            path: PathBuf::from("/tmp/plugins/ghost"),
+        }),
+        ErrorType::NotFound
+    )]
+    #[case::plugin_not_a_directory(
+        CoreError::Plugin(PluginError::NotADirectory {
+            path: PathBuf::from("/tmp/plugins/regular-file"),
+        }),
+        ErrorType::Validation
+    )]
+    #[case::plugin_symlink_refused(
+        CoreError::Plugin(PluginError::SymlinkRefused {
+            path: PathBuf::from("/tmp/plugins/escape"),
+        }),
+        ErrorType::Validation
+    )]
+    #[case::plugin_directory_unreadable(
+        CoreError::Plugin(PluginError::DirectoryUnreadable {
+            path: PathBuf::from("/tmp/plugins/noaccess"),
+            source: std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+        }),
+        ErrorType::IoError
+    )]
+    #[case::plugin_manifest_read_failed(
+        CoreError::Plugin(PluginError::ManifestReadFailed {
+            path: PathBuf::from("/tmp/plugins/x/plugin.json"),
+            source: std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+        }),
+        ErrorType::IoError
+    )]
+    #[case::plugin_remote_source_not_local(
+        CoreError::Plugin(PluginError::RemoteSourceNotLocal {
+            plugin: "acme".into(),
+        }),
         ErrorType::Validation
     )]
     fn core_error_maps_to_error_type(#[case] core_err: CoreError, #[case] expected: ErrorType) {

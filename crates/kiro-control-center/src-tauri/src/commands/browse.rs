@@ -7,12 +7,14 @@ use serde::Serialize;
 use tracing::{debug, warn};
 
 use kiro_market_core::cache::{CacheDir, MarketplaceSource};
+use kiro_market_core::error::error_full_chain;
 use kiro_market_core::git::GixCliBackend;
 use kiro_market_core::marketplace::{PluginEntry, PluginSource, StructuredSource};
 use kiro_market_core::plugin::{discover_skill_dirs, PluginManifest};
 use kiro_market_core::project::{InstalledSkills, KiroProject};
-use kiro_market_core::service::{InstallFilter, InstallMode, MarketplaceService};
-use kiro_market_core::skill::parse_frontmatter;
+use kiro_market_core::service::{
+    BulkSkillsResult, InstallFilter, InstallMode, MarketplaceService, SkillInfo,
+};
 
 use crate::error::{CommandError, ErrorType};
 
@@ -58,16 +60,6 @@ pub struct PluginInfo {
     pub source_type: SourceType,
 }
 
-/// Information about a single skill, including installation status.
-#[derive(Clone, Debug, Serialize, specta::Type)]
-pub struct SkillInfo {
-    pub name: String,
-    pub description: String,
-    pub plugin: String,
-    pub marketplace: String,
-    pub installed: bool,
-}
-
 /// Result of an install operation across multiple skills.
 #[derive(Clone, Debug, Serialize, specta::Type)]
 pub struct InstallResult {
@@ -81,23 +73,6 @@ pub struct InstallResult {
 pub struct FailedSkill {
     pub name: String,
     pub error: String,
-}
-
-/// Response for [`list_all_skills_for_marketplace`]. `skipped` carries the
-/// plugins whose directory or manifest errored — the bulk path continues past
-/// such errors to preserve the partial listing, but the frontend needs to
-/// know which plugins were silently dropped so it can surface a warning.
-#[derive(Clone, Debug, Serialize, specta::Type)]
-pub struct BulkSkillsResult {
-    pub skills: Vec<SkillInfo>,
-    pub skipped: Vec<SkippedPlugin>,
-}
-
-/// A plugin that was excluded from a bulk skills listing, with the reason.
-#[derive(Clone, Debug, Serialize, specta::Type)]
-pub struct SkippedPlugin {
-    pub name: String,
-    pub reason: String,
 }
 
 /// Summary information about a Kiro project directory.
@@ -137,8 +112,16 @@ pub async fn list_marketplaces() -> Result<Vec<MarketplaceInfo>, CommandError> {
     for entry in &known {
         let source_type = marketplace_source_type(&entry.source);
         let (plugin_count, load_error) = match svc.list_plugin_entries(&entry.name) {
-            Ok(entries) => (entries.len() as u32, None),
-            Err(e) => (0, Some(e.to_string())),
+            Ok(entries) => (saturate_to_u32(entries.len(), "plugin_count"), None),
+            Err(e) => {
+                let detail = error_full_chain(&e);
+                warn!(
+                    marketplace = %entry.name,
+                    error = %detail,
+                    "failed to list plugin entries for marketplace summary"
+                );
+                (0, Some(detail))
+            }
         };
         results.push(MarketplaceInfo {
             name: entry.name.clone(),
@@ -168,7 +151,7 @@ pub async fn list_plugins(marketplace: String) -> Result<Vec<PluginInfo>, Comman
         results.push(PluginInfo {
             name: plugin.name.clone(),
             description: plugin.description.clone(),
-            skill_count: skill_count as u32,
+            skill_count: saturate_to_u32(skill_count, "skill_count"),
             source_type,
         });
     }
@@ -185,52 +168,19 @@ pub async fn list_available_skills(
     project_path: String,
 ) -> Result<Vec<SkillInfo>, CommandError> {
     let svc = make_service()?;
-    let marketplace_path = svc.marketplace_path(&marketplace);
-    let plugin_entries = svc
-        .list_plugin_entries(&marketplace)
-        .map_err(CommandError::from)?;
-
-    let plugin_entry = plugin_entries
-        .iter()
-        .find(|p| p.name == plugin)
-        .ok_or_else(|| {
-            CommandError::new(
-                format!("plugin '{plugin}' not found in marketplace '{marketplace}'"),
-                ErrorType::NotFound,
-            )
-        })?;
-
     let project = KiroProject::new(PathBuf::from(&project_path));
     let installed = load_installed_or_error(&project, &project_path)?;
-
-    let mut results: Vec<SkillInfo> = Vec::new();
-    collect_skills_for_plugin(
-        plugin_entry,
-        &marketplace_path,
-        &marketplace,
-        &installed,
-        &mut results,
-    )
-    // Surface the original error — the user selected this plugin and
-    // deserves to know it's broken, not a silent partial result.
-    .map_err(|e| match e {
-        CollectSkillsError::MissingDir(err) | CollectSkillsError::MalformedManifest(err) => err,
-    })?;
-
-    Ok(results)
+    svc.list_skills_for_plugin(&marketplace, &plugin, &installed)
+        .map_err(CommandError::from)
 }
 
 /// List all skills across every plugin in a marketplace, cross-referenced
 /// with installed state.
 ///
 /// Bulk alternative to calling [`list_available_skills`] per plugin when no
-/// plugin filter is active. Does one `load_installed` up front instead of
-/// N (one per plugin), and returns a [`BulkSkillsResult`] whose `skipped`
-/// field carries plugin-level errors (missing directory, malformed manifest)
-/// so the frontend can surface a partial-listing warning. Per-skill errors
-/// inside a working plugin (unreadable `SKILL.md`, bad frontmatter) are
-/// always skipped silently with a `warn` — same behavior as the per-plugin
-/// path.
+/// plugin filter is active. The returned [`BulkSkillsResult::skipped`]
+/// carries plugin-level errors (missing directory, malformed manifest,
+/// remote source) so the frontend can surface a partial-listing warning.
 #[tauri::command]
 #[specta::specta]
 pub async fn list_all_skills_for_marketplace(
@@ -238,46 +188,10 @@ pub async fn list_all_skills_for_marketplace(
     project_path: String,
 ) -> Result<BulkSkillsResult, CommandError> {
     let svc = make_service()?;
-    let marketplace_path = svc.marketplace_path(&marketplace);
-    let plugin_entries = svc
-        .list_plugin_entries(&marketplace)
-        .map_err(CommandError::from)?;
-
     let project = KiroProject::new(PathBuf::from(&project_path));
     let installed = load_installed_or_error(&project, &project_path)?;
-
-    // Pre-allocate with `plugin_entries.len()` as a baseline — `skills`
-    // typically grows well past that (multiple skills per plugin) and
-    // `skipped` is bounded above by it. A rough capacity avoids the first
-    // few reallocations in the common case; exact-fit isn't possible without
-    // a second pass.
-    let mut skills: Vec<SkillInfo> = Vec::with_capacity(plugin_entries.len());
-    let mut skipped: Vec<SkippedPlugin> = Vec::with_capacity(plugin_entries.len());
-
-    for plugin_entry in &plugin_entries {
-        match collect_skills_for_plugin(
-            plugin_entry,
-            &marketplace_path,
-            &marketplace,
-            &installed,
-            &mut skills,
-        ) {
-            Ok(()) => {}
-            Err(CollectSkillsError::MissingDir(e) | CollectSkillsError::MalformedManifest(e)) => {
-                warn!(
-                    plugin = %plugin_entry.name,
-                    error = %e.message,
-                    "skipping plugin in bulk skill listing"
-                );
-                skipped.push(SkippedPlugin {
-                    name: plugin_entry.name.clone(),
-                    reason: e.message,
-                });
-            }
-        }
-    }
-
-    Ok(BulkSkillsResult { skills, skipped })
+    svc.list_all_skills(&marketplace, &installed)
+        .map_err(CommandError::from)
 }
 
 /// Install specific skills from a plugin into a Kiro project.
@@ -306,7 +220,9 @@ pub async fn install_skills(
             )
         })?;
 
-    let plugin_dir = resolve_local_plugin_dir(plugin_entry, &marketplace_path)?;
+    let plugin_dir = svc
+        .resolve_local_plugin_dir(plugin_entry, &marketplace_path)
+        .map_err(CommandError::from)?;
 
     let plugin_manifest = load_plugin_manifest(&plugin_dir)?;
     let version = plugin_manifest.as_ref().and_then(|m| m.version.clone());
@@ -346,7 +262,7 @@ pub async fn get_project_info(project_path: String) -> Result<ProjectInfo, Comma
     let project = KiroProject::new(path);
     let installed_skill_count = project
         .load_installed()
-        .map(|i| i.skills.len() as u32)
+        .map(|i| saturate_to_u32(i.skills.len(), "installed_skill_count"))
         .map_err(|e| {
             warn!(path = %project_path, error = %e, "failed to load installed skills");
             CommandError::new(
@@ -365,32 +281,6 @@ pub async fn get_project_info(project_path: String) -> Result<ProjectInfo, Comma
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-
-/// Per-plugin failure modes surfaced by [`collect_skills_for_plugin`] so
-/// callers can decide whether to propagate or continue.
-///
-/// Per-plugin callers (user selected this plugin) propagate both variants;
-/// bulk callers (fanning out across a marketplace) fold both into the
-/// response's `skipped` list so a single bad plugin doesn't hide its 49
-/// siblings. Per-skill errors (unreadable `SKILL.md`, malformed frontmatter)
-/// are always skipped silently with a `warn` and don't surface here — they
-/// never suggest the containing plugin itself is broken.
-enum CollectSkillsError {
-    MissingDir(CommandError),
-    MalformedManifest(CommandError),
-}
-
-// Debug impl so test assertions can format CollectSkillsError in panic
-// messages. Defined alongside the enum (not behind `#[cfg(test)]`) to avoid
-// clippy's `items-after-test-module` lint.
-impl std::fmt::Debug for CollectSkillsError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::MissingDir(e) => write!(f, "MissingDir({})", e.message),
-            Self::MalformedManifest(e) => write!(f, "MalformedManifest({})", e.message),
-        }
-    }
-}
 
 /// Load the project's installed-skills tracking file, wrapping I/O errors
 /// with an actionable message that names the path and hints at the next
@@ -412,62 +302,23 @@ fn load_installed_or_error(
     })
 }
 
-/// Collect every skill defined by a single plugin, appending `SkillInfo`
-/// records to `out` as they're built. Pure function extracted from the two
-/// commands that previously duplicated this loop — keeps the per-skill skip
-/// philosophy in one place and exposes plugin-level errors as typed variants
-/// so callers can choose propagate-or-continue.
-fn collect_skills_for_plugin(
-    plugin_entry: &PluginEntry,
-    marketplace_path: &Path,
-    marketplace: &str,
-    installed: &InstalledSkills,
-    out: &mut Vec<SkillInfo>,
-) -> Result<(), CollectSkillsError> {
-    let plugin_dir = resolve_local_plugin_dir(plugin_entry, marketplace_path)
-        .map_err(CollectSkillsError::MissingDir)?;
-    let plugin_manifest =
-        load_plugin_manifest(&plugin_dir).map_err(CollectSkillsError::MalformedManifest)?;
-    let skill_dirs = discover_skills_for_plugin(&plugin_dir, plugin_manifest.as_ref());
-    out.reserve(skill_dirs.len());
-
-    for skill_dir in &skill_dirs {
-        let skill_md_path = skill_dir.join("SKILL.md");
-        let content = match fs::read_to_string(&skill_md_path) {
-            Ok(c) => c,
-            Err(e) => {
-                warn!(
-                    path = %skill_md_path.display(),
-                    error = %e,
-                    "failed to read SKILL.md, skipping"
-                );
-                continue;
-            }
-        };
-
-        let (frontmatter, _body_offset) = match parse_frontmatter(&content) {
-            Ok(result) => result,
-            Err(e) => {
-                warn!(
-                    path = %skill_md_path.display(),
-                    error = %e,
-                    "failed to parse SKILL.md frontmatter, skipping"
-                );
-                continue;
-            }
-        };
-
-        let is_installed = installed.skills.contains_key(&frontmatter.name);
-        out.push(SkillInfo {
-            name: frontmatter.name,
-            description: frontmatter.description,
-            plugin: plugin_entry.name.clone(),
-            marketplace: marketplace.to_owned(),
-            installed: is_installed,
-        });
-    }
-
-    Ok(())
+/// Narrow a `usize` count into a `u32` for the serialized frontend
+/// response, saturating at `u32::MAX` if the count overflows.
+///
+/// A count above `u32::MAX` means registry corruption or runaway
+/// discovery, not a legitimate value — so the overflow arm logs
+/// the original `usize` with the `field` name that overflowed, rather
+/// than silently pegging the UI at `4294967295` with no trace.
+fn saturate_to_u32(count: usize, field: &'static str) -> u32 {
+    u32::try_from(count)
+        .inspect_err(|_| {
+            warn!(
+                field,
+                original = count,
+                "count exceeds u32::MAX, saturating"
+            );
+        })
+        .unwrap_or(u32::MAX)
 }
 
 /// Map a `MarketplaceSource` to a `SourceType`.
@@ -486,34 +337,6 @@ fn plugin_source_type(source: &PluginSource) -> SourceType {
         PluginSource::Structured(StructuredSource::GitHub { .. }) => SourceType::GitHub,
         PluginSource::Structured(StructuredSource::GitUrl { .. }) => SourceType::Git,
         PluginSource::Structured(StructuredSource::GitSubdir { .. }) => SourceType::GitSubdir,
-    }
-}
-
-/// Resolve the local directory for a plugin. Only supports `RelativePath` sources;
-/// structured (remote) sources return an error since they require git cloning.
-fn resolve_local_plugin_dir(
-    entry: &PluginEntry,
-    marketplace_path: &Path,
-) -> Result<PathBuf, CommandError> {
-    match &entry.source {
-        PluginSource::RelativePath(rel) => {
-            let resolved = marketplace_path.join(rel);
-            if !resolved.exists() {
-                return Err(CommandError::new(
-                    format!("plugin directory does not exist: {}", resolved.display()),
-                    ErrorType::NotFound,
-                ));
-            }
-            Ok(resolved)
-        }
-        PluginSource::Structured(_) => Err(CommandError::new(
-            format!(
-                "plugin '{}' uses a remote source and is not available locally; \
-                 use the CLI to clone it first",
-                entry.name
-            ),
-            ErrorType::Validation,
-        )),
     }
 }
 
@@ -536,13 +359,29 @@ fn discover_skills_for_plugin(
 
 /// Load a `plugin.json` from the given directory.
 ///
-/// Returns `Ok(None)` if the file is genuinely missing (not an error) and
-/// `Err` if the file exists but could not be read or parsed (corruption /
-/// permission issues).
+/// Returns `Ok(None)` if the file is genuinely absent, or if it is a
+/// symlink — a symlinked `plugin.json` inside an untrusted cloned
+/// repository could leak host file contents through the parse-error
+/// path, so it is treated as absent with a `warn!`. Matches the
+/// hardening in `kiro_market_core::service::browse::load_plugin_manifest`
+/// and `kiro_market::commands::install::load_plugin_manifest`. Returns
+/// `Err` if the file exists but could not be read or parsed (corruption
+/// or permission issues).
 fn load_plugin_manifest(plugin_dir: &Path) -> Result<Option<PluginManifest>, CommandError> {
     let manifest_path = plugin_dir.join("plugin.json");
-    let bytes = match fs::read(&manifest_path) {
-        Ok(b) => b,
+
+    // Refuse to follow symlinks. Matches the core-side and CLI-side
+    // load_plugin_manifest implementations; a symlinked plugin.json
+    // inside a cloned repo could point at arbitrary host files.
+    match fs::symlink_metadata(&manifest_path) {
+        Ok(m) if m.file_type().is_symlink() => {
+            warn!(
+                path = %manifest_path.display(),
+                "plugin.json is a symlink, refusing to follow; treating as missing"
+            );
+            return Ok(None);
+        }
+        Ok(_) => {}
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
             debug!(
                 path = %manifest_path.display(),
@@ -550,6 +389,24 @@ fn load_plugin_manifest(plugin_dir: &Path) -> Result<Option<PluginManifest>, Com
             );
             return Ok(None);
         }
+        Err(e) => {
+            warn!(
+                path = %manifest_path.display(),
+                error = %e,
+                "failed to stat plugin.json"
+            );
+            return Err(CommandError::new(
+                format!(
+                    "failed to stat plugin.json at {}: {e}",
+                    manifest_path.display()
+                ),
+                ErrorType::IoError,
+            ));
+        }
+    }
+
+    let bytes = match fs::read(&manifest_path) {
+        Ok(b) => b,
         Err(e) => {
             warn!(
                 path = %manifest_path.display(),
@@ -619,12 +476,8 @@ fn count_plugin_skills(entry: &PluginEntry, marketplace_path: &Path) -> usize {
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
-
-    use tempfile::tempdir;
-
     use kiro_market_core::cache::MarketplaceSource;
-    use kiro_market_core::marketplace::{PluginEntry, PluginSource, StructuredSource};
+    use kiro_market_core::marketplace::{PluginSource, StructuredSource};
 
     use super::*;
 
@@ -706,190 +559,23 @@ mod tests {
     }
 
     // -----------------------------------------------------------------------
-    // resolve_local_plugin_dir
+    // saturate_to_u32
     // -----------------------------------------------------------------------
 
     #[test]
-    fn resolve_local_plugin_dir_relative_path_exists() {
-        let tmp = tempdir().expect("failed to create tempdir");
-        let plugin_dir = tmp.path().join("plugins").join("my-plugin");
-        fs::create_dir_all(&plugin_dir).expect("failed to create plugin dir");
-
-        let entry = PluginEntry {
-            name: "my-plugin".into(),
-            description: None,
-            source: PluginSource::RelativePath(
-                kiro_market_core::validation::RelativePath::new("plugins/my-plugin").unwrap(),
-            ),
-        };
-
-        let result = resolve_local_plugin_dir(&entry, tmp.path());
-        assert!(result.is_ok());
-        assert_eq!(result.expect("should resolve"), plugin_dir);
+    fn saturate_to_u32_passes_through_in_range_values() {
+        assert_eq!(saturate_to_u32(0, "test"), 0);
+        assert_eq!(saturate_to_u32(42, "test"), 42);
+        assert_eq!(saturate_to_u32(u32::MAX as usize, "test"), u32::MAX);
     }
 
+    /// On 32-bit targets `usize::MAX == u32::MAX` so `try_from` never fails
+    /// and the overflow arm is unreachable. Gate the overflow test to 64-bit
+    /// where the arm is actually exercised.
+    #[cfg(target_pointer_width = "64")]
     #[test]
-    fn resolve_local_plugin_dir_relative_path_not_found() {
-        let tmp = tempdir().expect("failed to create tempdir");
-
-        let entry = PluginEntry {
-            name: "missing-plugin".into(),
-            description: None,
-            source: PluginSource::RelativePath(
-                kiro_market_core::validation::RelativePath::new("plugins/missing-plugin").unwrap(),
-            ),
-        };
-
-        let result = resolve_local_plugin_dir(&entry, tmp.path());
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert_eq!(err.error_type, ErrorType::NotFound);
-        assert!(
-            err.message.contains("does not exist"),
-            "expected 'does not exist' in message, got: {}",
-            err.message
-        );
-    }
-
-    #[test]
-    fn resolve_local_plugin_dir_structured_returns_validation_error() {
-        let tmp = tempdir().expect("failed to create tempdir");
-
-        let entry = PluginEntry {
-            name: "remote-plugin".into(),
-            description: None,
-            source: PluginSource::Structured(StructuredSource::GitHub {
-                repo: "owner/repo".into(),
-                git_ref: None,
-                sha: None,
-            }),
-        };
-
-        let result = resolve_local_plugin_dir(&entry, tmp.path());
-        assert!(result.is_err());
-        let err = result.unwrap_err();
-        assert_eq!(err.error_type, ErrorType::Validation);
-        assert!(
-            err.message.contains("remote source"),
-            "expected 'remote source' in message, got: {}",
-            err.message
-        );
-    }
-
-    // -----------------------------------------------------------------------
-    // collect_skills_for_plugin
-    // -----------------------------------------------------------------------
-
-    /// Build a plugin directory with skills under the default `skills/`
-    /// layout that `discover_skills_for_plugin` walks.
-    fn make_plugin_with_skills(root: &std::path::Path, plugin_name: &str, skill_names: &[&str]) {
-        let skills_root = root.join("plugins").join(plugin_name).join("skills");
-        fs::create_dir_all(&skills_root).expect("create skills dir");
-        for name in skill_names {
-            let dir = skills_root.join(name);
-            fs::create_dir_all(&dir).expect("create skill dir");
-            fs::write(
-                dir.join("SKILL.md"),
-                format!("---\nname: {name}\ndescription: test\n---\n"),
-            )
-            .expect("write SKILL.md");
-        }
-    }
-
-    fn relative_path_entry(name: &str, rel: &str) -> PluginEntry {
-        PluginEntry {
-            name: name.into(),
-            description: None,
-            source: PluginSource::RelativePath(
-                kiro_market_core::validation::RelativePath::new(rel).unwrap(),
-            ),
-        }
-    }
-
-    #[test]
-    fn collect_skills_for_plugin_happy_path() {
-        let tmp = tempdir().expect("tempdir");
-        make_plugin_with_skills(tmp.path(), "good", &["alpha", "beta"]);
-        let entry = relative_path_entry("good", "plugins/good");
-
-        let mut out: Vec<SkillInfo> = Vec::new();
-        let installed = InstalledSkills::default();
-        let result = collect_skills_for_plugin(&entry, tmp.path(), "mp1", &installed, &mut out);
-
-        assert!(result.is_ok(), "expected ok, got {result:?}");
-        assert_eq!(out.len(), 2);
-        assert!(out.iter().any(|s| s.name == "alpha"));
-        assert!(out.iter().any(|s| s.name == "beta"));
-        assert!(out
-            .iter()
-            .all(|s| s.plugin == "good" && s.marketplace == "mp1"));
-        assert!(out.iter().all(|s| !s.installed));
-    }
-
-    #[test]
-    fn collect_skills_for_plugin_missing_dir_returns_missing_dir_variant() {
-        let tmp = tempdir().expect("tempdir");
-        let entry = relative_path_entry("ghost", "plugins/ghost");
-
-        let mut out: Vec<SkillInfo> = Vec::new();
-        let installed = InstalledSkills::default();
-        let result = collect_skills_for_plugin(&entry, tmp.path(), "mp1", &installed, &mut out);
-
-        match result {
-            Err(CollectSkillsError::MissingDir(e)) => {
-                assert_eq!(e.error_type, ErrorType::NotFound);
-            }
-            other => panic!("expected MissingDir, got {other:?}"),
-        }
-        assert!(out.is_empty());
-    }
-
-    #[test]
-    fn collect_skills_for_plugin_malformed_manifest_returns_malformed_variant() {
-        let tmp = tempdir().expect("tempdir");
-        let plugin_dir = tmp.path().join("plugins").join("broken");
-        fs::create_dir_all(&plugin_dir).expect("create plugin dir");
-        fs::write(plugin_dir.join("plugin.json"), "{ not valid json").expect("write manifest");
-        let entry = relative_path_entry("broken", "plugins/broken");
-
-        let mut out: Vec<SkillInfo> = Vec::new();
-        let installed = InstalledSkills::default();
-        let result = collect_skills_for_plugin(&entry, tmp.path(), "mp1", &installed, &mut out);
-
-        match result {
-            Err(CollectSkillsError::MalformedManifest(e)) => {
-                assert_eq!(e.error_type, ErrorType::ParseError);
-            }
-            other => panic!("expected MalformedManifest, got {other:?}"),
-        }
-        assert!(out.is_empty());
-    }
-
-    #[test]
-    fn collect_skills_for_plugin_skips_bad_frontmatter_and_continues() {
-        let tmp = tempdir().expect("tempdir");
-        let skills_dir = tmp.path().join("plugins").join("mixed").join("skills");
-        fs::create_dir_all(skills_dir.join("good-skill")).expect("create skill dir");
-        fs::create_dir_all(skills_dir.join("bad-skill")).expect("create skill dir");
-        fs::write(
-            skills_dir.join("good-skill").join("SKILL.md"),
-            "---\nname: good-skill\ndescription: works\n---\n",
-        )
-        .expect("write good skill");
-        // Missing closing `---` makes frontmatter parsing fail.
-        fs::write(
-            skills_dir.join("bad-skill").join("SKILL.md"),
-            "---\nname: bad\n",
-        )
-        .expect("write bad skill");
-        let entry = relative_path_entry("mixed", "plugins/mixed");
-
-        let mut out: Vec<SkillInfo> = Vec::new();
-        let installed = InstalledSkills::default();
-        let result = collect_skills_for_plugin(&entry, tmp.path(), "mp1", &installed, &mut out);
-
-        assert!(result.is_ok(), "expected ok, got {result:?}");
-        assert_eq!(out.len(), 1, "bad frontmatter should be skipped, good kept");
-        assert_eq!(out[0].name, "good-skill");
+    fn saturate_to_u32_clamps_values_above_u32_max() {
+        assert_eq!(saturate_to_u32((u32::MAX as usize) + 1, "test"), u32::MAX);
+        assert_eq!(saturate_to_u32(usize::MAX, "test"), u32::MAX);
     }
 }
