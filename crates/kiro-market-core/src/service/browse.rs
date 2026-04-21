@@ -169,12 +169,14 @@ impl SkippedReason {
                 plugin: plugin.clone(),
                 source: plugin_source.clone(),
             }),
+            PluginError::NoSkills { path, .. } => Some(Self::NoSkills { path: path.clone() }),
             // Explicit match on non-skip variants rather than `_ => None`
             // so adding a new PluginError variant triggers a compiler
             // error until the author decides whether it's plugin-level.
-            PluginError::NotFound { .. }
-            | PluginError::ManifestNotFound { .. }
-            | PluginError::NoSkills { .. } => None,
+            // `NotFound` and `ManifestNotFound` stay here because they
+            // represent "caller asked for the wrong thing" — a user-input
+            // bug, not a damaged plugin to fold into `skipped`.
+            PluginError::NotFound { .. } | PluginError::ManifestNotFound { .. } => None,
         }
     }
 }
@@ -222,6 +224,17 @@ pub enum SkippedReason {
     RemoteSourceNotLocal {
         plugin: String,
         source: StructuredSource,
+    },
+    /// The plugin exists and its manifest is well-formed, but it
+    /// declares no skills. Defensive classification — today no producer
+    /// in the bulk/listing path returns [`PluginError::NoSkills`], but
+    /// folding it into `skipped` means a future caller that DOES surface
+    /// it can't accidentally abort the bulk listing. The plugin name
+    /// lives on the wrapping [`SkippedPlugin`]; this variant carries
+    /// only `path` for UI remediation (the directory the user might
+    /// populate).
+    NoSkills {
+        path: PathBuf,
     },
 }
 
@@ -1219,6 +1232,10 @@ mod tests {
             sha: None,
         },
     }))]
+    #[case::no_skills(Error::Plugin(PluginError::NoSkills {
+        name: "empty-plug".into(),
+        path: "/tmp/x".into(),
+    }))]
     fn skipped_plugin_from_plugin_error_accepts_plugin_level_variants(#[case] err: Error) {
         let sp = SkippedPlugin::from_plugin_error("test-plug".into(), &err);
         assert!(sp.is_some(), "expected bulk-path skip for: {err:?}");
@@ -1785,6 +1802,10 @@ mod tests {
             "path": "/tmp/plugins/x/plugin.json",
             "reason": "permission denied",
         })
+    )]
+    #[case::no_skills(
+        SkippedReason::NoSkills { path: PathBuf::from("/tmp/plugins/empty") },
+        serde_json::json!({ "kind": "no_skills", "path": "/tmp/plugins/empty" })
     )]
     fn skipped_reason_path_variants_json_shape(
         #[case] reason: SkippedReason,

@@ -136,6 +136,17 @@ export type ErrorType = "not_found" | "already_exists" | "validation" | "git_err
  *  frontends should `match` on when deciding how to render the failure.
  *  The two are deliberately redundant — `error` can rephrase freely over
  *  time, while `kind` stays stable.
+ * 
+ *  Fields are `pub(crate)` so external callers cannot desync the two —
+ *  construction routes exclusively through [`Self::install_failed`] and
+ *  [`Self::requested_but_not_found`], each of which derives `error` and
+ *  `kind` together from a single source. Read access from outside the
+ *  crate happens via the [`Self::name`] / [`Self::error`] / [`Self::kind`]
+ *  accessors, and via the Serde/specta boundary (the generated
+ *  TypeScript type still exposes all three fields, because Serde ignores
+ *  Rust visibility). This mirrors the [`crate::service::browse::SkippedPlugin`]
+ *  enforcement pattern so the two redundant-by-design types stay
+ *  symmetric.
  */
 export type FailedSkill = {
 	name: string,
@@ -418,7 +429,18 @@ export type SkippedPlugin = {
  *  a single place so the projection stays consistent with the error
  *  classifier.
  */
-export type SkippedReason = { kind: "directory_missing"; path: string } | { kind: "not_a_directory"; path: string } | { kind: "symlink_refused"; path: string } | { kind: "directory_unreadable"; path: string; reason: string } | { kind: "invalid_manifest"; path: string; reason: string } | { kind: "manifest_read_failed"; path: string; reason: string } | { kind: "remote_source_not_local"; plugin: string; source: StructuredSource };
+export type SkippedReason = { kind: "directory_missing"; path: string } | { kind: "not_a_directory"; path: string } | { kind: "symlink_refused"; path: string } | { kind: "directory_unreadable"; path: string; reason: string } | { kind: "invalid_manifest"; path: string; reason: string } | { kind: "manifest_read_failed"; path: string; reason: string } | { kind: "remote_source_not_local"; plugin: string; source: StructuredSource } | 
+/**
+ *  The plugin exists and its manifest is well-formed, but it
+ *  declares no skills. Defensive classification — today no producer
+ *  in the bulk/listing path returns [`PluginError::NoSkills`], but
+ *  folding it into `skipped` means a future caller that DOES surface
+ *  it can't accidentally abort the bulk listing. The plugin name
+ *  lives on the wrapping [`SkippedPlugin`]; this variant carries
+ *  only `path` for UI remediation (the directory the user might
+ *  populate).
+ */
+{ kind: "no_skills"; path: string };
 
 /**
  *  A skill that was excluded from a listing because its `SKILL.md` or

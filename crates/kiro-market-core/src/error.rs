@@ -212,9 +212,14 @@ impl PluginError {
         // which enumerates for the same reason — the two classifications
         // cannot drift.
         match self {
-            Self::RemoteSourceNotLocal { .. } => Some(match surface {
+            Self::RemoteSourceNotLocal { plugin, .. } => Some(match surface {
+                // `kiro-market install` uses the cloning resolver
+                // (`resolve_plugin_dir`), whereas `list`/`info`/`search`
+                // use `resolve_local_plugin_dir` — the non-cloning
+                // variant that produces this error. Installing is the
+                // user-facing remediation that triggers the clone.
                 Surface::Cli => {
-                    "clone it first with `kiro-market add` before listing or installing".to_owned()
+                    format!("run `kiro-market install {plugin}@<marketplace>` to clone it locally")
                 }
                 Surface::Ui => {
                     "open the plugin's detail page in the marketplace to clone it".to_owned()
@@ -638,6 +643,25 @@ mod tests {
         assert!(
             cli.to_lowercase().contains("cli") || cli.to_lowercase().contains("kiro-market"),
             "CLI hint should reference CLI vocabulary, got: {cli}"
+        );
+        // Pin the specific CLI subcommand. `kiro-market install` is the
+        // remediation because it uses the cloning resolver; previously
+        // this hint said `kiro-market add` which does not exist as a
+        // subcommand (flagged by gemini-code-assist on PR #35). The
+        // `install` substring catches a regression back to any
+        // non-existent command.
+        assert!(
+            cli.contains("kiro-market install"),
+            "CLI hint must reference `kiro-market install` (the cloning \
+             remediation), got: {cli}"
+        );
+        // The hint must interpolate the plugin name so the user can
+        // copy-paste it verbatim. "acme" is the plugin name seeded in
+        // the fixture above.
+        assert!(
+            cli.contains("acme"),
+            "CLI hint must interpolate the plugin name from the error \
+             payload, got: {cli}"
         );
         assert!(
             !ui.to_lowercase().contains("cli") && !ui.contains("kiro-market"),
