@@ -8,8 +8,17 @@ export const commands = {
 	listMarketplaces: () => typedError<MarketplaceInfo[], CommandError>(__TAURI_INVOKE("list_marketplaces")),
 	// List all plugins in a given marketplace.
 	listPlugins: (marketplace: string) => typedError<PluginInfo[], CommandError>(__TAURI_INVOKE("list_plugins", { marketplace })),
-	// List all available skills for a plugin, cross-referenced with installed state.
-	listAvailableSkills: (marketplace: string, plugin: string, projectPath: string) => typedError<SkillInfo[], CommandError>(__TAURI_INVOKE("list_available_skills", { marketplace, plugin, projectPath })),
+	/**
+	 *  List all available skills for a plugin, cross-referenced with installed state.
+	 * 
+	 *  Returns a [`PluginSkillsResult`] carrying both the happy-path skill list
+	 *  and any per-skill read failures (unreadable `SKILL.md`, malformed
+	 *  frontmatter) as [`PluginSkillsResult::skipped_skills`]. Previously these
+	 *  per-skill failures vanished into `warn!` logs, leaving the frontend to
+	 *  wonder why the count shrank; surfacing them structurally lets the UI
+	 *  show "N skills failed to load" with a drill-down.
+	 */
+	listAvailableSkills: (marketplace: string, plugin: string, projectPath: string) => typedError<PluginSkillsResult, CommandError>(__TAURI_INVOKE("list_available_skills", { marketplace, plugin, projectPath })),
 	/**
 	 *  List all skills across every plugin in a marketplace, cross-referenced
 	 *  with installed state.
@@ -20,8 +29,17 @@ export const commands = {
 	 *  remote source) so the frontend can surface a partial-listing warning.
 	 */
 	listAllSkillsForMarketplace: (marketplace: string, projectPath: string) => typedError<BulkSkillsResult, CommandError>(__TAURI_INVOKE("list_all_skills_for_marketplace", { marketplace, projectPath })),
-	// Install specific skills from a plugin into a Kiro project.
-	installSkills: (marketplace: string, plugin: string, skills: string[], force: boolean, projectPath: string) => typedError<InstallResult, CommandError>(__TAURI_INVOKE("install_skills", { marketplace, plugin, skills, force, projectPath })),
+	/**
+	 *  Install specific skills from a plugin into a Kiro project.
+	 * 
+	 *  Returns the core [`InstallSkillsResult`] directly rather than through a
+	 *  Tauri-local wrapper — the previous wrapper was a field-by-field copy
+	 *  and risked drifting away from the core shape (e.g. losing the
+	 *  `FailedSkill::kind` and `skipped_skills` fields introduced in #30).
+	 *  Using the core type keeps the wire format lockstep with what the
+	 *  service emits.
+	 */
+	installSkills: (marketplace: string, plugin: string, skills: string[], force: boolean, projectPath: string) => typedError<InstallSkillsResult, CommandError>(__TAURI_INVOKE("install_skills", { marketplace, plugin, skills, force, projectPath })),
 	// Get summary information about a Kiro project directory.
 	getProjectInfo: (projectPath: string) => typedError<ProjectInfo, CommandError>(__TAURI_INVOKE("get_project_info", { projectPath })),
 	// List all skills installed in a Kiro project, sorted by name.
@@ -72,12 +90,15 @@ export const commands = {
 /**
  *  Result of a marketplace-wide skill listing. The bulk path continues
  *  past per-plugin errors (missing directory, malformed manifest) to
- *  preserve the partial listing; `skipped` records those errors so the
- *  frontend can show a warning rather than silently dropping plugins.
+ *  preserve the partial listing; `skipped` records plugin-level drops
+ *  and `skipped_skills` records per-skill drops inside otherwise-working
+ *  plugins, so the frontend can show a warning rather than silently
+ *  shrinking the count.
  */
 export type BulkSkillsResult = {
 	skills: SkillInfo[],
 	skipped: SkippedPlugin[],
+	skipped_skills: SkippedSkill[],
 };
 
 /**
@@ -107,11 +128,59 @@ export type DiscoveredProject = {
  */
 export type ErrorType = "not_found" | "already_exists" | "validation" | "git_error" | "io_error" | "parse_error" | "unknown";
 
-// A skill that failed to install, with the reason.
+/**
+ *  A skill that failed to install, with the reason.
+ * 
+ *  `error` is the human-readable Display (suitable for log lines or UI
+ *  direct rendering); `kind` is the stable programmatic contract that
+ *  frontends should `match` on when deciding how to render the failure.
+ *  The two are deliberately redundant — `error` can rephrase freely over
+ *  time, while `kind` stays stable.
+ * 
+ *  Fields are `pub(crate)` so external callers cannot desync the two —
+ *  construction routes exclusively through [`Self::install_failed`] and
+ *  [`Self::requested_but_not_found`], each of which derives `error` and
+ *  `kind` together from a single source. Read access from outside the
+ *  crate happens via the [`Self::name`] / [`Self::error`] / [`Self::kind`]
+ *  accessors, and via the Serde/specta boundary (the generated
+ *  TypeScript type still exposes all three fields, because Serde ignores
+ *  Rust visibility). This mirrors the [`crate::service::browse::SkippedPlugin`]
+ *  enforcement pattern so the two redundant-by-design types stay
+ *  symmetric.
+ */
 export type FailedSkill = {
 	name: string,
 	error: string,
+	kind: FailedSkillReason,
 };
+
+/**
+ *  Why a skill install failed. Separates "we tried to install and it
+ *  went wrong" ([`Self::InstallFailed`]) from "the caller named a skill
+ *  that isn't in this plugin" ([`Self::RequestedButNotFound`]) so
+ *  frontends can render a typo banner distinct from an install error
+ *  without substring-matching `FailedSkill::error`.
+ * 
+ *  [`Self::InstallFailed`] is unit-shaped: the human-readable error
+ *  message lives on [`FailedSkill::error`] and the typed `kind` here
+ *  exists to tell the typo case apart from every other failure mode.
+ *  Duplicating the error string into this variant would be redundant
+ *  since `FailedSkill.error` is always populated.
+ */
+export type FailedSkillReason = 
+/**
+ *  The install was attempted (`SKILL.md` read and frontmatter
+ *  parsed) but the filesystem copy / metadata write failed. See
+ *  [`FailedSkill::error`] for the human-readable reason.
+ */
+{ kind: "install_failed" } | 
+/**
+ *  The caller's `Names(_)` filter included a name that no skill in
+ *  the plugin's discovered list produced — typically a typo or a
+ *  stale reference. The `plugin` field carries the plugin context
+ *  so a flat UI list can attribute the miss.
+ */
+{ kind: "requested_but_not_found"; plugin: string };
 
 // A marketplace that failed to update, with the reason.
 export type FailedUpdate = {
@@ -129,11 +198,26 @@ export type GitProtocol =
 // Clone via SSH (uses SSH agent / keys).
 "ssh";
 
-// Result of an install operation across multiple skills.
-export type InstallResult = {
+// Outcome of installing a list of skill directories from one plugin.
+export type InstallSkillsResult = {
+	// Skill names successfully installed.
 	installed: string[],
+	// Skill names already installed and skipped (only when `force = false`).
 	skipped: string[],
+	/**
+	 *  Skill names whose install attempt failed (install error, or — for
+	 *  `Names(_)` filter — names requested but not found). Distinct from
+	 *  [`Self::skipped_skills`], which tracks entries we couldn't even
+	 *  read / parse before attempting to install them.
+	 */
 	failed: FailedSkill[],
+	/**
+	 *  Skill-source entries that could not be read or parsed, so no
+	 *  install was attempted. Surfaces what previously vanished into
+	 *  `warn!`-then-`continue`; mirrors
+	 *  [`crate::service::browse::BulkSkillsResult::skipped_skills`].
+	 */
+	skipped_skills: SkippedSkill[],
 };
 
 // Information about a single installed skill.
@@ -201,12 +285,38 @@ export type PluginInfo = {
 	source_type: SourceType,
 };
 
+/**
+ *  Result of [`MarketplaceService::list_skills_for_plugin`]. Mirrors
+ *  [`BulkSkillsResult`] for the single-plugin case so per-skill read
+ *  failures surface structurally rather than only via `warn!` logs.
+ */
+export type PluginSkillsResult = {
+	skills: SkillInfo[],
+	skipped_skills: SkippedSkill[],
+};
+
 // Summary information about a Kiro project directory.
 export type ProjectInfo = {
 	path: string,
 	kiro_initialized: boolean,
 	installed_skill_count: number,
 };
+
+/**
+ *  A string that has been validated as a safe relative path.
+ * 
+ *  Construction goes through [`RelativePath::new`], which applies
+ *  [`validate_relative_path`] — so holding a `RelativePath` is a static
+ *  guarantee that the inner string is non-empty, contains no `..`
+ *  components, no NUL bytes, and is not an absolute path.
+ * 
+ *  The newtype replaces a plain `String` in the manifest data model
+ *  (`PluginSource::RelativePath`, `StructuredSource::GitSubdir.path`) so
+ *  downstream code never needs to re-validate. `Deserialize` calls
+ *  `new` internally, so `serde_json::from_slice::<Marketplace>(…)`
+ *  rejects traversal at parse time.
+ */
+export type RelativePath = string;
 
 // Top-level category for a Kiro CLI setting.
 export type SettingCategory = "telemetry" | "chat" | "knowledge" | "key_bindings" | "features" | "api" | "mcp" | "environment";
@@ -281,11 +391,109 @@ export type SkillInfo = {
 	installed: boolean,
 };
 
-// A plugin that was excluded from a bulk listing, with the reason.
+/**
+ *  A plugin that was excluded from a bulk listing. Carries both a
+ *  human-readable `reason` (the error's rendered Display, suitable for
+ *  direct UI rendering or log lines) and a structured `kind` that
+ *  frontends match on for variant-specific affordances (e.g. a "clone"
+ *  button for [`SkippedReason::RemoteSourceNotLocal`]). The two are
+ *  deliberately redundant: `reason` is free-form text that may rephrase
+ *  over time, while `kind` is the stable programmatic contract.
+ * 
+ *  Fields are `pub(crate)` so external callers cannot desync the two
+ *  — construction routes exclusively through
+ *  [`SkippedPlugin::from_plugin_error`], which derives both from a
+ *  single source error. Read access from outside the crate happens via
+ *  the Serde/specta boundary (the generated TypeScript type still
+ *  exposes all three fields, because Serde ignores Rust visibility).
+ */
 export type SkippedPlugin = {
 	name: string,
 	reason: string,
+	kind: SkippedReason,
 };
+
+/**
+ *  Why a plugin was excluded from a bulk listing. Structured counterpart
+ *  to [`SkippedPlugin::reason`] so frontends can match on the cause
+ *  (rendering variant-specific UI like a "clone" button for
+ *  [`Self::RemoteSourceNotLocal`]) instead of substring-matching a
+ *  rendered error message.
+ * 
+ *  Mirrors the plugin-level subset of [`PluginError`] — exactly the
+ *  variants the bulk path folds into `skipped` rather than propagating.
+ *  Kept as a distinct type because [`PluginError`] is a Display-oriented
+ *  error carrying non-`Clone` `io::Error` chains, while `SkippedReason`
+ *  is `Serialize + specta::Type` data that crosses the FFI boundary.
+ *  Translating one to the other is the service layer's job, performed in
+ *  a single place so the projection stays consistent with the error
+ *  classifier.
+ */
+export type SkippedReason = { kind: "directory_missing"; path: string } | { kind: "not_a_directory"; path: string } | { kind: "symlink_refused"; path: string } | { kind: "directory_unreadable"; path: string; reason: string } | { kind: "invalid_manifest"; path: string; reason: string } | { kind: "manifest_read_failed"; path: string; reason: string } | { kind: "remote_source_not_local"; plugin: string; source: StructuredSource } | 
+/**
+ *  The plugin exists and its manifest is well-formed, but it
+ *  declares no skills. Defensive classification — today no producer
+ *  in the bulk/listing path returns [`PluginError::NoSkills`], but
+ *  folding it into `skipped` means a future caller that DOES surface
+ *  it can't accidentally abort the bulk listing. The plugin name
+ *  lives on the wrapping [`SkippedPlugin`]; this variant carries
+ *  only `path` for UI remediation (the directory the user might
+ *  populate).
+ */
+{ kind: "no_skills"; path: string };
+
+/**
+ *  A skill that was excluded from a listing because its `SKILL.md` or
+ *  frontmatter could not be read. Surfaces what previously vanished
+ *  into `warn!`-then-`continue` so the frontend can render "N skills
+ *  failed to load" with a drill-down rather than silently shrinking the
+ *  listed count.
+ */
+export type SkippedSkill = {
+	/**
+	 *  Name of the plugin this skill was being enumerated under. The
+	 *  bulk path [`MarketplaceService::list_all_skills`] accumulates
+	 *  `SkippedSkill`s across every plugin in a marketplace, so without
+	 *  this attribution the frontend would have no way to group "N
+	 *  skills failed to load in plugin X" — making the structured
+	 *  surface strictly less useful than the per-plugin `warn!` it
+	 *  replaced. Per-plugin callers already have the plugin context
+	 *  but carry it anyway so both code paths produce identical shapes.
+	 */
+	plugin: string,
+	/**
+	 *  Directory name of the skill as a best-effort label. Not a
+	 *  guarantee the skill *would* have had this name — the frontmatter
+	 *  `name` is authoritative, and parsing it is precisely what failed.
+	 *  `None` when `Path::file_name()` cannot extract a component
+	 *  (empty path, root, or a path terminating in `..`). Encoded as
+	 *  `Option<String>` rather than a sentinel empty string so the
+	 *  frontend's type system forces the "no label available" branch
+	 *  to be handled explicitly — specta renders it as `string | null`.
+	 */
+	name_hint: string | null,
+	// Path to the `SKILL.md` file that could not be consumed.
+	path: string,
+	reason: SkippedSkillReason,
+};
+
+/**
+ *  Why an individual skill was excluded from a listing. Both variants
+ *  describe a working plugin with a single broken skill file — a
+ *  plugin-level failure surfaces as [`SkippedPlugin`] / [`SkippedReason`]
+ *  instead.
+ */
+export type SkippedSkillReason = 
+/**
+ *  Reading `SKILL.md` failed (permission denied, I/O error, invalid
+ *  UTF-8, etc.). `reason` carries the underlying error's Display.
+ */
+{ kind: "read_failed"; reason: string } | 
+/**
+ *  `SKILL.md` read successfully but the frontmatter could not be
+ *  parsed (missing fences, malformed YAML, missing `name`, etc.).
+ */
+{ kind: "frontmatter_invalid"; reason: string };
 
 /**
  *  Source type classification for marketplaces and plugins.
@@ -294,6 +502,28 @@ export type SkippedPlugin = {
  *  type like `"github" | "git" | "local" | "relative" | "git_subdir"`.
  */
 export type SourceType = "github" | "git" | "local" | "relative" | "git-subdir";
+
+/**
+ *  Provider-specific structured source descriptor, internally tagged on `"source"`.
+ * 
+ *  Carries `specta::Type` because `SkippedReason::RemoteSourceNotLocal`
+ *  embeds a `StructuredSource` payload in the browse service's
+ *  frontend-bound response. The `RelativePath` inside `GitSubdir.path`
+ *  already carries specta via its own newtype, so the whole tree exports
+ *  cleanly without further changes.
+ */
+export type StructuredSource = 
+// A GitHub repository.
+{ source: "github"; repo: string; ref: string | null; sha: string | null } | 
+// A plain Git URL.
+{ source: "url"; url: string; ref: string | null; sha: string | null } | 
+// A subdirectory within a Git repository.
+{ source: "git-subdir"; url: string; 
+/**
+ *  The subdir is typed as [`RelativePath`] so traversal cannot even
+ *  exist in-memory — `RelativePath::new` is the only way in.
+ */
+path: RelativePath; ref: string | null; sha: string | null };
 
 // Result of updating one or more marketplaces.
 export type UpdateResult = {

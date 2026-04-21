@@ -103,7 +103,14 @@ impl<'de> Deserialize<'de> for PluginSource {
 }
 
 /// Provider-specific structured source descriptor, internally tagged on `"source"`.
+///
+/// Carries `specta::Type` because `SkippedReason::RemoteSourceNotLocal`
+/// embeds a `StructuredSource` payload in the browse service's
+/// frontend-bound response. The `RelativePath` inside `GitSubdir.path`
+/// already carries specta via its own newtype, so the whole tree exports
+/// cleanly without further changes.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
 #[serde(tag = "source")]
 pub enum StructuredSource {
     /// A GitHub repository.

@@ -5,7 +5,10 @@
 
 pub mod browse;
 
-pub use browse::{BulkSkillsResult, SkillInfo, SkippedPlugin};
+pub use browse::{
+    BulkSkillsResult, PluginSkillsResult, SkillInfo, SkippedPlugin, SkippedReason, SkippedSkill,
+    SkippedSkillReason,
+};
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -228,17 +231,126 @@ pub struct InstallSkillsResult {
     pub installed: Vec<String>,
     /// Skill names already installed and skipped (only when `force = false`).
     pub skipped: Vec<String>,
-    /// Skill names whose install attempt failed (read/parse/install error,
-    /// or — for `Names(_)` filter — names requested but not found).
+    /// Skill names whose install attempt failed (install error, or — for
+    /// `Names(_)` filter — names requested but not found). Distinct from
+    /// [`Self::skipped_skills`], which tracks entries we couldn't even
+    /// read / parse before attempting to install them.
     pub failed: Vec<FailedSkill>,
+    /// Skill-source entries that could not be read or parsed, so no
+    /// install was attempted. Surfaces what previously vanished into
+    /// `warn!`-then-`continue`; mirrors
+    /// [`crate::service::browse::BulkSkillsResult::skipped_skills`].
+    pub skipped_skills: Vec<browse::SkippedSkill>,
 }
 
 /// A skill that failed to install, with the reason.
+///
+/// `error` is the human-readable Display (suitable for log lines or UI
+/// direct rendering); `kind` is the stable programmatic contract that
+/// frontends should `match` on when deciding how to render the failure.
+/// The two are deliberately redundant — `error` can rephrase freely over
+/// time, while `kind` stays stable.
+///
+/// Fields are `pub(crate)` so external callers cannot desync the two —
+/// construction routes exclusively through [`Self::install_failed`] and
+/// [`Self::requested_but_not_found`], each of which derives `error` and
+/// `kind` together from a single source. Read access from outside the
+/// crate happens via the [`Self::name`] / [`Self::error`] / [`Self::kind`]
+/// accessors, and via the Serde/specta boundary (the generated
+/// TypeScript type still exposes all three fields, because Serde ignores
+/// Rust visibility). This mirrors the [`crate::service::browse::SkippedPlugin`]
+/// enforcement pattern so the two redundant-by-design types stay
+/// symmetric.
 #[derive(Clone, Debug, Serialize)]
 #[cfg_attr(feature = "specta", derive(specta::Type))]
 pub struct FailedSkill {
-    pub name: String,
-    pub error: String,
+    pub(crate) name: String,
+    pub(crate) error: String,
+    pub(crate) kind: FailedSkillReason,
+}
+
+impl FailedSkill {
+    /// Build a [`FailedSkill`] for an install-time failure (filesystem
+    /// copy error, tracking-file write error, etc.). Derives the
+    /// human-readable `error` from [`crate::error::error_full_chain`]
+    /// and sets `kind = InstallFailed` in lockstep.
+    ///
+    /// This is one of exactly two constructors (the other is
+    /// [`Self::requested_but_not_found`]); fields being `pub(crate)`
+    /// guarantees no external caller can produce a `FailedSkill` with
+    /// a mismatched `kind` and `error`.
+    #[must_use]
+    pub(crate) fn install_failed(name: String, err: &Error) -> Self {
+        Self {
+            name,
+            error: error_full_chain(err),
+            kind: FailedSkillReason::InstallFailed,
+        }
+    }
+
+    /// Build a [`FailedSkill`] for a `Names(_)` filter miss — the
+    /// caller asked for a skill name that no discovered `SKILL.md`
+    /// produced. Composes the user-facing error string and pins
+    /// `kind = RequestedButNotFound { plugin }` so the frontend can
+    /// render a typo banner distinct from an install error.
+    #[must_use]
+    pub(crate) fn requested_but_not_found(name: String, plugin: String) -> Self {
+        Self {
+            error: format!("skill '{name}' not found in plugin '{plugin}'"),
+            name,
+            kind: FailedSkillReason::RequestedButNotFound { plugin },
+        }
+    }
+
+    /// Name of the skill that failed. The equivalent read via the
+    /// Serde-generated TypeScript type is `FailedSkill.name`.
+    #[must_use]
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Human-readable failure message (rendered source-error chain or
+    /// a user-facing composition, depending on `kind`). Use
+    /// [`Self::kind`] for programmatic matching; use this for log
+    /// lines and simple UI labels.
+    #[must_use]
+    pub fn error(&self) -> &str {
+        &self.error
+    }
+
+    /// Structured classification of the failure. Stable contract for
+    /// frontends that render variant-specific affordances.
+    #[must_use]
+    pub fn kind(&self) -> &FailedSkillReason {
+        &self.kind
+    }
+}
+
+/// Why a skill install failed. Separates "we tried to install and it
+/// went wrong" ([`Self::InstallFailed`]) from "the caller named a skill
+/// that isn't in this plugin" ([`Self::RequestedButNotFound`]) so
+/// frontends can render a typo banner distinct from an install error
+/// without substring-matching `FailedSkill::error`.
+///
+/// [`Self::InstallFailed`] is unit-shaped: the human-readable error
+/// message lives on [`FailedSkill::error`] and the typed `kind` here
+/// exists to tell the typo case apart from every other failure mode.
+/// Duplicating the error string into this variant would be redundant
+/// since `FailedSkill.error` is always populated.
+#[derive(Clone, Debug, Serialize)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
+#[serde(tag = "kind", rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum FailedSkillReason {
+    /// The install was attempted (`SKILL.md` read and frontmatter
+    /// parsed) but the filesystem copy / metadata write failed. See
+    /// [`FailedSkill::error`] for the human-readable reason.
+    InstallFailed,
+    /// The caller's `Names(_)` filter included a name that no skill in
+    /// the plugin's discovered list produced — typically a typo or a
+    /// stale reference. The `plugin` field carries the plugin context
+    /// so a flat UI list can attribute the miss.
+    RequestedButNotFound { plugin: String },
 }
 
 /// Outcome of installing the agents from one plugin.
@@ -787,6 +899,14 @@ impl MarketplaceService {
                         error = %e,
                         "failed to read SKILL.md, skipping"
                     );
+                    result.skipped_skills.push(browse::SkippedSkill {
+                        plugin: plugin.to_owned(),
+                        name_hint: browse::name_hint_from_skill_dir(skill_dir),
+                        path: skill_md_path,
+                        reason: browse::SkippedSkillReason::ReadFailed {
+                            reason: e.to_string(),
+                        },
+                    });
                     continue;
                 }
             };
@@ -799,6 +919,14 @@ impl MarketplaceService {
                         error = %e,
                         "failed to parse SKILL.md frontmatter, skipping"
                     );
+                    result.skipped_skills.push(browse::SkippedSkill {
+                        plugin: plugin.to_owned(),
+                        name_hint: browse::name_hint_from_skill_dir(skill_dir),
+                        path: skill_md_path,
+                        reason: browse::SkippedSkillReason::FrontmatterInvalid {
+                            reason: e.to_string(),
+                        },
+                    });
                     continue;
                 }
             };
@@ -831,11 +959,14 @@ impl MarketplaceService {
                     result.skipped.push(frontmatter.name);
                 }
                 Err(e) => {
-                    warn!(skill = %frontmatter.name, error = %e, "skill install failed");
-                    result.failed.push(FailedSkill {
-                        name: frontmatter.name,
-                        error: error_full_chain(&e),
-                    });
+                    warn!(
+                        skill = %frontmatter.name,
+                        error = %error_full_chain(&e),
+                        "skill install failed"
+                    );
+                    result
+                        .failed
+                        .push(FailedSkill::install_failed(frontmatter.name, &e));
                 }
             }
         }
@@ -846,10 +977,10 @@ impl MarketplaceService {
             for name in requested {
                 if !processed.contains(name) {
                     warn!(skill = %name, plugin = %plugin, "requested skill not found in plugin");
-                    result.failed.push(FailedSkill {
-                        name: name.clone(),
-                        error: format!("skill '{name}' not found in plugin '{plugin}'"),
-                    });
+                    result.failed.push(FailedSkill::requested_but_not_found(
+                        name.clone(),
+                        plugin.to_owned(),
+                    ));
                 }
             }
         }
@@ -3285,5 +3416,281 @@ mod tests {
 
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].name, "solo");
+    }
+
+    // -------------------------------------------------------------------
+    // install_skills: per-skill surfacing + FailedSkillReason (audit #30)
+    // -------------------------------------------------------------------
+    //
+    // These tests pin the behavior introduced by the issue-#30 audit fold-in:
+    // install_skills used to vanish per-skill read/parse failures into
+    // `warn!` + `continue`. They now surface as structured `skipped_skills`
+    // entries, and requested-but-missing names carry the typed
+    // `FailedSkillReason::RequestedButNotFound` variant so frontends can
+    // distinguish a typo from an install error.
+
+    /// Per-skill frontmatter parse failures inside `install_skills` used
+    /// to silently drop. They now land in `skipped_skills` as structured
+    /// entries — the install count stays accurate even when some skill
+    /// directories have broken `SKILL.md` files.
+    #[test]
+    fn install_skills_surfaces_malformed_skill_md_as_skipped_skill() {
+        use crate::project::KiroProject;
+
+        let (_dir, svc) = temp_service();
+        let project_tmp = tempfile::tempdir().unwrap();
+        let project = KiroProject::new(project_tmp.path().to_path_buf());
+
+        let plugin_tmp = tempfile::tempdir().unwrap();
+        let ok_dir = plugin_tmp.path().join("ok");
+        fs::create_dir_all(&ok_dir).unwrap();
+        fs::write(
+            ok_dir.join("SKILL.md"),
+            "---\nname: ok\ndescription: works\n---\nbody\n",
+        )
+        .unwrap();
+        let broken_dir = plugin_tmp.path().join("broken");
+        fs::create_dir_all(&broken_dir).unwrap();
+        // Missing closing `---` breaks the frontmatter parse.
+        fs::write(broken_dir.join("SKILL.md"), "---\nname: broken\n").unwrap();
+
+        let skill_dirs = vec![ok_dir, broken_dir];
+        let result = svc.install_skills(
+            &project,
+            &skill_dirs,
+            &InstallFilter::All,
+            InstallMode::New,
+            "mp1",
+            "plug1",
+            None,
+        );
+
+        assert_eq!(result.installed, vec!["ok".to_string()]);
+        assert_eq!(result.skipped_skills.len(), 1);
+        assert_eq!(
+            result.skipped_skills[0].name_hint.as_deref(),
+            Some("broken")
+        );
+        assert!(
+            matches!(
+                result.skipped_skills[0].reason,
+                browse::SkippedSkillReason::FrontmatterInvalid { .. }
+            ),
+            "expected FrontmatterInvalid, got: {:?}",
+            result.skipped_skills[0].reason
+        );
+    }
+
+    /// A `Names(_)` filter requesting a skill that no discovered
+    /// SKILL.md produces must surface as
+    /// `FailedSkillReason::RequestedButNotFound` — distinguishable from
+    /// an install error so the frontend can render typo UX separately
+    /// from an I/O or filesystem failure.
+    #[test]
+    fn install_skills_requested_but_not_found_uses_typed_reason() {
+        use crate::project::KiroProject;
+
+        let (_dir, svc) = temp_service();
+        let project_tmp = tempfile::tempdir().unwrap();
+        let project = KiroProject::new(project_tmp.path().to_path_buf());
+
+        let plugin_tmp = tempfile::tempdir().unwrap();
+        let only_dir = plugin_tmp.path().join("present");
+        fs::create_dir_all(&only_dir).unwrap();
+        fs::write(
+            only_dir.join("SKILL.md"),
+            "---\nname: present\ndescription: here\n---\nbody\n",
+        )
+        .unwrap();
+
+        let requested = vec!["absent".to_string()];
+        let result = svc.install_skills(
+            &project,
+            &[only_dir],
+            &InstallFilter::Names(&requested),
+            InstallMode::New,
+            "mp1",
+            "plug1",
+            None,
+        );
+
+        assert!(result.installed.is_empty(), "nothing should install");
+        assert_eq!(result.failed.len(), 1);
+        assert_eq!(result.failed[0].name, "absent");
+        match &result.failed[0].kind {
+            FailedSkillReason::RequestedButNotFound { plugin } => {
+                assert_eq!(plugin, "plug1");
+            }
+            other => panic!("expected RequestedButNotFound, got: {other:?}"),
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // FailedSkillReason wire-format regression guards
+    // -------------------------------------------------------------------
+    //
+    // `FailedSkillReason` crosses the Tauri FFI via `InstallSkillsResult`,
+    // so its JSON shape is a public contract with the frontend. Pin the
+    // exact representation here so a silent serde-tag rename or casing
+    // flip surfaces as a failing unit test in this crate BEFORE a
+    // bindings.ts regeneration ever reaches the UI.
+
+    #[test]
+    fn failed_skill_reason_install_failed_json_shape() {
+        let reason = FailedSkillReason::InstallFailed;
+        let json = serde_json::to_value(&reason).expect("serialize");
+        assert_eq!(
+            json,
+            serde_json::json!({ "kind": "install_failed" }),
+            "InstallFailed is unit-shaped; the wire carries only the \
+             discriminant (no payload). FailedSkill.error holds the \
+             human-readable detail."
+        );
+    }
+
+    #[test]
+    fn failed_skill_reason_requested_but_not_found_json_shape() {
+        let reason = FailedSkillReason::RequestedButNotFound {
+            plugin: "plug1".into(),
+        };
+        let json = serde_json::to_value(&reason).expect("serialize");
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "kind": "requested_but_not_found",
+                "plugin": "plug1",
+            })
+        );
+    }
+
+    /// Regression guard for the `install_skills` per-skill
+    /// `read_to_string` failure path. Before the #30 audit fold-in,
+    /// this vanished into `warn!` + `continue`; now it must surface as
+    /// a structured `SkippedSkill` with `ReadFailed`. The sibling
+    /// `list_all_skills_surfaces_unreadable_skill_md_as_skipped_skill`
+    /// exists in the browse module and covers the identical branch in
+    /// `collect_skills_for_plugin_into` — this test catches a
+    /// divergence where the two structurally-identical codepaths gain
+    /// different error-wrapping over time.
+    #[cfg(unix)]
+    #[test]
+    fn install_skills_surfaces_unreadable_skill_md_as_skipped_skill() {
+        use std::os::unix::fs::PermissionsExt;
+
+        use crate::project::KiroProject;
+
+        let (_dir, svc) = temp_service();
+        let project_tmp = tempfile::tempdir().unwrap();
+        let project = KiroProject::new(project_tmp.path().to_path_buf());
+
+        let plugin_tmp = tempfile::tempdir().unwrap();
+        let skill_dir = plugin_tmp.path().join("vault");
+        fs::create_dir_all(&skill_dir).unwrap();
+        let skill_md = skill_dir.join("SKILL.md");
+        fs::write(
+            &skill_md,
+            "---\nname: vault\ndescription: locked\n---\nbody\n",
+        )
+        .expect("write SKILL.md");
+        // Remove all permissions so read_to_string fails with EACCES.
+        fs::set_permissions(&skill_md, fs::Permissions::from_mode(0o000))
+            .expect("chmod 000 SKILL.md");
+
+        let result = svc.install_skills(
+            &project,
+            std::slice::from_ref(&skill_dir),
+            &InstallFilter::All,
+            InstallMode::New,
+            "mp1",
+            "plug1",
+            None,
+        );
+        // Restore permissions BEFORE assertions so tempdir cleanup can
+        // delete the file even if an assertion panics.
+        fs::set_permissions(&skill_md, fs::Permissions::from_mode(0o644)).expect("restore perms");
+
+        assert!(
+            result.installed.is_empty(),
+            "unreadable skill must not install"
+        );
+        assert_eq!(result.skipped_skills.len(), 1);
+        assert_eq!(result.skipped_skills[0].name_hint.as_deref(), Some("vault"));
+        assert_eq!(result.skipped_skills[0].plugin, "plug1");
+        assert!(
+            matches!(
+                result.skipped_skills[0].reason,
+                browse::SkippedSkillReason::ReadFailed { .. }
+            ),
+            "expected ReadFailed, got: {:?}",
+            result.skipped_skills[0].reason
+        );
+    }
+
+    /// Regression guard for `FailedSkillReason::InstallFailed`. Induces
+    /// an install failure (a regular file where `.kiro/skills` would
+    /// need to be a directory) and pins that the error routes to
+    /// `failed` with `kind = InstallFailed`, not to `skipped_skills`
+    /// or anywhere else.
+    ///
+    /// Cross-platform (no chmod needed): a file sitting at the skills
+    /// directory path causes `fs::create_dir_all` to fail on every
+    /// OS we support. Install-time errors used to only carry a string;
+    /// the typed `kind` here is the programmatic contract that
+    /// survives Display rewording.
+    #[test]
+    fn install_skills_surfaces_typed_install_failed_on_fs_error() {
+        use crate::project::KiroProject;
+
+        let (_dir, svc) = temp_service();
+        let project_tmp = tempfile::tempdir().unwrap();
+        // Seed `.kiro/skills` as a regular file so create_dir_all fails.
+        let kiro = project_tmp.path().join(".kiro");
+        fs::create_dir_all(&kiro).unwrap();
+        fs::write(kiro.join("skills"), b"not a directory").expect("write blocker");
+
+        let project = KiroProject::new(project_tmp.path().to_path_buf());
+
+        let plugin_tmp = tempfile::tempdir().unwrap();
+        let skill_dir = plugin_tmp.path().join("target");
+        fs::create_dir_all(&skill_dir).unwrap();
+        fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\nname: target\ndescription: will-fail-install\n---\nbody\n",
+        )
+        .unwrap();
+
+        let result = svc.install_skills(
+            &project,
+            &[skill_dir],
+            &InstallFilter::All,
+            InstallMode::New,
+            "mp1",
+            "plug1",
+            None,
+        );
+
+        assert!(
+            result.installed.is_empty(),
+            "install must fail, got installed: {:?}",
+            result.installed
+        );
+        assert!(
+            result.skipped_skills.is_empty(),
+            "per-skill read/parse succeeded; failure belongs to `failed`, \
+             not `skipped_skills`: {:?}",
+            result.skipped_skills
+        );
+        assert_eq!(result.failed.len(), 1);
+        assert_eq!(result.failed[0].name, "target");
+        assert!(
+            !result.failed[0].error.is_empty(),
+            "FailedSkill.error must carry the human-readable chain, \
+             got empty string"
+        );
+        assert!(
+            matches!(result.failed[0].kind, FailedSkillReason::InstallFailed),
+            "expected InstallFailed, got: {:?}",
+            result.failed[0].kind
+        );
     }
 }

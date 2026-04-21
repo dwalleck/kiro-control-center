@@ -10,7 +10,7 @@ use kiro_market_core::git::{GitProtocol, GixCliBackend};
 use kiro_market_core::plugin::{PluginManifest, discover_skill_dirs};
 use kiro_market_core::project::KiroProject;
 use kiro_market_core::service::{
-    FailedAgent, FailedSkill, InstallAgentsResult, InstallFilter, InstallMode, InstallSkillsResult,
+    FailedAgent, InstallAgentsResult, InstallFilter, InstallMode, InstallSkillsResult,
     MarketplaceService,
 };
 use tracing::{debug, warn};
@@ -298,11 +298,48 @@ fn print_install_outcome(plugin_ref: &str, result: &InstallSkillsResult) {
             name.bold()
         );
     }
-    for FailedSkill { name, error } in &result.failed {
+    for failure in &result.failed {
+        // `FailedSkill`'s fields are `pub(crate)` — go through the
+        // accessors so the `error`/`kind` invariant (populated together
+        // via `FailedSkill::install_failed` or ::requested_but_not_found)
+        // stays enforced at the type boundary.
         eprintln!(
-            "  {} Failed to install skill '{}': {error}",
+            "  {} Failed to install skill '{}': {}",
             "✗".red().bold(),
-            name
+            failure.name(),
+            failure.error()
+        );
+    }
+    // Per-skill read/parse failures used to vanish into `warn!` logs;
+    // the service now surfaces them as structured SkippedSkill entries.
+    // Render them so users see *why* the install count is smaller than
+    // the skill directory count.
+    for sk in &result.skipped_skills {
+        // SkippedSkillReason is #[non_exhaustive]; a wildcard arm is
+        // required. Future variants render via their Debug form until
+        // an explicit arm lands — better than a bare "unreadable"
+        // label because it at least surfaces the variant payload in
+        // terminal output. Safer than a compile error in the downstream
+        // binary every time core gains a variant.
+        let reason = match &sk.reason {
+            kiro_market_core::service::SkippedSkillReason::ReadFailed { reason } => {
+                format!("could not read SKILL.md: {reason}")
+            }
+            kiro_market_core::service::SkippedSkillReason::FrontmatterInvalid { reason } => {
+                format!("malformed frontmatter: {reason}")
+            }
+            other => format!("unreadable: {other:?}"),
+        };
+        // `name_hint` is None when the skill directory's file_name()
+        // can't be extracted (degenerate path — empty, root, or `..`-
+        // terminated). Fall back to a `<unnamed>` placeholder; the
+        // skill's file path is still printed on the same line below,
+        // so the user retains a locator even when the label is empty.
+        let label = sk.name_hint.as_deref().unwrap_or("<unnamed>");
+        eprintln!(
+            "  {} Skipped unreadable skill '{label}' ({}): {reason}",
+            "⚠".yellow().bold(),
+            sk.path.display()
         );
     }
 
@@ -330,6 +367,18 @@ fn print_install_outcome(plugin_ref: &str, result: &InstallSkillsResult) {
             "✗".red().bold(),
             result.failed.len(),
             if result.failed.len() == 1 { "" } else { "s" }
+        );
+    }
+    if !result.skipped_skills.is_empty() {
+        println!(
+            "{} {} skill{} could not be read",
+            "⚠".yellow().bold(),
+            result.skipped_skills.len(),
+            if result.skipped_skills.len() == 1 {
+                ""
+            } else {
+                "s"
+            }
         );
     }
 }

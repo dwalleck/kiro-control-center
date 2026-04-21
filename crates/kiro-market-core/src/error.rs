@@ -10,6 +10,7 @@ use std::path::PathBuf;
 use thiserror::Error;
 
 use crate::agent::ParseFailure;
+use crate::marketplace::StructuredSource;
 
 // ---------------------------------------------------------------------------
 // Marketplace errors
@@ -74,9 +75,12 @@ pub enum PluginError {
     #[error("plugin manifest not found at {path}")]
     ManifestNotFound { path: PathBuf },
 
-    /// The plugin declares no skills.
-    #[error("plugin `{name}` has no skills")]
-    NoSkills { name: String },
+    /// The plugin declares no skills. Carries `path` for parity with
+    /// [`Self::InvalidManifest`] and [`Self::ManifestReadFailed`] so
+    /// bulk-listing callers that surface the error alongside a plugin
+    /// name can also point at the plugin directory in the message.
+    #[error("plugin `{name}` at {path} has no skills")]
+    NoSkills { name: String, path: PathBuf },
 
     /// The plugin directory referenced by a `RelativePath` source does not
     /// exist on disk. Typically means the marketplace manifest points at a
@@ -140,11 +144,98 @@ pub enum PluginError {
     /// Distinct from [`Self::DirectoryMissing`] so the UI can offer the
     /// right remediation ("clone this remote plugin" vs "the local copy
     /// is broken").
-    #[error(
-        "plugin `{plugin}` uses a remote source and is not available \
-         locally; use the CLI to clone it first"
-    )]
-    RemoteSourceNotLocal { plugin: String },
+    ///
+    /// `plugin_source` carries the [`StructuredSource`] so callers that
+    /// surface this error to a user can render provider-specific
+    /// remediation (e.g. a GitHub-clone hint vs a plain git-URL hint)
+    /// without having to refetch the plugin entry. The field is named
+    /// `plugin_source` rather than `source` because thiserror treats a
+    /// field literally named `source` as the `std::error::Error::source()`
+    /// implementation and requires its type to implement `Error` — which
+    /// [`StructuredSource`] deliberately does not. The wire-format
+    /// projection in [`crate::service::browse::SkippedReason::RemoteSourceNotLocal`]
+    /// uses the natural name `source` on the frontend-facing side.
+    ///
+    /// The Display intentionally does NOT embed remediation text —
+    /// remediation is surface-dependent (CLI vs UI) and is exposed via
+    /// [`PluginError::remediation_hint`] so each frontend picks its own
+    /// phrasing.
+    #[error("plugin `{plugin}` uses a remote source and is not available locally")]
+    RemoteSourceNotLocal {
+        plugin: String,
+        plugin_source: StructuredSource,
+    },
+}
+
+/// Which user-facing surface is rendering an error. Used by
+/// [`PluginError::remediation_hint`] to pick surface-appropriate
+/// remediation text — CLI hints reference CLI commands, UI hints
+/// reference UI affordances. Kept in core so error variants and their
+/// remediation stay colocated; consumer crates pick the variant that
+/// matches where the error is about to be shown.
+///
+/// Closed two-variant semantic (no `#[non_exhaustive]`): these are
+/// every rendering surface in this workspace. If a new surface ever
+/// lands (e.g. a web UI), adding a variant is an intentional breaking
+/// change that should force every `match Surface { ... }` to decide
+/// what the new surface's remediation text is.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Surface {
+    /// Terminal / CLI output. Remediation may reference CLI flags or
+    /// commands.
+    Cli,
+    /// Tauri desktop UI. Remediation may reference UI navigation or
+    /// buttons.
+    Ui,
+}
+
+impl PluginError {
+    /// A surface-appropriate remediation hint for this error, or `None`
+    /// if the variant is self-explanatory / no actionable next step
+    /// exists at this layer.
+    ///
+    /// The hint is deliberately NOT embedded in [`Display`] — a CLI
+    /// sentence ("use `kiro-market add` to clone it") renders as
+    /// misleading noise in the Tauri UI (which has no CLI), and a UI
+    /// sentence ("open the marketplace detail page") renders as
+    /// misleading noise in the CLI. Returning `Option<String>` also
+    /// lets callers decide how to compose the hint with the error
+    /// message (a trailing paragraph in the CLI, an inline badge in the
+    /// UI, etc.) rather than baking the composition into `Display`.
+    #[must_use]
+    pub fn remediation_hint(&self, surface: Surface) -> Option<String> {
+        // Every variant is enumerated explicitly (no `_ => None`) so a
+        // new `PluginError` variant that *should* have a remediation
+        // forces a compile error here rather than silently defaulting
+        // to `None`. This mirrors the sibling classifier
+        // [`crate::service::browse::SkippedReason::from_plugin_error`],
+        // which enumerates for the same reason — the two classifications
+        // cannot drift.
+        match self {
+            Self::RemoteSourceNotLocal { plugin, .. } => Some(match surface {
+                // `kiro-market install` uses the cloning resolver
+                // (`resolve_plugin_dir`), whereas `list`/`info`/`search`
+                // use `resolve_local_plugin_dir` — the non-cloning
+                // variant that produces this error. Installing is the
+                // user-facing remediation that triggers the clone.
+                Surface::Cli => {
+                    format!("run `kiro-market install {plugin}@<marketplace>` to clone it locally")
+                }
+                Surface::Ui => {
+                    "open the plugin's detail page in the marketplace to clone it".to_owned()
+                }
+            }),
+            Self::NotFound { .. }
+            | Self::InvalidManifest { .. }
+            | Self::ManifestNotFound { .. }
+            | Self::NoSkills { .. }
+            | Self::DirectoryMissing { .. }
+            | Self::NotADirectory { .. }
+            | Self::SymlinkRefused { .. }
+            | Self::DirectoryUnreadable { .. }
+            | Self::ManifestReadFailed { .. } => None,
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -455,8 +546,11 @@ mod tests {
         "plugin manifest not found at /tmp/plugin.json"
     )]
     #[case::plugin_no_skills(
-        PluginError::NoSkills { name: "empty".into() },
-        "plugin `empty` has no skills"
+        PluginError::NoSkills {
+            name: "empty".into(),
+            path: PathBuf::from("/tmp/plugins/empty"),
+        },
+        "plugin `empty` at /tmp/plugins/empty has no skills"
     )]
     #[case::plugin_directory_missing(
         PluginError::DirectoryMissing { path: PathBuf::from("/tmp/plugins/x") },
@@ -485,12 +579,132 @@ mod tests {
         "could not read plugin manifest at /tmp/plugins/x/plugin.json"
     )]
     #[case::plugin_remote_source_not_local(
-        PluginError::RemoteSourceNotLocal { plugin: "acme".into() },
-        "plugin `acme` uses a remote source and is not available \
-         locally; use the CLI to clone it first"
+        PluginError::RemoteSourceNotLocal {
+            plugin: "acme".into(),
+            plugin_source: StructuredSource::GitHub {
+                repo: "owner/repo".into(),
+                git_ref: None,
+                sha: None,
+            },
+        },
+        "plugin `acme` uses a remote source and is not available locally"
     )]
     fn plugin_error_display(#[case] err: PluginError, #[case] expected: &str) {
         assert_eq!(err.to_string(), expected);
+    }
+
+    /// Regression guard: the Display of `RemoteSourceNotLocal` must NOT
+    /// embed the "use the CLI to clone it first" remediation any longer.
+    /// That sentence renders as misleading noise in the Tauri UI (which
+    /// has no CLI). Surface-appropriate remediation now lives on
+    /// [`PluginError::remediation_hint`]. If this test fails, somebody
+    /// put the CLI hint back in the format string — break out
+    /// `remediation_hint` instead.
+    #[test]
+    fn remote_source_not_local_display_has_no_cli_hint() {
+        let err = PluginError::RemoteSourceNotLocal {
+            plugin: "acme".into(),
+            plugin_source: StructuredSource::GitHub {
+                repo: "owner/repo".into(),
+                git_ref: None,
+                sha: None,
+            },
+        };
+        let display = err.to_string();
+        assert!(
+            !display.to_lowercase().contains("cli"),
+            "Display must be surface-neutral, got: {display}"
+        );
+        assert!(
+            !display.to_lowercase().contains("clone"),
+            "remediation verbs belong in remediation_hint, not Display: {display}"
+        );
+    }
+
+    #[test]
+    fn remediation_hint_remote_source_distinguishes_surfaces() {
+        let err = PluginError::RemoteSourceNotLocal {
+            plugin: "acme".into(),
+            plugin_source: StructuredSource::GitHub {
+                repo: "owner/repo".into(),
+                git_ref: None,
+                sha: None,
+            },
+        };
+        let cli = err
+            .remediation_hint(Surface::Cli)
+            .expect("CLI hint must be present for RemoteSourceNotLocal");
+        let ui = err
+            .remediation_hint(Surface::Ui)
+            .expect("UI hint must be present for RemoteSourceNotLocal");
+        assert_ne!(cli, ui, "CLI and UI hints must differ");
+        // Each hint must only reference its own surface's vocabulary —
+        // swapping them would be the whole point of bug.
+        assert!(
+            cli.to_lowercase().contains("cli") || cli.to_lowercase().contains("kiro-market"),
+            "CLI hint should reference CLI vocabulary, got: {cli}"
+        );
+        // Pin the specific CLI subcommand. `kiro-market install` is the
+        // remediation because it uses the cloning resolver; previously
+        // this hint said `kiro-market add` which does not exist as a
+        // subcommand (flagged by gemini-code-assist on PR #35). The
+        // `install` substring catches a regression back to any
+        // non-existent command.
+        assert!(
+            cli.contains("kiro-market install"),
+            "CLI hint must reference `kiro-market install` (the cloning \
+             remediation), got: {cli}"
+        );
+        // The hint must interpolate the plugin name so the user can
+        // copy-paste it verbatim. "acme" is the plugin name seeded in
+        // the fixture above.
+        assert!(
+            cli.contains("acme"),
+            "CLI hint must interpolate the plugin name from the error \
+             payload, got: {cli}"
+        );
+        assert!(
+            !ui.to_lowercase().contains("cli") && !ui.contains("kiro-market"),
+            "UI hint must not reference CLI commands, got: {ui}"
+        );
+    }
+
+    /// Remediation hints are only defined for variants where the caller
+    /// can take an actionable next step. Every other plugin-level variant
+    /// returns `None` so consumers don't render empty trailing hints.
+    #[rstest]
+    #[case::not_found(PluginError::NotFound {
+        plugin: "p".into(),
+        marketplace: "m".into(),
+    })]
+    #[case::invalid_manifest(PluginError::InvalidManifest {
+        path: PathBuf::from("/tmp/plugin.json"),
+        reason: "bad json".into(),
+    })]
+    #[case::directory_missing(PluginError::DirectoryMissing {
+        path: PathBuf::from("/tmp/plugins/ghost"),
+    })]
+    #[case::not_a_directory(PluginError::NotADirectory {
+        path: PathBuf::from("/tmp/plugins/file"),
+    })]
+    #[case::symlink_refused(PluginError::SymlinkRefused {
+        path: PathBuf::from("/tmp/plugins/link"),
+    })]
+    #[case::no_skills(PluginError::NoSkills {
+        name: "empty".into(),
+        path: PathBuf::from("/tmp/plugins/empty"),
+    })]
+    fn remediation_hint_returns_none_for_variants_without_actionable_step(
+        #[case] err: PluginError,
+    ) {
+        assert!(
+            err.remediation_hint(Surface::Cli).is_none(),
+            "CLI hint must be None for variant without remediation"
+        );
+        assert!(
+            err.remediation_hint(Surface::Ui).is_none(),
+            "UI hint must be None for variant without remediation"
+        );
     }
 
     #[rstest]
@@ -645,6 +859,7 @@ mod tests {
     fn from_plugin_error() {
         let inner = PluginError::NoSkills {
             name: "test".into(),
+            path: PathBuf::from("/tmp/plugins/test"),
         };
         let err: Error = inner.into();
         assert!(matches!(err, Error::Plugin(_)));
