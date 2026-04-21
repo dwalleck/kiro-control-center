@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 use serde::Serialize;
 use tracing::{debug, warn};
 
-use crate::error::{Error, PluginError};
+use crate::error::{Error, PluginError, error_full_chain};
 use crate::marketplace::{PluginEntry, PluginSource, StructuredSource};
 use crate::plugin::{PluginManifest, discover_skill_dirs};
 use crate::project::InstalledSkills;
@@ -95,7 +95,17 @@ impl SkippedPlugin {
         let kind = SkippedReason::from_plugin_error(pe)?;
         Some(Self {
             name,
-            reason: err.to_string(),
+            // `error_full_chain`, not `err.to_string()` — variants like
+            // `PluginError::DirectoryUnreadable` and `ManifestReadFailed`
+            // carry an `io::Error` via `#[source]`, and their Display
+            // deliberately omits the source's detail ("could not access
+            // plugin directory at {path}" with no "permission denied"
+            // suffix). `err.to_string()` would drop that detail at the
+            // Tauri FFI boundary where it becomes `SkippedPlugin.reason`.
+            // CLAUDE.md mandates `error_full_chain` at such boundaries.
+            // The sibling constructor `FailedSkill::install_failed`
+            // already uses this; keep the two lockstep.
+            reason: error_full_chain(err),
             kind,
         })
     }
@@ -1246,9 +1256,45 @@ mod tests {
         );
         assert_eq!(
             sp.reason,
-            err.to_string(),
-            "reason must equal the source error's Display so it stays in \
-             lockstep with kind"
+            error_full_chain(&err),
+            "reason must equal the full source chain so `io::Error` \
+             details behind `#[source]` survive the Tauri FFI boundary — \
+             `err.to_string()` would strip them"
+        );
+    }
+
+    /// Regression guard for the `err.to_string()` → `error_full_chain(err)`
+    /// fix on `SkippedPlugin::from_plugin_error`. Before the fix, this
+    /// field lost `io::Error` detail at the Tauri FFI boundary for any
+    /// `PluginError` variant that carried `#[source]`. Using
+    /// `DirectoryUnreadable` here because it's the simplest variant with
+    /// a non-trivial source chain — the Display says only "could not
+    /// access plugin directory at {path}" with no mention of the
+    /// underlying `io::ErrorKind`, so the chain walk is load-bearing.
+    ///
+    /// Explicitly asserts the source detail appears in `reason`;
+    /// `err.to_string()` would fail this assertion because its output
+    /// stops at the top-level Display.
+    #[test]
+    fn skipped_plugin_reason_preserves_io_source_detail_from_chain() {
+        let err = Error::Plugin(PluginError::DirectoryUnreadable {
+            path: PathBuf::from("/tmp/plugins/locked"),
+            source: std::io::Error::new(std::io::ErrorKind::PermissionDenied, "forbidden zone"),
+        });
+        let sp = SkippedPlugin::from_plugin_error("locked-plug".into(), &err)
+            .expect("DirectoryUnreadable is plugin-level, must construct");
+
+        assert!(
+            sp.reason.contains("could not access plugin directory"),
+            "reason must include the variant's Display text, got: {}",
+            sp.reason
+        );
+        assert!(
+            sp.reason.contains("forbidden zone"),
+            "reason must include the io::Error's message from the \
+             source chain (regression guard against `err.to_string()`), \
+             got: {}",
+            sp.reason
         );
     }
 
