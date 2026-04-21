@@ -7,10 +7,15 @@ cargo build
 
 ## Test
 ```bash
-cargo test                          # all tests
-cargo test -p kiro-market-core      # core library tests
-cargo test -p kiro-market           # CLI + integration tests
+cargo test                                             # all tests
+cargo test -p kiro-market-core                         # core library tests
+cargo test -p kiro-market                              # CLI + integration tests
+cargo test -p kiro-control-center --lib -- --ignored   # regenerate bindings.ts
 ```
+
+## Frontend (Tauri crate)
+From `crates/kiro-control-center/`:
+- `npm run check` — Svelte + TypeScript typecheck via `svelte-check`. Run after any core type change that flows through `bindings.ts`.
 
 ## Lint
 ```bash
@@ -30,9 +35,11 @@ Run all three before committing — CI enforces each:
 ## Code Style
 - Edition 2024, rust-version 1.85.0
 - `thiserror` for typed errors in kiro-market-core
-- Error chain: `#[source]` on inner variants (e.g. `PluginError::ManifestReadFailed { #[source] source: io::Error }`), `#[error(transparent)]` on top-level `Error` variants so `.source()` walks through. At Tauri/log boundaries call `error_full_chain(&err)` from `kiro_market_core::error` — `err.to_string()` only prints outer Display and loses source detail.
+- Error chain: `#[source]` on inner variants (e.g. `PluginError::ManifestReadFailed { #[source] source: io::Error }`), `#[error(transparent)]` on top-level `Error` variants so `.source()` walks through. At Tauri/log boundaries, AND in any wire-format `reason`/`error: String` field that crosses the FFI, use `error_full_chain(&err)` — not `err.to_string()`, which drops the source chain. See `SkippedPlugin::from_plugin_error` and `FailedSkill::install_failed` as the canonical constructors.
+- Don't name a non-`Error` payload field `source` on a `thiserror`-derived variant — the name is reserved for the `Error::source()` impl and requires the type to implement `Error`. Rename (e.g. `plugin_source: StructuredSource`) and keep the wire-format name via the projection to `SkippedReason`.
 - Prefer dedicated enum variants over `reason: String` sentinels when callers might branch on the semantic (e.g. `NotADirectory` / `SymlinkRefused` vs. a shared `DirectoryUnreadable { reason }`). `io::Error` goes directly in `#[source]` — no `Box` needed, it's `Send + Sync + 'static`.
 - **Parse, don't validate, at deserialization boundaries.** Untrusted string fields from manifests (`marketplace.json`, `plugin.json`, agent frontmatter) get wrapped in a newtype with a private inner field and a fallible `new` — see `RelativePath` (`validation.rs:28`) and `GitRef` (`git.rs:34`) as templates. Implement `Deserialize` to route through `new` so `serde_json::from_slice` rejects bad input at parse time, not later. A free `validate_xyz(&Thing) -> Result<()>` that nothing constructs is usually a missed newtype.
+- **Classifier functions over error enums enumerate every variant.** `SkippedReason::from_plugin_error`, `PluginError::remediation_hint`, and any similar "project a `PluginError` into a narrower type or pick a branch per variant" function must match every variant explicitly — no `_ => None` / `_ => default`. A new `PluginError` variant should then force a compile-time classification decision rather than silently defaulting. Two classifiers that share the same input enum drift one `_` apart otherwise.
 - `anyhow` for error propagation in kiro-market binary
 - `rstest` for parameterized tests, `tempfile` for test fixtures
 - `clippy::all` and `clippy::pedantic` enabled as warnings
