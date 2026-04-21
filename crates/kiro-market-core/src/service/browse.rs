@@ -306,7 +306,7 @@ pub struct PluginSkillsResult {
     pub skipped_skills: Vec<SkippedSkill>,
 }
 
-/// Result of `MarketplaceService::count_skills_for_plugin`.
+/// Result of [`MarketplaceService::count_skills_for_plugin`].
 /// Distinguishes the three cases the frontend must render differently:
 /// a known count, a remote plugin (not locally countable), and a local
 /// plugin whose directory or manifest could not be loaded. Replaces the
@@ -561,6 +561,61 @@ impl MarketplaceService {
             skipped_skills,
         })
     }
+
+    /// Count skills for a single plugin entry without loading skill bodies.
+    ///
+    /// Returns [`SkillCount::RemoteNotCounted`] for remote sources,
+    /// [`SkillCount::ManifestFailed`] if the plugin directory or its
+    /// `plugin.json` cannot be read or parsed, and [`SkillCount::Known`]
+    /// otherwise (including the legitimate zero case where the manifest
+    /// is absent or declares no skills).
+    ///
+    /// Takes the pre-resolved [`PluginEntry`] and `marketplace_path` so
+    /// the batch caller in `list_plugins` pays the registry-parse cost
+    /// once per marketplace rather than once per plugin. Errors are
+    /// never propagated as `Err` — every outcome fits the three-way
+    /// union.
+    ///
+    /// The plugin-directory pre-check delegates to
+    /// [`Self::resolve_local_plugin_dir`] so the hardening (symlink
+    /// refusal, `is_dir` check, `NotFound` / other-I/O classification) stays
+    /// consistent with the bulk-listing path and does not duplicate.
+    #[must_use]
+    pub fn count_skills_for_plugin(
+        &self,
+        plugin: &PluginEntry,
+        marketplace_path: &Path,
+    ) -> SkillCount {
+        // Short-circuit remote sources before `resolve_local_plugin_dir`
+        // is called — it would return `PluginError::RemoteSourceNotLocal`
+        // which we would then translate to `ManifestFailed`, conflating
+        // "remote by design" with "should have been local but resolved
+        // remote." The two need distinct UI states.
+        if matches!(plugin.source, PluginSource::Structured(_)) {
+            return SkillCount::RemoteNotCounted;
+        }
+
+        let plugin_dir = match self.resolve_local_plugin_dir(plugin, marketplace_path) {
+            Ok(p) => p,
+            Err(err) => {
+                return SkillCount::ManifestFailed {
+                    reason: skipped_reason_from_resolve_error(&plugin.name, err),
+                };
+            }
+        };
+
+        match load_plugin_manifest(&plugin_dir) {
+            Ok(manifest) => {
+                let count = discover_skills_for_plugin(&plugin_dir, manifest.as_ref()).len();
+                SkillCount::Known {
+                    count: u32::try_from(count).unwrap_or(u32::MAX),
+                }
+            }
+            Err(err) => SkillCount::ManifestFailed {
+                reason: skipped_reason_from_manifest_error(&plugin.name, &plugin_dir, err),
+            },
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -684,6 +739,79 @@ fn discover_skills_for_plugin(
     };
 
     discover_skill_dirs(plugin_dir, &skill_paths)
+}
+
+/// Project a `resolve_local_plugin_dir` error into a [`SkippedReason`].
+///
+/// `resolve_local_plugin_dir` only returns [`PluginError`] variants
+/// that [`SkippedReason::from_plugin_error`] classifies as
+/// plugin-level skips (`DirectoryMissing`, `NotADirectory`,
+/// `SymlinkRefused`, `DirectoryUnreadable`, plus
+/// `RemoteSourceNotLocal` — pre-empted at the caller). The defensive
+/// `unwrap_or_else` branch exists for forward-compatibility: if a
+/// future `PluginError` variant lands and the classifier chooses to
+/// propagate rather than skip, we fold it into `DirectoryUnreadable`
+/// with a `warn!` rather than regress to a silent `0`.
+fn skipped_reason_from_resolve_error(plugin_name: &str, err: Error) -> SkippedReason {
+    let Error::Plugin(pe) = err else {
+        // `resolve_local_plugin_dir` only returns `Error::Plugin` today,
+        // but `Error` is `#[non_exhaustive]` — defensive.
+        warn!(
+            plugin = %plugin_name,
+            error = %error_full_chain(&err),
+            "unexpected non-plugin error resolving plugin_dir; reporting as DirectoryUnreadable"
+        );
+        return SkippedReason::DirectoryUnreadable {
+            path: PathBuf::new(),
+            reason: error_full_chain(&err),
+        };
+    };
+    SkippedReason::from_plugin_error(&pe).unwrap_or_else(|| {
+        warn!(
+            plugin = %plugin_name,
+            error = ?pe,
+            "unclassified PluginError from resolve_local_plugin_dir; reporting as DirectoryUnreadable"
+        );
+        SkippedReason::DirectoryUnreadable {
+            path: PathBuf::new(),
+            reason: error_full_chain(&pe),
+        }
+    })
+}
+
+/// Project a `load_plugin_manifest` error into a [`SkippedReason`].
+///
+/// `load_plugin_manifest` returns [`PluginError::InvalidManifest`] or
+/// [`PluginError::ManifestReadFailed`] today. Same defensive pattern
+/// as [`skipped_reason_from_resolve_error`]: an unclassified variant
+/// folds into `ManifestReadFailed` with a `warn!`.
+fn skipped_reason_from_manifest_error(
+    plugin_name: &str,
+    plugin_dir: &Path,
+    err: Error,
+) -> SkippedReason {
+    let Error::Plugin(pe) = err else {
+        warn!(
+            plugin = %plugin_name,
+            error = %error_full_chain(&err),
+            "unexpected non-plugin error loading plugin.json; reporting as ManifestReadFailed"
+        );
+        return SkippedReason::ManifestReadFailed {
+            path: plugin_dir.join("plugin.json"),
+            reason: error_full_chain(&err),
+        };
+    };
+    SkippedReason::from_plugin_error(&pe).unwrap_or_else(|| {
+        warn!(
+            plugin = %plugin_name,
+            error = ?pe,
+            "unclassified PluginError from load_plugin_manifest; reporting as ManifestReadFailed"
+        );
+        SkippedReason::ManifestReadFailed {
+            path: plugin_dir.join("plugin.json"),
+            reason: error_full_chain(&pe),
+        }
+    })
 }
 
 /// Load a `plugin.json` from the given directory.
@@ -1993,5 +2121,199 @@ mod tests {
         assert_eq!(json["reason"]["kind"], "invalid_manifest");
         assert_eq!(json["reason"]["path"], "/tmp/plug/plugin.json");
         assert_eq!(json["reason"]["reason"], "expected `}`");
+    }
+
+    // -----------------------------------------------------------------------
+    // count_skills_for_plugin
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn count_skills_for_plugin_returns_known_for_local_plugin() {
+        let (dir, svc) = temp_service();
+        let marketplace_path = dir.path().join("marketplace");
+        make_plugin_with_skills(&marketplace_path, "my-plugin", &["alpha", "beta", "gamma"]);
+
+        let entry = relative_path_entry("my-plugin", "plugins/my-plugin");
+        let result = svc.count_skills_for_plugin(&entry, &marketplace_path);
+        assert!(
+            matches!(result, SkillCount::Known { count: 3 }),
+            "expected Known {{ count: 3 }}, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn count_skills_for_plugin_returns_known_with_zero_when_no_skills() {
+        let (dir, svc) = temp_service();
+        let marketplace_path = dir.path().join("marketplace");
+        let plugin_dir = marketplace_path.join("plugins/lonely");
+        fs::create_dir_all(&plugin_dir).expect("create plugin dir");
+        // A plugin.json with no custom skill paths → default paths apply,
+        // but no skills/ directory exists, so count is 0.
+        fs::write(
+            plugin_dir.join("plugin.json"),
+            r#"{"name": "lonely", "version": "0.0.0"}"#,
+        )
+        .expect("write plugin.json");
+
+        let entry = relative_path_entry("lonely", "plugins/lonely");
+        let result = svc.count_skills_for_plugin(&entry, &marketplace_path);
+        assert!(
+            matches!(result, SkillCount::Known { count: 0 }),
+            "expected Known {{ count: 0 }}, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn count_skills_for_plugin_returns_known_when_manifest_absent() {
+        let (dir, svc) = temp_service();
+        let marketplace_path = dir.path().join("marketplace");
+        // No plugin.json → defaults kick in. make_plugin_with_skills creates
+        // skills/ subdirs (not plugin.json), so the count comes from those
+        // subdirs alone.
+        make_plugin_with_skills(&marketplace_path, "defaults", &["alpha", "beta"]);
+
+        let entry = relative_path_entry("defaults", "plugins/defaults");
+        let result = svc.count_skills_for_plugin(&entry, &marketplace_path);
+        assert!(
+            matches!(result, SkillCount::Known { count: 2 }),
+            "expected Known {{ count: 2 }}, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn count_skills_for_plugin_returns_remote_for_structured_source() {
+        let (_dir, svc) = temp_service();
+        let marketplace_path = Path::new("/tmp/nonexistent-marketplace");
+
+        let entry = PluginEntry {
+            name: "remote".into(),
+            description: None,
+            source: PluginSource::Structured(StructuredSource::GitHub {
+                repo: "owner/repo".into(),
+                git_ref: None,
+                sha: None,
+            }),
+        };
+
+        let result = svc.count_skills_for_plugin(&entry, marketplace_path);
+        assert!(
+            matches!(result, SkillCount::RemoteNotCounted),
+            "expected RemoteNotCounted, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn count_skills_for_plugin_returns_manifest_failed_on_missing_plugin_dir() {
+        let (dir, svc) = temp_service();
+        let marketplace_path = dir.path().join("marketplace");
+        fs::create_dir_all(&marketplace_path).expect("create marketplace root");
+
+        let entry = relative_path_entry("ghost", "plugins/ghost");
+        let result = svc.count_skills_for_plugin(&entry, &marketplace_path);
+        assert!(
+            matches!(
+                result,
+                SkillCount::ManifestFailed {
+                    reason: SkippedReason::DirectoryMissing { .. }
+                }
+            ),
+            "expected ManifestFailed/DirectoryMissing, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn count_skills_for_plugin_returns_manifest_failed_when_plugin_dir_is_a_file() {
+        let (dir, svc) = temp_service();
+        let marketplace_path = dir.path().join("marketplace");
+        let plugins_root = marketplace_path.join("plugins");
+        fs::create_dir_all(&plugins_root).expect("create plugins root");
+        // Create a regular file where the plugin dir should be.
+        fs::write(plugins_root.join("not-a-dir"), b"i am a file").expect("write file");
+
+        let entry = relative_path_entry("not-a-dir", "plugins/not-a-dir");
+        let result = svc.count_skills_for_plugin(&entry, &marketplace_path);
+        assert!(
+            matches!(
+                result,
+                SkillCount::ManifestFailed {
+                    reason: SkippedReason::NotADirectory { .. }
+                }
+            ),
+            "expected ManifestFailed/NotADirectory, got: {result:?}"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn count_skills_for_plugin_returns_manifest_failed_on_symlinked_plugin_dir() {
+        use std::os::unix::fs::symlink;
+
+        let (dir, svc) = temp_service();
+        let marketplace_path = dir.path().join("marketplace");
+        let plugins_root = marketplace_path.join("plugins");
+        fs::create_dir_all(&plugins_root).expect("create plugins root");
+        // Symlink target must exist so the symlink itself is what triggers
+        // the refusal, not a broken-symlink variant.
+        let real_target = dir.path().join("real-plugin");
+        fs::create_dir_all(&real_target).expect("create real target");
+        symlink(&real_target, plugins_root.join("symlinked")).expect("create symlink");
+
+        let entry = relative_path_entry("symlinked", "plugins/symlinked");
+        let result = svc.count_skills_for_plugin(&entry, &marketplace_path);
+        assert!(
+            matches!(
+                result,
+                SkillCount::ManifestFailed {
+                    reason: SkippedReason::SymlinkRefused { .. }
+                }
+            ),
+            "expected ManifestFailed/SymlinkRefused, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn count_skills_for_plugin_returns_manifest_failed_on_malformed_json() {
+        let (dir, svc) = temp_service();
+        let marketplace_path = dir.path().join("marketplace");
+        let plugin_dir = marketplace_path.join("plugins/broken");
+        fs::create_dir_all(&plugin_dir).expect("create plugin dir");
+        fs::write(plugin_dir.join("plugin.json"), b"{not json").expect("write plugin.json");
+
+        let entry = relative_path_entry("broken", "plugins/broken");
+        let result = svc.count_skills_for_plugin(&entry, &marketplace_path);
+        assert!(
+            matches!(
+                result,
+                SkillCount::ManifestFailed {
+                    reason: SkippedReason::InvalidManifest { .. }
+                }
+            ),
+            "expected ManifestFailed/InvalidManifest, got: {result:?}"
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn count_skills_for_plugin_treats_symlinked_plugin_json_as_missing() {
+        use std::os::unix::fs::symlink;
+
+        let (dir, svc) = temp_service();
+        let marketplace_path = dir.path().join("marketplace");
+        let plugin_dir = marketplace_path.join("plugins/symjson");
+        fs::create_dir_all(&plugin_dir).expect("create plugin dir");
+        // Symlinked plugin.json is treated as absent by load_plugin_manifest
+        // (security hardening; see its symlink_metadata branch). That means
+        // we fall back to default skill paths — no skills/ dir exists here,
+        // so count is 0. Regression pin for this specific interaction.
+        let real_manifest = dir.path().join("real-plugin.json");
+        fs::write(&real_manifest, b"{\"name\":\"irrelevant\"}").expect("write real manifest");
+        symlink(&real_manifest, plugin_dir.join("plugin.json")).expect("create symlink");
+
+        let entry = relative_path_entry("symjson", "plugins/symjson");
+        let result = svc.count_skills_for_plugin(&entry, &marketplace_path);
+        assert!(
+            matches!(result, SkillCount::Known { count: 0 }),
+            "expected Known {{ count: 0 }}, got: {result:?}"
+        );
     }
 }
