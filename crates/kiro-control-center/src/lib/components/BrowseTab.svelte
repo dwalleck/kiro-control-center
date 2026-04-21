@@ -214,41 +214,52 @@
     }
   }
 
-  // Shared scaffold for fetch helpers: manages `pendingFetches` membership,
-  // error-banner state on success/failure, and structured console logging.
-  // Each caller provides the result-producing op and the success-side cache
-  // update; cache-hit guards stay at the call site since each helper has
-  // its own cache shape.
+  // Shared scaffold for fetch helpers: manages `pendingFetches` membership
+  // and structured console logging. The guard deliberately does NOT mutate
+  // `fetchErrors` — callers own their banner lifecycle end-to-end via the
+  // `onSuccess` / `onError` callbacks. A prior design had the guard clear
+  // the banner at `pendingKey` after `onSuccess` returned, which silently
+  // wiped any banner the callback had set under the same key (see the
+  // `skipped_skills` regression on the single-plugin path). Keeping error
+  // ownership at the call site prevents that class of collision — the
+  // guard never touches keys it doesn't own.
   async function withFetchGuard<T>(
-    key: ErrorSource,
+    pendingKey: ErrorSource,
     label: string,
     op: () => Promise<{ status: "ok"; data: T } | { status: "error"; error: { message: string } }>,
-    onSuccess: (data: T) => void
+    callbacks: {
+      onSuccess: (data: T) => void;
+      onError: (message: string) => void;
+    }
   ): Promise<void> {
-    pendingFetches.add(key);
+    pendingFetches.add(pendingKey);
     try {
       const result = await op();
       if (result.status === "ok") {
-        onSuccess(result.data);
-        fetchErrors.delete(key);
+        callbacks.onSuccess(result.data);
       } else {
         console.error(`[BrowseTab] ${label} returned error`, result.error);
-        fetchErrors.set(key, `${label}: ${result.error.message}`);
+        callbacks.onError(result.error.message);
       }
     } catch (e) {
       console.error(`[BrowseTab] ${label} threw`, e);
-      const reason = e instanceof Error ? e.message : String(e);
-      fetchErrors.set(key, `${label}: ${reason}`);
+      callbacks.onError(e instanceof Error ? e.message : String(e));
     } finally {
-      pendingFetches.delete(key);
+      pendingFetches.delete(pendingKey);
     }
   }
 
   async function fetchPluginsFor(mp: string) {
     const key = pluginsErrKey(mp);
     if (pendingFetches.has(key) || pluginsByMarketplace[mp]) return;
-    await withFetchGuard(key, mp, () => commands.listPlugins(mp), (data) => {
-      pluginsByMarketplace[mp] = data;
+    await withFetchGuard(key, mp, () => commands.listPlugins(mp), {
+      onSuccess: (data) => {
+        pluginsByMarketplace[mp] = data;
+        fetchErrors.delete(key);
+      },
+      onError: (message) => {
+        fetchErrors.set(key, `${mp}: ${message}`);
+      },
     });
   }
 
@@ -261,22 +272,30 @@
       key,
       `${mp}/${plugin}`,
       () => commands.listAvailableSkills(mp, plugin, projectPath),
-      (data) => {
-        // data is PluginSkillsResult (#30): { skills, skipped_skills }.
-        // Happy-path skills populate the card grid; per-skill read
-        // failures surface via the same per-plugin fetchErrors banner
-        // stream used by plugin-level skips (from the bulk path), so a
-        // user who sees "plugin X" in the warning list can also see
-        // "plugin Y has 2 skills that failed to load" on the same
-        // panel. Dropping skipped_skills on the floor was the silent
-        // regression flagged in the review.
-        skillsByPluginPair[cacheKey] = data.skills;
-        if (data.skipped_skills.length > 0) {
-          fetchErrors.set(
-            skillsErrKey(mp, plugin),
-            `${mp}/${plugin}: ${formatSkippedSkillsForPlugin(data.skipped_skills)}`
-          );
-        }
+      {
+        onSuccess: (data) => {
+          // data is PluginSkillsResult (#30): { skills, skipped_skills }.
+          // Happy-path skills populate the card grid; per-skill read
+          // failures surface via the same per-plugin fetchErrors banner
+          // stream used by plugin-level skips (from the bulk path), so a
+          // user who sees "plugin X" in the warning list can also see
+          // "plugin Y has 2 skills that failed to load" on the same
+          // panel. The set/delete branches are mutually exclusive: a
+          // retry that fixes the malformed SKILL.md must clear the stale
+          // banner, a retry that still has failures must replace it.
+          skillsByPluginPair[cacheKey] = data.skills;
+          if (data.skipped_skills.length > 0) {
+            fetchErrors.set(
+              key,
+              `${mp}/${plugin}: ${formatSkippedSkillsForPlugin(data.skipped_skills)}`
+            );
+          } else {
+            fetchErrors.delete(key);
+          }
+        },
+        onError: (message) => {
+          fetchErrors.set(key, `${mp}/${plugin}: ${message}`);
+        },
       }
     );
   }
@@ -304,66 +323,76 @@
       key,
       mp,
       () => commands.listAllSkillsForMarketplace(mp, projectPath),
-      ({ skills: skillList, skipped, skipped_skills }) => {
-        const byPlugin = new Map<string, SkillInfo[]>();
-        for (const s of skillList) {
-          const arr = byPlugin.get(s.plugin);
-          if (arr) arr.push(s);
-          else byPlugin.set(s.plugin, [s]);
-        }
-        const skippedNames = new Set(skipped.map((s) => s.name));
+      {
+        onSuccess: ({ skills: skillList, skipped, skipped_skills }) => {
+          const byPlugin = new Map<string, SkillInfo[]>();
+          for (const s of skillList) {
+            const arr = byPlugin.get(s.plugin);
+            if (arr) arr.push(s);
+            else byPlugin.set(s.plugin, [s]);
+          }
+          const skippedNames = new Set(skipped.map((s) => s.name));
 
-        // Group per-skill skips by plugin so each plugin gets one
-        // warning banner regardless of how many of its skills failed.
-        // Per-skill and plugin-level skips are disjoint (a plugin whose
-        // directory fails to resolve never reaches the per-skill loop),
-        // so the two banner streams don't collide on the same key.
-        const skippedSkillsByPlugin = new Map<string, SkippedSkill[]>();
-        for (const s of skipped_skills) {
-          const arr = skippedSkillsByPlugin.get(s.plugin);
-          if (arr) arr.push(s);
-          else skippedSkillsByPlugin.set(s.plugin, [s]);
-        }
+          // Group per-skill skips by plugin so each plugin gets one
+          // warning banner regardless of how many of its skills failed.
+          // Per-skill and plugin-level skips are disjoint (a plugin whose
+          // directory fails to resolve never reaches the per-skill loop),
+          // so the two banner streams don't collide on the same key.
+          const skippedSkillsByPlugin = new Map<string, SkippedSkill[]>();
+          for (const s of skipped_skills) {
+            const arr = skippedSkillsByPlugin.get(s.plugin);
+            if (arr) arr.push(s);
+            else skippedSkillsByPlugin.set(s.plugin, [s]);
+          }
 
-        for (const p of plugins) {
-          // Skipped plugins get NO cache entry so the per-plugin path can
-          // still be tried if the user narrows to them — a retry might
-          // succeed (e.g. if the manifest was hand-edited).
-          if (skippedNames.has(p.name)) continue;
-          skillsByPluginPair[pluginKey(mp, p.name)] = byPlugin.get(p.name) ?? [];
-        }
+          for (const p of plugins) {
+            // Skipped plugins get NO cache entry so the per-plugin path can
+            // still be tried if the user narrows to them — a retry might
+            // succeed (e.g. if the manifest was hand-edited).
+            if (skippedNames.has(p.name)) continue;
+            skillsByPluginPair[pluginKey(mp, p.name)] = byPlugin.get(p.name) ?? [];
+          }
 
-        // Record per-plugin error banners for every skipped plugin.
-        for (const s of skipped) {
-          fetchErrors.set(skillsErrKey(mp, s.name), `${mp}/${s.name}: ${s.reason}`);
-        }
-        // Record per-plugin error banners for plugins with per-skill
-        // read/parse failures — previously dropped silently (the exact
-        // regression the code-review called out for the bulk path).
-        for (const [plugin, list] of skippedSkillsByPlugin) {
-          fetchErrors.set(
-            skillsErrKey(mp, plugin),
-            `${mp}/${plugin}: ${formatSkippedSkillsForPlugin(list)}`
-          );
-        }
+          // Record per-plugin error banners for every skipped plugin.
+          for (const s of skipped) {
+            fetchErrors.set(skillsErrKey(mp, s.name), `${mp}/${s.name}: ${s.reason}`);
+          }
+          // Record per-plugin error banners for plugins with per-skill
+          // read/parse failures — previously dropped silently (the exact
+          // regression the code-review called out for the bulk path).
+          for (const [plugin, list] of skippedSkillsByPlugin) {
+            fetchErrors.set(
+              skillsErrKey(mp, plugin),
+              `${mp}/${plugin}: ${formatSkippedSkillsForPlugin(list)}`
+            );
+          }
 
-        // The bulk response is authoritative for working plugins — clear
-        // stale per-plugin skill errors for THIS mp EXCEPT for pairs whose
-        // fetch is still in flight (racing write could clobber us) and
-        // EXCEPT entries we just set above for skipped plugins OR plugins
-        // with surfaced per-skill failures (both populate the same
-        // banner key and must survive the post-bulk cleanup).
-        const stale: ErrorSource[] = [];
-        for (const k of fetchErrors.keys()) {
-          if (!k.startsWith(SKILLS_ERR_PREFIX)) continue;
-          const { marketplace, plugin } = parsePluginKey(k.slice(SKILLS_ERR_PREFIX.length));
-          if (marketplace !== mp) continue;
-          if (skippedNames.has(plugin)) continue;
-          if (skippedSkillsByPlugin.has(plugin)) continue;
-          if (pendingFetches.has(skillsErrKey(marketplace, plugin))) continue;
-          stale.push(k);
-        }
-        for (const k of stale) fetchErrors.delete(k);
+          // The bulk response is authoritative for working plugins — clear
+          // stale per-plugin skill errors for THIS mp EXCEPT for pairs whose
+          // fetch is still in flight (racing write could clobber us) and
+          // EXCEPT entries we just set above for skipped plugins OR plugins
+          // with surfaced per-skill failures (both populate the same
+          // banner key and must survive the post-bulk cleanup).
+          const stale: ErrorSource[] = [];
+          for (const k of fetchErrors.keys()) {
+            if (!k.startsWith(SKILLS_ERR_PREFIX)) continue;
+            const { marketplace, plugin } = parsePluginKey(k.slice(SKILLS_ERR_PREFIX.length));
+            if (marketplace !== mp) continue;
+            if (skippedNames.has(plugin)) continue;
+            if (skippedSkillsByPlugin.has(plugin)) continue;
+            if (pendingFetches.has(skillsErrKey(marketplace, plugin))) continue;
+            stale.push(k);
+          }
+          for (const k of stale) fetchErrors.delete(k);
+
+          // Clear the bulk-level error banner for this marketplace. The
+          // per-plugin writes above target a different prefix, so this
+          // does not collide with anything we just set.
+          fetchErrors.delete(key);
+        },
+        onError: (message) => {
+          fetchErrors.set(key, `${mp}: ${message}`);
+        },
       }
     );
   }
