@@ -10,7 +10,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use serde::Serialize;
-use tracing::{debug, warn};
+use tracing::{debug, error, warn};
 
 use crate::error::{Error, PluginError, error_full_chain};
 use crate::marketplace::{PluginEntry, PluginSource, StructuredSource};
@@ -330,8 +330,8 @@ pub enum SkillCount {
     /// The plugin is local but something about its directory or
     /// `plugin.json` prevented a skill count.
     ///
-    /// `SkippedReason` is reused as the error payload to share the #30
-    /// projection [`SkippedReason::from_plugin_error`]. Reachable from
+    /// `SkippedReason` is reused as the error payload to share the
+    /// [`SkippedReason::from_plugin_error`] classifier. Reachable from
     /// this path:
     ///
     /// From the `MarketplaceService::resolve_local_plugin_dir` pre-check:
@@ -598,8 +598,17 @@ impl MarketplaceService {
         let plugin_dir = match self.resolve_local_plugin_dir(plugin, marketplace_path) {
             Ok(p) => p,
             Err(err) => {
+                // Compute the intended path for defensive fallback logging;
+                // `resolve_local_plugin_dir`'s success path would have
+                // returned this value. For `Structured` sources we'd
+                // never reach here (the remote short-circuit above
+                // caught it), so the `rel` branch is the only case.
+                let plugin_dir_hint = match &plugin.source {
+                    PluginSource::RelativePath(rel) => marketplace_path.join(rel),
+                    PluginSource::Structured(_) => marketplace_path.to_path_buf(),
+                };
                 return SkillCount::ManifestFailed {
-                    reason: skipped_reason_from_resolve_error(&plugin.name, err),
+                    reason: skipped_reason_from_resolve_error(&plugin.name, &plugin_dir_hint, err),
                 };
             }
         };
@@ -607,9 +616,16 @@ impl MarketplaceService {
         match load_plugin_manifest(&plugin_dir) {
             Ok(manifest) => {
                 let count = discover_skills_for_plugin(&plugin_dir, manifest.as_ref()).len();
-                SkillCount::Known {
-                    count: u32::try_from(count).unwrap_or(u32::MAX),
-                }
+                let saturated = u32::try_from(count).unwrap_or_else(|_| {
+                    warn!(
+                        plugin = %plugin.name,
+                        path = %plugin_dir.display(),
+                        original = count,
+                        "skill count exceeds u32::MAX; saturating"
+                    );
+                    u32::MAX
+                });
+                SkillCount::Known { count: saturated }
             }
             Err(err) => SkillCount::ManifestFailed {
                 reason: skipped_reason_from_manifest_error(&plugin.name, &plugin_dir, err),
@@ -749,10 +765,20 @@ fn discover_skills_for_plugin(
 /// `SymlinkRefused`, `DirectoryUnreadable`, plus
 /// `RemoteSourceNotLocal` — pre-empted at the caller). The defensive
 /// `unwrap_or_else` branch exists for forward-compatibility: if a
-/// future `PluginError` variant lands and the classifier chooses to
-/// propagate rather than skip, we fold it into `DirectoryUnreadable`
-/// with a `warn!` rather than regress to a silent `0`.
-fn skipped_reason_from_resolve_error(plugin_name: &str, err: Error) -> SkippedReason {
+/// future `PluginError` variant lands and the classifier returns
+/// `None`, we fold it into `DirectoryUnreadable` with an `error!`
+/// (a missing classification is a code defect, not a runtime warning)
+/// rather than regress to a silent `0`.
+///
+/// `plugin_dir_hint` is the intended plugin directory the caller would
+/// have resolved on the success path; it is used to populate the
+/// `DirectoryUnreadable.path` field in the defensive fallbacks so the
+/// UI can render something more informative than an empty path.
+fn skipped_reason_from_resolve_error(
+    plugin_name: &str,
+    plugin_dir_hint: &Path,
+    err: Error,
+) -> SkippedReason {
     let Error::Plugin(pe) = err else {
         // `resolve_local_plugin_dir` only returns `Error::Plugin` today,
         // but `Error` is `#[non_exhaustive]` — defensive.
@@ -762,18 +788,18 @@ fn skipped_reason_from_resolve_error(plugin_name: &str, err: Error) -> SkippedRe
             "unexpected non-plugin error resolving plugin_dir; reporting as DirectoryUnreadable"
         );
         return SkippedReason::DirectoryUnreadable {
-            path: PathBuf::new(),
+            path: plugin_dir_hint.to_path_buf(),
             reason: error_full_chain(&err),
         };
     };
     SkippedReason::from_plugin_error(&pe).unwrap_or_else(|| {
-        warn!(
+        error!(
             plugin = %plugin_name,
             error = ?pe,
             "unclassified PluginError from resolve_local_plugin_dir; reporting as DirectoryUnreadable"
         );
         SkippedReason::DirectoryUnreadable {
-            path: PathBuf::new(),
+            path: plugin_dir_hint.to_path_buf(),
             reason: error_full_chain(&pe),
         }
     })
@@ -784,7 +810,9 @@ fn skipped_reason_from_resolve_error(plugin_name: &str, err: Error) -> SkippedRe
 /// `load_plugin_manifest` returns [`PluginError::InvalidManifest`] or
 /// [`PluginError::ManifestReadFailed`] today. Same defensive pattern
 /// as [`skipped_reason_from_resolve_error`]: an unclassified variant
-/// folds into `ManifestReadFailed` with a `warn!`.
+/// folds into `ManifestReadFailed` with an `error!` — a missing
+/// classification indicates a new `PluginError` variant was added
+/// without a corresponding branch in `SkippedReason::from_plugin_error`.
 fn skipped_reason_from_manifest_error(
     plugin_name: &str,
     plugin_dir: &Path,
@@ -802,7 +830,7 @@ fn skipped_reason_from_manifest_error(
         };
     };
     SkippedReason::from_plugin_error(&pe).unwrap_or_else(|| {
-        warn!(
+        error!(
             plugin = %plugin_name,
             error = ?pe,
             "unclassified PluginError from load_plugin_manifest; reporting as ManifestReadFailed"
@@ -1165,7 +1193,7 @@ mod tests {
         )
         .expect("per-skill errors should not propagate");
 
-        // Regression for #30: previously the bad frontmatter vanished into
+        // Regression guard: previously the bad frontmatter vanished into
         // a warn! log. Now it must surface as a structured SkippedSkill.
         assert_eq!(out.len(), 1, "bad frontmatter should not be in skills");
         assert_eq!(out[0].name, "good-skill");
@@ -1632,8 +1660,8 @@ mod tests {
         // The structured `kind` is the programmatic contract; the
         // `reason` Display-string is a human-readable convenience and
         // may rephrase freely. Previously this test substring-matched
-        // on `reason` (the TODO(#30) it replaced); the `matches!` below
-        // survives any Display rewording.
+        // on `reason` before the structured SkippedReason existed; the
+        // `matches!` below survives any Display rewording.
         assert!(
             matches!(
                 result.skipped[0].kind,
@@ -1696,7 +1724,7 @@ mod tests {
 
     /// Regression guard: a regular file sitting at the plugin path must
     /// fold into `skipped` with `kind = NotADirectory`, not propagate
-    /// or mis-classify as `DirectoryMissing`. Pre-#30 this class was
+    /// or mis-classify as `DirectoryMissing`. Previously this class was
     /// only covered at the `resolve_local_plugin_dir` unit layer; the
     /// e2e assertion catches a regression where the bulk loop gets
     /// narrowed to a subset of plugin-level variants.
@@ -1733,7 +1761,7 @@ mod tests {
     }
 
     /// Regression guard: a symlink at the plugin path must classify as
-    /// `SymlinkRefused` end-to-end. Before #30 only the
+    /// `SymlinkRefused` end-to-end. Previously only the
     /// `resolve_local_plugin_dir` unit test covered this; the bulk
     /// classifier could regress silently (symlink falls through to a
     /// different variant).
@@ -1825,7 +1853,7 @@ mod tests {
         }
     }
 
-    /// Before #30, a single malformed `SKILL.md` inside an otherwise-
+    /// Previously, a single malformed `SKILL.md` inside an otherwise-
     /// working plugin vanished into `warn!` + `continue`, leaving the
     /// frontend to guess why the skill count shrank. The bulk path now
     /// folds it into [`BulkSkillsResult::skipped_skills`] as a
@@ -2289,6 +2317,32 @@ mod tests {
                 }
             ),
             "expected ManifestFailed/InvalidManifest, got: {result:?}"
+        );
+    }
+
+    #[test]
+    fn count_skills_for_plugin_returns_manifest_failed_when_plugin_json_is_a_directory() {
+        let (dir, svc) = temp_service();
+        let marketplace_path = dir.path().join("marketplace");
+        let plugin_dir = marketplace_path.join("plugins/json-is-a-dir");
+        fs::create_dir_all(&plugin_dir).expect("create plugin dir");
+        // Create `plugin.json` as a directory (not a regular file). stat
+        // succeeds (not a symlink, not NotFound), so load_plugin_manifest
+        // proceeds to fs::read which fails with ErrorKind::IsADirectory →
+        // PluginError::ManifestReadFailed. Pins the ManifestReadFailed
+        // branch portably without requiring chmod or root-awareness.
+        fs::create_dir(plugin_dir.join("plugin.json")).expect("create plugin.json as dir");
+
+        let entry = relative_path_entry("json-is-a-dir", "plugins/json-is-a-dir");
+        let result = svc.count_skills_for_plugin(&entry, &marketplace_path);
+        assert!(
+            matches!(
+                result,
+                SkillCount::ManifestFailed {
+                    reason: SkippedReason::ManifestReadFailed { .. }
+                }
+            ),
+            "expected ManifestFailed/ManifestReadFailed, got: {result:?}"
         );
     }
 

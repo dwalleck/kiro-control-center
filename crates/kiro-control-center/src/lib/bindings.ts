@@ -35,7 +35,7 @@ export const commands = {
 	 *  Returns the core [`InstallSkillsResult`] directly rather than through a
 	 *  Tauri-local wrapper — the previous wrapper was a field-by-field copy
 	 *  and risked drifting away from the core shape (e.g. losing the
-	 *  `FailedSkill::kind` and `skipped_skills` fields introduced in #30).
+	 *  structured `FailedSkill::kind` and `skipped_skills` fields).
 	 *  Using the core type keeps the wire format lockstep with what the
 	 *  service emits.
 	 */
@@ -400,8 +400,8 @@ export type SkillCount =
  *  The plugin is local but something about its directory or
  *  `plugin.json` prevented a skill count.
  * 
- *  `SkippedReason` is reused as the error payload to share the #30
- *  projection [`SkippedReason::from_plugin_error`]. Reachable from
+ *  `SkippedReason` is reused as the error payload to share the
+ *  [`SkippedReason::from_plugin_error`] classifier. Reachable from
  *  this path:
  * 
  *  From the `MarketplaceService::resolve_local_plugin_dir` pre-check:

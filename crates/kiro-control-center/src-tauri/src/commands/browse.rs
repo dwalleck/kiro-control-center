@@ -191,7 +191,7 @@ pub async fn list_all_skills_for_marketplace(
 /// Returns the core [`InstallSkillsResult`] directly rather than through a
 /// Tauri-local wrapper — the previous wrapper was a field-by-field copy
 /// and risked drifting away from the core shape (e.g. losing the
-/// `FailedSkill::kind` and `skipped_skills` fields introduced in #30).
+/// structured `FailedSkill::kind` and `skipped_skills` fields).
 /// Using the core type keeps the wire format lockstep with what the
 /// service emits.
 #[tauri::command]

@@ -3419,10 +3419,10 @@ mod tests {
     }
 
     // -------------------------------------------------------------------
-    // install_skills: per-skill surfacing + FailedSkillReason (audit #30)
+    // install_skills: per-skill surfacing + FailedSkillReason
     // -------------------------------------------------------------------
     //
-    // These tests pin the behavior introduced by the issue-#30 audit fold-in:
+    // These tests pin the behavior introduced by the silent-drop audit:
     // install_skills used to vanish per-skill read/parse failures into
     // `warn!` + `continue`. They now surface as structured `skipped_skills`
     // entries, and requested-but-missing names carry the typed
@@ -3564,9 +3564,9 @@ mod tests {
     }
 
     /// Regression guard for the `install_skills` per-skill
-    /// `read_to_string` failure path. Before the #30 audit fold-in,
-    /// this vanished into `warn!` + `continue`; now it must surface as
-    /// a structured `SkippedSkill` with `ReadFailed`. The sibling
+    /// `read_to_string` failure path. Previously, this vanished into
+    /// `warn!` + `continue`; now it must surface as a structured
+    /// `SkippedSkill` with `ReadFailed`. The sibling
     /// `list_all_skills_surfaces_unreadable_skill_md_as_skipped_skill`
     /// exists in the browse module and covers the identical branch in
     /// `collect_skills_for_plugin_into` — this test catches a
