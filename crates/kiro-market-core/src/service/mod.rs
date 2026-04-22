@@ -907,7 +907,7 @@ impl MarketplaceService {
                         name_hint: browse::name_hint_from_skill_dir(skill_dir),
                         path: skill_md_path,
                         reason: browse::SkippedSkillReason::ReadFailed {
-                            reason: e.to_string(),
+                            reason: error_full_chain(&e),
                         },
                     });
                     continue;
@@ -927,7 +927,7 @@ impl MarketplaceService {
                         name_hint: browse::name_hint_from_skill_dir(skill_dir),
                         path: skill_md_path,
                         reason: browse::SkippedSkillReason::FrontmatterInvalid {
-                            reason: e.to_string(),
+                            reason: error_full_chain(&e),
                         },
                     });
                     continue;

@@ -746,7 +746,7 @@ fn collect_skills_for_plugin_into(
                     name_hint: name_hint_from_skill_dir(skill_dir),
                     path: skill_md_path,
                     reason: SkippedSkillReason::ReadFailed {
-                        reason: e.to_string(),
+                        reason: error_full_chain(&e),
                     },
                 });
                 continue;
@@ -768,7 +768,7 @@ fn collect_skills_for_plugin_into(
                     name_hint: name_hint_from_skill_dir(skill_dir),
                     path: skill_md_path,
                     reason: SkippedSkillReason::FrontmatterInvalid {
-                        reason: e.to_string(),
+                        reason: error_full_chain(&e),
                     },
                 });
                 continue;
@@ -989,7 +989,7 @@ fn load_plugin_manifest(plugin_dir: &Path) -> Result<Option<PluginManifest>, Err
             );
             Err(PluginError::InvalidManifest {
                 path: manifest_path,
-                reason: e.to_string(),
+                reason: error_full_chain(&e),
             }
             .into())
         }
@@ -1011,6 +1011,55 @@ mod tests {
     use crate::service::test_support::{
         make_plugin_with_skills, relative_path_entry, seed_marketplace_with_registry, temp_service,
     };
+
+    /// Build an `io::Error` whose Custom repr wraps a two-link error chain.
+    /// Regression tests that observe chain preservation need depth beyond
+    /// the `io::Error`'s top-level Display — `io::Error::from(ErrorKind)`
+    /// alone has no source, so `source.to_string()` and
+    /// `error_full_chain(source)` would produce identical output and
+    /// render the tests tautological. The returned error has Display
+    /// = `outer_msg` and `source().to_string()` = `inner_msg`.
+    fn chained_io_error(
+        kind: std::io::ErrorKind,
+        outer_msg: &'static str,
+        inner_msg: &'static str,
+    ) -> std::io::Error {
+        use std::error::Error as StdError;
+        use std::fmt;
+
+        #[derive(Debug)]
+        struct Inner(&'static str);
+        impl fmt::Display for Inner {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str(self.0)
+            }
+        }
+        impl StdError for Inner {}
+
+        #[derive(Debug)]
+        struct Outer {
+            display: &'static str,
+            source: Inner,
+        }
+        impl fmt::Display for Outer {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str(self.display)
+            }
+        }
+        impl StdError for Outer {
+            fn source(&self) -> Option<&(dyn StdError + 'static)> {
+                Some(&self.source)
+            }
+        }
+
+        std::io::Error::new(
+            kind,
+            Outer {
+                display: outer_msg,
+                source: Inner(inner_msg),
+            },
+        )
+    }
 
     // -----------------------------------------------------------------------
     // resolve_local_plugin_dir
@@ -1495,45 +1544,20 @@ mod tests {
     /// `Error::Plugin` wrapping). Before the fix, deeper causes wrapped
     /// inside an `io::Error` were dropped.
     ///
-    /// Uses a custom chained error inside the `io::Error` so the chain has
-    /// observable depth — `io::Error::from(ErrorKind)` alone has no
-    /// source, so `source.to_string()` and `error_full_chain(source)`
-    /// would produce identical output. Only a chained construction
-    /// distinguishes them.
+    /// Uses [`chained_io_error`] to construct an `io::Error` with
+    /// observable chain depth. A bare `io::Error::from(ErrorKind)` has
+    /// no source and would make `source.to_string()` and
+    /// `error_full_chain(source)` produce identical output, rendering
+    /// this test tautological.
     #[test]
     fn skipped_reason_directory_unreadable_preserves_io_source_chain() {
-        use std::error::Error as StdError;
-        use std::fmt;
-
-        #[derive(Debug)]
-        struct ChainedInner;
-        impl fmt::Display for ChainedInner {
-            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-                f.write_str("deep cause from filesystem driver")
-            }
-        }
-        impl StdError for ChainedInner {}
-
-        #[derive(Debug)]
-        struct ChainedOuter(ChainedInner);
-        impl fmt::Display for ChainedOuter {
-            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-                f.write_str("forbidden zone")
-            }
-        }
-        impl StdError for ChainedOuter {
-            fn source(&self) -> Option<&(dyn StdError + 'static)> {
-                Some(&self.0)
-            }
-        }
-
-        let io_err = std::io::Error::new(
-            std::io::ErrorKind::PermissionDenied,
-            ChainedOuter(ChainedInner),
-        );
         let plugin_err = PluginError::DirectoryUnreadable {
             path: PathBuf::from("/tmp/plugins/locked"),
-            source: io_err,
+            source: chained_io_error(
+                std::io::ErrorKind::PermissionDenied,
+                "forbidden zone",
+                "deep cause from filesystem driver",
+            ),
         };
 
         let Some(SkippedReason::DirectoryUnreadable { reason, .. }) =
@@ -1550,6 +1574,10 @@ mod tests {
             reason.contains("deep cause from filesystem driver"),
             "reason must include deeper source chain via error_full_chain, got: {reason}"
         );
+        assert!(
+            reason.contains(": deep cause from filesystem driver"),
+            "chain segments must be joined by `: `, got: {reason}"
+        );
     }
 
     /// Sibling of the `DirectoryUnreadable` regression test — same
@@ -1558,35 +1586,13 @@ mod tests {
     /// tests paired so future divergence fails both, not one.
     #[test]
     fn skipped_reason_manifest_read_failed_preserves_io_source_chain() {
-        use std::error::Error as StdError;
-        use std::fmt;
-
-        #[derive(Debug)]
-        struct ChainedInner;
-        impl fmt::Display for ChainedInner {
-            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-                f.write_str("deep cause from parser layer")
-            }
-        }
-        impl StdError for ChainedInner {}
-
-        #[derive(Debug)]
-        struct ChainedOuter(ChainedInner);
-        impl fmt::Display for ChainedOuter {
-            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-                f.write_str("read failure")
-            }
-        }
-        impl StdError for ChainedOuter {
-            fn source(&self) -> Option<&(dyn StdError + 'static)> {
-                Some(&self.0)
-            }
-        }
-
-        let io_err = std::io::Error::other(ChainedOuter(ChainedInner));
         let plugin_err = PluginError::ManifestReadFailed {
             path: PathBuf::from("/tmp/plugins/corrupt/plugin.json"),
-            source: io_err,
+            source: chained_io_error(
+                std::io::ErrorKind::Other,
+                "read failure",
+                "deep cause from parser layer",
+            ),
         };
 
         let Some(SkippedReason::ManifestReadFailed { reason, .. }) =
@@ -1602,6 +1608,10 @@ mod tests {
         assert!(
             reason.contains("deep cause from parser layer"),
             "reason must include deeper source chain via error_full_chain, got: {reason}"
+        );
+        assert!(
+            reason.contains(": deep cause from parser layer"),
+            "chain segments must be joined by `: `, got: {reason}"
         );
     }
 
