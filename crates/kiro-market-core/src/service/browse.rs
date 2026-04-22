@@ -2461,7 +2461,26 @@ mod tests {
             .resolve_plugin_install_context("mp1", "myplugin")
             .expect("happy path");
         assert_eq!(ctx.version.as_deref(), Some("1.2.3"));
-        assert_eq!(ctx.skill_dirs.len(), 3);
+        let mut names: Vec<String> = ctx
+            .skill_dirs
+            .iter()
+            .map(|p| {
+                p.file_name()
+                    .and_then(|s| s.to_str())
+                    .expect("skill dir has valid UTF-8 name")
+                    .to_string()
+            })
+            .collect();
+        names.sort();
+        assert_eq!(
+            names,
+            vec!["alpha".to_string(), "beta".to_string(), "gamma".to_string()]
+        );
+        assert!(
+            ctx.skill_dirs.iter().all(|p| p.join("SKILL.md").is_file()),
+            "every skill dir must contain a SKILL.md: {:?}",
+            ctx.skill_dirs
+        );
     }
 
     #[test]
@@ -2508,6 +2527,62 @@ mod tests {
             ctx.version
         );
         assert_eq!(ctx.skill_dirs.len(), 1);
+    }
+
+    #[test]
+    fn resolve_plugin_install_context_uses_manifest_skills_when_declared() {
+        let (dir, svc) = temp_service();
+        let entries = vec![relative_path_entry("withcustom", "plugins/withcustom")];
+        let marketplace_path = seed_marketplace_with_registry(dir.path(), &svc, "mp1", &entries);
+        let plugin_dir = marketplace_path.join("plugins").join("withcustom");
+        let agents_dir = plugin_dir.join("agents");
+        for skill in &["foo", "bar"] {
+            let skill_dir = agents_dir.join(skill);
+            fs::create_dir_all(&skill_dir).expect("create agent skill dir");
+            fs::write(
+                skill_dir.join("SKILL.md"),
+                format!("---\nname: {skill}\ndescription: test\n---\n"),
+            )
+            .expect("write SKILL.md");
+        }
+        fs::write(
+            plugin_dir.join("plugin.json"),
+            br#"{"name": "withcustom", "version": "0.1.0", "skills": ["./agents/"]}"#,
+        )
+        .expect("write plugin.json");
+
+        let ctx = svc
+            .resolve_plugin_install_context("mp1", "withcustom")
+            .expect("happy path");
+        assert_eq!(ctx.version.as_deref(), Some("0.1.0"));
+        let mut names: Vec<String> = ctx
+            .skill_dirs
+            .iter()
+            .map(|p| {
+                p.file_name()
+                    .and_then(|s| s.to_str())
+                    .expect("skill dir has valid UTF-8 name")
+                    .to_string()
+            })
+            .collect();
+        names.sort();
+        assert_eq!(names, vec!["bar".to_string(), "foo".to_string()]);
+        assert!(
+            ctx.skill_dirs.iter().all(|p| {
+                p.components()
+                    .any(|c| c.as_os_str() == std::ffi::OsStr::new("agents"))
+            }),
+            "every skill dir must live under agents/: {:?}",
+            ctx.skill_dirs
+        );
+        assert!(
+            ctx.skill_dirs.iter().all(|p| {
+                !p.components()
+                    .any(|c| c.as_os_str() == std::ffi::OsStr::new("skills"))
+            }),
+            "no skill dir should live under the default skills/ tree: {:?}",
+            ctx.skill_dirs
+        );
     }
 
     #[test]
@@ -2578,6 +2653,29 @@ mod tests {
         assert!(
             matches!(err, Error::Plugin(PluginError::InvalidManifest { .. })),
             "expected Plugin::InvalidManifest, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn resolve_plugin_install_context_errors_on_remote_source() {
+        let (dir, svc) = temp_service();
+        let entries = vec![PluginEntry {
+            name: "remote-plugin".into(),
+            description: None,
+            source: PluginSource::Structured(StructuredSource::GitHub {
+                repo: "owner/repo".into(),
+                git_ref: None,
+                sha: None,
+            }),
+        }];
+        seed_marketplace_with_registry(dir.path(), &svc, "mp1", &entries);
+
+        let err = svc
+            .resolve_plugin_install_context("mp1", "remote-plugin")
+            .expect_err("remote source must refuse local resolution");
+        assert!(
+            matches!(err, Error::Plugin(PluginError::RemoteSourceNotLocal { .. })),
+            "expected Plugin::RemoteSourceNotLocal, got: {err:?}"
         );
     }
 }
