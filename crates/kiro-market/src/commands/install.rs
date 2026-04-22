@@ -1,13 +1,11 @@
 //! `install` command: install a plugin or specific skill into a Kiro project.
 
-use std::fs;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use colored::Colorize;
 use kiro_market_core::cache::CacheDir;
 use kiro_market_core::git::{GitProtocol, GixCliBackend};
-use kiro_market_core::plugin::{PluginManifest, discover_skill_dirs};
 use kiro_market_core::project::KiroProject;
 use kiro_market_core::service::{
     FailedAgent, InstallAgentsResult, InstallFilter, InstallMode, InstallSkillsResult,
@@ -63,23 +61,22 @@ pub fn run(
         protocol,
     )?;
 
-    let plugin_manifest = load_plugin_manifest(&plugin_dir)?;
-    let skill_dirs = discover_plugin_skills(&plugin_dir, plugin_manifest.as_ref());
-    let agent_scan_paths = agent_scan_paths(plugin_manifest.as_ref());
+    let ctx = svc
+        .resolve_plugin_install_context_from_dir(&plugin_dir)
+        .with_context(|| format!("failed to resolve install context for '{plugin_name}'"))?;
 
     let cwd = std::env::current_dir().context("failed to determine current directory")?;
     let project = KiroProject::new(cwd);
-    let version = plugin_manifest.as_ref().and_then(|m| m.version.clone());
 
     let skill_result = run_skill_install(
         &svc,
         &project,
-        &skill_dirs,
+        &ctx.skill_dirs,
         skill_filter,
         mode,
         marketplace_name,
         plugin_name,
-        version.as_deref(),
+        ctx.version.as_deref(),
     );
     print_install_outcome(plugin_ref, &skill_result);
 
@@ -87,13 +84,13 @@ pub fn run(
         &svc,
         &project,
         &plugin_dir,
-        &agent_scan_paths,
+        &ctx.agent_scan_paths,
         skill_filter,
         mode,
         accept_mcp,
         marketplace_name,
         plugin_name,
-        version.as_deref(),
+        ctx.version.as_deref(),
     );
     print_agent_outcome(&agent_result);
 
@@ -230,18 +227,6 @@ fn summarize_outcome(
     Ok(())
 }
 
-/// Resolve the list of agent scan paths for a plugin.
-fn agent_scan_paths(plugin_manifest: Option<&PluginManifest>) -> Vec<String> {
-    if let Some(m) = plugin_manifest.filter(|m| !m.agents.is_empty()) {
-        m.agents.clone()
-    } else {
-        kiro_market_core::DEFAULT_AGENT_PATHS
-            .iter()
-            .map(|s| (*s).to_string())
-            .collect()
-    }
-}
-
 /// Render the agent install summary plus any warnings and per-agent
 /// failures. Warnings and failures go to stderr so they don't pollute
 /// stdout piping, matching the skill flow.
@@ -266,21 +251,6 @@ fn print_agent_outcome(result: &InstallAgentsResult) {
     for w in &result.warnings {
         eprintln!("  {} {w}", "!".yellow().bold());
     }
-}
-
-/// Discover skill directories from a plugin, using its manifest or defaults.
-fn discover_plugin_skills(
-    plugin_dir: &Path,
-    plugin_manifest: Option<&PluginManifest>,
-) -> Vec<PathBuf> {
-    let skill_paths: Vec<&str> =
-        if let Some(manifest) = plugin_manifest.filter(|m| !m.skills.is_empty()) {
-            manifest.skills.iter().map(String::as_str).collect()
-        } else {
-            kiro_market_core::DEFAULT_SKILL_PATHS.to_vec()
-        };
-
-    discover_skill_dirs(plugin_dir, &skill_paths)
 }
 
 /// Render a per-skill summary plus the rolled-up totals from a service-layer
@@ -379,115 +349,6 @@ fn print_install_outcome(plugin_ref: &str, result: &InstallSkillsResult) {
             } else {
                 "s"
             }
-        );
-    }
-}
-
-/// Load a `plugin.json` from the given directory.
-///
-/// Returns:
-/// - `Ok(Some(manifest))` on success.
-/// - `Ok(None)` when the file is genuinely absent (`NotFound`) or when it is
-///   a symlink — a symlinked `plugin.json` inside a cloned repo could point
-///   at arbitrary host files, so it is treated as absent with a `warn!`.
-/// - `Err` for every other condition: permission denied, EIO, interrupted,
-///   malformed JSON, etc. Matches the allowlist-style error handling in
-///   `find_plugin_entry` — never mask a broken cache as "missing manifest."
-fn load_plugin_manifest(plugin_dir: &Path) -> Result<Option<PluginManifest>> {
-    let manifest_path = plugin_dir.join("plugin.json");
-
-    // Refuse to follow symlinks. plugin_dir lives inside a cloned (untrusted)
-    // repository; matches project::copy_dir_recursive and
-    // agent::discover_agents_in_dirs.
-    match fs::symlink_metadata(&manifest_path) {
-        Ok(m) if m.file_type().is_symlink() => {
-            warn!(
-                path = %manifest_path.display(),
-                "plugin.json is a symlink, refusing to follow; treating as missing"
-            );
-            return Ok(None);
-        }
-        Ok(_) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            debug!(
-                path = %manifest_path.display(),
-                "plugin.json not found, using defaults"
-            );
-            return Ok(None);
-        }
-        Err(e) => {
-            return Err(anyhow::Error::new(e).context(format!(
-                "failed to stat plugin.json at {}",
-                manifest_path.display()
-            )));
-        }
-    }
-
-    let bytes = fs::read(&manifest_path)
-        .with_context(|| format!("failed to read plugin.json at {}", manifest_path.display()))?;
-    let manifest = PluginManifest::from_json(&bytes)
-        .with_context(|| format!("plugin.json at {} is malformed", manifest_path.display()))?;
-    debug!(name = %manifest.name, "loaded plugin manifest");
-    Ok(Some(manifest))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn load_plugin_manifest_reads_regular_file() {
-        let tmp = tempfile::tempdir().unwrap();
-        fs::write(
-            tmp.path().join("plugin.json"),
-            r#"{"name":"ok","version":"1.0.0"}"#,
-        )
-        .unwrap();
-        let m = load_plugin_manifest(tmp.path())
-            .expect("ok result")
-            .expect("some manifest");
-        assert_eq!(m.name, "ok");
-    }
-
-    #[test]
-    fn load_plugin_manifest_returns_ok_none_when_absent() {
-        // Genuine absence is expected — NotFound is part of the contract,
-        // not an error. Regression guard for the allowlist split.
-        let tmp = tempfile::tempdir().unwrap();
-        let result = load_plugin_manifest(tmp.path()).expect("NotFound must be Ok(None)");
-        assert!(result.is_none());
-    }
-
-    #[test]
-    fn load_plugin_manifest_errors_on_malformed_json() {
-        // Regression: previously malformed plugin.json silently fell back
-        // to defaults. Allowlist-style handling requires it to surface.
-        let tmp = tempfile::tempdir().unwrap();
-        fs::write(tmp.path().join("plugin.json"), b"{ not json").unwrap();
-        let err = load_plugin_manifest(tmp.path()).expect_err("malformed must error");
-        let msg = format!("{err:#}");
-        assert!(
-            msg.contains("malformed") || msg.contains("plugin.json"),
-            "error chain should mention the manifest: {msg}"
-        );
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn load_plugin_manifest_refuses_symlinked_manifest() {
-        // A malicious cloned repo could include a symlink
-        // `plugin.json -> /etc/passwd`. We must not follow it. Symlink is
-        // treated as absent (Ok(None)) with a warn!, not as an error —
-        // the install degrades to "no skills" rather than aborting.
-        let tmp = tempfile::tempdir().unwrap();
-        let target = tmp.path().join("elsewhere.json");
-        fs::write(&target, r#"{"name":"smuggled"}"#).unwrap();
-        std::os::unix::fs::symlink(&target, tmp.path().join("plugin.json")).unwrap();
-
-        let result = load_plugin_manifest(tmp.path()).expect("symlink should not error");
-        assert!(
-            result.is_none(),
-            "symlinked plugin.json must be treated as absent, got: {result:?}"
         );
     }
 }
