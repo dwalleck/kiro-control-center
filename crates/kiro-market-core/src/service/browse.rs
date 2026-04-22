@@ -162,7 +162,7 @@ impl SkippedReason {
             }
             PluginError::DirectoryUnreadable { path, source } => Some(Self::DirectoryUnreadable {
                 path: path.clone(),
-                reason: source.to_string(),
+                reason: error_full_chain(source),
             }),
             PluginError::InvalidManifest { path, reason } => Some(Self::InvalidManifest {
                 path: path.clone(),
@@ -170,7 +170,7 @@ impl SkippedReason {
             }),
             PluginError::ManifestReadFailed { path, source } => Some(Self::ManifestReadFailed {
                 path: path.clone(),
-                reason: source.to_string(),
+                reason: error_full_chain(source),
             }),
             PluginError::RemoteSourceNotLocal {
                 plugin,
@@ -1484,6 +1484,124 @@ mod tests {
              source chain (regression guard against `err.to_string()`), \
              got: {}",
             sp.reason
+        );
+    }
+
+    /// Regression guard for the `source.to_string()` → `error_full_chain(source)`
+    /// fix on `SkippedReason::from_plugin_error`. Sibling to the
+    /// `SkippedPlugin::from_plugin_error` test above, but pinning the
+    /// inner projection (which builds the wire-format `reason` string
+    /// directly from the `#[source]` `io::Error`, not through the outer
+    /// `Error::Plugin` wrapping). Before the fix, deeper causes wrapped
+    /// inside an `io::Error` were dropped.
+    ///
+    /// Uses a custom chained error inside the `io::Error` so the chain has
+    /// observable depth — `io::Error::from(ErrorKind)` alone has no
+    /// source, so `source.to_string()` and `error_full_chain(source)`
+    /// would produce identical output. Only a chained construction
+    /// distinguishes them.
+    #[test]
+    fn skipped_reason_directory_unreadable_preserves_io_source_chain() {
+        use std::error::Error as StdError;
+        use std::fmt;
+
+        #[derive(Debug)]
+        struct ChainedInner;
+        impl fmt::Display for ChainedInner {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("deep cause from filesystem driver")
+            }
+        }
+        impl StdError for ChainedInner {}
+
+        #[derive(Debug)]
+        struct ChainedOuter(ChainedInner);
+        impl fmt::Display for ChainedOuter {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("forbidden zone")
+            }
+        }
+        impl StdError for ChainedOuter {
+            fn source(&self) -> Option<&(dyn StdError + 'static)> {
+                Some(&self.0)
+            }
+        }
+
+        let io_err = std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            ChainedOuter(ChainedInner),
+        );
+        let plugin_err = PluginError::DirectoryUnreadable {
+            path: PathBuf::from("/tmp/plugins/locked"),
+            source: io_err,
+        };
+
+        let Some(SkippedReason::DirectoryUnreadable { reason, .. }) =
+            SkippedReason::from_plugin_error(&plugin_err)
+        else {
+            panic!("DirectoryUnreadable must classify as skip");
+        };
+
+        assert!(
+            reason.contains("forbidden zone"),
+            "reason must include io::Error top-level Display, got: {reason}"
+        );
+        assert!(
+            reason.contains("deep cause from filesystem driver"),
+            "reason must include deeper source chain via error_full_chain, got: {reason}"
+        );
+    }
+
+    /// Sibling of the `DirectoryUnreadable` regression test — same
+    /// chain-preservation contract on `ManifestReadFailed`. The two
+    /// `source.to_string()` sites were patched together; keeping the
+    /// tests paired so future divergence fails both, not one.
+    #[test]
+    fn skipped_reason_manifest_read_failed_preserves_io_source_chain() {
+        use std::error::Error as StdError;
+        use std::fmt;
+
+        #[derive(Debug)]
+        struct ChainedInner;
+        impl fmt::Display for ChainedInner {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("deep cause from parser layer")
+            }
+        }
+        impl StdError for ChainedInner {}
+
+        #[derive(Debug)]
+        struct ChainedOuter(ChainedInner);
+        impl fmt::Display for ChainedOuter {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                f.write_str("read failure")
+            }
+        }
+        impl StdError for ChainedOuter {
+            fn source(&self) -> Option<&(dyn StdError + 'static)> {
+                Some(&self.0)
+            }
+        }
+
+        let io_err = std::io::Error::other(ChainedOuter(ChainedInner));
+        let plugin_err = PluginError::ManifestReadFailed {
+            path: PathBuf::from("/tmp/plugins/corrupt/plugin.json"),
+            source: io_err,
+        };
+
+        let Some(SkippedReason::ManifestReadFailed { reason, .. }) =
+            SkippedReason::from_plugin_error(&plugin_err)
+        else {
+            panic!("ManifestReadFailed must classify as skip");
+        };
+
+        assert!(
+            reason.contains("read failure"),
+            "reason must include io::Error top-level Display, got: {reason}"
+        );
+        assert!(
+            reason.contains("deep cause from parser layer"),
+            "reason must include deeper source chain via error_full_chain, got: {reason}"
         );
     }
 
