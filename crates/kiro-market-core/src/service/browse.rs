@@ -356,6 +356,21 @@ pub enum SkillCount {
     ManifestFailed { reason: SkippedReason },
 }
 
+/// Inputs that [`MarketplaceService::install_skills`] needs for a
+/// single-plugin install, resolved from a `(marketplace, plugin)` pair.
+///
+/// Constructed by [`MarketplaceService::resolve_plugin_install_context`].
+/// Rust-internal only — never crosses the FFI boundary, so no `Serialize`
+/// or `specta::Type` derive. The type is `pub` so frontend handlers can
+/// hold onto the resolved inputs between the context-resolution call and
+/// the install call without pulling the preamble logic back into each
+/// handler.
+#[derive(Clone, Debug)]
+pub struct PluginInstallContext {
+    pub version: Option<String>,
+    pub skill_dirs: Vec<PathBuf>,
+}
+
 // ---------------------------------------------------------------------------
 // Service methods
 // ---------------------------------------------------------------------------
@@ -631,6 +646,58 @@ impl MarketplaceService {
                 reason: skipped_reason_from_manifest_error(&plugin.name, &plugin_dir, err),
             },
         }
+    }
+
+    /// Resolve the inputs [`Self::install_skills`] needs for a single plugin.
+    ///
+    /// Performs the registry lookup, plugin-directory resolution,
+    /// `plugin.json` load, and skill-directory enumeration that Tauri
+    /// and CLI callers previously assembled by hand.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Marketplace`] / [`Error::Io`] / [`Error::Json`] from
+    ///   [`Self::list_plugin_entries`] (unknown marketplace, corrupt or
+    ///   unreadable registry).
+    /// - [`Error::Plugin`] ([`PluginError::NotFound`]) if `plugin` is not
+    ///   in the marketplace.
+    /// - [`Error::Plugin`] ([`PluginError::DirectoryMissing`] /
+    ///   [`PluginError::NotADirectory`] / [`PluginError::SymlinkRefused`] /
+    ///   [`PluginError::DirectoryUnreadable`] /
+    ///   [`PluginError::RemoteSourceNotLocal`]) from
+    ///   [`Self::resolve_local_plugin_dir`].
+    /// - [`Error::Plugin`] ([`PluginError::InvalidManifest`] /
+    ///   [`PluginError::ManifestReadFailed`]) from [`load_plugin_manifest`]
+    ///   if `plugin.json` is present but malformed or unreadable.
+    ///
+    /// All errors propagate rather than fold into a partial-success shape
+    /// — the caller explicitly asked to install this plugin, so missing
+    /// directories, malformed manifests, and remote sources are hard
+    /// failures, not skips.
+    pub fn resolve_plugin_install_context(
+        &self,
+        marketplace: &str,
+        plugin: &str,
+    ) -> Result<PluginInstallContext, Error> {
+        let marketplace_path = self.marketplace_path(marketplace);
+        let plugin_entries = self.list_plugin_entries(marketplace)?;
+        let plugin_entry = plugin_entries
+            .iter()
+            .find(|p| p.name == plugin)
+            .ok_or_else(|| {
+                Error::Plugin(PluginError::NotFound {
+                    plugin: plugin.to_owned(),
+                    marketplace: marketplace.to_owned(),
+                })
+            })?;
+        let plugin_dir = self.resolve_local_plugin_dir(plugin_entry, &marketplace_path)?;
+        let manifest = load_plugin_manifest(&plugin_dir)?;
+        let version = manifest.as_ref().and_then(|m| m.version.clone());
+        let skill_dirs = discover_skills_for_plugin(&plugin_dir, manifest.as_ref());
+        Ok(PluginInstallContext {
+            version,
+            skill_dirs,
+        })
     }
 }
 
@@ -2368,6 +2435,149 @@ mod tests {
         assert!(
             matches!(result, SkillCount::Known { count: 0 }),
             "expected Known {{ count: 0 }}, got: {result:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // resolve_plugin_install_context
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn resolve_plugin_install_context_returns_context_for_local_plugin() {
+        let (dir, svc) = temp_service();
+        let entries = vec![relative_path_entry("myplugin", "plugins/myplugin")];
+        let marketplace_path = seed_marketplace_with_registry(dir.path(), &svc, "mp1", &entries);
+        make_plugin_with_skills(&marketplace_path, "myplugin", &["alpha", "beta", "gamma"]);
+        fs::write(
+            marketplace_path
+                .join("plugins")
+                .join("myplugin")
+                .join("plugin.json"),
+            br#"{"name": "myplugin", "version": "1.2.3"}"#,
+        )
+        .expect("write plugin.json");
+
+        let ctx = svc
+            .resolve_plugin_install_context("mp1", "myplugin")
+            .expect("happy path");
+        assert_eq!(ctx.version.as_deref(), Some("1.2.3"));
+        assert_eq!(ctx.skill_dirs.len(), 3);
+    }
+
+    #[test]
+    fn resolve_plugin_install_context_returns_empty_skill_dirs_when_no_skills() {
+        let (dir, svc) = temp_service();
+        let entries = vec![relative_path_entry("lonely", "plugins/lonely")];
+        let marketplace_path = seed_marketplace_with_registry(dir.path(), &svc, "mp1", &entries);
+        let plugin_dir = marketplace_path.join("plugins").join("lonely");
+        fs::create_dir_all(&plugin_dir).expect("create plugin dir");
+        fs::write(
+            plugin_dir.join("plugin.json"),
+            br#"{"name": "lonely", "version": "0.1.0"}"#,
+        )
+        .expect("write plugin.json");
+
+        let ctx = svc
+            .resolve_plugin_install_context("mp1", "lonely")
+            .expect("happy path");
+        assert_eq!(ctx.version.as_deref(), Some("0.1.0"));
+        assert!(ctx.skill_dirs.is_empty());
+    }
+
+    #[test]
+    fn resolve_plugin_install_context_returns_none_version_when_manifest_has_no_version() {
+        let (dir, svc) = temp_service();
+        let entries = vec![relative_path_entry("nover", "plugins/nover")];
+        let marketplace_path = seed_marketplace_with_registry(dir.path(), &svc, "mp1", &entries);
+        make_plugin_with_skills(&marketplace_path, "nover", &["one"]);
+        fs::write(
+            marketplace_path
+                .join("plugins")
+                .join("nover")
+                .join("plugin.json"),
+            br#"{"name": "nover"}"#,
+        )
+        .expect("write plugin.json");
+
+        let ctx = svc
+            .resolve_plugin_install_context("mp1", "nover")
+            .expect("happy path");
+        assert!(
+            ctx.version.is_none(),
+            "expected no version, got: {:?}",
+            ctx.version
+        );
+        assert_eq!(ctx.skill_dirs.len(), 1);
+    }
+
+    #[test]
+    fn resolve_plugin_install_context_errors_on_unknown_marketplace() {
+        let (_dir, svc) = temp_service();
+        let err = svc
+            .resolve_plugin_install_context("does-not-exist", "anyplugin")
+            .expect_err("unknown marketplace must error");
+        // The inner MarketplaceError variant is an implementation detail
+        // of list_plugin_entries; pin only the top-level Error::Marketplace
+        // shape, matching the sibling list_skills_for_plugin_unknown_marketplace_errors
+        // test.
+        assert!(
+            matches!(err, Error::Marketplace(_)),
+            "expected Error::Marketplace, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn resolve_plugin_install_context_errors_on_plugin_not_found() {
+        let (dir, svc) = temp_service();
+        let entries = vec![relative_path_entry("alpha", "plugins/alpha")];
+        seed_marketplace_with_registry(dir.path(), &svc, "mp1", &entries);
+
+        let err = svc
+            .resolve_plugin_install_context("mp1", "does-not-exist")
+            .expect_err("unknown plugin must error");
+        assert!(
+            matches!(
+                err,
+                Error::Plugin(PluginError::NotFound { ref plugin, .. })
+                    if plugin == "does-not-exist"
+            ),
+            "expected Plugin::NotFound, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn resolve_plugin_install_context_errors_on_missing_plugin_dir() {
+        let (dir, svc) = temp_service();
+        // Registry entry claims the plugin lives at "plugins/ghost", but
+        // the directory is never created — the resolver must surface
+        // DirectoryMissing rather than silently falling back to defaults.
+        let entries = vec![relative_path_entry("ghost", "plugins/ghost")];
+        seed_marketplace_with_registry(dir.path(), &svc, "mp1", &entries);
+
+        let err = svc
+            .resolve_plugin_install_context("mp1", "ghost")
+            .expect_err("missing plugin_dir must error");
+        assert!(
+            matches!(err, Error::Plugin(PluginError::DirectoryMissing { .. })),
+            "expected Plugin::DirectoryMissing, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn resolve_plugin_install_context_errors_on_malformed_plugin_json() {
+        let (dir, svc) = temp_service();
+        let entries = vec![relative_path_entry("broken", "plugins/broken")];
+        let marketplace_path = seed_marketplace_with_registry(dir.path(), &svc, "mp1", &entries);
+        let plugin_dir = marketplace_path.join("plugins").join("broken");
+        fs::create_dir_all(&plugin_dir).expect("create plugin dir");
+        fs::write(plugin_dir.join("plugin.json"), b"{not json").expect("write plugin.json");
+
+        let err = svc
+            .resolve_plugin_install_context("mp1", "broken")
+            .expect_err("malformed plugin.json must error");
+        assert!(
+            matches!(err, Error::Plugin(PluginError::InvalidManifest { .. })),
+            "expected Plugin::InvalidManifest, got: {err:?}"
         );
     }
 }
