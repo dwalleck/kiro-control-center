@@ -281,7 +281,7 @@ fn load_installed_or_error(
         CommandError::new(
             format!(
                 "failed to read installed skills for project at '{project_path}': {e}. \
-                 Check that .kiro/installed.json exists and is readable."
+                 Check that .kiro/installed-skills.json exists and is readable."
             ),
             ErrorType::IoError,
         )
