@@ -5,6 +5,9 @@
 
 pub mod browse;
 
+#[cfg(any(test, feature = "test-support"))]
+pub mod test_support;
+
 pub use browse::{
     BulkSkillsResult, PluginSkillsResult, SkillCount, SkillInfo, SkippedPlugin, SkippedReason,
     SkippedSkill, SkippedSkillReason,

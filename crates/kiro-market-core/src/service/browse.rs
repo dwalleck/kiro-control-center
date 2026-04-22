@@ -1007,72 +1007,10 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
-    use crate::cache::CacheDir;
-    use crate::error::GitError;
-    use crate::git::{CloneOptions, GitBackend};
     use crate::marketplace::{PluginSource, StructuredSource};
-    use crate::validation::RelativePath;
-
-    // -----------------------------------------------------------------------
-    // Test fixtures
-    // -----------------------------------------------------------------------
-
-    /// A `GitBackend` that panics on any network operation — browse-side
-    /// tests never clone, so any call means a bug in the code under test.
-    #[derive(Default)]
-    struct PanicOnNetworkBackend;
-
-    impl GitBackend for PanicOnNetworkBackend {
-        fn clone_repo(
-            &self,
-            _url: &str,
-            _dest: &Path,
-            _opts: &CloneOptions,
-        ) -> Result<(), GitError> {
-            panic!("browse-side tests must not clone");
-        }
-
-        fn pull_repo(&self, _path: &Path) -> Result<(), GitError> {
-            panic!("browse-side tests must not pull");
-        }
-
-        fn verify_sha(&self, _path: &Path, _expected: &str) -> Result<(), GitError> {
-            Ok(())
-        }
-    }
-
-    fn temp_service() -> (tempfile::TempDir, MarketplaceService) {
-        let dir = tempdir().expect("tempdir");
-        let cache = CacheDir::with_root(dir.path().to_path_buf());
-        cache.ensure_dirs().expect("ensure_dirs");
-        let svc = MarketplaceService::new(cache, PanicOnNetworkBackend);
-        (dir, svc)
-    }
-
-    /// Build a plugin directory tree with `skills/<name>/SKILL.md` files
-    /// under `<root>/plugins/<plugin_name>/skills/`, matching the
-    /// default skill-discovery layout.
-    fn make_plugin_with_skills(root: &Path, plugin_name: &str, skill_names: &[&str]) {
-        let skills_root = root.join("plugins").join(plugin_name).join("skills");
-        fs::create_dir_all(&skills_root).expect("create skills dir");
-        for name in skill_names {
-            let dir = skills_root.join(name);
-            fs::create_dir_all(&dir).expect("create skill dir");
-            fs::write(
-                dir.join("SKILL.md"),
-                format!("---\nname: {name}\ndescription: test\n---\n"),
-            )
-            .expect("write SKILL.md");
-        }
-    }
-
-    fn relative_path_entry(name: &str, rel: &str) -> PluginEntry {
-        PluginEntry {
-            name: name.into(),
-            description: None,
-            source: PluginSource::RelativePath(RelativePath::new(rel).unwrap()),
-        }
-    }
+    use crate::service::test_support::{
+        make_plugin_with_skills, relative_path_entry, seed_marketplace_with_registry, temp_service,
+    };
 
     // -----------------------------------------------------------------------
     // resolve_local_plugin_dir
@@ -1305,28 +1243,6 @@ mod tests {
     // -----------------------------------------------------------------------
     // list_all_skills (bulk public API)
     // -----------------------------------------------------------------------
-
-    /// Build a plugin-registry-backed marketplace so the bulk path can
-    /// enumerate entries without a real `marketplace.json`.
-    ///
-    /// Reconstructs a sibling `CacheDir` pointing at the same root the
-    /// service was built with — `CacheDir` is stateless, so this is a
-    /// safe end-run around the service's private cache field without
-    /// exposing it.
-    fn seed_marketplace_with_registry(
-        cache_root: &Path,
-        svc: &MarketplaceService,
-        marketplace_name: &str,
-        entries: &[PluginEntry],
-    ) -> PathBuf {
-        let marketplace_path = svc.marketplace_path(marketplace_name);
-        fs::create_dir_all(&marketplace_path).expect("create marketplace root");
-        let cache = CacheDir::with_root(cache_root.to_path_buf());
-        cache
-            .write_plugin_registry(marketplace_name, entries)
-            .expect("write plugin registry");
-        marketplace_path
-    }
 
     #[test]
     fn list_all_skills_happy_path_enumerates_across_plugins() {
@@ -2605,7 +2521,7 @@ mod tests {
     fn resolve_plugin_install_context_errors_on_plugin_not_found() {
         let (dir, svc) = temp_service();
         let entries = vec![relative_path_entry("alpha", "plugins/alpha")];
-        seed_marketplace_with_registry(dir.path(), &svc, "mp1", &entries);
+        let _ = seed_marketplace_with_registry(dir.path(), &svc, "mp1", &entries);
 
         let err = svc
             .resolve_plugin_install_context("mp1", "does-not-exist")
@@ -2627,7 +2543,7 @@ mod tests {
         // the directory is never created — the resolver must surface
         // DirectoryMissing rather than silently falling back to defaults.
         let entries = vec![relative_path_entry("ghost", "plugins/ghost")];
-        seed_marketplace_with_registry(dir.path(), &svc, "mp1", &entries);
+        let _ = seed_marketplace_with_registry(dir.path(), &svc, "mp1", &entries);
 
         let err = svc
             .resolve_plugin_install_context("mp1", "ghost")
@@ -2668,7 +2584,7 @@ mod tests {
                 sha: None,
             }),
         }];
-        seed_marketplace_with_registry(dir.path(), &svc, "mp1", &entries);
+        let _ = seed_marketplace_with_registry(dir.path(), &svc, "mp1", &entries);
 
         let err = svc
             .resolve_plugin_install_context("mp1", "remote-plugin")
