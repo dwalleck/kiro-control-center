@@ -6,8 +6,8 @@
 pub mod browse;
 
 pub use browse::{
-    BulkSkillsResult, PluginSkillsResult, SkillInfo, SkippedPlugin, SkippedReason, SkippedSkill,
-    SkippedSkillReason,
+    BulkSkillsResult, PluginSkillsResult, SkillCount, SkillInfo, SkippedPlugin, SkippedReason,
+    SkippedSkill, SkippedSkillReason,
 };
 
 use std::fs;

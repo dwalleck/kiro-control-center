@@ -9,12 +9,12 @@ use tracing::{debug, warn};
 use kiro_market_core::cache::{CacheDir, MarketplaceSource};
 use kiro_market_core::error::error_full_chain;
 use kiro_market_core::git::GixCliBackend;
-use kiro_market_core::marketplace::{PluginEntry, PluginSource, StructuredSource};
+use kiro_market_core::marketplace::{PluginSource, StructuredSource};
 use kiro_market_core::plugin::{discover_skill_dirs, PluginManifest};
 use kiro_market_core::project::{InstalledSkills, KiroProject};
 use kiro_market_core::service::{
     BulkSkillsResult, InstallFilter, InstallMode, InstallSkillsResult, MarketplaceService,
-    PluginSkillsResult,
+    PluginSkillsResult, SkillCount,
 };
 
 use crate::error::{CommandError, ErrorType};
@@ -57,7 +57,7 @@ pub struct MarketplaceInfo {
 pub struct PluginInfo {
     pub name: String,
     pub description: Option<String>,
-    pub skill_count: u32,
+    pub skill_count: SkillCount,
     pub source_type: SourceType,
 }
 
@@ -133,11 +133,10 @@ pub async fn list_plugins(marketplace: String) -> Result<Vec<PluginInfo>, Comman
     let mut results = Vec::with_capacity(plugin_entries.len());
     for plugin in &plugin_entries {
         let source_type = plugin_source_type(&plugin.source);
-        let skill_count = count_plugin_skills(plugin, &marketplace_path);
         results.push(PluginInfo {
             name: plugin.name.clone(),
             description: plugin.description.clone(),
-            skill_count: saturate_to_u32(skill_count, "skill_count"),
+            skill_count: svc.count_skills_for_plugin(plugin, &marketplace_path),
             source_type,
         });
     }
@@ -429,35 +428,6 @@ fn load_plugin_manifest(plugin_dir: &Path) -> Result<Option<PluginManifest>, Com
                 ErrorType::ParseError,
             ))
         }
-    }
-}
-
-/// Count skills within a plugin entry. Only counts for local (relative path)
-/// plugins; remote plugins report 0.
-///
-/// A malformed `plugin.json` is logged at `warn` rather than collapsed into
-/// "use defaults" so the listing count agrees with `list_available_skills`,
-/// which surfaces the parse error to the user. A genuinely missing manifest
-/// (the common case) falls back to default skill paths silently.
-fn count_plugin_skills(entry: &PluginEntry, marketplace_path: &Path) -> usize {
-    match &entry.source {
-        PluginSource::RelativePath(rel) => {
-            let plugin_dir = marketplace_path.join(rel);
-            let manifest = match load_plugin_manifest(&plugin_dir) {
-                Ok(opt) => opt,
-                Err(e) => {
-                    warn!(
-                        plugin = %entry.name,
-                        path = %plugin_dir.display(),
-                        error = %e.message,
-                        "could not load plugin.json for skill count; reporting 0"
-                    );
-                    return 0;
-                }
-            };
-            discover_skills_for_plugin(&plugin_dir, manifest.as_ref()).len()
-        }
-        PluginSource::Structured(_) => 0,
     }
 }
 

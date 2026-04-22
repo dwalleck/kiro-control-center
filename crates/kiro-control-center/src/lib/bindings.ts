@@ -281,7 +281,7 @@ export type PluginBasicInfo = {
 export type PluginInfo = {
 	name: string,
 	description: string | null,
-	skill_count: number,
+	skill_count: SkillCount,
 	source_type: SourceType,
 };
 
@@ -374,6 +374,57 @@ export type Settings = {
 	// Last active project path (restored on launch).
 	last_project?: string | null,
 };
+
+/**
+ *  Result of [`MarketplaceService::count_skills_for_plugin`].
+ *  Distinguishes the three cases the frontend must render differently:
+ *  a known count, a remote plugin (not locally countable), and a local
+ *  plugin whose directory or manifest could not be loaded. Replaces the
+ *  prior `usize` that collapsed failures into a silent `0`.
+ */
+export type SkillCount = 
+/**
+ *  The plugin directory was readable; `count` is the number of
+ *  discovered skill directories (including the legitimate zero case).
+ */
+{ state: "known"; count: number } | 
+/**
+ *  Plugin source is remote (GitHub / git URL). Skills cannot be
+ *  enumerated without cloning, which the listing path never does.
+ *  Distinct from `ManifestFailed { reason: RemoteSourceNotLocal }`:
+ *  here we know the plugin is remote by construction and never
+ *  attempt the local resolution.
+ */
+{ state: "remote_not_counted" } | 
+/**
+ *  The plugin is local but something about its directory or
+ *  `plugin.json` prevented a skill count.
+ * 
+ *  `SkippedReason` is reused as the error payload to share the #30
+ *  projection [`SkippedReason::from_plugin_error`]. Reachable from
+ *  this path:
+ * 
+ *  From the `MarketplaceService::resolve_local_plugin_dir` pre-check:
+ *  - [`SkippedReason::DirectoryMissing`] — `plugin_dir` not found.
+ *  - [`SkippedReason::NotADirectory`] — `plugin_dir` is a file.
+ *  - [`SkippedReason::SymlinkRefused`] — `plugin_dir` is a symlink.
+ *  - [`SkippedReason::DirectoryUnreadable`] — stat failed for any
+ *    other reason (permission denied, transient I/O, etc.).
+ * 
+ *  From [`load_plugin_manifest`]:
+ *  - [`SkippedReason::InvalidManifest`] — `plugin.json` malformed.
+ *  - [`SkippedReason::ManifestReadFailed`] — `plugin.json` read
+ *    failed after a successful stat.
+ * 
+ *  [`SkippedReason::NoSkills`] is not produced anywhere in this
+ *  path; [`SkippedReason::RemoteSourceNotLocal`] is pre-empted by
+ *  [`Self::RemoteNotCounted`] before resolution is attempted.
+ *  Frontends typed against `SkippedReason` will not get
+ *  compile-time narrowing for those two — accepted because
+ *  consolidating the projection is more valuable than a narrower
+ *  wire type.
+ */
+{ state: "manifest_failed"; reason: SkippedReason };
 
 /**
  *  Information about a single skill, cross-referenced with the target
