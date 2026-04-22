@@ -6,16 +6,64 @@
     MarketplaceInfo,
     PluginInfo,
     SkillInfo,
+    SkillCount,
+    SkippedReason,
     SkippedSkill,
   } from "$lib/bindings";
   import SkillCard from "./SkillCard.svelte";
+
+  // Render a structured SkippedReason as a one-line string. Total over
+  // all eight variants (not just the six reachable via SkillCount) —
+  // TypeScript's exhaustiveness check forces full coverage. The two
+  // currently-unreachable variants (remote_source_not_local, no_skills)
+  // are reserved for future reuse with SkippedPlugin banners.
+  function formatSkippedReason(r: SkippedReason): string {
+    switch (r.kind) {
+      case "directory_missing":
+        return `plugin directory not found: ${r.path}`;
+      case "not_a_directory":
+        return `plugin path is not a directory: ${r.path}`;
+      case "symlink_refused":
+        return `plugin path is a symlink (refused): ${r.path}`;
+      case "directory_unreadable":
+        return `could not read ${r.path}: ${r.reason}`;
+      case "invalid_manifest":
+        return `malformed plugin.json at ${r.path}: ${r.reason}`;
+      case "manifest_read_failed":
+        return `could not read plugin.json at ${r.path}: ${r.reason}`;
+      case "remote_source_not_local":
+        return `plugin source is remote: ${r.plugin}`;
+      case "no_skills":
+        return `plugin declares no skills: ${r.path}`;
+    }
+  }
+
+  function skillCountLabel(sc: SkillCount): string {
+    switch (sc.state) {
+      case "known": return String(sc.count);
+      case "remote_not_counted": return "–";
+      case "manifest_failed": return "!";
+    }
+  }
+
+  function skillCountTitle(sc: SkillCount): string | undefined {
+    switch (sc.state) {
+      case "known":
+        return undefined;
+      case "remote_not_counted":
+        return "Remote plugin — skills cannot be counted without cloning";
+      case "manifest_failed":
+        return formatSkippedReason(sc.reason);
+    }
+  }
 
   // Render a structured SkippedSkill as a one-line label for warning
   // banners. Uses name_hint (Option<String> in core → string | null on
   // the wire) with "<unnamed>" fallback so a skill whose directory name
   // could not be extracted still shows up in the UI rather than being
-  // silently dropped — that silent drop is exactly the class of bug #30
-  // is fighting across all three call sites that consume SkippedSkill.
+  // silently dropped — that silent drop is exactly the class of bug the
+  // SkippedSkill surfacing pattern is fighting across all three call
+  // sites that consume SkippedSkill.
   function formatSkippedSkill(s: SkippedSkill): string {
     const label = s.name_hint ?? "<unnamed>";
     // SkippedSkillReason is a discriminated union on `kind`. A future
@@ -274,7 +322,7 @@
       () => commands.listAvailableSkills(mp, plugin, projectPath),
       {
         onSuccess: (data) => {
-          // data is PluginSkillsResult (#30): { skills, skipped_skills }.
+          // data is PluginSkillsResult: { skills, skipped_skills }.
           // Happy-path skills populate the card grid; per-skill read
           // failures surface via the same per-plugin fetchErrors banner
           // stream used by plugin-level skips (from the bulk path), so a
@@ -701,7 +749,11 @@
                     class="h-3.5 w-3.5 rounded border-kiro-muted text-kiro-accent-500"
                   />
                   <span class="flex-1 truncate">{ap.plugin.name}</span>
-                  <span class="text-[11px] text-kiro-subtle">{ap.plugin.skill_count}</span>
+                  <span
+                    class="text-[11px] {ap.plugin.skill_count.state === 'manifest_failed' ? 'text-kiro-warning' : 'text-kiro-subtle'}"
+                    title={skillCountTitle(ap.plugin.skill_count)}
+                    aria-label={skillCountTitle(ap.plugin.skill_count)}
+                  >{skillCountLabel(ap.plugin.skill_count)}</span>
                 </label>
               {/each}
             </div>
