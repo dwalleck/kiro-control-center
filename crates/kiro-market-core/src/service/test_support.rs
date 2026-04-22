@@ -6,6 +6,21 @@
 //! activate the feature via a `dev-dependencies` override on
 //! `kiro-market-core` so the fixtures land only in test builds.
 
+// Fails the build if `test-support` is enabled in a release, non-test
+// context. Catches the specific misuse of adding
+// `kiro-market-core = { features = ["test-support"] }` under a downstream
+// crate's `[dependencies]` (not `[dev-dependencies]`), which would ship
+// `PanicOnNetworkBackend` into release binaries. `cargo test --release`
+// on downstream crates is the one false positive; those callers should
+// gate their release-test setup behind a local feature.
+#[cfg(all(feature = "test-support", not(any(test, debug_assertions))))]
+compile_error!(
+    "The `test-support` feature is for test dev-dependencies only. \
+     Enabling it from `[dependencies]` or the default feature list would ship \
+     `PanicOnNetworkBackend` into release binaries, where any browse-side \
+     git operation would panic."
+);
+
 use std::path::{Path, PathBuf};
 
 use tempfile::{TempDir, tempdir};
@@ -20,7 +35,7 @@ use crate::validation::RelativePath;
 /// A [`GitBackend`] that panics on any network operation. Browse and
 /// listing tests never clone — reaching a network call means a bug in
 /// the code under test, not a missing fixture.
-#[derive(Default)]
+#[derive(Clone, Copy, Debug, Default)]
 pub struct PanicOnNetworkBackend;
 
 impl GitBackend for PanicOnNetworkBackend {

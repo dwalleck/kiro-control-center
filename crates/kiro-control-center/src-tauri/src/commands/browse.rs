@@ -202,18 +202,26 @@ pub async fn install_skills(
     project_path: String,
 ) -> Result<InstallSkillsResult, CommandError> {
     let svc = make_service()?;
-    install_skills_impl(&svc, &marketplace, &plugin, &skills, force, &project_path)
+    install_skills_impl(
+        &svc,
+        &marketplace,
+        &plugin,
+        &skills,
+        InstallMode::from(force),
+        &project_path,
+    )
 }
 
 // Separated from the `#[tauri::command]` wrapper so the body is unit-testable
 // with a test-built `MarketplaceService` — the wrapper's only extra work is
-// constructing the service from process globals.
+// constructing the service from process globals and translating the FFI
+// `force: bool` into an `InstallMode`.
 fn install_skills_impl(
     svc: &MarketplaceService,
     marketplace: &str,
     plugin: &str,
     skills: &[String],
-    force: bool,
+    mode: InstallMode,
     project_path: &str,
 ) -> Result<InstallSkillsResult, CommandError> {
     let ctx = svc
@@ -224,7 +232,7 @@ fn install_skills_impl(
         &project,
         &ctx.skill_dirs,
         &InstallFilter::Names(skills),
-        InstallMode::from(force),
+        mode,
         marketplace,
         plugin,
         ctx.version.as_deref(),
@@ -464,7 +472,7 @@ mod tests {
             "mp1",
             "myplugin",
             &["alpha".to_string()],
-            false,
+            InstallMode::New,
             &project_path,
         )
         .expect("install happy path");
@@ -482,6 +490,115 @@ mod tests {
             .get("alpha")
             .expect("alpha should be recorded in installed-skills.json");
         assert_eq!(meta.version.as_deref(), Some("2.0.0"));
+        assert!(
+            std::path::PathBuf::from(&project_path)
+                .join(".kiro/installed-skills.json")
+                .exists(),
+            "installed-skills.json must land under the requested project_path, not an unrelated directory"
+        );
+    }
+
+    #[test]
+    fn install_skills_impl_force_mode_overwrites_existing_install() {
+        let (dir, svc) = temp_service();
+        let entries = vec![relative_path_entry("myplugin", "plugins/myplugin")];
+        let marketplace_path = seed_marketplace_with_registry(dir.path(), &svc, "mp1", &entries);
+        make_plugin_with_skills(&marketplace_path, "myplugin", &["alpha"]);
+        fs::write(
+            marketplace_path.join("plugins/myplugin/plugin.json"),
+            br#"{"name": "myplugin", "version": "1.0.0"}"#,
+        )
+        .expect("write plugin.json");
+        let project_path = make_kiro_project(dir.path());
+
+        let first = install_skills_impl(
+            &svc,
+            "mp1",
+            "myplugin",
+            &["alpha".to_string()],
+            InstallMode::New,
+            &project_path,
+        )
+        .expect("first install");
+        assert_eq!(first.installed, vec!["alpha".to_string()]);
+
+        // Re-installing with InstallMode::New must skip, not re-install.
+        let second_safe = install_skills_impl(
+            &svc,
+            "mp1",
+            "myplugin",
+            &["alpha".to_string()],
+            InstallMode::New,
+            &project_path,
+        )
+        .expect("second install with InstallMode::New");
+        assert!(
+            second_safe.installed.is_empty(),
+            "InstallMode::New should not re-install an existing skill, got: {:?}",
+            second_safe.installed
+        );
+
+        // InstallMode::Force must re-install.
+        let third_force = install_skills_impl(
+            &svc,
+            "mp1",
+            "myplugin",
+            &["alpha".to_string()],
+            InstallMode::Force,
+            &project_path,
+        )
+        .expect("third install with InstallMode::Force");
+        assert_eq!(
+            third_force.installed,
+            vec!["alpha".to_string()],
+            "InstallMode::Force must re-install an existing skill, got: {:?}",
+            third_force.installed
+        );
+    }
+
+    #[test]
+    fn install_skills_impl_names_filter_installs_only_requested_subset() {
+        let (dir, svc) = temp_service();
+        let entries = vec![relative_path_entry("myplugin", "plugins/myplugin")];
+        let marketplace_path = seed_marketplace_with_registry(dir.path(), &svc, "mp1", &entries);
+        make_plugin_with_skills(&marketplace_path, "myplugin", &["alpha", "beta"]);
+        fs::write(
+            marketplace_path.join("plugins/myplugin/plugin.json"),
+            br#"{"name": "myplugin", "version": "1.0.0"}"#,
+        )
+        .expect("write plugin.json");
+        let project_path = make_kiro_project(dir.path());
+
+        let result = install_skills_impl(
+            &svc,
+            "mp1",
+            "myplugin",
+            &["alpha".to_string()],
+            InstallMode::New,
+            &project_path,
+        )
+        .expect("install subset");
+
+        assert_eq!(result.installed, vec!["alpha".to_string()]);
+
+        // beta was not requested — it must not appear in the result or on disk.
+        let project = KiroProject::new(std::path::PathBuf::from(&project_path));
+        let installed = project.load_installed().expect("load installed-skills");
+        assert!(
+            !installed.skills.contains_key("beta"),
+            "beta was not requested; must not appear in installed-skills.json"
+        );
+        assert!(
+            !project_path_contains_skill_dir(&project_path, "beta"),
+            "beta was not requested; must not land on disk at .kiro/skills/beta/"
+        );
+    }
+
+    fn project_path_contains_skill_dir(project_path: &str, skill: &str) -> bool {
+        std::path::PathBuf::from(project_path)
+            .join(".kiro/skills")
+            .join(skill)
+            .exists()
     }
 
     #[test]
@@ -491,8 +608,15 @@ mod tests {
         let _ = seed_marketplace_with_registry(dir.path(), &svc, "mp1", &entries);
         let project_path = make_kiro_project(dir.path());
 
-        let err = install_skills_impl(&svc, "mp1", "does-not-exist", &[], false, &project_path)
-            .expect_err("unknown plugin must error");
+        let err = install_skills_impl(
+            &svc,
+            "mp1",
+            "does-not-exist",
+            &[],
+            InstallMode::New,
+            &project_path,
+        )
+        .expect_err("unknown plugin must error");
 
         assert_eq!(err.error_type, ErrorType::NotFound);
     }
@@ -514,8 +638,15 @@ mod tests {
         let _ = seed_marketplace_with_registry(dir.path(), &svc, "mp1", &entries);
         let project_path = make_kiro_project(dir.path());
 
-        let err = install_skills_impl(&svc, "mp1", "remote-plugin", &[], false, &project_path)
-            .expect_err("remote source must refuse local install");
+        let err = install_skills_impl(
+            &svc,
+            "mp1",
+            "remote-plugin",
+            &[],
+            InstallMode::New,
+            &project_path,
+        )
+        .expect_err("remote source must refuse local install");
 
         assert_eq!(err.error_type, ErrorType::Validation);
     }
