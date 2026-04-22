@@ -61,6 +61,9 @@ Marketplace operations (add/remove/update/list) live in `kiro-market-core::servi
 CLI and Tauri handlers are thin wrappers that construct the service, call it, and format output.
 Domain logic is never duplicated between frontends.
 
+### Tauri command handlers
+Each `#[tauri::command]` splits into a thin wrapper plus a private `fn <name>_impl(svc: &MarketplaceService, ...) -> Result<T, CommandError>`. The wrapper does the globals work (`make_service()?`) and calls the `_impl`; the `_impl` is pure Rust and takes the service + primitives by reference. Tests exercise `_impl` directly using fixtures from `kiro_market_core::service::test_support` (activated via a `dev-dependencies` feature override). See `install_skills_impl` in `crates/kiro-control-center/src-tauri/src/commands/browse.rs` and its `#[cfg(test)] mod tests` for the exemplar. New commands follow this shape so their bodies are testable without a Tauri runtime.
+
 ### Git Abstraction
 Git operations are abstracted behind the `GitBackend` trait (`kiro-market-core::git`).
 `GixCliBackend` implements the trait using `gix` for clone/open and the system `git` CLI
