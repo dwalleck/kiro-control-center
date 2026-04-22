@@ -359,7 +359,8 @@ pub enum SkillCount {
 /// Inputs that [`MarketplaceService::install_skills`] needs for a
 /// single-plugin install, resolved from a `(marketplace, plugin)` pair.
 ///
-/// Constructed by [`MarketplaceService::resolve_plugin_install_context`].
+/// Constructed by [`MarketplaceService::resolve_plugin_install_context`]
+/// or [`MarketplaceService::resolve_plugin_install_context_from_dir`].
 /// Rust-internal only — never crosses the FFI boundary, so no `Serialize`
 /// or `specta::Type` derive. The type is `pub` so frontend handlers can
 /// hold onto the resolved inputs between the context-resolution call and
@@ -369,6 +370,12 @@ pub enum SkillCount {
 pub struct PluginInstallContext {
     pub version: Option<String>,
     pub skill_dirs: Vec<PathBuf>,
+    /// Directories to scan for agent `.md` files inside the plugin.
+    /// Derived from `plugin.json`'s `agents` field, or
+    /// [`crate::DEFAULT_AGENT_PATHS`] when the manifest is absent or
+    /// declares no agents. Consumed by
+    /// [`MarketplaceService::install_plugin_agents`].
+    pub agent_scan_paths: Vec<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -691,12 +698,38 @@ impl MarketplaceService {
                 })
             })?;
         let plugin_dir = self.resolve_local_plugin_dir(plugin_entry, &marketplace_path)?;
-        let manifest = load_plugin_manifest(&plugin_dir)?;
+        self.resolve_plugin_install_context_from_dir(&plugin_dir)
+    }
+
+    /// Build a [`PluginInstallContext`] from an already-resolved plugin
+    /// directory. Loads `plugin.json` (refusing symlinked manifests),
+    /// enumerates skill directories, and derives agent-scan paths.
+    ///
+    /// Companion to [`Self::resolve_plugin_install_context`], which
+    /// starts from a `(marketplace, plugin)` reference and drives a
+    /// local-only resolution. This variant takes the directory as input,
+    /// so callers that have already resolved `plugin_dir` by other means
+    /// — including fetch-aware CLI callers that cloned a remote source
+    /// first — can share the manifest-loading and path-discovery logic
+    /// without re-entering the registry lookup.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Plugin`] ([`PluginError::InvalidManifest`] /
+    ///   [`PluginError::ManifestReadFailed`]) if `plugin.json` is
+    ///   present but malformed or unreadable.
+    pub fn resolve_plugin_install_context_from_dir(
+        &self,
+        plugin_dir: &Path,
+    ) -> Result<PluginInstallContext, Error> {
+        let manifest = load_plugin_manifest(plugin_dir)?;
         let version = manifest.as_ref().and_then(|m| m.version.clone());
-        let skill_dirs = discover_skills_for_plugin(&plugin_dir, manifest.as_ref());
+        let skill_dirs = discover_skills_for_plugin(plugin_dir, manifest.as_ref());
+        let agent_scan_paths = agent_scan_paths_for_plugin(manifest.as_ref());
         Ok(PluginInstallContext {
             version,
             skill_dirs,
+            agent_scan_paths,
         })
     }
 }
@@ -822,6 +855,22 @@ fn discover_skills_for_plugin(
     };
 
     discover_skill_dirs(plugin_dir, &skill_paths)
+}
+
+/// Resolve the list of agent-scan paths a plugin declares, falling
+/// back to [`crate::DEFAULT_AGENT_PATHS`] when the manifest is absent
+/// or its `agents` list is empty. Mirrors the "empty list means no
+/// custom paths, not no agents" fallback policy used by
+/// [`discover_skills_for_plugin`].
+fn agent_scan_paths_for_plugin(manifest: Option<&PluginManifest>) -> Vec<String> {
+    if let Some(m) = manifest.filter(|m| !m.agents.is_empty()) {
+        m.agents.clone()
+    } else {
+        crate::DEFAULT_AGENT_PATHS
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect()
+    }
 }
 
 /// Project a `resolve_local_plugin_dir` error into a [`SkippedReason`].
@@ -2721,5 +2770,79 @@ mod tests {
             matches!(err, Error::Plugin(PluginError::RemoteSourceNotLocal { .. })),
             "expected Plugin::RemoteSourceNotLocal, got: {err:?}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // resolve_plugin_install_context_from_dir
+    // -----------------------------------------------------------------------
+
+    #[test]
+    #[cfg(unix)]
+    fn resolve_plugin_install_context_from_dir_refuses_symlinked_manifest() {
+        use std::os::unix::fs::symlink;
+
+        let (dir, svc) = temp_service();
+        let plugin_dir = dir.path().join("plugin");
+        fs::create_dir_all(&plugin_dir).expect("create plugin dir");
+
+        // Real manifest lives elsewhere; symlink it into plugin_dir. A
+        // hardened loader must treat the symlink as absent — following it
+        // would leak `real-plugin.json` into the plugin's identity.
+        let real_manifest = dir.path().join("real-plugin.json");
+        fs::write(&real_manifest, br#"{"name":"smuggled","version":"9.9.9"}"#)
+            .expect("write real manifest");
+        symlink(&real_manifest, plugin_dir.join("plugin.json")).expect("create symlink");
+
+        let ctx = svc
+            .resolve_plugin_install_context_from_dir(&plugin_dir)
+            .expect("symlinked manifest must be treated as absent, not error");
+        assert!(
+            ctx.version.is_none(),
+            "symlinked manifest must not leak its version, got: {:?}",
+            ctx.version
+        );
+        assert!(
+            ctx.skill_dirs.is_empty(),
+            "no skills/ tree exists, expected empty, got: {:?}",
+            ctx.skill_dirs
+        );
+    }
+
+    #[test]
+    fn resolve_plugin_install_context_from_dir_falls_back_to_default_agent_paths_when_manifest_absent()
+     {
+        let (dir, svc) = temp_service();
+        let plugin_dir = dir.path().join("plugin");
+        fs::create_dir_all(&plugin_dir).expect("create plugin dir");
+        // No plugin.json — fallback path must activate.
+
+        let ctx = svc
+            .resolve_plugin_install_context_from_dir(&plugin_dir)
+            .expect("missing manifest must yield default agent paths, not error");
+        assert_eq!(
+            ctx.agent_scan_paths,
+            crate::DEFAULT_AGENT_PATHS
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect::<Vec<_>>(),
+            "absent manifest must fall back to DEFAULT_AGENT_PATHS"
+        );
+    }
+
+    #[test]
+    fn resolve_plugin_install_context_from_dir_uses_manifest_agents_when_declared() {
+        let (dir, svc) = temp_service();
+        let plugin_dir = dir.path().join("plugin");
+        fs::create_dir_all(&plugin_dir).expect("create plugin dir");
+        fs::write(
+            plugin_dir.join("plugin.json"),
+            br#"{"name": "p", "agents": ["./custom-agents/"]}"#,
+        )
+        .expect("write plugin.json");
+
+        let ctx = svc
+            .resolve_plugin_install_context_from_dir(&plugin_dir)
+            .expect("happy path");
+        assert_eq!(ctx.agent_scan_paths, vec!["./custom-agents/".to_string()]);
     }
 }
