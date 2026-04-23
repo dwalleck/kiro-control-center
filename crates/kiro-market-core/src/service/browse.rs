@@ -356,11 +356,14 @@ pub enum SkillCount {
     ManifestFailed { reason: SkippedReason },
 }
 
-/// Inputs that [`MarketplaceService::install_skills`] needs for a
-/// single-plugin install, resolved from a `(marketplace, plugin)` pair.
+/// Inputs that [`MarketplaceService::install_skills`] and
+/// [`MarketplaceService::install_plugin_agents`] need for a single-plugin
+/// install.
 ///
 /// Constructed by [`MarketplaceService::resolve_plugin_install_context`]
-/// or [`MarketplaceService::resolve_plugin_install_context_from_dir`].
+/// (registry-driven) or
+/// [`MarketplaceService::resolve_plugin_install_context_from_dir`]
+/// (directory-driven, for fetch-aware CLI callers).
 /// Rust-internal only — never crosses the FFI boundary, so no `Serialize`
 /// or `specta::Type` derive. The type is `pub` so frontend handlers can
 /// hold onto the resolved inputs between the context-resolution call and
@@ -674,8 +677,9 @@ impl MarketplaceService {
     ///   [`PluginError::RemoteSourceNotLocal`]) from
     ///   [`Self::resolve_local_plugin_dir`].
     /// - [`Error::Plugin`] ([`PluginError::InvalidManifest`] /
-    ///   [`PluginError::ManifestReadFailed`]) from [`load_plugin_manifest`]
-    ///   if `plugin.json` is present but malformed or unreadable.
+    ///   [`PluginError::ManifestReadFailed`]) from
+    ///   [`Self::resolve_plugin_install_context_from_dir`] if `plugin.json`
+    ///   is present but malformed or unreadable.
     ///
     /// All errors propagate rather than fold into a partial-success shape
     /// — the caller explicitly asked to install this plugin, so missing
@@ -965,8 +969,7 @@ fn skipped_reason_from_manifest_error(
 /// - `Ok(None)` when the file is genuinely absent (`NotFound`) or when
 ///   it is a symlink — a symlinked `plugin.json` inside an untrusted
 ///   cloned repository could point at arbitrary host files, so it is
-///   treated as absent with a `warn!`. Matches the hardening in
-///   `crate::commands::install::load_plugin_manifest` in the CLI crate.
+///   treated as absent with a `warn!`.
 /// - `Err(PluginError::InvalidManifest)` if the file exists but could
 ///   not be parsed.
 /// - `Err(PluginError::ManifestReadFailed)` for any other read or stat
@@ -1431,9 +1434,7 @@ mod tests {
     }
 
     /// Regression guard: `load_plugin_manifest` treats a symlinked
-    /// `plugin.json` as absent (matching the CLI-side
-    /// `kiro_market::commands::install::load_plugin_manifest` and the
-    /// agent discovery hardening). A symlinked manifest inside a cloned
+    /// `plugin.json` as absent. A symlinked manifest inside a cloned
     /// repo could leak host file contents through the `InvalidManifest`
     /// error path, which embeds the serde parse error over the target
     /// bytes.
@@ -2640,7 +2641,7 @@ mod tests {
         }
         fs::write(
             plugin_dir.join("plugin.json"),
-            br#"{"name": "withcustom", "version": "0.1.0", "skills": ["./agents/"]}"#,
+            br#"{"name": "withcustom", "version": "0.1.0", "skills": ["./agents/"], "agents": ["./custom-agents/"]}"#,
         )
         .expect("write plugin.json");
 
@@ -2648,6 +2649,11 @@ mod tests {
             .resolve_plugin_install_context("mp1", "withcustom")
             .expect("happy path");
         assert_eq!(ctx.version.as_deref(), Some("0.1.0"));
+        assert_eq!(
+            ctx.agent_scan_paths,
+            vec!["./custom-agents/".to_string()],
+            "wrapper must thread agent_scan_paths through from the delegate"
+        );
         let mut names: Vec<String> = ctx
             .skill_dirs
             .iter()
@@ -2806,6 +2812,14 @@ mod tests {
             "no skills/ tree exists, expected empty, got: {:?}",
             ctx.skill_dirs
         );
+        assert_eq!(
+            ctx.agent_scan_paths,
+            crate::DEFAULT_AGENT_PATHS
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect::<Vec<_>>(),
+            "symlinked manifest must fall back to DEFAULT_AGENT_PATHS, not leak target's agents"
+        );
     }
 
     #[test]
@@ -2814,7 +2828,6 @@ mod tests {
         let (dir, svc) = temp_service();
         let plugin_dir = dir.path().join("plugin");
         fs::create_dir_all(&plugin_dir).expect("create plugin dir");
-        // No plugin.json — fallback path must activate.
 
         let ctx = svc
             .resolve_plugin_install_context_from_dir(&plugin_dir)
@@ -2844,5 +2857,15 @@ mod tests {
             .resolve_plugin_install_context_from_dir(&plugin_dir)
             .expect("happy path");
         assert_eq!(ctx.agent_scan_paths, vec!["./custom-agents/".to_string()]);
+        assert!(
+            ctx.version.is_none(),
+            "manifest has no version field, got: {:?}",
+            ctx.version
+        );
+        assert!(
+            ctx.skill_dirs.is_empty(),
+            "manifest declares no skills and no skills/ tree exists, got: {:?}",
+            ctx.skill_dirs
+        );
     }
 }
