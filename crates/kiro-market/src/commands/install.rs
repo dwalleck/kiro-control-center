@@ -128,7 +128,9 @@ fn fetch_plugin_dir(
     protocol: GitProtocol,
 ) -> Result<PathBuf> {
     print!("  Fetching plugin '{plugin_name}'...");
-    let _ = std::io::Write::flush(&mut std::io::stdout());
+    if let Err(e) = std::io::Write::flush(&mut std::io::stdout()) {
+        warn!(error = %e, "failed to flush stdout before fetch progress message");
+    }
     let dir = svc
         .resolve_plugin_dir(entry, marketplace_path, marketplace_name, protocol)
         .with_context(|| format!("failed to resolve plugin directory for '{plugin_name}'"))?;
