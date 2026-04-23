@@ -61,8 +61,7 @@ pub fn run(
         protocol,
     )?;
 
-    let ctx = svc
-        .resolve_plugin_install_context_from_dir(&plugin_dir)
+    let ctx = MarketplaceService::resolve_plugin_install_context_from_dir(&plugin_dir)
         .with_context(|| format!("failed to resolve install context for '{plugin_name}'"))?;
 
     let cwd = std::env::current_dir().context("failed to determine current directory")?;

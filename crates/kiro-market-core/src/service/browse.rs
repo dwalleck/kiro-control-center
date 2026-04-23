@@ -702,7 +702,7 @@ impl MarketplaceService {
                 })
             })?;
         let plugin_dir = self.resolve_local_plugin_dir(plugin_entry, &marketplace_path)?;
-        self.resolve_plugin_install_context_from_dir(&plugin_dir)
+        Self::resolve_plugin_install_context_from_dir(&plugin_dir)
     }
 
     /// Build a [`PluginInstallContext`] from an already-resolved plugin
@@ -723,7 +723,6 @@ impl MarketplaceService {
     ///   [`PluginError::ManifestReadFailed`]) if `plugin.json` is
     ///   present but malformed or unreadable.
     pub fn resolve_plugin_install_context_from_dir(
-        &self,
         plugin_dir: &Path,
     ) -> Result<PluginInstallContext, Error> {
         let manifest = load_plugin_manifest(plugin_dir)?;
@@ -2787,7 +2786,7 @@ mod tests {
     fn resolve_plugin_install_context_from_dir_refuses_symlinked_manifest() {
         use std::os::unix::fs::symlink;
 
-        let (dir, svc) = temp_service();
+        let (dir, _svc) = temp_service();
         let plugin_dir = dir.path().join("plugin");
         fs::create_dir_all(&plugin_dir).expect("create plugin dir");
 
@@ -2799,8 +2798,7 @@ mod tests {
             .expect("write real manifest");
         symlink(&real_manifest, plugin_dir.join("plugin.json")).expect("create symlink");
 
-        let ctx = svc
-            .resolve_plugin_install_context_from_dir(&plugin_dir)
+        let ctx = MarketplaceService::resolve_plugin_install_context_from_dir(&plugin_dir)
             .expect("symlinked manifest must be treated as absent, not error");
         assert!(
             ctx.version.is_none(),
@@ -2825,12 +2823,11 @@ mod tests {
     #[test]
     fn resolve_plugin_install_context_from_dir_falls_back_to_default_agent_paths_when_manifest_absent()
      {
-        let (dir, svc) = temp_service();
+        let (dir, _svc) = temp_service();
         let plugin_dir = dir.path().join("plugin");
         fs::create_dir_all(&plugin_dir).expect("create plugin dir");
 
-        let ctx = svc
-            .resolve_plugin_install_context_from_dir(&plugin_dir)
+        let ctx = MarketplaceService::resolve_plugin_install_context_from_dir(&plugin_dir)
             .expect("missing manifest must yield default agent paths, not error");
         assert_eq!(
             ctx.agent_scan_paths,
@@ -2844,7 +2841,7 @@ mod tests {
 
     #[test]
     fn resolve_plugin_install_context_from_dir_uses_manifest_agents_when_declared() {
-        let (dir, svc) = temp_service();
+        let (dir, _svc) = temp_service();
         let plugin_dir = dir.path().join("plugin");
         fs::create_dir_all(&plugin_dir).expect("create plugin dir");
         fs::write(
@@ -2853,8 +2850,7 @@ mod tests {
         )
         .expect("write plugin.json");
 
-        let ctx = svc
-            .resolve_plugin_install_context_from_dir(&plugin_dir)
+        let ctx = MarketplaceService::resolve_plugin_install_context_from_dir(&plugin_dir)
             .expect("happy path");
         assert_eq!(ctx.agent_scan_paths, vec!["./custom-agents/".to_string()]);
         assert!(
