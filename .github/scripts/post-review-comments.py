@@ -69,9 +69,11 @@ REVIEW_START_RE = re.compile(r"^#\s+Code Review\b", re.MULTILINE)
 # no backticks. This pattern accepts both shapes so the parser works
 # regardless of whether `NO_COLOR`/`TERM=dumb` convinces the CLI to
 # preserve the raw markdown. Anchored on line-start so it doesn't match
-# `File: foo.ts` mentions inside a Problem paragraph.
+# `File: foo.ts` mentions inside a Problem paragraph. The `(?!\w+://)`
+# lookahead rejects URLs (e.g. `File: http://x.com:8080`) that would
+# otherwise parse as `path=http://x.com`, `line=8080`.
 FILE_LINE_RE = re.compile(
-    r"^\s*(?:\*\*)?File:(?:\*\*)?\s+`?(?P<path>[^\s`]+?):(?P<line>\d+)(?:-\d+)?`?\s*$",
+    r"^\s*(?:\*\*)?File:(?:\*\*)?\s+`?(?!\w+://)(?P<path>[^\s`]+?):(?P<line>\d+)(?:-\d+)?`?\s*$",
     re.MULTILINE,
 )
 
@@ -90,6 +92,30 @@ FENCE_RE = re.compile(r"^\s*(?:`{3,}|~{3,})")
 # `#` is the top-level title; `####` is the next finding. Anything deeper
 # (`#####`+) is allowed inside a finding body.
 HEADING_TERMINATOR_RE = re.compile(r"^#{1,4}\s")
+
+# The orchestrator emits a structured JSON manifest after the markdown
+# review (see review-orchestrator.md "Machine-Readable Manifest" section).
+# These regexes locate the section and the fenced JSON payload inside it,
+# so we can parse findings deterministically instead of regexing prose.
+MANIFEST_SECTION_RE = re.compile(
+    r"^##\s+Machine-Readable Findings\b\s*$", re.MULTILINE
+)
+MANIFEST_FENCE_RE = re.compile(
+    r"```(?:json)?\s*\n(?P<payload>.*?)\n```", re.DOTALL
+)
+
+# Severity → emoji for reconstructing a finding's heading line when
+# rendering a JSON-manifest entry as an inline comment body. Kept in sync
+# with review-process.md's severity buckets; unknown severities fall
+# through with no emoji rather than being rejected.
+_SEVERITY_EMOJI = {
+    "Critical": "❌",
+    "Important": "⚠️",
+    "Suggestion": "💡",
+    "Nitpick": "📝",
+    "Verified": "✅",
+    "Uncertain": "⚠️",
+}
 
 # GitHub's PR review API rejects comments whose body exceeds ~65k chars and
 # rejects whole review payloads over the same limit. Cap each finding body so
@@ -155,6 +181,110 @@ def _iter_finding_blocks(text):
             start = None
     if start is not None:
         yield lines[start], "\n".join(lines[start:])
+
+
+def _validate_manifest_item(item):
+    """Return True iff a JSON-manifest entry passes schema checks.
+
+    Required shape per the review-orchestrator prompt:
+      severity: str (one of the six buckets; not enforced here so new
+                     orchestrator severities don't break parsing)
+      agent:    str
+      path:     str, forward-slash
+      line:     int >= 1
+      title:    str
+      body:     str
+
+    Any missing field, wrong type, or empty required string fails the
+    check. The caller's contract is "all items valid or fall back to
+    regex" — one bad entry invalidates the whole manifest rather than
+    producing a partial list that silently drops findings.
+    """
+    if not isinstance(item, dict):
+        return False
+    required = {"severity", "agent", "path", "line", "title", "body"}
+    if not required.issubset(item):
+        return False
+    if not isinstance(item["line"], int) or item["line"] < 1:
+        return False
+    for key in ("severity", "agent", "path", "title", "body"):
+        if not isinstance(item[key], str) or not item[key]:
+            return False
+    return True
+
+
+def _render_manifest_body(item):
+    """Reconstruct a markdown heading + body from a JSON manifest entry.
+
+    The manifest keeps `title` and `body` separate so the orchestrator
+    doesn't have to emit the heading twice; rendering prepends the
+    conventional `#### <emoji> <severity> — <title> [source: <agent>]`
+    heading used by the regex path so inline comment bodies look
+    identical regardless of which parser produced them.
+    """
+    severity = item["severity"]
+    emoji = _SEVERITY_EMOJI.get(severity, "")
+    emoji_prefix = f"{emoji} " if emoji else ""
+    header = f"#### {emoji_prefix}{severity} — {item['title']} [source: {item['agent']}]"
+    body = f"{header}\n\n{item['body']}"
+    if len(body) > MAX_BODY_CHARS:
+        body = body[:MAX_BODY_CHARS].rstrip() + "\n\n… (truncated)"
+    return body
+
+
+def parse_json_manifest(text):
+    """Extract findings from the orchestrator's JSON manifest, or None.
+
+    Returns:
+      list[dict] — when a valid manifest section exists. May be empty
+                   if the orchestrator legitimately found no issues.
+      None       — when the manifest section is absent, the fenced JSON
+                   block is missing, JSON parsing fails, or any item
+                   fails schema validation. Signals "fall back to the
+                   regex parser" — callers must distinguish this from
+                   "valid empty manifest" so a clean review doesn't
+                   accidentally trigger format-drift warnings.
+
+    The JSON path is preferred over the regex parser because it bypasses
+    markdown-rendering drift (bold markers eaten, backticks stripped,
+    emoji substitution) that the regex parser has to tolerate.
+    """
+    section_match = MANIFEST_SECTION_RE.search(text)
+    if section_match is None:
+        return None
+    fence_match = MANIFEST_FENCE_RE.search(text, pos=section_match.end())
+    if fence_match is None:
+        print("::warning::Machine-Readable Findings section found but no "
+              "fenced JSON block inside it. Falling back to regex parser.",
+              file=sys.stderr)
+        return None
+    try:
+        payload = json.loads(fence_match.group("payload"))
+    except json.JSONDecodeError as exc:
+        print(f"::warning::JSON manifest failed to parse ({exc}). "
+              f"Falling back to regex parser.", file=sys.stderr)
+        return None
+    if not isinstance(payload, list):
+        print(f"::warning::JSON manifest is not a list "
+              f"(got {type(payload).__name__}). "
+              f"Falling back to regex parser.", file=sys.stderr)
+        return None
+
+    findings = []
+    for index, item in enumerate(payload):
+        if not _validate_manifest_item(item):
+            print(f"::warning::JSON manifest item {index} failed schema "
+                  f"validation. Falling back to regex parser.",
+                  file=sys.stderr)
+            return None
+        findings.append({
+            "agent": item["agent"],
+            "severity": item["severity"],
+            "path": item["path"],
+            "line": item["line"],
+            "body": _render_manifest_body(item),
+        })
+    return findings
 
 
 def parse_findings(text):
@@ -359,6 +489,27 @@ def _format_summary_entry(path, line, body):
     return f"- `{path}:{line}` — {indented}"
 
 
+def _render_fallback_summary(findings):
+    """Render all findings as a single issue-comment body.
+
+    Used when `get_diff_lines` fails and we can't determine which findings
+    are inside the PR diff for inline commenting — we still want the
+    review content on the PR, just not anchored to lines.
+    """
+    parts = [
+        "## Kiro Review Summary",
+        f"Found **{len(findings)}** findings. "
+        f"Unable to determine diff ranges — posting all findings here "
+        f"rather than as inline review comments.\n",
+        "### Findings\n",
+    ]
+    parts.extend(
+        _format_summary_entry(f["path"], f["line"], f["body"])
+        for f in findings
+    )
+    return "\n".join(parts)
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--review-file", required=True)
@@ -378,8 +529,30 @@ def main():
     # Strip ANSI sequences and trim to the `# Code Review` H1 so downstream
     # parsing — and any raw-output fallback — never sees the chat transcript.
     review_text = preprocess_review_text(raw_text)
+    if not review_text.strip():
+        # preprocess_review_text returns the ANSI-stripped text even when
+        # no `# Code Review` marker is found, so a whitespace-only result
+        # means the original was either all-ANSI or all-whitespace. Either
+        # way, nothing to post — exit loudly rather than sending an empty
+        # comment that looks like the pipeline succeeded.
+        print("::error::Preprocessed review is empty — orchestrator output "
+              "contained no reviewable content after ANSI strip / transcript trim.",
+              file=sys.stderr)
+        sys.exit(1)
 
-    findings = parse_findings(review_text)
+    # Prefer the JSON manifest path. When the orchestrator follows the
+    # prompt, the manifest is deterministic and bypasses every regex
+    # fragility (markdown rendering, bold marker eating, emoji drift).
+    # `None` from parse_json_manifest means "manifest missing/invalid —
+    # fall through"; an empty list means "orchestrator validly reported
+    # no findings."
+    findings = parse_json_manifest(review_text)
+    parser_source = "json-manifest"
+    if findings is None:
+        findings = parse_findings(review_text)
+        parser_source = "regex"
+    print(f"Using {parser_source} parser → {len(findings)} findings")
+
     if not findings:
         if looks_like_findings(review_text):
             print("::warning::Review text contains finding-like headings but "
@@ -393,10 +566,30 @@ def main():
             print(f"::error::Failed to post raw-output fallback comment. "
                   f"stderr={err} stdout={out}", file=sys.stderr)
             sys.exit(1)
-        print("No inline findings parsed. Posted raw output as PR comment.")
+        print("No findings parsed. Posted raw output as PR comment.")
         return
 
-    diff_lines = get_diff_lines(args.base_ref)
+    # get_diff_lines can raise RuntimeError (git failure) or ValueError
+    # (empty base_ref). An unhandled exception here would discard all
+    # parsed findings and leave the PR without a review comment. Instead,
+    # fall through to the issue-comment fallback with every finding in
+    # the summary body — no findings lost, just posted less prettily.
+    try:
+        diff_lines = get_diff_lines(args.base_ref)
+    except (RuntimeError, ValueError) as exc:
+        print(f"::error::get_diff_lines failed ({exc}). Falling back to "
+              f"issue comment with all {len(findings)} findings in summary.",
+              file=sys.stderr)
+        rc, out, err = gh_issue_comment(
+            args.repo, args.pr, _render_fallback_summary(findings)
+        )
+        if rc != 0:
+            print(f"::error::Fallback issue comment also failed. "
+                  f"stderr={err} stdout={out}", file=sys.stderr)
+            sys.exit(1)
+        print(f"Posted {len(findings)} findings via issue-comment fallback "
+              f"(get_diff_lines failed).")
+        return
 
     inline_comments = []
     body_comments = []
