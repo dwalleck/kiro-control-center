@@ -3,10 +3,12 @@ name: Kiro Code Review
 # Uses pull_request_target so fork PRs can receive review comments (the default
 # pull_request trigger gives forks a read-only GITHUB_TOKEN). The job below is
 # gated so same-repo PRs run automatically on every event, but fork PRs run
-# only on the `labeled` event with `safe-to-review` — NOT on `synchronize`.
-# That closes the TOCTOU: once a fork PR is labeled, new pushes won't re-run
-# with secrets until a maintainer re-labels the PR. We never execute PR code;
-# only file paths and contents are read.
+# only when the `safe-to-review` label is the one that fired the event — NOT
+# on `synchronize`, and NOT when unrelated labels (`bug`, `needs-triage`, etc.)
+# are added while `safe-to-review` happens to already be present. Gating on
+# `github.event.label.name` forces a maintainer to re-apply `safe-to-review`
+# after every fork push before secrets are exposed again. We never execute PR
+# code; only file paths and contents are read.
 on:
   pull_request_target:
     types: [opened, synchronize, labeled]
@@ -20,7 +22,7 @@ jobs:
     if: >-
       github.event.pull_request.head.repo.full_name == github.repository ||
       (github.event.action == 'labeled' &&
-       contains(github.event.pull_request.labels.*.name, 'safe-to-review'))
+       github.event.label.name == 'safe-to-review')
     runs-on: ubuntu-latest
     env:
       BASE_REF: ${{ github.base_ref }}
