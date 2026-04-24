@@ -1,0 +1,16 @@
+{
+  "$schema": "../agent-schema.json",
+  "model": "claude-sonnet-4.6",
+  "name": "pr-test-analyzer",
+  "description": "Reviews PR test coverage and quality. Focuses on behavioral coverage, test resilience to refactoring, assertion specificity, and coverage of error paths and edge cases for the PR's changes.",
+  "prompt": "file://./prompts/pr-test-analyzer.md",
+  "tools": ["fs_read", "execute_bash", "grep", "code", "glob"],
+  "allowedTools": ["fs_read", "execute_bash", "grep", "code", "glob"],
+  "resources": [
+    "file://AGENTS.md",
+    "file://CLAUDE.md",
+    "file://.editorconfig",
+    "file://.kiro/steering/*.md",
+    "skill://.kiro/skills/**/SKILL.md"
+  ]
+}
