@@ -42,11 +42,37 @@ FINDING_HEADER_RE = re.compile(
     r"(?P<rest>.+?)\s*$"
 )
 
-# `**File:** ` is the required locator from review-process.md:220. Matching on
-# the literal label (not a bare backtick span) avoids false positives from
-# inline `file:line` mentions inside a Problem/Fix-direction paragraph.
+# Kiro CLI's `chat --no-interactive` output contains ANSI color sequences in
+# two forms:
+#   * Real CSI escapes (\x1b[...m) that propagate when the CLI's color
+#     renderer runs despite redirection.
+#   * Literal caret-bracket strings (`^[[...m`, where `^` and `[` are
+#     printable ASCII) that the CLI emits when it detects a non-TTY stdout
+#     but still encodes color sequences into the stream.
+# Both forms wrap every markdown heading and break `^####` anchoring. Also
+# matches non-`m` CSI sequences (`\x1b[K` erase-line, cursor moves) that
+# some terminal renderers inject during long-running output.
+ANSI_RE = re.compile(r"(?:\x1b|\^\[)\[[0-9;?]*[a-zA-Z]")
+
+# The orchestrator prompt (review-orchestrator.md:110) pins the start of
+# the actual review at a level-1 `# Code Review —` heading. Everything
+# before that heading is `kiro-cli chat` session narration (tool calls,
+# tool output, assistant thinking) and must not leak into the parsed
+# findings or the raw-output fallback comment.
+REVIEW_START_RE = re.compile(r"^#\s+Code Review\b", re.MULTILINE)
+
+# `File:` is the required locator from review-process.md:220. The spec
+# form is `**File:** `path:line``, but kiro-cli renders markdown for its
+# terminal output: bold markers become ANSI bold (\[1m ... \[22m) and
+# inline code becomes colored text (\[38;5;10m...\[0m). After ANSI
+# stripping, what remains is plain `File: path:line` — no `**` markers,
+# no backticks. This pattern accepts both shapes so the parser works
+# regardless of whether `NO_COLOR`/`TERM=dumb` convinces the CLI to
+# preserve the raw markdown. Anchored on line-start so it doesn't match
+# `File: foo.ts` mentions inside a Problem paragraph.
 FILE_LINE_RE = re.compile(
-    r"\*\*File:\*\*\s+`(?P<path>[^`]+?):(?P<line>\d+)(?:-\d+)?`"
+    r"^\s*(?:\*\*)?File:(?:\*\*)?\s+`?(?P<path>[^\s`]+?):(?P<line>\d+)(?:-\d+)?`?\s*$",
+    re.MULTILINE,
 )
 
 # Orchestrator annotates each block with [source: agent-name] per
@@ -69,6 +95,35 @@ HEADING_TERMINATOR_RE = re.compile(r"^#{1,4}\s")
 # rejects whole review payloads over the same limit. Cap each finding body so
 # a single verbose finding can't bust the limit for the whole review.
 MAX_BODY_CHARS = 2000
+
+
+def _strip_ansi(text):
+    """Remove ANSI/CSI escape sequences, including the literal `^[` encoding.
+
+    Returns the text unchanged if no matches are found, so the cost on a
+    clean input is a single regex scan.
+    """
+    return ANSI_RE.sub("", text)
+
+
+def preprocess_review_text(text):
+    """Clean and trim raw kiro-cli output to the review proper.
+
+    Two passes, both required:
+      1. Strip ANSI sequences so `^####` anchors match heading lines.
+      2. Trim everything before `# Code Review` so tool-call narration
+         doesn't pollute parsed findings or the raw-output fallback.
+
+    If the review start marker is absent — which typically means the
+    orchestrator crashed before producing its final report — returns the
+    ANSI-stripped text as-is so callers can still post it via the fallback
+    path rather than silently dropping the run.
+    """
+    stripped = _strip_ansi(text)
+    match = REVIEW_START_RE.search(stripped)
+    if match is None:
+        return stripped
+    return stripped[match.start():]
 
 
 def _iter_finding_blocks(text):
@@ -314,11 +369,15 @@ def main():
                         help="Base branch name for diff range (e.g. 'main')")
     args = parser.parse_args()
 
-    review_text = Path(args.review_file).read_text(encoding="utf-8")
-    if not review_text.strip():
+    raw_text = Path(args.review_file).read_text(encoding="utf-8")
+    if not raw_text.strip():
         print("::error::Review output is empty — the orchestrator likely failed.",
               file=sys.stderr)
         sys.exit(1)
+
+    # Strip ANSI sequences and trim to the `# Code Review` H1 so downstream
+    # parsing — and any raw-output fallback — never sees the chat transcript.
+    review_text = preprocess_review_text(raw_text)
 
     findings = parse_findings(review_text)
     if not findings:
