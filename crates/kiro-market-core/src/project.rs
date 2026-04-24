@@ -85,11 +85,42 @@ pub struct InstalledAgentMeta {
     pub installed_hash: Option<String>,
 }
 
+/// Tracking entry for a plugin's companion file bundle that lives under
+/// `.kiro/agents/`. Populated by:
+///
+/// - The translated-agent install path (this stage): each translated
+///   agent's `prompts/<name>.md` body file is added to its plugin's
+///   bundle entry. This makes the file plugin-owned from day one, so a
+///   later native plugin install at the same path is correctly flagged
+///   as a cross-plugin clash rather than a free-for-the-taking orphan.
+/// - The native-agent install path (Stage 2): plugin-wide companion
+///   bundles discovered alongside native agent JSONs.
+///
+/// Ownership is at the plugin level (not per-agent), so this entry
+/// tracks the union of files installed for one plugin.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InstalledNativeCompanionsMeta {
+    pub marketplace: String,
+    pub plugin: String,
+    pub version: Option<String>,
+    pub installed_at: DateTime<Utc>,
+    /// Relative paths under `.kiro/agents/` of every companion file owned
+    /// by this plugin. Used for collision detection (cross-plugin path
+    /// overlap) and for uninstall.
+    pub files: Vec<PathBuf>,
+    pub source_hash: String,
+    pub installed_hash: String,
+}
+
 /// The on-disk structure of `installed-agents.json`.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct InstalledAgents {
     /// Map from agent name to its installation metadata.
     pub agents: HashMap<String, InstalledAgentMeta>,
+    /// Per-plugin companion file ownership. Defaults to empty for
+    /// backward compat with legacy tracking files.
+    #[serde(default)]
+    pub native_companions: HashMap<String, InstalledNativeCompanionsMeta>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1921,5 +1952,45 @@ mod tests {
         assert_eq!(meta.dialect, AgentDialect::Claude);
         assert!(meta.source_hash.is_none());
         assert!(meta.installed_hash.is_none());
+    }
+
+    #[test]
+    fn installed_agents_loads_legacy_json_without_native_companions() {
+        // Old tracking files (pre-Stage-1) lack the native_companions map.
+        // The new schema must deserialize them with native_companions = empty.
+        let legacy = br#"{
+            "agents": {
+                "x": {
+                    "marketplace": "m",
+                    "plugin": "p",
+                    "version": null,
+                    "installed_at": "2026-01-01T00:00:00Z",
+                    "dialect": "claude"
+                }
+            }
+        }"#;
+
+        let installed: InstalledAgents = serde_json::from_slice(legacy).unwrap();
+        assert_eq!(installed.agents.len(), 1);
+        assert!(installed.native_companions.is_empty());
+    }
+
+    #[test]
+    fn installed_native_companions_meta_round_trips_through_serde() {
+        let meta = InstalledNativeCompanionsMeta {
+            marketplace: "m".into(),
+            plugin: "p".into(),
+            version: Some("0.1.0".into()),
+            installed_at: chrono::Utc::now(),
+            files: vec![
+                std::path::PathBuf::from("prompts/a.md"),
+                std::path::PathBuf::from("prompts/b.md"),
+            ],
+            source_hash: "blake3:abc".into(),
+            installed_hash: "blake3:abc".into(),
+        };
+        let bytes = serde_json::to_vec(&meta).unwrap();
+        let back: InstalledNativeCompanionsMeta = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(back.files.len(), 2);
     }
 }
