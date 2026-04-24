@@ -282,7 +282,10 @@ def parse_json_manifest(text):
               file=sys.stderr)
         return None
     try:
-        payload, _ = json.JSONDecoder().raw_decode(text[array_start:])
+        # Pass the full text + idx to raw_decode rather than slicing —
+        # avoids a memory copy AND preserves original line/col in any
+        # JSONDecodeError message for easier debugging.
+        payload, _ = json.JSONDecoder().raw_decode(text, array_start)
     except json.JSONDecodeError as exc:
         print(f"::warning::JSON manifest failed to parse ({exc}). "
               f"Falling back to regex parser.", file=sys.stderr)
@@ -450,10 +453,14 @@ def get_diff_lines(base_ref):
 
     Raises:
       ValueError — base_ref is empty (misconfigured workflow).
-      RuntimeError — git exited non-zero OR git itself isn't on PATH.
-                     FileNotFoundError from subprocess is normalized to
-                     RuntimeError so callers only need one except clause
-                     to route all git-lookup failures to the fallback.
+      RuntimeError — git exited non-zero, the git binary isn't on PATH,
+                     or it's present but unusable (non-executable bit,
+                     process-limit hit, permission denied, etc.). OSError
+                     is the parent class for FileNotFoundError +
+                     PermissionError + other subprocess-launch failures;
+                     catching it means callers only need one except
+                     clause to route all git-lookup failures to the
+                     fallback.
     """
     if not base_ref:
         raise ValueError("base_ref is empty; cannot compute diff range")
@@ -470,8 +477,8 @@ def get_diff_lines(base_ref):
             ],
             capture_output=True, text=True,
         )
-    except FileNotFoundError as exc:
-        raise RuntimeError(f"git binary not found on PATH: {exc}") from exc
+    except OSError as exc:
+        raise RuntimeError(f"git binary unavailable: {exc}") from exc
     if result.returncode != 0:
         raise RuntimeError(
             f"git diff failed (exit {result.returncode}): {result.stderr.strip()}"
@@ -498,12 +505,14 @@ def looks_like_findings(text):
 def _gh_api_post_json(api_path, payload):
     """Shell out to `gh api --input -` with a JSON stdin payload.
 
-    Returns (returncode, stdout, stderr). Normalizes FileNotFoundError
-    (missing `gh` binary) to a synthetic (-1, "", "...") result so call
-    sites use one return-code check instead of mixing exception handling
-    with subprocess-result handling. `gh api` writes 4xx/5xx response
-    bodies to stdout (not stderr), so callers need both streams to
-    diagnose failures.
+    Returns (returncode, stdout, stderr). Normalizes OSError — the
+    parent class for FileNotFoundError (missing binary), PermissionError
+    (present but not executable), and other subprocess-launch failures
+    — to a synthetic (-1, "", "...") result so call sites use one
+    return-code check instead of mixing exception handling with
+    subprocess-result handling. `gh api` writes 4xx/5xx response bodies
+    to stdout (not stderr), so callers need both streams to diagnose
+    failures.
     """
     try:
         result = subprocess.run(
@@ -511,8 +520,8 @@ def _gh_api_post_json(api_path, payload):
             input=json.dumps(payload),
             capture_output=True, text=True,
         )
-    except FileNotFoundError as exc:
-        return -1, "", f"gh binary not found on PATH: {exc}"
+    except OSError as exc:
+        return -1, "", f"gh binary unavailable: {exc}"
     return result.returncode, result.stdout, result.stderr
 
 

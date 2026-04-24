@@ -685,9 +685,10 @@ class TestValidateManifestItem:
 
 class TestGetDiffLinesErrorNormalization:
     # get_diff_lines is the only boundary where subprocess.run can raise
-    # FileNotFoundError — if the git binary is missing from the runner's
-    # PATH, the exception type differs from the RuntimeError/ValueError
-    # the rest of the module uses. Verify the function normalizes it to
+    # OSError — missing git, non-executable git, or other
+    # subprocess-launch failures all raise OSError subclasses, but none
+    # of those match the RuntimeError/ValueError the rest of the module
+    # uses. Verify the function normalizes the whole OSError family to
     # RuntimeError so main()'s except clause catches every git failure
     # without a second exception type.
 
@@ -705,13 +706,27 @@ class TestGetDiffLinesErrorNormalization:
 
         monkeypatch.setattr(_mod.subprocess, "run", fake_run)
 
-        with pytest.raises(RuntimeError, match="git binary not found"):
+        with pytest.raises(RuntimeError, match="git binary unavailable"):
+            _mod.get_diff_lines("main")
+
+    def test_non_executable_git_raises_runtime_error(self, monkeypatch):
+        # PermissionError is a sibling of FileNotFoundError under OSError —
+        # raised when the binary exists but its execute bit is stripped
+        # (common in misconfigured container images). The OSError-based
+        # catch must handle this class too; a FileNotFoundError-only
+        # catch would silently drop all findings.
+        def fake_run(*args, **kwargs):
+            raise PermissionError("[Errno 13] Permission denied: 'git'")
+
+        monkeypatch.setattr(_mod.subprocess, "run", fake_run)
+
+        with pytest.raises(RuntimeError, match="git binary unavailable"):
             _mod.get_diff_lines("main")
 
     def test_empty_base_ref_still_raises_value_error(self):
-        # Regression guard: normalizing FileNotFoundError must not
-        # accidentally swallow the ValueError for an empty base_ref,
-        # which is a distinct misconfiguration.
+        # Regression guard: normalizing OSError must not accidentally
+        # swallow the ValueError for an empty base_ref, which is a
+        # distinct misconfiguration.
         with pytest.raises(ValueError, match="base_ref is empty"):
             _mod.get_diff_lines("")
 
@@ -735,7 +750,22 @@ class TestGhApiPostJson:
         rc, out, err = _mod._gh_api_post_json("/repos/x/y/issues/1/comments", {})
         assert rc == -1
         assert out == ""
-        assert "gh binary not found" in err
+        assert "gh binary unavailable" in err
+
+    def test_non_executable_gh_returns_minus_one(self, monkeypatch):
+        # PermissionError is the realistic alternative mode: binary is
+        # present on PATH but its execute bit is stripped. Before the
+        # OSError widening this escaped uncaught and crashed main with
+        # a Python traceback instead of posting any review comment.
+        def fake_run(*args, **kwargs):
+            raise PermissionError("[Errno 13] Permission denied: 'gh'")
+
+        monkeypatch.setattr(_mod.subprocess, "run", fake_run)
+
+        rc, out, err = _mod._gh_api_post_json("/repos/x/y/issues/1/comments", {})
+        assert rc == -1
+        assert out == ""
+        assert "gh binary unavailable" in err
 
     def test_subprocess_success_passes_through(self, monkeypatch):
         # Happy path: subprocess returns normally, _gh_api_post_json
