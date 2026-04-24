@@ -245,7 +245,7 @@ class TestParseFindings:
         # Tight bound: MAX_BODY_CHARS (2000) plus the 15-char truncation
         # marker "\n\n… (truncated)". A looser bound would hide a
         # regression in the truncation logic.
-        assert len(findings[0]["body"]) <= _mod.MAX_BODY_CHARS + 20
+        assert len(findings[0]["body"]) <= _mod.MAX_BODY_CHARS + 15
 
     def test_line_range_uses_first_line(self):
         text = (
@@ -535,11 +535,15 @@ class TestParseJsonManifest:
         text = "# Code Review — PR #1\n\nJust prose.\n"
         assert parse_json_manifest(text) is None
 
-    def test_section_without_fence_returns_none(self):
+    def test_section_without_array_returns_none(self):
+        # No `[` after the heading → signal fallback. raw_decode can't
+        # locate a JSON array if there isn't one; this can happen if the
+        # orchestrator emitted the heading but crashed before producing
+        # findings, or wrote a prose apology instead.
         text = (
             "# Code Review — PR #1\n\n"
             "## Machine-Readable Findings\n\n"
-            "Oops, forgot the fence.\n"
+            "The orchestrator failed; no findings extracted.\n"
         )
         assert parse_json_manifest(text) is None
 
@@ -581,14 +585,34 @@ class TestParseJsonManifest:
         text = self._wrap(json.dumps([broken]))
         assert parse_json_manifest(text) is None
 
-    def test_fence_without_json_tag_still_matches(self):
-        # The fence language tag is optional — accept ```\n as well as ```json\n.
+    def test_unfenced_output_from_kiro_cli_still_parses(self):
+        # Kiro CLI's markdown renderer consumes ``` fence markers before
+        # writing stdout (PR #51 confirmed this by capturing the actual
+        # orchestrator output). After ANSI stripping, a block emitted as
+        # ```json\n[...]\n``` arrives as `json\n[...]` with no fences.
+        # raw_decode must handle this since the fence-free shape is what
+        # we see in production, not the shape a markdown-preserving tool
+        # would emit.
         text = (
             "# Code Review — PR #1\n\n"
             "## Machine-Readable Findings\n\n"
-            "```\n"
+            "json\n"
             f"{json.dumps([self._VALID])}\n"
-            "```\n"
+        )
+        findings = parse_json_manifest(text)
+        assert findings is not None
+        assert len(findings) == 1
+        assert findings[0]["path"] == "src/auth.ts"
+
+    def test_trailing_content_after_array_is_ignored(self):
+        # raw_decode parses one JSON value and stops. Any content after
+        # the closing `]` (e.g. the next section heading or orchestrator
+        # verdict text) must not interfere.
+        text = (
+            "## Machine-Readable Findings\n\n"
+            f"{json.dumps([self._VALID])}\n\n"
+            "## Verdict\n\n"
+            "✅ LGTM — all findings addressed.\n"
         )
         findings = parse_json_manifest(text)
         assert findings is not None
@@ -600,7 +624,7 @@ class TestParseJsonManifest:
         findings = parse_json_manifest(text)
         assert findings is not None
         assert findings[0]["body"].endswith("… (truncated)")
-        assert len(findings[0]["body"]) <= _mod.MAX_BODY_CHARS + 20
+        assert len(findings[0]["body"]) <= _mod.MAX_BODY_CHARS + 15
 
     def test_unknown_severity_renders_without_emoji(self):
         # Forward-compatible: a new severity bucket shouldn't crash; we
@@ -644,11 +668,15 @@ class TestValidateManifestItem:
             assert not _validate_manifest_item(bad), f"empty {key} should fail"
 
     def test_bool_line_is_rejected(self):
-        # `isinstance(True, int)` is True in Python because bool is an
-        # int subclass. Without the explicit bool-reject, a manifest with
-        # `"line": true` would pass as line=1 and silently fabricate an
-        # inline comment on line 1 of whatever file the orchestrator
-        # pointed at.
+        # True is the dangerous case: `isinstance(True, int)` is True
+        # (bool subclasses int) AND `True >= 1` is True, so without an
+        # explicit bool reject, `{"line": true}` passes as line=1 and
+        # fabricates an inline comment on line 1 of whatever file the
+        # orchestrator pointed at. False would actually be caught by the
+        # existing `< 1` check (False >= 1 is False), so it's already
+        # rejected — but we pin both cases for symmetry so a future
+        # refactor that removes the `< 1` check doesn't silently accept
+        # `{"line": false}`.
         bad_true = dict(self._BASE, line=True)
         bad_false = dict(self._BASE, line=False)
         assert not _validate_manifest_item(bad_true)
@@ -657,35 +685,102 @@ class TestValidateManifestItem:
 
 class TestGetDiffLinesErrorNormalization:
     # get_diff_lines is the only boundary where subprocess.run can raise
-    # FileNotFoundError — if the git binary is missing from the runner's
-    # PATH, the exception type differs from the RuntimeError/ValueError
-    # the rest of the module uses. Verify the function normalizes it to
+    # OSError — missing git, non-executable git, or other
+    # subprocess-launch failures all raise OSError subclasses, but none
+    # of those match the RuntimeError/ValueError the rest of the module
+    # uses. Verify the function normalizes the whole OSError family to
     # RuntimeError so main()'s except clause catches every git failure
     # without a second exception type.
 
     def test_missing_git_binary_raises_runtime_error(self, monkeypatch):
-        import subprocess
-
+        # `_mod.subprocess` is the same object as the top-level
+        # `subprocess` module (verified: `_mod.subprocess is subprocess`
+        # → True), so patching `_mod.subprocess.run` is sufficient. The
+        # module uses attribute lookup (`subprocess.run(...)`) at call
+        # time, not at import time, so this patch takes effect even
+        # though the import happened during module load.
         def fake_run(*args, **kwargs):
             raise FileNotFoundError(
                 "[Errno 2] No such file or directory: 'git'"
             )
 
-        monkeypatch.setattr(subprocess, "run", fake_run)
-        # Reload subprocess reference inside _mod — it was imported at module
-        # load, so monkeypatch on `subprocess.run` propagates via attribute
-        # lookup on the module the code actually uses.
         monkeypatch.setattr(_mod.subprocess, "run", fake_run)
 
-        with pytest.raises(RuntimeError, match="git binary not found"):
+        with pytest.raises(RuntimeError, match="git binary unavailable"):
+            _mod.get_diff_lines("main")
+
+    def test_non_executable_git_raises_runtime_error(self, monkeypatch):
+        # PermissionError is a sibling of FileNotFoundError under OSError —
+        # raised when the binary exists but its execute bit is stripped
+        # (common in misconfigured container images). The OSError-based
+        # catch must handle this class too; a FileNotFoundError-only
+        # catch would silently drop all findings.
+        def fake_run(*args, **kwargs):
+            raise PermissionError("[Errno 13] Permission denied: 'git'")
+
+        monkeypatch.setattr(_mod.subprocess, "run", fake_run)
+
+        with pytest.raises(RuntimeError, match="git binary unavailable"):
             _mod.get_diff_lines("main")
 
     def test_empty_base_ref_still_raises_value_error(self):
-        # Regression guard: normalizing FileNotFoundError must not
-        # accidentally swallow the ValueError for an empty base_ref,
-        # which is a distinct misconfiguration.
+        # Regression guard: normalizing OSError must not accidentally
+        # swallow the ValueError for an empty base_ref, which is a
+        # distinct misconfiguration.
         with pytest.raises(ValueError, match="base_ref is empty"):
             _mod.get_diff_lines("")
+
+
+class TestGhApiPostJson:
+    # _gh_api_post_json wraps subprocess.run to normalize missing-gh
+    # failures into a (rc, stdout, stderr) triple instead of a raised
+    # FileNotFoundError. Without this, call sites in main() (the review
+    # POST at line ~657 and the gh_issue_comment fallback) would need
+    # exception-handling duplicated at each site, and a missing `gh`
+    # would escape as an uncaught Python traceback.
+
+    def test_missing_gh_binary_returns_minus_one(self, monkeypatch):
+        def fake_run(*args, **kwargs):
+            raise FileNotFoundError(
+                "[Errno 2] No such file or directory: 'gh'"
+            )
+
+        monkeypatch.setattr(_mod.subprocess, "run", fake_run)
+
+        rc, out, err = _mod._gh_api_post_json("/repos/x/y/issues/1/comments", {})
+        assert rc == -1
+        assert out == ""
+        assert "gh binary unavailable" in err
+
+    def test_non_executable_gh_returns_minus_one(self, monkeypatch):
+        # PermissionError is the realistic alternative mode: binary is
+        # present on PATH but its execute bit is stripped. Before the
+        # OSError widening this escaped uncaught and crashed main with
+        # a Python traceback instead of posting any review comment.
+        def fake_run(*args, **kwargs):
+            raise PermissionError("[Errno 13] Permission denied: 'gh'")
+
+        monkeypatch.setattr(_mod.subprocess, "run", fake_run)
+
+        rc, out, err = _mod._gh_api_post_json("/repos/x/y/issues/1/comments", {})
+        assert rc == -1
+        assert out == ""
+        assert "gh binary unavailable" in err
+
+    def test_subprocess_success_passes_through(self, monkeypatch):
+        # Happy path: subprocess returns normally, _gh_api_post_json
+        # forwards returncode/stdout/stderr unchanged.
+        class FakeResult:
+            returncode = 0
+            stdout = '{"id":42}'
+            stderr = ""
+
+        monkeypatch.setattr(_mod.subprocess, "run", lambda *a, **kw: FakeResult())
+
+        rc, out, err = _mod._gh_api_post_json("/repos/x/y/issues/1/comments", {"body": "hi"})
+        assert rc == 0
+        assert out == '{"id":42}'
+        assert err == ""
 
 
 class TestRenderFallbackSummary:
@@ -704,11 +799,14 @@ class TestRenderFallbackSummary:
         assert "- `a.py:10` — first finding" in out
         assert "- `b.py:20` — second finding" in out
 
-    def test_empty_list_still_renders_with_zero_count(self):
-        # Defensive: _render_fallback_summary is called when get_diff_lines
-        # fails after findings were parsed. Zero findings here is an edge
-        # case (the no-findings branch runs earlier), but it should still
-        # produce coherent output rather than crashing.
+    def test_empty_list_renders_coherently(self):
+        # Unit-level contract: main() never actually calls
+        # _render_fallback_summary with an empty list (the no-findings
+        # branch fires earlier and returns before reaching the
+        # get_diff_lines exception path that renders the fallback). This
+        # test is a contract check on the function in isolation — it
+        # should produce coherent output if ever called with [], rather
+        # than crashing or dropping the heading.
         out = _render_fallback_summary([])
         assert "Found **0** findings" in out
         assert "## Kiro Review Summary" in out
