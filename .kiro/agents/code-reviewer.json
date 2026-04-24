@@ -1,0 +1,16 @@
+{
+  "$schema": "../agent-schema.json",
+  "model": "claude-sonnet-4.6",
+  "name": "code-reviewer",
+  "description": "General-purpose code reviewer. Covers project-guideline compliance, bug detection, code quality, and any concern not handled by a specialist. Runs standalone or as part of the orchestrated review.",
+  "prompt": "file://./prompts/code-reviewer.md",
+  "tools": ["fs_read", "execute_bash", "grep", "code", "glob"],
+  "allowedTools": ["fs_read", "execute_bash", "grep", "code", "glob"],
+  "resources": [
+    "file://AGENTS.md",
+    "file://CLAUDE.md",
+    "file://.editorconfig",
+    "file://.kiro/steering/*.md",
+    "skill://.kiro/skills/**/SKILL.md"
+  ]
+}
