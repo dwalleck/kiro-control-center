@@ -95,13 +95,19 @@ HEADING_TERMINATOR_RE = re.compile(r"^#{1,4}\s")
 
 # The orchestrator emits a structured JSON manifest after the markdown
 # review (see review-orchestrator.md "Machine-Readable Findings" section).
-# These regexes locate the section and the fenced JSON payload inside it,
-# so we can parse findings deterministically instead of regexing prose.
+# This regex locates the section heading; the JSON payload itself is
+# extracted with json.JSONDecoder.raw_decode starting at the first `[`
+# after the heading rather than pattern-matching a fence.
+#
+# Why not a fence regex: Kiro CLI's markdown renderer consumes ``` fence
+# markers before writing to stdout, the same way it consumes `**bold**`
+# and inline backticks. After ANSI stripping, a block that was emitted
+# as ```json\n[...]\n``` arrives as `json\n[...]` with no fence markers
+# to anchor on. Balanced-bracket parsing sidesteps the whole
+# fence-rendering concern and works whether markdown fences survive
+# rendering or not.
 MANIFEST_SECTION_RE = re.compile(
     r"^##\s+Machine-Readable Findings\b\s*$", re.MULTILINE
-)
-MANIFEST_FENCE_RE = re.compile(
-    r"```(?:json)?\s*\n(?P<payload>.*?)\n```", re.DOTALL
 )
 
 # Severity → emoji for reconstructing a finding's heading line when
@@ -249,28 +255,34 @@ def parse_json_manifest(text):
     Returns:
       list[dict] — when a valid manifest section exists. May be empty
                    if the orchestrator legitimately found no issues.
-      None       — when the manifest section is absent, the fenced JSON
-                   block is missing, JSON parsing fails, or any item
+      None       — when the manifest section is absent, no JSON array
+                   follows the heading, JSON parsing fails, or any item
                    fails schema validation. Signals "fall back to the
                    regex parser" — callers must distinguish this from
                    "valid empty manifest" so a clean review doesn't
                    accidentally trigger format-drift warnings.
 
-    The JSON path is preferred over the regex parser because it bypasses
-    markdown-rendering drift (bold markers eaten, backticks stripped,
-    emoji substitution) that the regex parser has to tolerate.
+    Extraction strategy: find `## Machine-Readable Findings`, then
+    locate the first `[` after it and hand the slice to
+    `json.JSONDecoder.raw_decode`. The decoder finds the matching `]`
+    itself and ignores trailing content, so we never need to detect a
+    closing marker. This is deliberate — kiro-cli's markdown renderer
+    consumes ``` fence markers before writing stdout, so a fence-based
+    regex like the one this used to use never actually matches in
+    production (PR #51 confirmed the orchestrator emits valid JSON but
+    loses the fence markers en route).
     """
     section_match = MANIFEST_SECTION_RE.search(text)
     if section_match is None:
         return None
-    fence_match = MANIFEST_FENCE_RE.search(text, pos=section_match.end())
-    if fence_match is None:
+    array_start = text.find("[", section_match.end())
+    if array_start == -1:
         print("::warning::Machine-Readable Findings section found but no "
-              "fenced JSON block inside it. Falling back to regex parser.",
+              "JSON array follows the heading. Falling back to regex parser.",
               file=sys.stderr)
         return None
     try:
-        payload = json.loads(fence_match.group("payload"))
+        payload, _ = json.JSONDecoder().raw_decode(text[array_start:])
     except json.JSONDecodeError as exc:
         print(f"::warning::JSON manifest failed to parse ({exc}). "
               f"Falling back to regex parser.", file=sys.stderr)
@@ -483,21 +495,39 @@ def looks_like_findings(text):
     )
 
 
+def _gh_api_post_json(api_path, payload):
+    """Shell out to `gh api --input -` with a JSON stdin payload.
+
+    Returns (returncode, stdout, stderr). Normalizes FileNotFoundError
+    (missing `gh` binary) to a synthetic (-1, "", "...") result so call
+    sites use one return-code check instead of mixing exception handling
+    with subprocess-result handling. `gh api` writes 4xx/5xx response
+    bodies to stdout (not stderr), so callers need both streams to
+    diagnose failures.
+    """
+    try:
+        result = subprocess.run(
+            ["gh", "api", api_path, "--input", "-"],
+            input=json.dumps(payload),
+            capture_output=True, text=True,
+        )
+    except FileNotFoundError as exc:
+        return -1, "", f"gh binary not found on PATH: {exc}"
+    return result.returncode, result.stdout, result.stderr
+
+
 def gh_issue_comment(repo, pr, body):
     """Post a plain issue comment. Returns (returncode, stdout, stderr).
 
-    Passes the body through stdin as a JSON payload via `gh api --input -`.
-    Sending large bodies through `-f body=...` puts the text on argv, which
-    is bounded by ARG_MAX and fragile for content containing shell-special
-    sequences. `gh api` writes 4xx/5xx response bodies to stdout (not stderr),
-    so callers need both streams to diagnose failures.
+    Passes the body through stdin as a JSON payload. Sending large
+    bodies through `-f body=...` puts the text on argv, which is
+    bounded by ARG_MAX and fragile for content containing
+    shell-special sequences.
     """
-    result = subprocess.run(
-        ["gh", "api", f"/repos/{repo}/issues/{pr}/comments", "--input", "-"],
-        input=json.dumps({"body": body}),
-        capture_output=True, text=True,
+    return _gh_api_post_json(
+        f"/repos/{repo}/issues/{pr}/comments",
+        {"body": body},
     )
-    return result.returncode, result.stdout, result.stderr
 
 
 def _format_summary_entry(path, line, body):
@@ -642,19 +672,17 @@ def main():
         "comments": inline_comments,
     }
 
-    result = subprocess.run(
-        ["gh", "api", f"/repos/{args.repo}/pulls/{args.pr}/reviews",
-         "--input", "-"],
-        input=json.dumps(review_payload),
-        capture_output=True, text=True,
+    rc, out, err = _gh_api_post_json(
+        f"/repos/{args.repo}/pulls/{args.pr}/reviews",
+        review_payload,
     )
 
-    if result.returncode == 0:
+    if rc == 0:
         print(f"Posted review with {len(inline_comments)} inline comments.")
         return
 
     print(f"::warning::Primary review post failed. "
-          f"stderr={result.stderr} stdout={result.stdout}", file=sys.stderr)
+          f"stderr={err} stdout={out}", file=sys.stderr)
     fallback = "\n".join(body_parts)
     if inline_comments:
         fallback += "\n\n### Inline findings\n"
