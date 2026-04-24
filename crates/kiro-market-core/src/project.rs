@@ -521,7 +521,6 @@ impl KiroProject {
         self.install_agent_inner(def, mapped_tools, meta, true, source_path)
     }
 
-    #[allow(clippy::too_many_lines)]
     fn install_agent_inner(
         &self,
         def: &AgentDefinition,
@@ -575,183 +574,35 @@ impl KiroProject {
                 // of this agent is currently running.
                 self.cleanup_leftover_agent_staging(&def.name)?;
 
-                let staging = self.fresh_agent_staging_dir(&def.name);
-                // Staging layout mirrors the final agents_root layout:
-                // <name>.json and prompts/<name>.md. This allows hashing
-                // staging with agents_root-relative paths and obtaining the
-                // same hash value as hashing the final placement.
-                let staging_json = staging.join(format!("{}.json", def.name));
-                let staging_prompt_dir = staging.join("prompts");
-                let staging_prompt = staging_prompt_dir.join(format!("{}.md", def.name));
+                let (staging, json_rel, prompt_rel, installed_hash) =
+                    self.stage_agent_files(&def.name, &json_bytes, def.prompt_body.as_bytes())?;
 
-                // Stage both files.
-                fs::create_dir_all(&staging_prompt_dir)?;
-                if let Err(e) = fs::write(&staging_json, &json_bytes)
-                    .and_then(|()| fs::write(&staging_prompt, def.prompt_body.as_bytes()))
-                {
-                    remove_staging_dir(&staging);
-                    return Err(e.into());
-                }
-
-                // Compute installed_hash against the staged copies BEFORE any
-                // destructive operations. Staging mirrors the final layout
-                // (<name>.json + prompts/<name>.md), so hashing staging with
-                // agents_root-relative paths yields the same value as hashing
-                // post-rename. Any failure here leaves the previous install
-                // (in force mode) intact — we haven't touched `agents_root` yet.
-                let json_rel = std::path::PathBuf::from(format!("{}.json", def.name));
-                let prompt_rel = std::path::PathBuf::from(format!("prompts/{}.md", def.name));
-                let installed_hash = match crate::hash::hash_artifact(
-                    &staging,
-                    &[json_rel.clone(), prompt_rel.clone()],
-                ) {
-                    Ok(h) => h,
-                    Err(e) => {
-                        warn!(
-                            name = %def.name,
-                            error = %e,
-                            "installed_hash computation failed on staging; removing staging dir"
-                        );
-                        remove_staging_dir(&staging);
-                        return Err(e.into());
-                    }
-                };
-
-                fs::create_dir_all(self.agent_prompts_dir())?;
-
-                let json_target = self.agents_dir().join(format!("{}.json", def.name));
-                let prompt_target = self.agent_prompts_dir().join(format!("{}.md", def.name));
-
-                if force {
-                    // Remove existing targets before rename. Required for
-                    // Windows (rename fails on existing dest) and makes the
-                    // Unix path explicit rather than relying on rename's
-                    // replace-on-Unix behaviour. Missing-file is fine.
-                    for p in [&json_target, &prompt_target] {
-                        if let Err(e) = fs::remove_file(p)
-                            && e.kind() != std::io::ErrorKind::NotFound
-                        {
-                            remove_staging_dir(&staging);
-                            return Err(e.into());
-                        }
-                    }
-                } else if json_target.exists() || prompt_target.exists() {
-                    // Non-force install: a prior crash could leave orphaned
-                    // files on disk without a tracking entry. Refuse to
-                    // silently clobber — the user either manually cleans up
-                    // or re-invokes with `install_agent_force`.
-                    remove_staging_dir(&staging);
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::AlreadyExists,
-                        format!(
-                            "agent files for `{}` exist on disk but have no tracking entry; \
-                             remove {} and {} manually before re-installing",
-                            def.name,
-                            json_target.display(),
-                            prompt_target.display(),
-                        ),
-                    )
-                    .into());
-                }
-
-                // Rename JSON first. If the prompt rename fails afterwards,
-                // roll back the JSON rename so we never leave an agent with
-                // only half its files on disk.
-                if let Err(e) = fs::rename(&staging_json, &json_target) {
-                    remove_staging_dir(&staging);
-                    return Err(e.into());
-                }
-                if let Err(e) = fs::rename(&staging_prompt, &prompt_target) {
-                    if let Err(rb_err) = fs::remove_file(&json_target) {
-                        warn!(
-                            path = %json_target.display(),
-                            error = %rb_err,
-                            "failed to roll back agent JSON after prompt-rename failure"
-                        );
-                    }
-                    remove_staging_dir(&staging);
-                    return Err(e.into());
-                }
-
-                // Staging directory should now be empty (or contain the empty
-                // prompts subdir).
-                remove_staging_dir(&staging);
+                let (json_target, prompt_target) =
+                    self.promote_staged_agent(&def.name, &staging, &json_rel, &prompt_rel, force)?;
 
                 // installed_hash was computed pre-destructive (against staging).
-                // agents_root is still needed for the companion hash below.
-                let agents_root = self.agents_dir();
+                let agents_root = self.agents_dir(); // needed for companion hash below
 
                 meta.source_hash = source_hash;
                 meta.installed_hash = Some(installed_hash);
 
                 // Capture plugin identity before moving meta into the map.
-                let plugin_for_companion = meta.plugin.clone();
-                let marketplace_for_companion = meta.marketplace.clone();
-                let version_for_companion = meta.version.clone();
+                let marketplace = meta.marketplace.clone();
+                let plugin = meta.plugin.clone();
+                let version = meta.version.clone();
 
-                // Tracking last. On failure, roll back both files.
                 installed.agents.insert(def.name.clone(), meta);
 
-                // Synthesize/update the companion entry for this plugin's
-                // prompt files. We track the union of installed prompt paths
-                // so the native install path (Stage 2) sees them as
-                // plugin-owned, not orphaned.
-                //
-                // Hash semantics: source_hash == installed_hash because the
-                // translated path does not separately track original .md
-                // source files; both equal the hash over the prompt-bundle
-                // bytes.
-                let companion_entry = installed
-                    .native_companions
-                    .entry(plugin_for_companion.clone())
-                    .or_insert_with(|| InstalledNativeCompanionsMeta {
-                        marketplace: marketplace_for_companion.clone(),
-                        plugin: plugin_for_companion.clone(),
-                        version: version_for_companion.clone(),
-                        installed_at: chrono::Utc::now(),
-                        files: Vec::new(),
-                        source_hash: String::new(),
-                        installed_hash: String::new(),
-                    });
-                // Update version + timestamp + marketplace on every install to
-                // reflect the most-recent operation.
-                companion_entry.marketplace = marketplace_for_companion;
-                companion_entry.version = version_for_companion;
-                companion_entry.installed_at = chrono::Utc::now();
-                // Add the prompt path if not already present.
-                if !companion_entry.files.contains(&prompt_rel) {
-                    companion_entry.files.push(prompt_rel);
-                }
-                // Recompute hashes over the full prompt set for this plugin.
-                let companion_files_snapshot = companion_entry.files.clone();
-                let companion_hash =
-                    match crate::hash::hash_artifact(&agents_root, &companion_files_snapshot) {
-                        Ok(h) => h,
-                        Err(e) => {
-                            warn!(
-                                plugin = %plugin_for_companion,
-                                error = %e,
-                                "companion hash computation failed; rolling back files"
-                            );
-                            if let Err(rb_err) = fs::remove_file(&json_target) {
-                                warn!(
-                                    path = %json_target.display(),
-                                    error = %rb_err,
-                                    "failed to roll back agent JSON after companion-hash failure"
-                                );
-                            }
-                            if let Err(rb_err) = fs::remove_file(&prompt_target) {
-                                warn!(
-                                    path = %prompt_target.display(),
-                                    error = %rb_err,
-                                    "failed to roll back agent prompt after companion-hash failure"
-                                );
-                            }
-                            return Err(e.into());
-                        }
-                    };
-                companion_entry.source_hash = companion_hash.clone();
-                companion_entry.installed_hash = companion_hash;
+                Self::synthesize_companion_entry(
+                    &mut installed,
+                    &marketplace,
+                    &plugin,
+                    version.as_deref(),
+                    &agents_root,
+                    &prompt_rel,
+                    &json_target,
+                    &prompt_target,
+                )?;
 
                 if let Err(e) = self.write_agent_tracking(&installed) {
                     warn!(
@@ -781,6 +632,220 @@ impl KiroProject {
                 Ok(())
             },
         )
+    }
+
+    /// Move staged agent files from `staging` into their final locations under
+    /// `agents_root`. In force mode, existing targets are unlinked first. In
+    /// non-force mode, any pre-existing target file (e.g. from a prior crash)
+    /// causes an `AlreadyExists` error without touching `agents_root`.
+    ///
+    /// On any error, `staging` is cleaned up before returning. JSON is renamed
+    /// first; if the prompt rename then fails, the JSON rename is rolled back so
+    /// neither target is left half-populated.
+    ///
+    /// Returns `(json_target, prompt_target)` on success.
+    fn promote_staged_agent(
+        &self,
+        name: &str,
+        staging: &Path,
+        json_rel: &Path,
+        prompt_rel: &Path,
+        force: bool,
+    ) -> crate::error::Result<(PathBuf, PathBuf)> {
+        let staging_json = staging.join(json_rel);
+        let staging_prompt = staging.join(prompt_rel);
+
+        fs::create_dir_all(self.agent_prompts_dir())?;
+
+        let json_target = self.agents_dir().join(format!("{name}.json"));
+        let prompt_target = self.agent_prompts_dir().join(format!("{name}.md"));
+
+        if force {
+            // Remove existing targets before rename. Required for Windows
+            // (rename fails on existing dest) and makes the Unix path
+            // explicit rather than relying on rename's replace-on-Unix
+            // behaviour. Missing-file is fine.
+            for p in [&json_target, &prompt_target] {
+                if let Err(e) = fs::remove_file(p)
+                    && e.kind() != std::io::ErrorKind::NotFound
+                {
+                    remove_staging_dir(staging);
+                    return Err(e.into());
+                }
+            }
+        } else if json_target.exists() || prompt_target.exists() {
+            // Non-force install: a prior crash could leave orphaned files
+            // on disk without a tracking entry. Refuse to silently clobber
+            // — the user either manually cleans up or re-invokes with
+            // `install_agent_force`.
+            remove_staging_dir(staging);
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                format!(
+                    "agent files for `{name}` exist on disk but have no tracking entry; \
+                     remove {} and {} manually before re-installing",
+                    json_target.display(),
+                    prompt_target.display(),
+                ),
+            )
+            .into());
+        }
+
+        // Rename JSON first. If the prompt rename fails afterwards, roll
+        // back the JSON rename so we never leave an agent with only half
+        // its files on disk.
+        if let Err(e) = fs::rename(&staging_json, &json_target) {
+            remove_staging_dir(staging);
+            return Err(e.into());
+        }
+        if let Err(e) = fs::rename(&staging_prompt, &prompt_target) {
+            if let Err(rb_err) = fs::remove_file(&json_target) {
+                warn!(
+                    path = %json_target.display(),
+                    error = %rb_err,
+                    "failed to roll back agent JSON after prompt-rename failure"
+                );
+            }
+            remove_staging_dir(staging);
+            return Err(e.into());
+        }
+
+        // Staging directory should now be empty (or contain the empty prompts subdir).
+        remove_staging_dir(staging);
+        Ok((json_target, prompt_target))
+    }
+
+    /// Write agent JSON and prompt into a fresh staging directory, then compute
+    /// `installed_hash` against the staged copies BEFORE any destructive
+    /// operations on `agents_root`. Returns `(staging, json_rel, prompt_rel,
+    /// installed_hash)`. On any failure the staging directory is cleaned up and
+    /// an error is returned — `agents_root` is guaranteed untouched.
+    ///
+    /// Staging mirrors the final layout (`<name>.json` + `prompts/<name>.md`)
+    /// so hashing staging with `agents_root`-relative paths yields the same
+    /// value as hashing after rename.
+    fn stage_agent_files(
+        &self,
+        name: &str,
+        json_bytes: &[u8],
+        prompt_bytes: &[u8],
+    ) -> crate::error::Result<(PathBuf, PathBuf, PathBuf, String)> {
+        let staging = self.fresh_agent_staging_dir(name);
+        let json_rel = PathBuf::from(format!("{name}.json"));
+        let prompt_rel = PathBuf::from(format!("prompts/{name}.md"));
+        let staging_json = staging.join(&json_rel);
+        let staging_prompt_dir = staging.join("prompts");
+        let staging_prompt = staging.join(&prompt_rel);
+
+        fs::create_dir_all(&staging_prompt_dir)?;
+        if let Err(e) = fs::write(&staging_json, json_bytes)
+            .and_then(|()| fs::write(&staging_prompt, prompt_bytes))
+        {
+            remove_staging_dir(&staging);
+            return Err(e.into());
+        }
+
+        let installed_hash =
+            match crate::hash::hash_artifact(&staging, &[json_rel.clone(), prompt_rel.clone()]) {
+                Ok(h) => h,
+                Err(e) => {
+                    warn!(
+                        name,
+                        error = %e,
+                        "installed_hash computation failed on staging; removing staging dir"
+                    );
+                    remove_staging_dir(&staging);
+                    return Err(e.into());
+                }
+            };
+
+        Ok((staging, json_rel, prompt_rel, installed_hash))
+    }
+
+    /// Synthesize/update the per-plugin `native_companions` tracking entry
+    /// to register this agent's prompt file as plugin-owned. Called from
+    /// the translated agent install path; Stage 2's native install path
+    /// will call this with its own companion bundle.
+    ///
+    /// Recomputes the per-plugin companion hash over the full union of
+    /// prompt files for this plugin. On hash failure, rolls back the
+    /// just-placed json/prompt files.
+    ///
+    /// # Residual risk (force mode)
+    /// The companion hash runs post-rename because it must hash prompt files
+    /// from prior installs that live at their real `agents_root` locations.
+    /// A hash failure in force mode will try to remove the newly placed files,
+    /// but the previously existing files were already unlinked. A full
+    /// backup-then-swap atomic install is deferred to a follow-up PR.
+    #[allow(clippy::too_many_arguments)]
+    fn synthesize_companion_entry(
+        installed: &mut InstalledAgents,
+        marketplace: &str,
+        plugin: &str,
+        version: Option<&str>,
+        agents_root: &Path,
+        prompt_rel: &Path,
+        json_target: &Path,
+        prompt_target: &Path,
+    ) -> crate::error::Result<()> {
+        // Synthesize/update the companion entry for this plugin's prompt
+        // files. We track the union of installed prompt paths so the
+        // native install path (Stage 2) sees them as plugin-owned, not
+        // orphaned.
+        //
+        // Hash semantics: source_hash == installed_hash because the
+        // translated path does not separately track original .md source
+        // files; both equal the hash over the prompt-bundle bytes.
+        let companion_entry = installed
+            .native_companions
+            .entry(plugin.to_owned())
+            .or_insert_with(|| InstalledNativeCompanionsMeta {
+                marketplace: marketplace.to_owned(),
+                plugin: plugin.to_owned(),
+                version: version.map(str::to_owned),
+                installed_at: chrono::Utc::now(),
+                files: Vec::new(),
+                source_hash: String::new(),
+                installed_hash: String::new(),
+            });
+        // Refresh marketplace/version/timestamp on every install.
+        marketplace.clone_into(&mut companion_entry.marketplace);
+        companion_entry.version = version.map(str::to_owned);
+        companion_entry.installed_at = chrono::Utc::now();
+        if !companion_entry.files.contains(&prompt_rel.to_path_buf()) {
+            companion_entry.files.push(prompt_rel.to_path_buf());
+        }
+        // Recompute hashes over the full prompt set for this plugin.
+        let companion_files_snapshot = companion_entry.files.clone();
+        let companion_hash =
+            match crate::hash::hash_artifact(agents_root, &companion_files_snapshot) {
+                Ok(h) => h,
+                Err(e) => {
+                    warn!(
+                        plugin,
+                        error = %e,
+                        "companion hash computation failed; rolling back files"
+                    );
+                    if let Err(rb_err) = fs::remove_file(json_target) {
+                        warn!(
+                            path = %json_target.display(),
+                            error = %rb_err,
+                            "failed to roll back agent JSON after companion-hash failure"
+                        );
+                    }
+                    if let Err(rb_err) = fs::remove_file(prompt_target) {
+                        warn!(
+                            path = %prompt_target.display(),
+                            error = %rb_err,
+                            "failed to roll back agent prompt after companion-hash failure"
+                        );
+                    }
+                    return Err(e.into());
+                }
+            };
+        companion_entry.source_hash = companion_hash.clone();
+        companion_entry.installed_hash = companion_hash;
+        Ok(())
     }
 
     /// Remove any `_installing-agent-<name>-*` staging directories left over
