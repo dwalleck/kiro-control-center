@@ -576,7 +576,11 @@ impl KiroProject {
                 self.cleanup_leftover_agent_staging(&def.name)?;
 
                 let staging = self.fresh_agent_staging_dir(&def.name);
-                let staging_json = staging.join("agent.json");
+                // Staging layout mirrors the final agents_root layout:
+                // <name>.json and prompts/<name>.md. This allows hashing
+                // staging with agents_root-relative paths and obtaining the
+                // same hash value as hashing the final placement.
+                let staging_json = staging.join(format!("{}.json", def.name));
                 let staging_prompt_dir = staging.join("prompts");
                 let staging_prompt = staging_prompt_dir.join(format!("{}.md", def.name));
 
@@ -588,6 +592,30 @@ impl KiroProject {
                     remove_staging_dir(&staging);
                     return Err(e.into());
                 }
+
+                // Compute installed_hash against the staged copies BEFORE any
+                // destructive operations. Staging mirrors the final layout
+                // (<name>.json + prompts/<name>.md), so hashing staging with
+                // agents_root-relative paths yields the same value as hashing
+                // post-rename. Any failure here leaves the previous install
+                // (in force mode) intact — we haven't touched `agents_root` yet.
+                let json_rel = std::path::PathBuf::from(format!("{}.json", def.name));
+                let prompt_rel = std::path::PathBuf::from(format!("prompts/{}.md", def.name));
+                let installed_hash = match crate::hash::hash_artifact(
+                    &staging,
+                    &[json_rel.clone(), prompt_rel.clone()],
+                ) {
+                    Ok(h) => h,
+                    Err(e) => {
+                        warn!(
+                            name = %def.name,
+                            error = %e,
+                            "installed_hash computation failed on staging; removing staging dir"
+                        );
+                        remove_staging_dir(&staging);
+                        return Err(e.into());
+                    }
+                };
 
                 fs::create_dir_all(self.agent_prompts_dir())?;
 
@@ -649,41 +677,9 @@ impl KiroProject {
                 // prompts subdir).
                 remove_staging_dir(&staging);
 
-                // Compute installed_hash over the two files we just placed.
-                // Both renames have succeeded at this point, so the files must
-                // exist. Roll back on failure — tracking write hasn't happened
-                // yet so there's nothing to undo on the tracking side.
+                // installed_hash was computed pre-destructive (against staging).
+                // agents_root is still needed for the companion hash below.
                 let agents_root = self.agents_dir();
-                let json_rel = std::path::PathBuf::from(format!("{}.json", def.name));
-                let prompt_rel = std::path::PathBuf::from(format!("prompts/{}.md", def.name));
-                let installed_hash = match crate::hash::hash_artifact(
-                    &agents_root,
-                    &[json_rel.clone(), prompt_rel.clone()],
-                ) {
-                    Ok(h) => h,
-                    Err(e) => {
-                        warn!(
-                            name = %def.name,
-                            error = %e,
-                            "installed_hash computation failed after rename; rolling back files"
-                        );
-                        if let Err(rb_err) = fs::remove_file(&json_target) {
-                            warn!(
-                                path = %json_target.display(),
-                                error = %rb_err,
-                                "failed to roll back agent JSON after hash failure"
-                            );
-                        }
-                        if let Err(rb_err) = fs::remove_file(&prompt_target) {
-                            warn!(
-                                path = %prompt_target.display(),
-                                error = %rb_err,
-                                "failed to roll back agent prompt after hash failure"
-                            );
-                        }
-                        return Err(e.into());
-                    }
-                };
 
                 meta.source_hash = source_hash;
                 meta.installed_hash = Some(installed_hash);
