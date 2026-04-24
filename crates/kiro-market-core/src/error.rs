@@ -451,6 +451,9 @@ pub enum Error {
     Validation(#[from] ValidationError),
 
     #[error(transparent)]
+    Hash(#[from] crate::hash::HashError),
+
+    #[error(transparent)]
     Io(#[from] std::io::Error),
 
     #[error(transparent)]
