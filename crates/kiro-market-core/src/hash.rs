@@ -93,4 +93,17 @@ mod tests {
         // 32-byte blake3 → 64 hex chars + "blake3:" prefix = 71 chars.
         assert_eq!(h.len(), "blake3:".len() + 64);
     }
+
+    #[test]
+    fn hash_artifact_is_order_independent() {
+        let tmp = tempdir().unwrap();
+        let base = tmp.path();
+        fs::write(base.join("a.txt"), b"alpha").unwrap();
+        fs::write(base.join("b.txt"), b"beta").unwrap();
+
+        let h_ab = hash_artifact(base, &[PathBuf::from("a.txt"), PathBuf::from("b.txt")]).unwrap();
+        let h_ba = hash_artifact(base, &[PathBuf::from("b.txt"), PathBuf::from("a.txt")]).unwrap();
+
+        assert_eq!(h_ab, h_ba, "input order must not affect hash");
+    }
 }
