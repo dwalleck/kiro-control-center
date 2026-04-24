@@ -75,6 +75,62 @@ pub fn hash_artifact(base: &Path, relative_paths: &[PathBuf]) -> Result<String, 
     Ok(format!("blake3:{}", hex::encode(digest.as_bytes())))
 }
 
+/// Hash an entire directory tree by walking it and feeding each regular
+/// file (non-recursively-following symlinks) through `hash_artifact`.
+///
+/// Symlinks are skipped — they would otherwise let a malicious source dir
+/// pull arbitrary file contents into the hash via paths outside `root`.
+///
+/// # Errors
+///
+/// - `HashError::WalkFailed` if directory traversal fails.
+/// - `HashError::ReadFailed` if a file in the tree cannot be read.
+pub fn hash_dir_tree(root: &Path) -> Result<String, HashError> {
+    let mut relative_paths: Vec<PathBuf> = Vec::new();
+    walk_collect(root, root, &mut relative_paths)?;
+    hash_artifact(root, &relative_paths)
+}
+
+/// Recursive helper for `hash_dir_tree`. Collects relative paths of regular
+/// files (not symlinks, not directories) under `current` into `out`.
+fn walk_collect(root: &Path, current: &Path, out: &mut Vec<PathBuf>) -> Result<(), HashError> {
+    let entries = std::fs::read_dir(current).map_err(|e| HashError::WalkFailed {
+        path: current.to_path_buf(),
+        source: e,
+    })?;
+    for entry in entries {
+        let entry = entry.map_err(|e| HashError::WalkFailed {
+            path: current.to_path_buf(),
+            source: e,
+        })?;
+        let path = entry.path();
+        // Use symlink_metadata so we don't follow symlinks.
+        let md = std::fs::symlink_metadata(&path).map_err(|e| HashError::WalkFailed {
+            path: path.clone(),
+            source: e,
+        })?;
+        let ft = md.file_type();
+        if ft.is_symlink() {
+            continue;
+        }
+        if ft.is_dir() {
+            walk_collect(root, &path, out)?;
+        } else if ft.is_file() {
+            // Strip the root prefix to get a relative path.
+            // SAFETY: `path` is always under `root` because `read_dir(current)` returns
+            // entries inside `current`, which itself was reached by recursive descent
+            // from `root`. This invariant cannot be violated by directory traversal alone.
+            let rel = path
+                .strip_prefix(root)
+                .expect("walk_collect only produces paths under root")
+                .to_path_buf();
+            out.push(rel);
+        }
+        // Skip other file types (sockets, FIFOs, devices) silently.
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -162,6 +218,60 @@ mod tests {
         assert_ne!(
             h_lf, h_crlf,
             "hash must NOT normalize line endings — different bytes are different content"
+        );
+    }
+
+    #[test]
+    fn hash_dir_tree_produces_stable_hash_over_tree() {
+        let tmp = tempdir().unwrap();
+        let root = tmp.path();
+        fs::create_dir_all(root.join("sub")).unwrap();
+        fs::write(root.join("top.md"), b"top content").unwrap();
+        fs::write(root.join("sub/nested.md"), b"nested content").unwrap();
+
+        let h1 = hash_dir_tree(root).unwrap();
+        let h2 = hash_dir_tree(root).unwrap();
+
+        assert_eq!(h1, h2, "same tree must produce same hash");
+        assert!(h1.starts_with("blake3:"));
+    }
+
+    #[test]
+    fn hash_dir_tree_changes_when_content_changes() {
+        let tmp = tempdir().unwrap();
+        let root = tmp.path();
+        fs::write(root.join("a.md"), b"v1").unwrap();
+        let h1 = hash_dir_tree(root).unwrap();
+
+        fs::write(root.join("a.md"), b"v2").unwrap();
+        let h2 = hash_dir_tree(root).unwrap();
+
+        assert_ne!(h1, h2, "content change must change the tree hash");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn hash_dir_tree_skips_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempdir().unwrap();
+        let root = tmp.path();
+        fs::write(root.join("real.md"), b"real").unwrap();
+
+        let outside = tempdir().unwrap();
+        fs::write(outside.path().join("secret.md"), b"secret").unwrap();
+        symlink(outside.path().join("secret.md"), root.join("link.md")).unwrap();
+
+        // Hash with symlink present
+        let h_with_link = hash_dir_tree(root).unwrap();
+
+        // Remove the symlink and re-hash
+        fs::remove_file(root.join("link.md")).unwrap();
+        let h_without = hash_dir_tree(root).unwrap();
+
+        assert_eq!(
+            h_with_link, h_without,
+            "symlinks must not contribute to the directory hash"
         );
     }
 }
