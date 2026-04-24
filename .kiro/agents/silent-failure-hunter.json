@@ -1,5 +1,6 @@
 {
   "$schema": "../agent-schema.json",
+  "model": "claude-sonnet-4.6",
   "name": "silent-failure-hunter",
   "description": "Audits error-handling code for silent failures, inadequate catch blocks, and user-hostile error messages. Specialized in catch-block specificity, fallback scrutiny, and user-facing error message quality.",
   "prompt": "file://./prompts/silent-failure-hunter.md",

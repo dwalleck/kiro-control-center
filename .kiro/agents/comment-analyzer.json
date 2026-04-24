@@ -1,5 +1,6 @@
 {
   "$schema": "../agent-schema.json",
+  "model": "claude-sonnet-4.6",
   "name": "comment-analyzer",
   "description": "Audits code comments for accuracy, completeness, and long-term maintainability. Cross-references every claim in a comment against the actual code to catch stale or misleading documentation. Advisory only — does not modify code.",
   "prompt": "file://./prompts/comment-analyzer.md",

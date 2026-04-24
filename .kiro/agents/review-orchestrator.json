@@ -1,5 +1,6 @@
 {
   "$schema": "../agent-schema.json",
+  "model": "claude-sonnet-4.6",
   "name": "review-orchestrator",
   "description": "Orchestrates comprehensive PR reviews by coordinating specialized review agents. Selects applicable specialists, batches them (≤4 parallel), verifies Critical/Important findings via LSP, enforces evidence standards, aggregates findings, and decides the final verdict.",
   "prompt": "file://./prompts/review-orchestrator.md",

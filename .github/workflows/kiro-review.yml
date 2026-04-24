@@ -49,6 +49,12 @@ jobs:
       - name: Install Kiro CLI
         run: curl -fsSL https://cli.kiro.dev/install | bash
 
+      - name: Install typescript-language-server
+        run: npm install -g typescript typescript-language-server
+
+      - name: Install rust-analyzer
+        run: rustup component add rust-analyzer
+
       - name: Verify KIRO_API_KEY is configured
         env:
           KIRO_API_KEY: ${{ secrets.KIRO_API_KEY }}

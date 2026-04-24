@@ -1,5 +1,6 @@
 {
   "$schema": "../agent-schema.json",
+  "model": "claude-sonnet-4.6",
   "name": "type-design-analyzer",
   "description": "Analyzes type design for invariant strength, encapsulation, and practical usefulness. Produces per-type ratings across four design dimensions and flags types whose invariants are weak, inconsistent, or under-enforced.",
   "prompt": "file://./prompts/type-design-analyzer.md",

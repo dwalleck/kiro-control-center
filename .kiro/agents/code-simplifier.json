@@ -1,5 +1,6 @@
 {
   "$schema": "../agent-schema.json",
+  "model": "claude-sonnet-4.6",
   "name": "code-simplifier",
   "description": "Simplifies recently-modified code for clarity and maintainability while preserving exact functionality. Runs last in the review sequence as a polish step. Modifies code — does not produce findings.",
   "prompt": "file://./prompts/code-simplifier.md",
