@@ -131,4 +131,21 @@ mod tests {
             "NUL separator must distinguish rename-collision layouts"
         );
     }
+
+    #[test]
+    fn hash_artifact_returns_read_failed_for_missing_file() {
+        let tmp = tempdir().unwrap();
+        let base = tmp.path();
+        // Don't create the file.
+
+        let err = hash_artifact(base, &[PathBuf::from("missing.txt")]).unwrap_err();
+
+        match err {
+            HashError::ReadFailed { path, source } => {
+                assert!(path.ends_with("missing.txt"), "got: {}", path.display());
+                assert_eq!(source.kind(), std::io::ErrorKind::NotFound);
+            }
+            other => panic!("expected ReadFailed, got: {other:?}"),
+        }
+    }
 }
