@@ -472,19 +472,11 @@ impl KiroProject {
             .join(format!("_installing-agent-{name}-{pid}-{seq}"))
     }
 
-    /// Install a parsed agent: emit its Kiro JSON + externalized prompt
-    /// markdown under `.kiro/agents/`, and record metadata in
-    /// `installed-agents.json`.
+    /// Install a parsed agent into the Kiro project.
     ///
-    /// The caller is responsible for parsing the source file and mapping the
-    /// tool list — the service layer does both upstream so warnings can be
-    /// surfaced before the install lock is acquired. This method is purely
-    /// the on-disk write step.
-    ///
-    /// File writes use a staging-and-rename pattern: prompt + JSON are
-    /// written to `_installing-agent-<name>-<pid>-<seq>/` under `.kiro/`,
-    /// renamed into place after the duplicate check, then tracking is
-    /// written last. The whole flow runs under the agent tracking lock.
+    /// Pass `source_path` as the `.md` file the definition was parsed from to
+    /// populate `source_hash` in the tracking entry. Pass `None` to leave it
+    /// unrecorded (e.g. for synthetic test agents).
     ///
     /// # Errors
     ///
@@ -496,13 +488,18 @@ impl KiroProject {
         def: &AgentDefinition,
         mapped_tools: &[MappedTool],
         meta: InstalledAgentMeta,
+        source_path: Option<&Path>,
     ) -> crate::error::Result<()> {
-        self.install_agent_inner(def, mapped_tools, meta, false)
+        self.install_agent_inner(def, mapped_tools, meta, false, source_path)
     }
 
     /// Install a parsed agent, overwriting any existing agent of the same
     /// name. Mirrors [`install_skill_from_dir_force`] for the agent path so
     /// the CLI's `--force` flag can honor its documented contract.
+    ///
+    /// Pass `source_path` as the `.md` file the definition was parsed from to
+    /// populate `source_hash` in the tracking entry. Pass `None` to leave it
+    /// unrecorded (e.g. for synthetic test agents).
     ///
     /// If an agent with the same name is already tracked, its JSON + prompt
     /// files are removed before the new ones are renamed into place. Orphaned
@@ -518,22 +515,48 @@ impl KiroProject {
         def: &AgentDefinition,
         mapped_tools: &[MappedTool],
         meta: InstalledAgentMeta,
+        source_path: Option<&Path>,
     ) -> crate::error::Result<()> {
-        self.install_agent_inner(def, mapped_tools, meta, true)
+        self.install_agent_inner(def, mapped_tools, meta, true, source_path)
     }
 
+    #[allow(clippy::too_many_lines)]
     fn install_agent_inner(
         &self,
         def: &AgentDefinition,
         mapped_tools: &[MappedTool],
-        meta: InstalledAgentMeta,
+        mut meta: InstalledAgentMeta,
         force: bool,
+        source_path: Option<&Path>,
     ) -> crate::error::Result<()> {
         validation::validate_name(&def.name)?;
 
         // CPU-bound work outside the lock to keep the critical section short.
         let json = crate::agent::emit::build_kiro_json(def, mapped_tools)?;
         let json_bytes = serde_json::to_vec_pretty(&json)?;
+
+        // Compute source_hash outside the lock — it's a read-only I/O
+        // operation on the source file and need not block other installers.
+        let source_hash: Option<String> = source_path
+            .map(|p| -> crate::error::Result<String> {
+                let parent = p.parent().ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!("source path `{}` has no parent dir", p.display()),
+                    )
+                })?;
+                let filename = p.file_name().ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!("source path `{}` has no file name", p.display()),
+                    )
+                })?;
+                Ok(crate::hash::hash_artifact(
+                    parent,
+                    &[std::path::PathBuf::from(filename)],
+                )?)
+            })
+            .transpose()?;
 
         crate::file_lock::with_file_lock(
             &self.agent_tracking_path(),
@@ -625,8 +648,114 @@ impl KiroProject {
                 // prompts subdir).
                 remove_staging_dir(&staging);
 
+                // Compute installed_hash over the two files we just placed.
+                // Both renames have succeeded at this point, so the files must
+                // exist. Roll back on failure — tracking write hasn't happened
+                // yet so there's nothing to undo on the tracking side.
+                let agents_root = self.agents_dir();
+                let json_rel = std::path::PathBuf::from(format!("{}.json", def.name));
+                let prompt_rel = std::path::PathBuf::from(format!("prompts/{}.md", def.name));
+                let installed_hash = match crate::hash::hash_artifact(
+                    &agents_root,
+                    &[json_rel.clone(), prompt_rel.clone()],
+                ) {
+                    Ok(h) => h,
+                    Err(e) => {
+                        warn!(
+                            name = %def.name,
+                            error = %e,
+                            "installed_hash computation failed after rename; rolling back files"
+                        );
+                        if let Err(rb_err) = fs::remove_file(&json_target) {
+                            warn!(
+                                path = %json_target.display(),
+                                error = %rb_err,
+                                "failed to roll back agent JSON after hash failure"
+                            );
+                        }
+                        if let Err(rb_err) = fs::remove_file(&prompt_target) {
+                            warn!(
+                                path = %prompt_target.display(),
+                                error = %rb_err,
+                                "failed to roll back agent prompt after hash failure"
+                            );
+                        }
+                        return Err(e.into());
+                    }
+                };
+
+                meta.source_hash = source_hash;
+                meta.installed_hash = Some(installed_hash);
+
+                // Capture plugin identity before moving meta into the map.
+                let plugin_for_companion = meta.plugin.clone();
+                let marketplace_for_companion = meta.marketplace.clone();
+                let version_for_companion = meta.version.clone();
+
                 // Tracking last. On failure, roll back both files.
                 installed.agents.insert(def.name.clone(), meta);
+
+                // Synthesize/update the companion entry for this plugin's
+                // prompt files. We track the union of installed prompt paths
+                // so the native install path (Stage 2) sees them as
+                // plugin-owned, not orphaned.
+                //
+                // Hash semantics: source_hash == installed_hash because the
+                // translated path does not separately track original .md
+                // source files; both equal the hash over the prompt-bundle
+                // bytes.
+                let companion_entry = installed
+                    .native_companions
+                    .entry(plugin_for_companion.clone())
+                    .or_insert_with(|| InstalledNativeCompanionsMeta {
+                        marketplace: marketplace_for_companion.clone(),
+                        plugin: plugin_for_companion.clone(),
+                        version: version_for_companion.clone(),
+                        installed_at: chrono::Utc::now(),
+                        files: Vec::new(),
+                        source_hash: String::new(),
+                        installed_hash: String::new(),
+                    });
+                // Update version + timestamp + marketplace on every install to
+                // reflect the most-recent operation.
+                companion_entry.marketplace = marketplace_for_companion;
+                companion_entry.version = version_for_companion;
+                companion_entry.installed_at = chrono::Utc::now();
+                // Add the prompt path if not already present.
+                if !companion_entry.files.contains(&prompt_rel) {
+                    companion_entry.files.push(prompt_rel);
+                }
+                // Recompute hashes over the full prompt set for this plugin.
+                let companion_files_snapshot = companion_entry.files.clone();
+                let companion_hash =
+                    match crate::hash::hash_artifact(&agents_root, &companion_files_snapshot) {
+                        Ok(h) => h,
+                        Err(e) => {
+                            warn!(
+                                plugin = %plugin_for_companion,
+                                error = %e,
+                                "companion hash computation failed; rolling back files"
+                            );
+                            if let Err(rb_err) = fs::remove_file(&json_target) {
+                                warn!(
+                                    path = %json_target.display(),
+                                    error = %rb_err,
+                                    "failed to roll back agent JSON after companion-hash failure"
+                                );
+                            }
+                            if let Err(rb_err) = fs::remove_file(&prompt_target) {
+                                warn!(
+                                    path = %prompt_target.display(),
+                                    error = %rb_err,
+                                    "failed to roll back agent prompt after companion-hash failure"
+                                );
+                            }
+                            return Err(e.into());
+                        }
+                    };
+                companion_entry.source_hash = companion_hash.clone();
+                companion_entry.installed_hash = companion_hash;
+
                 if let Err(e) = self.write_agent_tracking(&installed) {
                     warn!(
                         name = %def.name,
@@ -1001,7 +1130,7 @@ mod tests {
         let (def, mapped) = parse_and_map(&src);
 
         project
-            .install_agent(&def, &mapped, sample_agent_meta())
+            .install_agent(&def, &mapped, sample_agent_meta(), None)
             .expect("install");
 
         let json_path = project.root.join(".kiro/agents/reviewer.json");
@@ -1030,10 +1159,10 @@ mod tests {
         let (def, mapped) = parse_and_map(&src);
 
         project
-            .install_agent(&def, &mapped, sample_agent_meta())
+            .install_agent(&def, &mapped, sample_agent_meta(), None)
             .unwrap();
         let err = project
-            .install_agent(&def, &mapped, sample_agent_meta())
+            .install_agent(&def, &mapped, sample_agent_meta(), None)
             .unwrap_err();
         assert!(matches!(
             err,
@@ -1052,7 +1181,7 @@ mod tests {
         );
         let (def_v1, mapped_v1) = parse_and_map(&src_v1);
         project
-            .install_agent(&def_v1, &mapped_v1, sample_agent_meta())
+            .install_agent(&def_v1, &mapped_v1, sample_agent_meta(), None)
             .expect("first install");
 
         let src_v2 = write_agent(
@@ -1062,7 +1191,7 @@ mod tests {
         );
         let (def_v2, mapped_v2) = parse_and_map(&src_v2);
         project
-            .install_agent_force(&def_v2, &mapped_v2, sample_agent_meta())
+            .install_agent_force(&def_v2, &mapped_v2, sample_agent_meta(), None)
             .expect("force install should overwrite");
 
         let prompt = fs::read_to_string(project.root.join(".kiro/agents/prompts/rev.md")).unwrap();
@@ -1094,7 +1223,7 @@ mod tests {
         let (def, mapped) = parse_and_map(&src);
 
         project
-            .install_agent_force(&def, &mapped, sample_agent_meta())
+            .install_agent_force(&def, &mapped, sample_agent_meta(), None)
             .expect("force install should overwrite orphans");
 
         let prompt =
@@ -1119,7 +1248,7 @@ mod tests {
         };
 
         let err = project
-            .install_agent_force(&def, &[], sample_agent_meta())
+            .install_agent_force(&def, &[], sample_agent_meta(), None)
             .expect_err("unsafe name must be rejected under force");
         assert!(
             matches!(
@@ -1138,7 +1267,7 @@ mod tests {
         let (def, mapped) = parse_and_map(&src);
 
         project
-            .install_agent(&def, &mapped, sample_agent_meta())
+            .install_agent(&def, &mapped, sample_agent_meta(), None)
             .unwrap();
 
         let tracking_path = project.root.join(".kiro/installed-agents.json");
@@ -1156,7 +1285,7 @@ mod tests {
         let (mut def, mapped) = parse_and_map(&src);
         def.name = "../escape".into();
         let err = project
-            .install_agent(&def, &mapped, sample_agent_meta())
+            .install_agent(&def, &mapped, sample_agent_meta(), None)
             .unwrap_err();
         assert!(matches!(err, crate::error::Error::Validation(_)));
     }
@@ -1174,7 +1303,7 @@ mod tests {
         assert_eq!(mapped.len(), 2, "sanity: both tools mapped");
 
         project
-            .install_agent(&def, &mapped, sample_agent_meta())
+            .install_agent(&def, &mapped, sample_agent_meta(), None)
             .expect("install");
 
         let json_path = project.root.join(".kiro/agents/mixed.json");
@@ -1195,7 +1324,7 @@ mod tests {
         let (def, mapped) = parse_and_map(&src);
 
         project
-            .install_agent(&def, &mapped, sample_agent_meta())
+            .install_agent(&def, &mapped, sample_agent_meta(), None)
             .unwrap();
 
         // Staging lives directly under .kiro/, not under agents/.
@@ -1229,7 +1358,7 @@ mod tests {
         fs::write(ghost.join("agent.json"), b"{}").unwrap();
 
         project
-            .install_agent(&def, &mapped, sample_agent_meta())
+            .install_agent(&def, &mapped, sample_agent_meta(), None)
             .expect("install should succeed and sweep leftover");
 
         assert!(!ghost.exists(), "leftover staging should have been swept");
@@ -1250,7 +1379,7 @@ mod tests {
         fs::write(agents_dir.join("orphan.json"), b"{}").unwrap();
 
         let err = project
-            .install_agent(&def, &mapped, sample_agent_meta())
+            .install_agent(&def, &mapped, sample_agent_meta(), None)
             .unwrap_err();
         // Surfaced as an Io error (AlreadyExists) with a message pointing at
         // the offending files.
@@ -1274,7 +1403,7 @@ mod tests {
         fs::write(prompts_dir.join("rb.md").join("inside.txt"), b"x").unwrap();
 
         let err = project
-            .install_agent(&def, &mapped, sample_agent_meta())
+            .install_agent(&def, &mapped, sample_agent_meta(), None)
             .unwrap_err();
         assert!(matches!(err, crate::error::Error::Io(_)));
 
@@ -1313,7 +1442,7 @@ mod tests {
                 let mapped = std::sync::Arc::clone(&mapped);
                 std::thread::spawn(move || {
                     barrier.wait();
-                    project.install_agent(&def, &mapped, sample_agent_meta())
+                    project.install_agent(&def, &mapped, sample_agent_meta(), None)
                 })
             })
             .collect();
@@ -1363,7 +1492,7 @@ mod tests {
         fs::create_dir_all(project.root.join(".kiro/installed-agents.json")).unwrap();
 
         let err = project
-            .install_agent(&def, &mapped, sample_agent_meta())
+            .install_agent(&def, &mapped, sample_agent_meta(), None)
             .unwrap_err();
         assert!(matches!(err, crate::error::Error::Io(_)));
 
@@ -2059,5 +2188,112 @@ mod tests {
         // Source and installed contents are identical (we just copied), so the
         // hashes match.
         assert_eq!(src_hash, inst_hash);
+    }
+
+    #[test]
+    fn install_agent_translated_populates_source_and_installed_hashes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = KiroProject::new(tmp.path().to_path_buf());
+
+        let source_md = write_agent(tmp.path(), "rev", "You are a reviewer.");
+        let def = crate::agent::AgentDefinition {
+            name: "rev".into(),
+            description: None,
+            prompt_body: "You are a reviewer.".into(),
+            model: None,
+            source_tools: vec![],
+            mcp_servers: std::collections::BTreeMap::new(),
+            dialect: crate::agent::AgentDialect::Claude,
+        };
+        let mapped: Vec<crate::agent::tools::MappedTool> = vec![];
+        let mut meta = sample_agent_meta();
+        meta.source_hash = None;
+        meta.installed_hash = None;
+        let plugin_name = meta.plugin.clone();
+
+        project
+            .install_agent(&def, &mapped, meta, Some(&source_md))
+            .expect("install succeeds");
+
+        let installed = project.load_installed_agents().unwrap();
+        let entry = installed.agents.get("rev").expect("entry persisted");
+
+        let src = entry.source_hash.as_ref().expect("source_hash set");
+        let inst = entry.installed_hash.as_ref().expect("installed_hash set");
+        assert!(src.starts_with("blake3:"));
+        assert!(inst.starts_with("blake3:"));
+        // Translated path: source bytes (raw .md) differ from installed bytes
+        // (emitted .json + prompt body), so the two hashes ARE different here.
+        assert_ne!(src, inst);
+
+        // Sanity: re-hashing the source file directly matches the recorded
+        // source_hash.
+        let recomputed_src = crate::hash::hash_artifact(
+            source_md.parent().unwrap(),
+            &[std::path::PathBuf::from(source_md.file_name().unwrap())],
+        )
+        .unwrap();
+        assert_eq!(src, &recomputed_src);
+
+        // Companion-entry synthesis: this plugin should now own
+        // `prompts/rev.md` in the native_companions map.
+        let companion = installed
+            .native_companions
+            .get(&plugin_name)
+            .expect("native_companions entry synthesized");
+        assert!(
+            companion
+                .files
+                .contains(&std::path::PathBuf::from("prompts/rev.md")),
+            "prompt file must be tracked under native_companions: {:?}",
+            companion.files
+        );
+        assert!(companion.source_hash.starts_with("blake3:"));
+        assert_eq!(companion.source_hash, companion.installed_hash);
+    }
+
+    #[test]
+    fn install_agent_translated_appends_to_existing_companion_entry() {
+        // A plugin that installs TWO translated agents must end up with a
+        // single native_companions entry listing BOTH prompt files.
+        let tmp = tempfile::tempdir().unwrap();
+        let project = KiroProject::new(tmp.path().to_path_buf());
+        let plugin_name = sample_agent_meta().plugin.clone();
+
+        for name in ["alpha", "beta"] {
+            let source_md = write_agent(tmp.path(), name, "body");
+            let def = crate::agent::AgentDefinition {
+                name: name.into(),
+                description: None,
+                prompt_body: "body".into(),
+                model: None,
+                source_tools: vec![],
+                mcp_servers: std::collections::BTreeMap::new(),
+                dialect: crate::agent::AgentDialect::Claude,
+            };
+            let mut meta = sample_agent_meta();
+            meta.source_hash = None;
+            meta.installed_hash = None;
+            project
+                .install_agent(&def, &[], meta, Some(&source_md))
+                .expect("install succeeds");
+        }
+
+        let installed = project.load_installed_agents().unwrap();
+        let companion = installed
+            .native_companions
+            .get(&plugin_name)
+            .expect("entry exists");
+        assert_eq!(companion.files.len(), 2);
+        assert!(
+            companion
+                .files
+                .contains(&std::path::PathBuf::from("prompts/alpha.md"))
+        );
+        assert!(
+            companion
+                .files
+                .contains(&std::path::PathBuf::from("prompts/beta.md"))
+        );
     }
 }

@@ -1253,9 +1253,9 @@ impl MarketplaceService {
                 installed_hash: None,
             };
             let install_result = if mode.is_force() {
-                project.install_agent_force(&def, &mapped, meta)
+                project.install_agent_force(&def, &mapped, meta, Some(&path))
             } else {
-                project.install_agent(&def, &mapped, meta)
+                project.install_agent(&def, &mapped, meta, Some(&path))
             };
             match install_result {
                 Ok(()) => result.installed.push(def.name),
