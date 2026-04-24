@@ -1,0 +1,15 @@
+{
+  "$schema": "../agent-schema.json",
+  "name": "silent-failure-hunter",
+  "description": "Audits error-handling code for silent failures, inadequate catch blocks, and user-hostile error messages. Specialized in catch-block specificity, fallback scrutiny, and user-facing error message quality.",
+  "prompt": "file://./prompts/silent-failure-hunter.md",
+  "tools": ["fs_read", "execute_bash", "grep", "code", "glob"],
+  "allowedTools": ["fs_read", "execute_bash", "grep", "code", "glob"],
+  "resources": [
+    "file://AGENTS.md",
+    "file://CLAUDE.md",
+    "file://.editorconfig",
+    "file://.kiro/steering/*.md",
+    "skill://.kiro/skills/**/SKILL.md"
+  ]
+}

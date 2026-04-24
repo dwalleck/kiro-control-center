@@ -1,0 +1,50 @@
+{
+  "$schema": "../agent-schema.json",
+  "name": "review-orchestrator",
+  "description": "Orchestrates comprehensive PR reviews by coordinating specialized review agents. Selects applicable specialists, batches them (≤4 parallel), verifies Critical/Important findings via LSP, enforces evidence standards, aggregates findings, and decides the final verdict.",
+  "prompt": "file://./prompts/review-orchestrator.md",
+  "tools": [
+    "fs_read",
+    "fs_write",
+    "execute_bash",
+    "grep",
+    "code",
+    "glob",
+    "use_subagent"
+  ],
+  "allowedTools": [
+    "fs_read",
+    "execute_bash",
+    "grep",
+    "code",
+    "glob",
+    "use_subagent"
+  ],
+  "resources": [
+    "file://AGENTS.md",
+    "file://CLAUDE.md",
+    "file://.editorconfig",
+    "file://.kiro/steering/*.md",
+    "skill://.kiro/skills/**/SKILL.md"
+  ],
+  "toolsSettings": {
+    "subagent": {
+      "availableAgents": [
+        "code-reviewer",
+        "code-simplifier",
+        "comment-analyzer",
+        "pr-test-analyzer",
+        "silent-failure-hunter",
+        "type-design-analyzer"
+      ],
+      "trustedAgents": [
+        "code-reviewer",
+        "code-simplifier",
+        "comment-analyzer",
+        "pr-test-analyzer",
+        "silent-failure-hunter",
+        "type-design-analyzer"
+      ]
+    }
+  }
+}

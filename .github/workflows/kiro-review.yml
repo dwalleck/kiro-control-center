@@ -1,0 +1,121 @@
+name: Kiro Code Review
+
+# Uses pull_request_target so fork PRs can receive review comments (the default
+# pull_request trigger gives forks a read-only GITHUB_TOKEN). The job below is
+# gated so same-repo PRs run automatically on every event, but fork PRs run
+# only on the `labeled` event with `safe-to-review` — NOT on `synchronize`.
+# That closes the TOCTOU: once a fork PR is labeled, new pushes won't re-run
+# with secrets until a maintainer re-labels the PR. We never execute PR code;
+# only file paths and contents are read.
+on:
+  pull_request_target:
+    types: [opened, synchronize, labeled]
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  review:
+    if: >-
+      github.event.pull_request.head.repo.full_name == github.repository ||
+      (github.event.action == 'labeled' &&
+       contains(github.event.pull_request.labels.*.name, 'safe-to-review'))
+    runs-on: ubuntu-latest
+    env:
+      BASE_REF: ${{ github.base_ref }}
+      REPO: ${{ github.repository }}
+      PR_NUMBER: ${{ github.event.pull_request.number }}
+      HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+    steps:
+      # pull_request_target checks out the base by default; we want the PR's
+      # actual contents for the review, so check out the head SHA explicitly.
+      # persist-credentials: false prevents attacker-controlled files (e.g. a
+      # malicious .gitattributes filter) from reading the GITHUB_TOKEN out of
+      # .git/config during later steps.
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.pull_request.head.sha }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Verify Kiro agent configs are present
+        run: |
+          if [ ! -f .kiro/agents/review-orchestrator.json ]; then
+            echo "::error::.kiro/agents/review-orchestrator.json not found. Copy the .kiro/ directory from github.com/dwalleck/kiro-starter-kit into your repository."
+            exit 1
+          fi
+
+      - name: Install Kiro CLI
+        run: curl -fsSL https://cli.kiro.dev/install | bash
+
+      - name: Verify KIRO_API_KEY is configured
+        env:
+          KIRO_API_KEY: ${{ secrets.KIRO_API_KEY }}
+        run: |
+          if [ -z "$KIRO_API_KEY" ]; then
+            echo "::error::KIRO_API_KEY secret is not configured in this repository."
+            exit 1
+          fi
+
+      - name: Run review-orchestrator
+        id: orchestrator
+        env:
+          KIRO_API_KEY: ${{ secrets.KIRO_API_KEY }}
+        run: |
+          set -eo pipefail
+          # Verify the base ref exists — otherwise an empty git diff below
+          # would silently masquerade as "no changes."
+          if ! git rev-parse --verify "origin/${BASE_REF}" >/dev/null 2>&1; then
+            echo "::error::origin/${BASE_REF} does not exist in the checkout."
+            exit 1
+          fi
+
+          DIFF=$(git diff "origin/${BASE_REF}...HEAD" --name-only)
+          if [ -z "$DIFF" ]; then
+            echo "::warning::No file changes between origin/${BASE_REF} and HEAD — skipping review."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # File names from `git diff` flow into the orchestrator prompt below
+          # as text. A PR adding a file whose name contains backticks or $()
+          # could inject additional instructions into the prompt (which has
+          # execute_bash trust). Reject suspicious characters conservatively.
+          if printf '%s\n' "$DIFF" | grep -qE '[`$\\"]'; then
+            echo "::error::Refusing to review PR containing filenames with shell metacharacters."
+            exit 1
+          fi
+
+          # stderr is sent to a separate log so CLI errors (stack traces, auth
+          # failures, rate limits) never end up inside the review markdown that
+          # gets parsed and posted to the PR.
+          kiro-cli chat \
+            --no-interactive \
+            --trust-tools=fs_read,grep,execute_bash,code,glob,use_subagent \
+            --agent review-orchestrator \
+            "Review the changes between this branch and origin/${BASE_REF} from these files with all agents:
+          ${DIFF}" \
+            > review-output.md 2> review-stderr.log
+
+      - name: Upload review artifacts on failure
+        if: failure() && steps.orchestrator.conclusion == 'failure'
+        uses: actions/upload-artifact@v4
+        with:
+          name: kiro-review-debug
+          path: |
+            review-output.md
+            review-stderr.log
+          if-no-files-found: warn
+
+      - name: Post review comments
+        if: steps.orchestrator.outputs.skip != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          python3 .github/scripts/post-review-comments.py \
+            --review-file review-output.md \
+            --repo "${REPO}" \
+            --pr "${PR_NUMBER}" \
+            --sha "${HEAD_SHA}" \
+            --base-ref "${BASE_REF}"

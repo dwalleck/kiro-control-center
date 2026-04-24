@@ -1,0 +1,15 @@
+{
+  "$schema": "../agent-schema.json",
+  "name": "type-design-analyzer",
+  "description": "Analyzes type design for invariant strength, encapsulation, and practical usefulness. Produces per-type ratings across four design dimensions and flags types whose invariants are weak, inconsistent, or under-enforced.",
+  "prompt": "file://./prompts/type-design-analyzer.md",
+  "tools": ["fs_read", "execute_bash", "grep", "code", "glob"],
+  "allowedTools": ["fs_read", "execute_bash", "grep", "code", "glob"],
+  "resources": [
+    "file://AGENTS.md",
+    "file://CLAUDE.md",
+    "file://.editorconfig",
+    "file://.kiro/steering/*.md",
+    "skill://.kiro/skills/**/SKILL.md"
+  ]
+}

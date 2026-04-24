@@ -1,0 +1,22 @@
+{
+  "$schema": "../agent-schema.json",
+  "name": "code-simplifier",
+  "description": "Simplifies recently-modified code for clarity and maintainability while preserving exact functionality. Runs last in the review sequence as a polish step. Modifies code — does not produce findings.",
+  "prompt": "file://./prompts/code-simplifier.md",
+  "tools": ["fs_read", "fs_write", "execute_bash", "grep", "code", "glob"],
+  "allowedTools": [
+    "fs_read",
+    "fs_write",
+    "execute_bash",
+    "grep",
+    "code",
+    "glob"
+  ],
+  "resources": [
+    "file://AGENTS.md",
+    "file://CLAUDE.md",
+    "file://.editorconfig",
+    "file://.kiro/steering/*.md",
+    "skill://.kiro/skills/**/SKILL.md"
+  ]
+}
