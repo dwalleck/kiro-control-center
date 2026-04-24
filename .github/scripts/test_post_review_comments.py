@@ -242,7 +242,10 @@ class TestParseFindings:
         findings = parse_findings(text)
         assert len(findings) == 1
         assert findings[0]["body"].endswith("… (truncated)")
-        assert len(findings[0]["body"]) < 2500
+        # Tight bound: MAX_BODY_CHARS (2000) plus the 15-char truncation
+        # marker "\n\n… (truncated)". A looser bound would hide a
+        # regression in the truncation logic.
+        assert len(findings[0]["body"]) <= _mod.MAX_BODY_CHARS + 20
 
     def test_line_range_uses_first_line(self):
         text = (
@@ -597,7 +600,7 @@ class TestParseJsonManifest:
         findings = parse_json_manifest(text)
         assert findings is not None
         assert findings[0]["body"].endswith("… (truncated)")
-        assert len(findings[0]["body"]) < 2500
+        assert len(findings[0]["body"]) <= _mod.MAX_BODY_CHARS + 20
 
     def test_unknown_severity_renders_without_emoji(self):
         # Forward-compatible: a new severity bucket shouldn't crash; we
@@ -640,17 +643,75 @@ class TestValidateManifestItem:
             bad = dict(self._BASE, **{key: ""})
             assert not _validate_manifest_item(bad), f"empty {key} should fail"
 
+    def test_bool_line_is_rejected(self):
+        # `isinstance(True, int)` is True in Python because bool is an
+        # int subclass. Without the explicit bool-reject, a manifest with
+        # `"line": true` would pass as line=1 and silently fabricate an
+        # inline comment on line 1 of whatever file the orchestrator
+        # pointed at.
+        bad_true = dict(self._BASE, line=True)
+        bad_false = dict(self._BASE, line=False)
+        assert not _validate_manifest_item(bad_true)
+        assert not _validate_manifest_item(bad_false)
+
+
+class TestGetDiffLinesErrorNormalization:
+    # get_diff_lines is the only boundary where subprocess.run can raise
+    # FileNotFoundError — if the git binary is missing from the runner's
+    # PATH, the exception type differs from the RuntimeError/ValueError
+    # the rest of the module uses. Verify the function normalizes it to
+    # RuntimeError so main()'s except clause catches every git failure
+    # without a second exception type.
+
+    def test_missing_git_binary_raises_runtime_error(self, monkeypatch):
+        import subprocess
+
+        def fake_run(*args, **kwargs):
+            raise FileNotFoundError(
+                "[Errno 2] No such file or directory: 'git'"
+            )
+
+        monkeypatch.setattr(subprocess, "run", fake_run)
+        # Reload subprocess reference inside _mod — it was imported at module
+        # load, so monkeypatch on `subprocess.run` propagates via attribute
+        # lookup on the module the code actually uses.
+        monkeypatch.setattr(_mod.subprocess, "run", fake_run)
+
+        with pytest.raises(RuntimeError, match="git binary not found"):
+            _mod.get_diff_lines("main")
+
+    def test_empty_base_ref_still_raises_value_error(self):
+        # Regression guard: normalizing FileNotFoundError must not
+        # accidentally swallow the ValueError for an empty base_ref,
+        # which is a distinct misconfiguration.
+        with pytest.raises(ValueError, match="base_ref is empty"):
+            _mod.get_diff_lines("")
+
 
 class TestRenderFallbackSummary:
-    def test_includes_count_and_entries(self):
+    def test_includes_headers_count_and_entries(self):
         findings = [
             {"path": "a.py", "line": 10, "body": "first finding"},
             {"path": "b.py", "line": 20, "body": "second finding"},
         ]
         out = _render_fallback_summary(findings)
+        # Top-level heading signals this as the Kiro review output to
+        # readers who see it in a PR comment thread mixed with other bots.
+        assert "## Kiro Review Summary" in out
+        # Subsection header delimits the finding list.
+        assert "### Findings" in out
         assert "Found **2** findings" in out
         assert "- `a.py:10` — first finding" in out
         assert "- `b.py:20` — second finding" in out
+
+    def test_empty_list_still_renders_with_zero_count(self):
+        # Defensive: _render_fallback_summary is called when get_diff_lines
+        # fails after findings were parsed. Zero findings here is an edge
+        # case (the no-findings branch runs earlier), but it should still
+        # produce coherent output rather than crashing.
+        out = _render_fallback_summary([])
+        assert "Found **0** findings" in out
+        assert "## Kiro Review Summary" in out
 
 
 class TestPreprocessReviewText:

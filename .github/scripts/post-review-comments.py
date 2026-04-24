@@ -94,7 +94,7 @@ FENCE_RE = re.compile(r"^\s*(?:`{3,}|~{3,})")
 HEADING_TERMINATOR_RE = re.compile(r"^#{1,4}\s")
 
 # The orchestrator emits a structured JSON manifest after the markdown
-# review (see review-orchestrator.md "Machine-Readable Manifest" section).
+# review (see review-orchestrator.md "Machine-Readable Findings" section).
 # These regexes locate the section and the fenced JSON payload inside it,
 # so we can parse findings deterministically instead of regexing prose.
 MANIFEST_SECTION_RE = re.compile(
@@ -187,13 +187,19 @@ def _validate_manifest_item(item):
     """Return True iff a JSON-manifest entry passes schema checks.
 
     Required shape per the review-orchestrator prompt:
-      severity: str (one of the six buckets; not enforced here so new
-                     orchestrator severities don't break parsing)
-      agent:    str
-      path:     str, forward-slash
-      line:     int >= 1
-      title:    str
-      body:     str
+      severity: non-empty str (any value; exact-bucket enforcement is
+                left to the caller so a new orchestrator severity
+                doesn't silently invalidate the whole manifest)
+      agent:    non-empty str
+      path:     non-empty str (forward-slash convention is a prompt
+                rule, not validated here — an OS-native path still
+                passes; the PR review API accepts either and GitHub
+                normalizes internally)
+      line:     int >= 1, and NOT bool (`isinstance(True, int)` is True
+                in Python; without the explicit bool reject a manifest
+                with `"line": true` would pass as line=1)
+      title:    non-empty str
+      body:     non-empty str
 
     Any missing field, wrong type, or empty required string fails the
     check. The caller's contract is "all items valid or fall back to
@@ -204,6 +210,11 @@ def _validate_manifest_item(item):
         return False
     required = {"severity", "agent", "path", "line", "title", "body"}
     if not required.issubset(item):
+        return False
+    # bool subclasses int in Python, so isinstance(True, int) is True.
+    # Reject bool explicitly before the int check or `{"line": true}`
+    # silently passes as line=1.
+    if isinstance(item["line"], bool):
         return False
     if not isinstance(item["line"], int) or item["line"] < 1:
         return False
@@ -423,7 +434,15 @@ def parse_diff_hunks(diff_text):
 
 
 def get_diff_lines(base_ref):
-    """Shell out to `git diff -U0` and parse the result. Raises on git failure."""
+    """Shell out to `git diff -U0` and parse the result.
+
+    Raises:
+      ValueError — base_ref is empty (misconfigured workflow).
+      RuntimeError — git exited non-zero OR git itself isn't on PATH.
+                     FileNotFoundError from subprocess is normalized to
+                     RuntimeError so callers only need one except clause
+                     to route all git-lookup failures to the fallback.
+    """
     if not base_ref:
         raise ValueError("base_ref is empty; cannot compute diff range")
     # -U0 strips context lines so @@ hunk ranges cover only changed lines —
@@ -431,13 +450,16 @@ def get_diff_lines(base_ref):
     # core.quotepath=false disables C-style quoting of non-ASCII paths so
     # parse_diff_hunks sees raw UTF-8 filenames and matches finding paths
     # that were never quoted in the first place.
-    result = subprocess.run(
-        [
-            "git", "-c", "core.quotepath=false",
-            "diff", "-U0", f"origin/{base_ref}...HEAD",
-        ],
-        capture_output=True, text=True,
-    )
+    try:
+        result = subprocess.run(
+            [
+                "git", "-c", "core.quotepath=false",
+                "diff", "-U0", f"origin/{base_ref}...HEAD",
+            ],
+            capture_output=True, text=True,
+        )
+    except FileNotFoundError as exc:
+        raise RuntimeError(f"git binary not found on PATH: {exc}") from exc
     if result.returncode != 0:
         raise RuntimeError(
             f"git diff failed (exit {result.returncode}): {result.stderr.strip()}"

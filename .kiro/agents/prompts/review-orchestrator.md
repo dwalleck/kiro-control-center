@@ -166,40 +166,40 @@ For each dimension below, state a specific observation OR write exactly `No conc
 
 ## Machine-Readable Findings
 
+**Why:** the GitHub-integration tooling parses this JSON manifest to post inline PR review comments. The markdown review above is for human readers; the JSON block below is the authoritative source for automation. Get it wrong and findings fall through to a regex fallback that tolerates drift but loses precision.
+
+**Required structure.** After this heading, emit exactly one fenced JSON block. The fence is a plain triple-backtick line with the `json` language tag; the fence closes with a matching triple-backtick line and nothing else on that line. No prose between the heading and the opening fence.
+
+~~~
+## Machine-Readable Findings
+
 ```json
 [
   {
-    "severity": "<Critical|Important|Suggestion|Nitpick>",
-    "agent": "<specialist name>",
-    "path": "<path/to/file.ext with forward slashes>",
-    "line": <integer, first line of the range>,
-    "title": "<same title as the markdown #### heading>",
-    "body": "<Problem / Failure scenario / Call-chain evidence / Verified with / Fix direction, in markdown, as one string>"
+    "severity": "Important",
+    "agent": "code-reviewer",
+    "path": "crates/kiro-market-core/src/hash.rs",
+    "line": 122,
+    "title": "<same title text as the #### markdown heading>",
+    "body": "Problem: …\n\nFailure scenario: …\n\nVerified with: …\n\nFix direction: …"
   }
 ]
 ```
-```
+~~~
 
-### Machine-Readable Findings — rules
+**Content rules:**
 
-The GitHub-integration tooling parses this JSON manifest to post inline PR review comments. The markdown review above is for human readers; this block is the authoritative source for automation.
-
-**Required:**
-
-- Include the `## Machine-Readable Findings` heading and exactly one fenced ```` ```json ```` block. The parser locates the block by searching after the heading for a fence — no second fence, no extra prose inside the fence.
-- One manifest entry per Critical, Important, Suggestion, or Nitpick finding that has a concrete `**File:**` line reference. Omit Verified and Uncertain findings from the manifest (they don't anchor to a specific line).
-- If the review has zero findings of those four severities, emit `[]` — **not** a missing section, and **not** commentary like `"no findings"`.
-
-**Field rules:**
-
+- One entry per Critical, Important, Suggestion, or Nitpick finding that has a concrete `**File:**` line reference. Omit Verified and Uncertain findings from the manifest — they don't anchor to a specific line.
+- If the review has zero findings of those four severities, emit `[]`. Never omit the section. Never write prose like `"no findings"` in place of the array.
+- `severity` is one of `Critical`, `Important`, `Suggestion`, `Nitpick` — exact capitalization.
 - `line` is a JSON integer, not a string. For a range like `42-48`, emit the first line (`42`).
-- `path` uses forward slashes even on Windows, matches the path the orchestrator cited in the markdown `File:` line.
-- `body` is a single JSON string containing the prose sections of the finding (Problem, Failure scenario, Call-chain evidence, Verified with, Fix direction). Multi-line prose uses `\n` escapes. Omit the `####` heading and `**File:**` line — the automation reconstructs them from the structured fields.
+- `path` uses forward slashes even on Windows, matching the path you cited in the markdown `File:` line.
+- `body` is a single JSON string containing the prose sections of the finding (Problem, Failure scenario, Call-chain evidence, Verified with, Fix direction). Multi-line prose uses `\n` escapes. Omit the `####` heading and the `**File:**` line — the automation reconstructs them from the structured fields.
 
 **Validity:**
 
-- Strict JSON: no trailing commas, no comments, all strings properly escaped (`\"`, `\\`, `\n`).
-- The automation falls back to regex-parsing the markdown if the JSON is malformed or any entry fails schema validation — but that's the degraded path. Treat strict JSON as load-bearing.
+- Strict JSON: no trailing commas, no JavaScript-style comments, all strings properly escaped (`\"`, `\\`, `\n`).
+- One bad entry invalidates the whole manifest: the automation falls back to regex-parsing the markdown if the JSON is malformed or any entry fails schema validation. That's the degraded path. Treat strict JSON as load-bearing.
 
 ---
 
