@@ -120,12 +120,20 @@ fn walk_collect(root: &Path, current: &Path, out: &mut Vec<PathBuf>) -> Result<(
             walk_collect(root, &path, out)?;
         } else if ft.is_file() {
             // Strip the root prefix to get a relative path.
-            // SAFETY: `path` is always under `root` because `read_dir(current)` returns
+            // `path` is always under `root` because `read_dir(current)` returns
             // entries inside `current`, which itself was reached by recursive descent
             // from `root`. This invariant cannot be violated by directory traversal alone.
+            // We still propagate as WalkFailed rather than panicking, per CLAUDE.md
+            // zero-tolerance on `.expect()` in production code.
             let rel = path
                 .strip_prefix(root)
-                .expect("walk_collect only produces paths under root")
+                .map_err(|_| HashError::WalkFailed {
+                    path: path.clone(),
+                    source: std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "walk produced a path outside root",
+                    ),
+                })?
                 .to_path_buf();
             out.push(rel);
         }
