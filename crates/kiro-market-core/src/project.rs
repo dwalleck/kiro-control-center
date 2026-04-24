@@ -118,8 +118,9 @@ pub struct InstalledAgents {
     /// Map from agent name to its installation metadata.
     pub agents: HashMap<String, InstalledAgentMeta>,
     /// Per-plugin companion file ownership. Defaults to empty for
-    /// backward compat with legacy tracking files.
-    #[serde(default)]
+    /// backward compat with legacy tracking files; omitted from serialized
+    /// output when empty so round-trips are byte-identical.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub native_companions: HashMap<String, InstalledNativeCompanionsMeta>,
 }
 
@@ -2150,6 +2151,24 @@ mod tests {
         let bytes = serde_json::to_vec(&meta).unwrap();
         let back: InstalledNativeCompanionsMeta = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(back.files.len(), 2);
+    }
+
+    #[test]
+    fn installed_agents_with_empty_native_companions_does_not_serialize_the_field() {
+        // Regression guard: a legacy tracking file (no native_companions key)
+        // must round-trip byte-identical when no companions exist. Without
+        // skip_serializing_if = "HashMap::is_empty", the empty default would
+        // serialize as `"native_companions": {}` and silently mutate the file.
+        let installed = InstalledAgents {
+            agents: std::collections::HashMap::new(),
+            native_companions: std::collections::HashMap::new(),
+        };
+
+        let json = serde_json::to_string(&installed).unwrap();
+        assert!(
+            !json.contains("native_companions"),
+            "empty native_companions must be omitted from serialized output, got: {json}"
+        );
     }
 
     #[test]
