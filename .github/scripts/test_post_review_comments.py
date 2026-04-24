@@ -5,6 +5,7 @@ load it via importlib. Run with: python3 -m pytest .github/scripts/
 """
 
 import importlib.util
+import json
 import sys
 from pathlib import Path
 
@@ -21,9 +22,12 @@ parse_findings = _mod.parse_findings
 parse_diff_hunks = _mod.parse_diff_hunks
 looks_like_findings = _mod.looks_like_findings
 preprocess_review_text = _mod.preprocess_review_text
+parse_json_manifest = _mod.parse_json_manifest
 _strip_ansi = _mod._strip_ansi
 _decode_diff_path = _mod._decode_diff_path
 _format_summary_entry = _mod._format_summary_entry
+_render_fallback_summary = _mod._render_fallback_summary
+_validate_manifest_item = _mod._validate_manifest_item
 
 
 # Fixture mirrors the per-finding block from .kiro/steering/review-process.md
@@ -433,6 +437,220 @@ class TestStripAnsi:
     def test_clean_text_unchanged(self):
         clean = "#### Critical — Title\n\n**File:** `a.py:10`"
         assert _strip_ansi(clean) == clean
+
+
+class TestFileLineRe:
+    # FILE_LINE_RE's URL-rejection lookahead is exercised indirectly via
+    # parse_findings since parse_findings is the only caller — these cases
+    # pin the false-positive class Kiro's own review flagged on PR #49.
+
+    def test_url_with_port_is_not_matched_as_file_line(self):
+        # Before the URL-rejection lookahead, `File: http://example.com:8080`
+        # parsed as `path=http://example.com`, `line=8080`.
+        text = (
+            "#### ⚠️ Important — Mention of a URL in docs\n"
+            "\n"
+            "File: http://example.com:8080\n"
+            "\n"
+            "Problem: body.\n"
+        )
+        assert parse_findings(text) == []
+
+    def test_https_url_is_not_matched(self):
+        text = (
+            "#### ⚠️ Important — HTTPS URL\n"
+            "\n"
+            "File: https://github.com:443\n"
+            "\n"
+            "Problem: body.\n"
+        )
+        assert parse_findings(text) == []
+
+    def test_git_url_is_not_matched(self):
+        # Non-http schemes must be rejected too — `\w+://` is the guard.
+        text = (
+            "#### ⚠️ Important — SSH URL\n"
+            "\n"
+            "File: git://example.com:22/repo\n"
+            "\n"
+            "Problem: body.\n"
+        )
+        assert parse_findings(text) == []
+
+    def test_plain_path_with_colons_in_body_still_matches(self):
+        # Regression guard: the lookahead must not reject normal paths
+        # just because they contain word-characters.
+        text = (
+            "#### ⚠️ Important — Real file\n"
+            "\n"
+            "File: crates/kiro-market-core/src/hash.rs:42\n"
+            "\n"
+            "Problem: body.\n"
+        )
+        findings = parse_findings(text)
+        assert len(findings) == 1
+        assert findings[0]["path"] == "crates/kiro-market-core/src/hash.rs"
+
+
+class TestParseJsonManifest:
+    _VALID = {
+        "severity": "Important",
+        "agent": "code-reviewer",
+        "path": "src/auth.ts",
+        "line": 42,
+        "title": "Missing null check",
+        "body": "**Problem:** token may be undefined.",
+    }
+
+    def _wrap(self, payload_text):
+        return (
+            "# Code Review — PR #1\n\n"
+            "## Detailed Findings\n\n"
+            "(markdown review here)\n\n"
+            "## Machine-Readable Findings\n\n"
+            "```json\n"
+            f"{payload_text}\n"
+            "```\n"
+        )
+
+    def test_happy_path_extracts_findings(self):
+        text = self._wrap(json.dumps([self._VALID]))
+        findings = parse_json_manifest(text)
+        assert findings is not None
+        assert len(findings) == 1
+        assert findings[0]["path"] == "src/auth.ts"
+        assert findings[0]["line"] == 42
+        assert findings[0]["severity"] == "Important"
+        assert findings[0]["agent"] == "code-reviewer"
+        # Body should include the reconstructed heading + the JSON body.
+        assert findings[0]["body"].startswith("#### ⚠️ Important — Missing null check")
+        assert "[source: code-reviewer]" in findings[0]["body"]
+        assert "**Problem:** token may be undefined." in findings[0]["body"]
+
+    def test_missing_section_returns_none(self):
+        # No `## Machine-Readable Findings` heading → signal fallback.
+        text = "# Code Review — PR #1\n\nJust prose.\n"
+        assert parse_json_manifest(text) is None
+
+    def test_section_without_fence_returns_none(self):
+        text = (
+            "# Code Review — PR #1\n\n"
+            "## Machine-Readable Findings\n\n"
+            "Oops, forgot the fence.\n"
+        )
+        assert parse_json_manifest(text) is None
+
+    def test_malformed_json_returns_none(self):
+        # Trailing comma is a common LLM mistake; must fall back, not crash.
+        text = self._wrap('[{"severity": "Important",}]')
+        assert parse_json_manifest(text) is None
+
+    def test_non_list_payload_returns_none(self):
+        text = self._wrap(json.dumps({"severity": "Important"}))
+        assert parse_json_manifest(text) is None
+
+    def test_empty_list_returns_empty_list_not_none(self):
+        # Crucial: an empty `[]` manifest is "orchestrator validly found
+        # nothing," which must NOT fall through to regex parsing. None is
+        # reserved for "manifest absent or invalid."
+        text = self._wrap("[]")
+        result = parse_json_manifest(text)
+        assert result == []
+        assert result is not None
+
+    def test_item_missing_required_field_returns_none(self):
+        # Missing `line` should invalidate the whole manifest so the
+        # caller falls back to regex rather than silently dropping.
+        broken = dict(self._VALID)
+        del broken["line"]
+        text = self._wrap(json.dumps([broken]))
+        assert parse_json_manifest(text) is None
+
+    def test_line_as_string_returns_none(self):
+        broken = dict(self._VALID)
+        broken["line"] = "42"  # JSON string, not int
+        text = self._wrap(json.dumps([broken]))
+        assert parse_json_manifest(text) is None
+
+    def test_line_zero_is_rejected(self):
+        broken = dict(self._VALID)
+        broken["line"] = 0
+        text = self._wrap(json.dumps([broken]))
+        assert parse_json_manifest(text) is None
+
+    def test_fence_without_json_tag_still_matches(self):
+        # The fence language tag is optional — accept ```\n as well as ```json\n.
+        text = (
+            "# Code Review — PR #1\n\n"
+            "## Machine-Readable Findings\n\n"
+            "```\n"
+            f"{json.dumps([self._VALID])}\n"
+            "```\n"
+        )
+        findings = parse_json_manifest(text)
+        assert findings is not None
+        assert len(findings) == 1
+
+    def test_body_exceeding_limit_is_truncated(self):
+        item = dict(self._VALID, body="x" * 5000)
+        text = self._wrap(json.dumps([item]))
+        findings = parse_json_manifest(text)
+        assert findings is not None
+        assert findings[0]["body"].endswith("… (truncated)")
+        assert len(findings[0]["body"]) < 2500
+
+    def test_unknown_severity_renders_without_emoji(self):
+        # Forward-compatible: a new severity bucket shouldn't crash; we
+        # just render without an emoji rather than reject.
+        item = dict(self._VALID, severity="Blocker")
+        text = self._wrap(json.dumps([item]))
+        findings = parse_json_manifest(text)
+        assert findings is not None
+        assert findings[0]["severity"] == "Blocker"
+        # Heading should still render, just without the emoji prefix.
+        assert findings[0]["body"].startswith("#### Blocker — Missing null check")
+
+
+class TestValidateManifestItem:
+    _BASE = {
+        "severity": "Important",
+        "agent": "code-reviewer",
+        "path": "a.py",
+        "line": 1,
+        "title": "t",
+        "body": "b",
+    }
+
+    def test_valid_item_passes(self):
+        assert _validate_manifest_item(self._BASE)
+
+    def test_non_dict_fails(self):
+        assert not _validate_manifest_item("not a dict")
+        assert not _validate_manifest_item(42)
+        assert not _validate_manifest_item([])
+
+    def test_missing_field_fails(self):
+        for key in self._BASE:
+            bad = dict(self._BASE)
+            del bad[key]
+            assert not _validate_manifest_item(bad), f"missing {key} should fail"
+
+    def test_empty_string_field_fails(self):
+        for key in ("severity", "agent", "path", "title", "body"):
+            bad = dict(self._BASE, **{key: ""})
+            assert not _validate_manifest_item(bad), f"empty {key} should fail"
+
+
+class TestRenderFallbackSummary:
+    def test_includes_count_and_entries(self):
+        findings = [
+            {"path": "a.py", "line": 10, "body": "first finding"},
+            {"path": "b.py", "line": 20, "body": "second finding"},
+        ]
+        out = _render_fallback_summary(findings)
+        assert "Found **2** findings" in out
+        assert "- `a.py:10` — first finding" in out
+        assert "- `b.py:20` — second finding" in out
 
 
 class TestPreprocessReviewText:

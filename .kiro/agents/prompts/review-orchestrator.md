@@ -161,7 +161,45 @@ For each dimension below, state a specific observation OR write exactly `No conc
 3. Consider Suggestions.
 4. Re-run affected specialists after fixes.
 5. After all Critical and Important findings are resolved, run `code-simplifier` as the final polish step.
+
+---
+
+## Machine-Readable Findings
+
+```json
+[
+  {
+    "severity": "<Critical|Important|Suggestion|Nitpick>",
+    "agent": "<specialist name>",
+    "path": "<path/to/file.ext with forward slashes>",
+    "line": <integer, first line of the range>,
+    "title": "<same title as the markdown #### heading>",
+    "body": "<Problem / Failure scenario / Call-chain evidence / Verified with / Fix direction, in markdown, as one string>"
+  }
+]
 ```
+```
+
+### Machine-Readable Findings — rules
+
+The GitHub-integration tooling parses this JSON manifest to post inline PR review comments. The markdown review above is for human readers; this block is the authoritative source for automation.
+
+**Required:**
+
+- Include the `## Machine-Readable Findings` heading and exactly one fenced ```` ```json ```` block. The parser locates the block by searching after the heading for a fence — no second fence, no extra prose inside the fence.
+- One manifest entry per Critical, Important, Suggestion, or Nitpick finding that has a concrete `**File:**` line reference. Omit Verified and Uncertain findings from the manifest (they don't anchor to a specific line).
+- If the review has zero findings of those four severities, emit `[]` — **not** a missing section, and **not** commentary like `"no findings"`.
+
+**Field rules:**
+
+- `line` is a JSON integer, not a string. For a range like `42-48`, emit the first line (`42`).
+- `path` uses forward slashes even on Windows, matches the path the orchestrator cited in the markdown `File:` line.
+- `body` is a single JSON string containing the prose sections of the finding (Problem, Failure scenario, Call-chain evidence, Verified with, Fix direction). Multi-line prose uses `\n` escapes. Omit the `####` heading and `**File:**` line — the automation reconstructs them from the structured fields.
+
+**Validity:**
+
+- Strict JSON: no trailing commas, no comments, all strings properly escaped (`\"`, `\\`, `\n`).
+- The automation falls back to regex-parsing the markdown if the JSON is malformed or any entry fails schema validation — but that's the degraded path. Treat strict JSON as load-bearing.
 
 ---
 
