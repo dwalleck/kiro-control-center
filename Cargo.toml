@@ -63,6 +63,10 @@ dirs = "6"
 # Date/time
 chrono = { version = "0.4", features = ["serde"] }
 
+# Hashing
+blake3 = "1.5"
+hex = "0.4"
+
 # Platform
 junction = "1"
 

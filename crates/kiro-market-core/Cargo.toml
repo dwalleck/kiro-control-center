@@ -23,6 +23,8 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 dirs = { workspace = true }
 chrono = { workspace = true }
+blake3 = { workspace = true }
+hex = { workspace = true }
 fs4 = { workspace = true }
 clap = { workspace = true, optional = true }
 specta = { version = "2.0.0-rc.24", optional = true, features = ["derive", "serde_json"] }
