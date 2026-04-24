@@ -68,8 +68,20 @@ jobs:
 
       - name: Run review-orchestrator
         id: orchestrator
+        # 20 min caps a hung orchestrator without truncating a legitimate
+        # deep review — on a ~8k-line PR this step legitimately took ~15 min.
+        # The GitHub default is 6h, which would make a genuine hang painful.
+        timeout-minutes: 20
         env:
           KIRO_API_KEY: ${{ secrets.KIRO_API_KEY }}
+          # Kiro CLI was observed emitting ANSI color sequences as literal
+          # `^[[...m` printable text when stdout is redirected to a file,
+          # which wrapped every `####` finding heading and broke the parser
+          # downstream. NO_COLOR is the https://no-color.org standard;
+          # TERM=dumb is a belt-and-suspenders signal for CLIs that fall
+          # back to TERM detection when NO_COLOR is unset.
+          NO_COLOR: "1"
+          TERM: dumb
         run: |
           set -eo pipefail
           # Verify the base ref exists — otherwise an empty git diff below
@@ -97,14 +109,17 @@ jobs:
 
           # stderr is sent to a separate log so CLI errors (stack traces, auth
           # failures, rate limits) never end up inside the review markdown that
-          # gets parsed and posted to the PR.
+          # gets parsed and posted to the PR. `tee` duplicates stdout to both
+          # the Actions log (live progress visibility during long runs) and
+          # review-output.md (parsed by the next step). `pipefail` propagates
+          # a kiro-cli failure through the pipe so the step still aborts.
           kiro-cli chat \
             --no-interactive \
             --trust-tools=fs_read,grep,execute_bash,code,glob,use_subagent \
             --agent review-orchestrator \
             "Review the changes between this branch and origin/${BASE_REF} from these files with all agents:
           ${DIFF}" \
-            > review-output.md 2> review-stderr.log
+            2> review-stderr.log | tee review-output.md
 
       - name: Upload review artifacts on failure
         if: failure() && steps.orchestrator.conclusion == 'failure'

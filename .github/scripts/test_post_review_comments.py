@@ -20,6 +20,8 @@ _spec.loader.exec_module(_mod)
 parse_findings = _mod.parse_findings
 parse_diff_hunks = _mod.parse_diff_hunks
 looks_like_findings = _mod.looks_like_findings
+preprocess_review_text = _mod.preprocess_review_text
+_strip_ansi = _mod._strip_ansi
 _decode_diff_path = _mod._decode_diff_path
 _format_summary_entry = _mod._format_summary_entry
 
@@ -263,6 +265,26 @@ class TestParseFindings:
             findings = parse_findings(text)
             assert len(findings) == 1, f"dash variant {dash!r} not accepted"
 
+    def test_rendered_markdown_file_line_matches(self):
+        # In production, kiro-cli renders `**File:** `path:line`` through
+        # its terminal markdown formatter, which eats the bold and
+        # backticks when we strip the resulting ANSI. The parser must
+        # accept the plain `File: path:line` form too — this is the
+        # regression observed on PR #48 where the spec-form-only parser
+        # extracted zero findings from real output.
+        text = (
+            "#### ⚠️ Important — .expect() in production code\n"
+            "\n"
+            "File: crates/kiro-market-core/src/hash.rs:122-126\n"
+            "\n"
+            "Problem: panic would abort the install.\n"
+        )
+        findings = parse_findings(text)
+        assert len(findings) == 1
+        assert findings[0]["path"] == "crates/kiro-market-core/src/hash.rs"
+        assert findings[0]["line"] == 122
+        assert findings[0]["severity"] == "Important"
+
 
 class TestParseDiffHunks:
     def test_basic_hunk_with_count(self):
@@ -387,6 +409,81 @@ class TestFormatSummaryEntry:
         # the list structure in GitHub's markdown renderer.
         out = _format_summary_entry("a.py", 10, "line one\nline two\nline three")
         assert out == "- `a.py:10` — line one\n  line two\n  line three"
+
+
+class TestStripAnsi:
+    def test_removes_real_esc_color_codes(self):
+        # Real CSI color sequences with the actual 0x1b byte.
+        text = "\x1b[38;5;252m\x1b[1m#### Critical — Title\x1b[0m"
+        assert _strip_ansi(text) == "#### Critical — Title"
+
+    def test_removes_literal_caret_bracket_form(self):
+        # Kiro CLI was observed emitting escape codes as printable
+        # `^[[...m` text (three ASCII characters `^`, `[`, `[` …) when
+        # stdout is redirected. Parser must strip this form too.
+        text = "^[[38;5;252m^[[1m#### Critical — Title^[[0m^[[0m"
+        assert _strip_ansi(text) == "#### Critical — Title"
+
+    def test_removes_non_color_csi_sequences(self):
+        # Some terminal renderers inject cursor/erase sequences during
+        # long-running output (e.g. `\x1b[K` erase-line, `\x1b[2A` up 2).
+        text = "line one\x1b[Kline two\x1b[2A"
+        assert _strip_ansi(text) == "line oneline two"
+
+    def test_clean_text_unchanged(self):
+        clean = "#### Critical — Title\n\n**File:** `a.py:10`"
+        assert _strip_ansi(clean) == clean
+
+
+class TestPreprocessReviewText:
+    def test_trims_kiro_cli_narration_before_code_review_h1(self):
+        # Realistic kiro-cli transcript: the CLI narrates tool calls
+        # before producing the actual review. Every heading is wrapped in
+        # the literal caret-bracket ANSI form. preprocess_review_text must
+        # strip the color codes and drop everything before the `# Code
+        # Review` H1 so the parser never sees the narration.
+        raw = (
+            "^[[38;5;141m> ^[[0mI'll start by gathering code context.^[[0m\n"
+            "I will run the following command: ^[[38;5;141mgit log --oneline -5^[[0m\n"
+            "abc1234 some commit\n"
+            "\n"
+            "^[[38;5;252m^[[1m# Code Review — PR #42^[[0m\n"
+            "\n"
+            "^[[38;5;252m^[[1m## Holistic Assessment^[[0m\n"
+            "\n"
+            "^[[38;5;252m^[[1m#### ❌ Critical — Bug [source: code-reviewer]^[[0m\n"
+            "\n"
+            "**File:** `a.py:10`\n"
+            "\n"
+            "**Problem:** body.\n"
+        )
+        out = preprocess_review_text(raw)
+        assert out.startswith("# Code Review — PR #42")
+        assert "I'll start by gathering" not in out
+        assert "git log" not in out
+        # Findings should now parse after preprocessing.
+        findings = parse_findings(out)
+        assert len(findings) == 1
+        assert findings[0]["severity"] == "Critical"
+        assert findings[0]["path"] == "a.py"
+
+    def test_returns_stripped_text_when_no_review_marker(self):
+        # If the orchestrator crashed before producing its final report,
+        # there's no `# Code Review` marker. Return the ANSI-stripped text
+        # so the fallback path can still post something — silent drop
+        # would be worse than a noisy comment.
+        raw = "^[[38;5;141m> ^[[0mI'll start.^[[0m\nbut then I crashed"
+        out = preprocess_review_text(raw)
+        assert out == "> I'll start.\nbut then I crashed"
+
+    def test_is_idempotent_on_clean_input(self):
+        clean = (
+            "# Code Review — PR #1\n\n"
+            "#### ❌ Critical — X [source: y]\n\n"
+            "**File:** `a.py:1`\n\n"
+            "**Problem:** body.\n"
+        )
+        assert preprocess_review_text(clean) == clean
 
 
 if __name__ == "__main__":
