@@ -148,4 +148,20 @@ mod tests {
             other => panic!("expected ReadFailed, got: {other:?}"),
         }
     }
+
+    #[test]
+    fn hash_artifact_distinguishes_crlf_vs_lf() {
+        let tmp_lf = tempdir().unwrap();
+        fs::write(tmp_lf.path().join("a.txt"), b"line1\nline2\n").unwrap();
+        let h_lf = hash_artifact(tmp_lf.path(), &[PathBuf::from("a.txt")]).unwrap();
+
+        let tmp_crlf = tempdir().unwrap();
+        fs::write(tmp_crlf.path().join("a.txt"), b"line1\r\nline2\r\n").unwrap();
+        let h_crlf = hash_artifact(tmp_crlf.path(), &[PathBuf::from("a.txt")]).unwrap();
+
+        assert_ne!(
+            h_lf, h_crlf,
+            "hash must NOT normalize line endings — different bytes are different content"
+        );
+    }
 }
