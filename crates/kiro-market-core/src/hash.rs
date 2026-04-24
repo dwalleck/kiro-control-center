@@ -60,13 +60,16 @@ pub fn hash_artifact(base: &Path, relative_paths: &[PathBuf]) -> Result<String, 
             path: abs.clone(),
             source: e,
         })?;
-        // Use the platform-agnostic Unicode form of the relative path.
-        // PathBuf::to_string_lossy is acceptable here because `relative_paths`
-        // come from controlled sources (discovery layer or directory walks
-        // we did ourselves) and we want the hash to be stable across OSes
-        // for the same logical layout.
+        // Use the platform-agnostic forward-slash form of the relative
+        // path. `PathBuf::to_string_lossy()` returns native separators
+        // (`\` on Windows, `/` on Unix); we normalize to `/` so the hash
+        // captures the logical layout, not the host's path conventions.
+        // `relative_paths` come from controlled sources (discovery layer
+        // or directory walks we did ourselves), so non-UTF-8 handling via
+        // `to_string_lossy` is acceptable.
         let path_str = rel.to_string_lossy();
-        hasher.update(path_str.as_bytes());
+        let normalized = path_str.replace('\\', "/");
+        hasher.update(normalized.as_bytes());
         hasher.update(&[0u8]);
         hasher.update(&bytes);
         hasher.update(&[0u8]);
@@ -247,6 +250,34 @@ mod tests {
         let h2 = hash_dir_tree(root).unwrap();
 
         assert_ne!(h1, h2, "content change must change the tree hash");
+    }
+
+    #[test]
+    fn hash_artifact_uses_forward_slash_canonical_path_form() {
+        // Golden-value test: pins the bytes fed into blake3 to the
+        // forward-slash canonical form of the relative path. A Windows
+        // regression that re-introduces `rel.to_string_lossy()` without
+        // normalization would flip to backslash and this test would
+        // fail on Windows. The expected value is computed by hand to
+        // make the invariant explicit.
+        let tmp = tempdir().unwrap();
+        let base = tmp.path();
+        std::fs::create_dir_all(base.join("sub")).unwrap();
+        fs::write(base.join("sub/nested.md"), b"content").unwrap();
+
+        let h = hash_artifact(base, &[PathBuf::from("sub/nested.md")]).unwrap();
+
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(b"sub/nested.md");
+        hasher.update(&[0u8]);
+        hasher.update(b"content");
+        hasher.update(&[0u8]);
+        let expected = format!("blake3:{}", hex::encode(hasher.finalize().as_bytes()));
+
+        assert_eq!(
+            h, expected,
+            "hash must use forward-slash canonical path form in the hasher input"
+        );
     }
 
     #[cfg(unix)]
