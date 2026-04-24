@@ -1249,6 +1249,8 @@ impl MarketplaceService {
                 version: version.map(String::from),
                 installed_at: chrono::Utc::now(),
                 dialect: def.dialect,
+                source_hash: None,
+                installed_hash: None,
             };
             let install_result = if mode.is_force() {
                 project.install_agent_force(&def, &mapped, meta)

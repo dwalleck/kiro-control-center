@@ -72,6 +72,17 @@ pub struct InstalledAgentMeta {
     /// Which source dialect the agent was parsed from. Persisted via the
     /// enum's serde rename so the wire format stays `"claude"` / `"copilot"`.
     pub dialect: AgentDialect,
+
+    /// Tree-hash of the agent source as it existed in the marketplace at
+    /// install time. `None` for entries written before Stage 1 of the
+    /// native-kiro-import work landed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_hash: Option<String>,
+
+    /// Tree-hash of the agent as it was copied into the project. `None`
+    /// for entries written before Stage 1 landed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub installed_hash: Option<String>,
 }
 
 /// The on-disk structure of `installed-agents.json`.
@@ -854,6 +865,8 @@ mod tests {
             version: Some("1.2.3".into()),
             installed_at: Utc::now(),
             dialect: AgentDialect::Claude,
+            source_hash: None,
+            installed_hash: None,
         };
         let json = serde_json::to_string(&meta).unwrap();
         let back: InstalledAgentMeta = serde_json::from_str(&json).unwrap();
@@ -874,6 +887,8 @@ mod tests {
             version: None,
             installed_at: Utc::now(),
             dialect: AgentDialect::Copilot,
+            source_hash: None,
+            installed_hash: None,
         };
         let json = serde_json::to_string(&meta).unwrap();
         assert!(json.contains("\"dialect\":\"copilot\""));
@@ -909,6 +924,8 @@ mod tests {
             version: None,
             installed_at: Utc::now(),
             dialect: AgentDialect::Claude,
+            source_hash: None,
+            installed_hash: None,
         }
     }
 
@@ -1885,6 +1902,23 @@ mod tests {
 
         assert_eq!(meta.marketplace, "m");
         assert_eq!(meta.plugin, "p");
+        assert!(meta.source_hash.is_none());
+        assert!(meta.installed_hash.is_none());
+    }
+
+    #[test]
+    fn installed_agent_meta_loads_legacy_json_without_hash_fields() {
+        let legacy = br#"{
+            "marketplace": "m",
+            "plugin": "p",
+            "version": "0.1.0",
+            "installed_at": "2026-01-01T00:00:00Z",
+            "dialect": "claude"
+        }"#;
+
+        let meta: InstalledAgentMeta = serde_json::from_slice(legacy).unwrap();
+
+        assert_eq!(meta.dialect, AgentDialect::Claude);
         assert!(meta.source_hash.is_none());
         assert!(meta.installed_hash.is_none());
     }
