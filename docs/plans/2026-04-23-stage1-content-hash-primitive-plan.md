@@ -25,9 +25,15 @@
 - `crates/kiro-market-core/src/project.rs`:
   - `InstalledSkillMeta` (line ~32) — add `source_hash` / `installed_hash` fields
   - `InstalledAgentMeta` (line ~52) — add `source_hash` / `installed_hash` fields
+  - `InstalledAgents` (line ~67) — add `native_companions: HashMap<String, InstalledNativeCompanionsMeta>` field
+  - `InstalledNativeCompanionsMeta` (NEW type, near line ~64)
   - `install_skill_from_dir` (line ~331) — compute and persist hashes
   - `write_skill_dir` (line ~669) — receive computed hashes via meta
-  - `install_agent_inner` (line ~470) — compute and persist hashes
+  - `install_agent_inner` (line ~470) — compute and persist hashes; also synthesize a `native_companions` entry so the prompt file is owned by this plugin from the moment it's installed (uniform cross-format collision tracking from day one — closes the spec gap that would otherwise let a future native plugin's companion install see the prompt as an orphan)
+
+**Cross-stage note:** Stage 2's plan (`2026-04-23-stage2-native-kiro-cli-agent-import-plan.md` Task 8) ALSO described adding `InstalledNativeCompanionsMeta` and the `native_companions` field. With this Stage 1 plan owning the schema additions, Stage 2 Task 8 becomes a no-op (the implementer should skip it during Stage 2 execution).
+
+**Why Stage 1 owns this synthesis:** the spec section "Translated-agent path also gets hashes (and a companion entry)" calls for translated installs to write a synthesized native_companions entry so the cross-format collision model is uniform. If we deferred the synthesis to Stage 2, any translated-agent install that happens between Stage 1 landing and Stage 2 landing would leave its prompt file as an "orphan" from native-install's later perspective — breaking the spec's uniformity claim. Doing it in Stage 1 keeps the tracking model consistent across the staged rollout.
 
 ---
 
@@ -754,7 +760,133 @@ git commit -m "feat(core): add source_hash + installed_hash to InstalledAgentMet
 
 ---
 
-## Task 12: `install_skill_from_dir` populates source + installed hashes
+## Task 12: Add `InstalledNativeCompanionsMeta` + `native_companions` map
+
+**Files:**
+- Modify: `crates/kiro-market-core/src/project.rs` (around line 64-71)
+
+This task adds the schema needed for translated install (Task 14 below) to register the prompt files it writes as plugin-owned companions. Without this, a future native plugin install that ships a same-pathed companion would see an "orphan file" and refuse without `--force`.
+
+- [ ] **Step 1: Write the backward-compat test**
+
+Append to the `#[cfg(test)] mod tests` block in `crates/kiro-market-core/src/project.rs`:
+
+```rust
+#[test]
+fn installed_agents_loads_legacy_json_without_native_companions() {
+    // Old tracking files (pre-Stage-1) lack the native_companions map.
+    // The new schema must deserialize them with native_companions = empty.
+    let legacy = br#"{
+        "agents": {
+            "x": {
+                "marketplace": "m",
+                "plugin": "p",
+                "version": null,
+                "installed_at": "2026-01-01T00:00:00Z",
+                "dialect": "claude"
+            }
+        }
+    }"#;
+
+    let installed: InstalledAgents = serde_json::from_slice(legacy).unwrap();
+    assert_eq!(installed.agents.len(), 1);
+    assert!(installed.native_companions.is_empty());
+}
+
+#[test]
+fn installed_native_companions_meta_round_trips_through_serde() {
+    let meta = InstalledNativeCompanionsMeta {
+        marketplace: "m".into(),
+        plugin: "p".into(),
+        version: Some("0.1.0".into()),
+        installed_at: chrono::Utc::now(),
+        files: vec![
+            std::path::PathBuf::from("prompts/a.md"),
+            std::path::PathBuf::from("prompts/b.md"),
+        ],
+        source_hash: "blake3:abc".into(),
+        installed_hash: "blake3:abc".into(),
+    };
+    let bytes = serde_json::to_vec(&meta).unwrap();
+    let back: InstalledNativeCompanionsMeta =
+        serde_json::from_slice(&bytes).unwrap();
+    assert_eq!(back.files.len(), 2);
+}
+```
+
+- [ ] **Step 2: Run tests, verify they fail**
+
+Run: `cargo test -p kiro-market-core --lib installed_agents_loads_legacy_json_without_native_companions`
+Expected: FAIL — `no field 'native_companions' on type 'InstalledAgents'`.
+
+- [ ] **Step 3: Add `InstalledNativeCompanionsMeta`**
+
+In `crates/kiro-market-core/src/project.rs`, immediately after the `InstalledAgentMeta` struct definition (around line 64), add:
+
+```rust
+/// Tracking entry for a plugin's companion file bundle that lives under
+/// `.kiro/agents/`. Populated by:
+///
+/// - The translated-agent install path (this stage): each translated
+///   agent's `prompts/<name>.md` body file is added to its plugin's
+///   bundle entry. This makes the file plugin-owned from day one, so a
+///   later native plugin install at the same path is correctly flagged
+///   as a cross-plugin clash rather than a free-for-the-taking orphan.
+/// - The native-agent install path (Stage 2): plugin-wide companion
+///   bundles discovered alongside native agent JSONs.
+///
+/// Ownership is at the plugin level (not per-agent), so this entry
+/// tracks the union of files installed for one plugin.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InstalledNativeCompanionsMeta {
+    pub marketplace: String,
+    pub plugin: String,
+    pub version: Option<String>,
+    pub installed_at: DateTime<Utc>,
+    /// Relative paths under `.kiro/agents/` of every companion file owned
+    /// by this plugin. Used for collision detection (cross-plugin path
+    /// overlap) and for uninstall.
+    pub files: Vec<PathBuf>,
+    pub source_hash: String,
+    pub installed_hash: String,
+}
+```
+
+- [ ] **Step 4: Extend `InstalledAgents`**
+
+Find `pub struct InstalledAgents` (around line 67) and add the new field:
+
+```rust
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct InstalledAgents {
+    pub agents: HashMap<String, InstalledAgentMeta>,
+    /// Per-plugin companion file ownership. Defaults to empty for
+    /// backward compat with legacy tracking files.
+    #[serde(default)]
+    pub native_companions: HashMap<String, InstalledNativeCompanionsMeta>,
+}
+```
+
+- [ ] **Step 5: Run tests, verify they pass**
+
+Run: `cargo test -p kiro-market-core --lib installed_agents_loads_legacy_json_without_native_companions`
+Expected: Both PASS.
+
+- [ ] **Step 6: Run full crate tests, fix any breakage**
+
+Run: `cargo test -p kiro-market-core`
+Expected: All tests pass. Any test that compares `InstalledAgents` literally may need a `..Default::default()` to pick up the new field — fix any such test.
+
+- [ ] **Step 7: Commit**
+
+```bash
+git add crates/kiro-market-core/src/project.rs
+git commit -m "feat(core): add InstalledNativeCompanionsMeta + native_companions map"
+```
+
+---
+
+## Task 13: `install_skill_from_dir` populates source + installed hashes
 
 **Files:**
 - Modify: `crates/kiro-market-core/src/project.rs` (around line 331 + line 669)
@@ -891,7 +1023,7 @@ git commit -m "feat(core): populate source/installed hashes during skill install
 
 ---
 
-## Task 13: `install_agent_inner` (translated path) populates hashes
+## Task 14: `install_agent_inner` (translated path) populates hashes + synthesizes companion entry
 
 **Files:**
 - Modify: `crates/kiro-market-core/src/project.rs` (around line 470)
@@ -920,9 +1052,10 @@ fn install_agent_translated_populates_source_and_installed_hashes() {
     let mut meta = sample_agent_meta();
     meta.source_hash = None;
     meta.installed_hash = None;
+    let plugin_name = meta.plugin.clone();
 
     project
-        .install_agent(&def, &mapped, meta)
+        .install_agent(&def, &mapped, meta, Some(&source_md))
         .expect("install succeeds");
 
     let installed = project.load_installed_agents().unwrap();
@@ -947,13 +1080,70 @@ fn install_agent_translated_populates_source_and_installed_hashes() {
     )
     .unwrap();
     assert_eq!(src, &recomputed_src);
+
+    // Companion-entry synthesis: this plugin should now own
+    // `prompts/rev.md` in the native_companions map.
+    let companion = installed
+        .native_companions
+        .get(&plugin_name)
+        .expect("native_companions entry synthesized");
+    assert!(
+        companion
+            .files
+            .contains(&std::path::PathBuf::from("prompts/rev.md")),
+        "prompt file must be tracked under native_companions: {:?}",
+        companion.files
+    );
+    assert!(companion.source_hash.starts_with("blake3:"));
+    assert_eq!(companion.source_hash, companion.installed_hash);
+}
+
+#[test]
+fn install_agent_translated_appends_to_existing_companion_entry() {
+    // A plugin that installs TWO translated agents must end up with a
+    // single native_companions entry listing BOTH prompt files.
+    let tmp = tempdir().unwrap();
+    let project = KiroProject::new(tmp.path()).unwrap();
+    let plugin_name = sample_agent_meta().plugin.clone();
+
+    for name in ["alpha", "beta"] {
+        let source_md = write_agent(tmp.path(), name, "body");
+        let def = crate::agent::AgentDefinition {
+            name: name.into(),
+            description: None,
+            prompt_body: "body".into(),
+            model: None,
+            source_tools: vec![],
+            mcp_servers: std::collections::BTreeMap::new(),
+            dialect: crate::agent::AgentDialect::Claude,
+        };
+        let mut meta = sample_agent_meta();
+        meta.source_hash = None;
+        meta.installed_hash = None;
+        project
+            .install_agent(&def, &[], meta, Some(&source_md))
+            .expect("install succeeds");
+    }
+
+    let installed = project.load_installed_agents().unwrap();
+    let companion = installed
+        .native_companions
+        .get(&plugin_name)
+        .expect("entry exists");
+    assert_eq!(companion.files.len(), 2);
+    assert!(companion
+        .files
+        .contains(&std::path::PathBuf::from("prompts/alpha.md")));
+    assert!(companion
+        .files
+        .contains(&std::path::PathBuf::from("prompts/beta.md")));
 }
 ```
 
-- [ ] **Step 2: Run test, verify it fails**
+- [ ] **Step 2: Run tests, verify they fail**
 
-Run: `cargo test -p kiro-market-core --lib install_agent_translated_populates_source_and_installed_hashes`
-Expected: FAIL — `expected source_hash set` panics.
+Run: `cargo test -p kiro-market-core --lib install_agent_translated`
+Expected: BOTH tests FAIL — `expected source_hash set` and `expected entry exists` panics.
 
 - [ ] **Step 3: Update `install_agent_inner` to compute hashes**
 
@@ -1035,39 +1225,105 @@ let json_rel = std::path::PathBuf::from(format!("{}.json", def.name));
 let prompt_rel = std::path::PathBuf::from(format!("prompts/{}.md", def.name));
 let installed_hash = crate::hash::hash_artifact(
     &agents_root,
-    &[json_rel, prompt_rel],
+    &[json_rel.clone(), prompt_rel.clone()],
 )?;
 
 meta.source_hash = source_hash;
 meta.installed_hash = Some(installed_hash);
-
-// (existing code that calls installed.agents.insert(...) follows)
 ```
 
-5. **Update all `self.install_agent(...)` and `install_agent_force(...)` callers** in tests AND in the service layer (`crates/kiro-market-core/src/service/`) to pass the source path. For tests that synthesize an `AgentDefinition` from thin air, pass `None`. For service callers that have the source path, pass `Some(&path)`.
+5. **Synthesize a `native_companions` entry for this plugin's prompt file.** This is the cross-format ownership glue described in the spec — without it, a future native plugin install at the same prompt path would see an "orphan file" and refuse to overwrite. Insert immediately AFTER the existing `installed.agents.insert(...)` call and BEFORE the `write_agent_tracking(&installed)` call:
+
+```rust
+// Synthesize/update the companion entry for THIS plugin's prompt files.
+// We track the plugin's union of installed prompt paths so the native
+// install path (Stage 2) sees them as plugin-owned, not orphaned.
+//
+// Hash semantics: we compute source_hash == installed_hash over the
+// installed prompt files (the prompt body bytes). The translated path
+// doesn't separately track original `.md` source files, so the two
+// hashes are the same value. This still gives a meaningful
+// drift-detection signal for future "user edited the prompt" checks.
+let companion_entry = installed
+    .native_companions
+    .entry(meta.plugin.clone())
+    .or_insert_with(|| InstalledNativeCompanionsMeta {
+        marketplace: meta.marketplace.clone(),
+        plugin: meta.plugin.clone(),
+        version: meta.version.clone(),
+        installed_at: chrono::Utc::now(),
+        files: Vec::new(),
+        source_hash: String::new(),
+        installed_hash: String::new(),
+    });
+// Update version + timestamp to reflect this most-recent install.
+companion_entry.marketplace = meta.marketplace.clone();
+companion_entry.version = meta.version.clone();
+companion_entry.installed_at = chrono::Utc::now();
+// Add the prompt path if not already present.
+if !companion_entry.files.contains(&prompt_rel) {
+    companion_entry.files.push(prompt_rel);
+}
+// Recompute hashes over the current prompt set for this plugin.
+let companion_files_snapshot = companion_entry.files.clone();
+let companion_hash = crate::hash::hash_artifact(
+    &agents_root,
+    &companion_files_snapshot,
+)?;
+companion_entry.source_hash = companion_hash.clone();
+companion_entry.installed_hash = companion_hash;
+
+// (existing code that calls write_agent_tracking(&installed) follows)
+```
+
+**Known v1 limitation:** if a translated agent is later overwritten by a different plugin via `--force`, the prior plugin's `native_companions` entry still lists the prompt path (incorrectly attributing the now-overwritten file). Cross-plugin `--force` ownership transfer for translated agents is out of scope for Stage 1 — the cross-plugin handling lives in Stage 2's `install_native_agent` / `install_native_companions`. Document this in the commit message.
+
+6. **Update all `self.install_agent(...)` and `install_agent_force(...)` callers** in tests AND in the service layer (`crates/kiro-market-core/src/service/`) to pass the source path. For tests that synthesize an `AgentDefinition` from thin air, pass `None`. For service callers that have the source path, pass `Some(&path)`.
 
 A quick way to find callers: `grep -rn "install_agent\b\|install_agent_force\b" crates/`.
 
-- [ ] **Step 4: Run test, verify it passes**
+- [ ] **Step 4: Run tests, verify they pass**
 
-Run: `cargo test -p kiro-market-core --lib install_agent_translated_populates_source_and_installed_hashes`
-Expected: PASS.
+Run: `cargo test -p kiro-market-core --lib install_agent_translated`
+Expected: BOTH tests PASS.
 
 - [ ] **Step 5: Run full workspace tests, fix any breakage**
 
 Run: `cargo test --workspace`
-Expected: All tests pass after updating callers in step 3.5.
+Expected: All tests pass after updating callers in step 6 (the source_path argument addition).
 
 - [ ] **Step 6: Commit**
 
 ```bash
 git add crates/kiro-market-core/src/project.rs crates/kiro-market-core/src/service/ crates/kiro-market/src/
-git commit -m "feat(core): populate source/installed hashes during translated agent install"
+git commit -m "$(cat <<'EOF'
+feat(core): populate hashes + synthesize companion entry on translated install
+
+Translated agent install now:
+- Computes source_hash over the source .md file
+- Computes installed_hash over the emitted JSON + prompt body
+- Synthesizes/updates a native_companions entry so the prompt file
+  is owned by THIS plugin from the moment it lands
+
+The synthesis closes the cross-format collision gap that would
+otherwise let a future native plugin install at the same prompt
+path see an "orphan file" and refuse without --force.
+
+Known v1 limitation: cross-plugin --force overwrite of a translated
+agent does not transfer companion-entry ownership. The prior
+plugin's entry still lists the prompt path. Cross-plugin transfer
+logic lives in Stage 2's native install paths.
+
+Adds Option<&Path> source_path parameter to install_agent /
+install_agent_force. Test fixtures pass None; service-layer callers
+pass Some(&path).
+EOF
+)"
 ```
 
 ---
 
-## Task 14: Final verification — full test suite + clippy + fmt
+## Task 15: Final verification — full test suite + clippy + fmt
 
 **Files:** none (verification only)
 
