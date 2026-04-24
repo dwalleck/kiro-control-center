@@ -56,6 +56,25 @@ pub fn hash_artifact(base: &Path, relative_paths: &[PathBuf]) -> Result<String, 
     let mut hasher = blake3::Hasher::new();
     for rel in sorted {
         let abs = base.join(rel);
+        // Defense-in-depth: re-check the file type immediately before reading
+        // to close the TOCTOU window between `walk_collect` (which checks
+        // `symlink_metadata` and skips symlinks) and this read (which would
+        // otherwise follow a symlink if an attacker swapped a regular file
+        // for a symlink between the two steps). Matches the security
+        // guarantee stated in this module's top-level doc comment.
+        let md = std::fs::symlink_metadata(&abs).map_err(|e| HashError::ReadFailed {
+            path: abs.clone(),
+            source: e,
+        })?;
+        if md.file_type().is_symlink() {
+            return Err(HashError::ReadFailed {
+                path: abs.clone(),
+                source: std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "symlink appeared between walk and read",
+                ),
+            });
+        }
         let bytes = std::fs::read(&abs).map_err(|e| HashError::ReadFailed {
             path: abs.clone(),
             source: e,
