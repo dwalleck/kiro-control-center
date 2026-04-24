@@ -106,4 +106,29 @@ mod tests {
 
         assert_eq!(h_ab, h_ba, "input order must not affect hash");
     }
+
+    #[test]
+    fn hash_artifact_distinguishes_rename_collisions() {
+        // Without NUL separators, "a" + "bXY" would collide with "ab" + "XY"
+        // (concatenation makes them identical streams). The NUL terminators
+        // make them distinct.
+        let tmp = tempdir().unwrap();
+        let base = tmp.path();
+
+        // Layout 1: file "a" with content "bXY"
+        fs::write(base.join("a"), b"bXY").unwrap();
+        let h1 = hash_artifact(base, &[PathBuf::from("a")]).unwrap();
+
+        // Layout 2: file "ab" with content "XY" — different layout, would
+        // collide without NUL separation.
+        let tmp2 = tempdir().unwrap();
+        let base2 = tmp2.path();
+        fs::write(base2.join("ab"), b"XY").unwrap();
+        let h2 = hash_artifact(base2, &[PathBuf::from("ab")]).unwrap();
+
+        assert_ne!(
+            h1, h2,
+            "NUL separator must distinguish rename-collision layouts"
+        );
+    }
 }
