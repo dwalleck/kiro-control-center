@@ -38,6 +38,17 @@ pub struct InstalledSkillMeta {
     pub version: Option<String>,
     /// Timestamp when the skill was installed.
     pub installed_at: DateTime<Utc>,
+
+    /// Tree-hash of the skill source as it existed in the marketplace at
+    /// install time. `None` for entries written before Stage 1 of the
+    /// native-kiro-import work landed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_hash: Option<String>,
+
+    /// Tree-hash of the skill as it was copied into the project. `None`
+    /// for entries written before Stage 1 landed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub installed_hash: Option<String>,
 }
 
 /// The on-disk structure of `installed-skills.json`.
@@ -830,6 +841,8 @@ mod tests {
             plugin: "test-plugin".into(),
             version: Some("1.0.0".into()),
             installed_at: Utc::now(),
+            source_hash: None,
+            installed_hash: None,
         }
     }
 
@@ -1855,5 +1868,24 @@ mod tests {
         assert!(!legacy.exists(), "legacy staging dir should be removed");
         assert!(!new_format.exists(), "new staging dir should be removed");
         assert!(unrelated.exists(), "unrelated skill's staging is untouched");
+    }
+
+    #[test]
+    fn installed_skill_meta_loads_legacy_json_without_hash_fields() {
+        // Old tracking files (pre-Stage-1) lack source_hash / installed_hash.
+        // The new schema must deserialize them with both fields = None.
+        let legacy = br#"{
+            "marketplace": "m",
+            "plugin": "p",
+            "version": "1.0.0",
+            "installed_at": "2026-01-01T00:00:00Z"
+        }"#;
+
+        let meta: InstalledSkillMeta = serde_json::from_slice(legacy).unwrap();
+
+        assert_eq!(meta.marketplace, "m");
+        assert_eq!(meta.plugin, "p");
+        assert!(meta.source_hash.is_none());
+        assert!(meta.installed_hash.is_none());
     }
 }

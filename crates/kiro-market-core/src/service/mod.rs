@@ -944,6 +944,8 @@ impl MarketplaceService {
                 plugin: plugin.to_owned(),
                 version: version.map(str::to_owned),
                 installed_at: chrono::Utc::now(),
+                source_hash: None,
+                installed_hash: None,
             };
 
             let outcome = if mode.is_force() {
