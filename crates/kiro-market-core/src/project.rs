@@ -891,8 +891,35 @@ impl KiroProject {
                 return Err(e.into());
             }
 
-            // For force installs, remove the old directory now that the new
-            // content is safely staged.
+            // Compute installed_hash on the staged copy BEFORE the destructive
+            // rename. Any hash failure here leaves the previous install (if
+            // force mode) intact on disk — the rename hasn't happened yet.
+            // Staging contains the same bytes that will land, so the hash value
+            // is identical to what we'd compute post-rename. This is the
+            // correct TOCTOU stance: `installed_hash` is the source of truth
+            // for what the user has, computed over the bytes we're about to
+            // commit to disk.
+            let installed_hash = match crate::hash::hash_dir_tree(&staging_dir) {
+                Ok(h) => h,
+                Err(e) => {
+                    warn!(
+                        name,
+                        error = %e,
+                        "installed_hash computation failed on staging; removing staging dir"
+                    );
+                    if let Err(cleanup_err) = fs::remove_dir_all(&staging_dir) {
+                        warn!(
+                            path = %staging_dir.display(),
+                            error = %cleanup_err,
+                            "failed to clean up staging directory after hash failure"
+                        );
+                    }
+                    return Err(e.into());
+                }
+            };
+
+            // Only now do the destructive swap — hash is already in hand so
+            // any failure from here is unrelated to the hash computation.
             if dir.exists() {
                 debug!(name, "removing existing skill directory for force install");
                 fs::remove_dir_all(&dir)?;
@@ -900,30 +927,6 @@ impl KiroProject {
 
             // Rename staging to final location.
             fs::rename(&staging_dir, &dir)?;
-
-            // Compute installed_hash AFTER the rename so we hash the bytes that
-            // actually landed in the project. (TOCTOU: the source could in
-            // principle change between source_hash computation and the copy; the
-            // installed_hash is the source of truth for what's in the project.)
-            let installed_hash = match crate::hash::hash_dir_tree(&dir) {
-                Ok(h) => h,
-                Err(e) => {
-                    warn!(
-                        name,
-                        error = %e,
-                        "installed_hash computation failed after rename, rolling back"
-                    );
-                    if let Err(rollback_err) = fs::remove_dir_all(&dir) {
-                        warn!(
-                            path = %dir.display(),
-                            error = %rollback_err,
-                            "failed to roll back skill directory after hash failure — \
-                             skill is installed on disk but not tracked"
-                        );
-                    }
-                    return Err(e.into());
-                }
-            };
             meta.source_hash = Some(source_hash);
             meta.installed_hash = Some(installed_hash);
 
