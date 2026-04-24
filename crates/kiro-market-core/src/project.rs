@@ -388,7 +388,8 @@ impl KiroProject {
         meta: InstalledSkillMeta,
     ) -> crate::error::Result<()> {
         validation::validate_name(name)?;
-        self.write_skill_dir(name, source_dir, meta, false)
+        let source_hash = crate::hash::hash_dir_tree(source_dir)?;
+        self.write_skill_dir(name, source_dir, meta, false, source_hash)
     }
 
     /// Install a skill by copying a source directory, overwriting any existing installation.
@@ -407,7 +408,8 @@ impl KiroProject {
         meta: InstalledSkillMeta,
     ) -> crate::error::Result<()> {
         validation::validate_name(name)?;
-        self.write_skill_dir(name, source_dir, meta, true)
+        let source_hash = crate::hash::hash_dir_tree(source_dir)?;
+        self.write_skill_dir(name, source_dir, meta, true, source_hash)
     }
 
     // -- agent installation ------------------------------------------------
@@ -723,8 +725,9 @@ impl KiroProject {
         &self,
         name: &str,
         source_dir: &Path,
-        meta: InstalledSkillMeta,
+        mut meta: InstalledSkillMeta,
         force: bool,
+        source_hash: String,
     ) -> crate::error::Result<()> {
         crate::file_lock::with_file_lock(&self.tracking_path(), || -> crate::error::Result<()> {
             let dir = self.skill_dir(name);
@@ -767,6 +770,32 @@ impl KiroProject {
 
             // Rename staging to final location.
             fs::rename(&staging_dir, &dir)?;
+
+            // Compute installed_hash AFTER the rename so we hash the bytes that
+            // actually landed in the project. (TOCTOU: the source could in
+            // principle change between source_hash computation and the copy; the
+            // installed_hash is the source of truth for what's in the project.)
+            let installed_hash = match crate::hash::hash_dir_tree(&dir) {
+                Ok(h) => h,
+                Err(e) => {
+                    warn!(
+                        name,
+                        error = %e,
+                        "installed_hash computation failed after rename, rolling back"
+                    );
+                    if let Err(rollback_err) = fs::remove_dir_all(&dir) {
+                        warn!(
+                            path = %dir.display(),
+                            error = %rollback_err,
+                            "failed to roll back skill directory after hash failure — \
+                             skill is installed on disk but not tracked"
+                        );
+                    }
+                    return Err(e.into());
+                }
+            };
+            meta.source_hash = Some(source_hash);
+            meta.installed_hash = Some(installed_hash);
 
             // Update tracking. If this fails, roll back the rename so the
             // filesystem and tracking file stay consistent.
@@ -1992,5 +2021,43 @@ mod tests {
         let bytes = serde_json::to_vec(&meta).unwrap();
         let back: InstalledNativeCompanionsMeta = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(back.files.len(), 2);
+    }
+
+    #[test]
+    fn install_skill_from_dir_populates_source_and_installed_hashes() {
+        let (tmp, project) = temp_project();
+
+        // Create a tiny source skill directory.
+        let skill_src = tmp.path().join("source");
+        fs::create_dir_all(&skill_src).unwrap();
+        fs::write(skill_src.join("SKILL.md"), b"# test skill\n\nbody").unwrap();
+
+        let meta = InstalledSkillMeta {
+            marketplace: "m".into(),
+            plugin: "p".into(),
+            version: Some("1.0.0".into()),
+            installed_at: chrono::Utc::now(),
+            source_hash: None,
+            installed_hash: None,
+        };
+
+        project
+            .install_skill_from_dir("test", &skill_src, meta)
+            .unwrap();
+
+        let installed = project.load_installed().unwrap();
+        let entry = installed.skills.get("test").expect("entry persisted");
+
+        let src_hash = entry.source_hash.as_ref().expect("source_hash populated");
+        let inst_hash = entry
+            .installed_hash
+            .as_ref()
+            .expect("installed_hash populated");
+
+        assert!(src_hash.starts_with("blake3:"));
+        assert!(inst_hash.starts_with("blake3:"));
+        // Source and installed contents are identical (we just copied), so the
+        // hashes match.
+        assert_eq!(src_hash, inst_hash);
     }
 }
