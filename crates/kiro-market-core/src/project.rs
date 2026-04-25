@@ -254,6 +254,25 @@ pub struct KiroProject {
     root: PathBuf,
 }
 
+/// Input bundle for [`KiroProject::synthesize_companion_entry`]. Groups the
+/// 7 immutable refs that the helper needs so the public-ish signature stays
+/// at two parameters (the `&mut InstalledAgents` plus the bundle), avoiding
+/// a `#[allow(clippy::too_many_arguments)]` waiver that would otherwise be
+/// required.
+struct CompanionInput<'a> {
+    marketplace: &'a str,
+    plugin: &'a str,
+    version: Option<&'a str>,
+    agents_root: &'a Path,
+    prompt_rel: &'a Path,
+    /// Final destination of the agent JSON; used by the rollback path on
+    /// companion-hash failure to remove just-renamed files.
+    json_target: &'a Path,
+    /// Final destination of the agent prompt body; used by the rollback path
+    /// on companion-hash failure.
+    prompt_target: &'a Path,
+}
+
 impl KiroProject {
     /// Create a new project handle rooted at the given directory.
     #[must_use]
@@ -595,13 +614,15 @@ impl KiroProject {
 
                 Self::synthesize_companion_entry(
                     &mut installed,
-                    &marketplace,
-                    &plugin,
-                    version.as_deref(),
-                    &agents_root,
-                    &prompt_rel,
-                    &json_target,
-                    &prompt_target,
+                    &CompanionInput {
+                        marketplace: &marketplace,
+                        plugin: &plugin,
+                        version: version.as_deref(),
+                        agents_root: &agents_root,
+                        prompt_rel: &prompt_rel,
+                        json_target: &json_target,
+                        prompt_target: &prompt_target,
+                    },
                 )?;
 
                 if let Err(e) = self.write_agent_tracking(&installed) {
@@ -777,16 +798,9 @@ impl KiroProject {
     /// A hash failure in force mode will try to remove the newly placed files,
     /// but the previously existing files were already unlinked. A full
     /// backup-then-swap atomic install is deferred to a follow-up PR.
-    #[allow(clippy::too_many_arguments)]
     fn synthesize_companion_entry(
         installed: &mut InstalledAgents,
-        marketplace: &str,
-        plugin: &str,
-        version: Option<&str>,
-        agents_root: &Path,
-        prompt_rel: &Path,
-        json_target: &Path,
-        prompt_target: &Path,
+        input: &CompanionInput<'_>,
     ) -> crate::error::Result<()> {
         // Synthesize/update the companion entry for this plugin's prompt
         // files. We track the union of installed prompt paths so the
@@ -798,44 +812,49 @@ impl KiroProject {
         // files; both equal the hash over the prompt-bundle bytes.
         let companion_entry = installed
             .native_companions
-            .entry(plugin.to_owned())
+            .entry(input.plugin.to_owned())
             .or_insert_with(|| InstalledNativeCompanionsMeta {
-                marketplace: marketplace.to_owned(),
-                plugin: plugin.to_owned(),
-                version: version.map(str::to_owned),
+                marketplace: input.marketplace.to_owned(),
+                plugin: input.plugin.to_owned(),
+                version: input.version.map(str::to_owned),
                 installed_at: chrono::Utc::now(),
                 files: Vec::new(),
                 source_hash: String::new(),
                 installed_hash: String::new(),
             });
         // Refresh marketplace/version/timestamp on every install.
-        marketplace.clone_into(&mut companion_entry.marketplace);
-        companion_entry.version = version.map(str::to_owned);
+        input
+            .marketplace
+            .clone_into(&mut companion_entry.marketplace);
+        companion_entry.version = input.version.map(str::to_owned);
         companion_entry.installed_at = chrono::Utc::now();
-        if !companion_entry.files.contains(&prompt_rel.to_path_buf()) {
-            companion_entry.files.push(prompt_rel.to_path_buf());
+        if !companion_entry
+            .files
+            .contains(&input.prompt_rel.to_path_buf())
+        {
+            companion_entry.files.push(input.prompt_rel.to_path_buf());
         }
         // Recompute hashes over the full prompt set for this plugin.
         let companion_files_snapshot = companion_entry.files.clone();
         let companion_hash =
-            match crate::hash::hash_artifact(agents_root, &companion_files_snapshot) {
+            match crate::hash::hash_artifact(input.agents_root, &companion_files_snapshot) {
                 Ok(h) => h,
                 Err(e) => {
                     warn!(
-                        plugin,
+                        plugin = input.plugin,
                         error = %e,
                         "companion hash computation failed; rolling back files"
                     );
-                    if let Err(rb_err) = fs::remove_file(json_target) {
+                    if let Err(rb_err) = fs::remove_file(input.json_target) {
                         warn!(
-                            path = %json_target.display(),
+                            path = %input.json_target.display(),
                             error = %rb_err,
                             "failed to roll back agent JSON after companion-hash failure"
                         );
                     }
-                    if let Err(rb_err) = fs::remove_file(prompt_target) {
+                    if let Err(rb_err) = fs::remove_file(input.prompt_target) {
                         warn!(
-                            path = %prompt_target.display(),
+                            path = %input.prompt_target.display(),
                             error = %rb_err,
                             "failed to roll back agent prompt after companion-hash failure"
                         );
