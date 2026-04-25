@@ -81,6 +81,8 @@ mod tests {
             plugin: "test-plugin".into(),
             version: Some("1.0.0".into()),
             installed_at: Utc::now(),
+            source_hash: None,
+            installed_hash: None,
         };
         let skill_src = tempfile::tempdir().expect("skill src");
         std::fs::write(
@@ -107,6 +109,8 @@ mod tests {
                 plugin: "test-plugin".into(),
                 version: Some("1.0.0".into()),
                 installed_at: Utc::now(),
+                source_hash: None,
+                installed_hash: None,
             };
             let skill_src = tempfile::tempdir().expect("skill src");
             std::fs::write(skill_src.path().join("SKILL.md"), "# Skill\nBody")

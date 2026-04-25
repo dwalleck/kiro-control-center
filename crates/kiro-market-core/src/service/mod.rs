@@ -944,6 +944,8 @@ impl MarketplaceService {
                 plugin: plugin.to_owned(),
                 version: version.map(str::to_owned),
                 installed_at: chrono::Utc::now(),
+                source_hash: None,
+                installed_hash: None,
             };
 
             let outcome = if mode.is_force() {
@@ -1247,11 +1249,13 @@ impl MarketplaceService {
                 version: version.map(String::from),
                 installed_at: chrono::Utc::now(),
                 dialect: def.dialect,
+                source_hash: None,
+                installed_hash: None,
             };
             let install_result = if mode.is_force() {
-                project.install_agent_force(&def, &mapped, meta)
+                project.install_agent_force(&def, &mapped, meta, Some(&path))
             } else {
-                project.install_agent(&def, &mapped, meta)
+                project.install_agent(&def, &mapped, meta, Some(&path))
             };
             match install_result {
                 Ok(()) => result.installed.push(def.name),

@@ -38,6 +38,17 @@ pub struct InstalledSkillMeta {
     pub version: Option<String>,
     /// Timestamp when the skill was installed.
     pub installed_at: DateTime<Utc>,
+
+    /// Tree-hash of the skill source as it existed in the marketplace at
+    /// install time. `None` for entries written before Stage 1 of the
+    /// native-kiro-import work landed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_hash: Option<String>,
+
+    /// Tree-hash of the skill as it was copied into the project. `None`
+    /// for entries written before Stage 1 landed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub installed_hash: Option<String>,
 }
 
 /// The on-disk structure of `installed-skills.json`.
@@ -61,6 +72,44 @@ pub struct InstalledAgentMeta {
     /// Which source dialect the agent was parsed from. Persisted via the
     /// enum's serde rename so the wire format stays `"claude"` / `"copilot"`.
     pub dialect: AgentDialect,
+
+    /// Tree-hash of the agent source as it existed in the marketplace at
+    /// install time. `None` for entries written before Stage 1 of the
+    /// native-kiro-import work landed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_hash: Option<String>,
+
+    /// Tree-hash of the agent as it was copied into the project. `None`
+    /// for entries written before Stage 1 landed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub installed_hash: Option<String>,
+}
+
+/// Tracking entry for a plugin's companion file bundle that lives under
+/// `.kiro/agents/`. Populated by:
+///
+/// - The translated-agent install path (this stage): each translated
+///   agent's `prompts/<name>.md` body file is added to its plugin's
+///   bundle entry. This makes the file plugin-owned from day one, so a
+///   later native plugin install at the same path is correctly flagged
+///   as a cross-plugin clash rather than a free-for-the-taking orphan.
+/// - The native-agent install path (Stage 2): plugin-wide companion
+///   bundles discovered alongside native agent JSONs.
+///
+/// Ownership is at the plugin level (not per-agent), so this entry
+/// tracks the union of files installed for one plugin.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InstalledNativeCompanionsMeta {
+    pub marketplace: String,
+    pub plugin: String,
+    pub version: Option<String>,
+    pub installed_at: DateTime<Utc>,
+    /// Relative paths under `.kiro/agents/` of every companion file owned
+    /// by this plugin. Used for collision detection (cross-plugin path
+    /// overlap) and for uninstall.
+    pub files: Vec<PathBuf>,
+    pub source_hash: String,
+    pub installed_hash: String,
 }
 
 /// The on-disk structure of `installed-agents.json`.
@@ -68,6 +117,11 @@ pub struct InstalledAgentMeta {
 pub struct InstalledAgents {
     /// Map from agent name to its installation metadata.
     pub agents: HashMap<String, InstalledAgentMeta>,
+    /// Per-plugin companion file ownership. Defaults to empty for
+    /// backward compat with legacy tracking files; omitted from serialized
+    /// output when empty so round-trips are byte-identical.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub native_companions: HashMap<String, InstalledNativeCompanionsMeta>,
 }
 
 // ---------------------------------------------------------------------------
@@ -198,6 +252,25 @@ fn copy_dir_recursive(src: &Path, dest: &Path) -> std::io::Result<()> {
 #[derive(Debug, Clone)]
 pub struct KiroProject {
     root: PathBuf,
+}
+
+/// Input bundle for [`KiroProject::synthesize_companion_entry`]. Groups the
+/// 7 immutable refs that the helper needs so the public-ish signature stays
+/// at two parameters (the `&mut InstalledAgents` plus the bundle), avoiding
+/// a `#[allow(clippy::too_many_arguments)]` waiver that would otherwise be
+/// required.
+struct CompanionInput<'a> {
+    marketplace: &'a str,
+    plugin: &'a str,
+    version: Option<&'a str>,
+    agents_root: &'a Path,
+    prompt_rel: &'a Path,
+    /// Final destination of the agent JSON; used by the rollback path on
+    /// companion-hash failure to remove just-renamed files.
+    json_target: &'a Path,
+    /// Final destination of the agent prompt body; used by the rollback path
+    /// on companion-hash failure.
+    prompt_target: &'a Path,
 }
 
 impl KiroProject {
@@ -335,7 +408,8 @@ impl KiroProject {
         meta: InstalledSkillMeta,
     ) -> crate::error::Result<()> {
         validation::validate_name(name)?;
-        self.write_skill_dir(name, source_dir, meta, false)
+        let source_hash = crate::hash::hash_dir_tree(source_dir)?;
+        self.write_skill_dir(name, source_dir, meta, false, source_hash)
     }
 
     /// Install a skill by copying a source directory, overwriting any existing installation.
@@ -354,7 +428,8 @@ impl KiroProject {
         meta: InstalledSkillMeta,
     ) -> crate::error::Result<()> {
         validation::validate_name(name)?;
-        self.write_skill_dir(name, source_dir, meta, true)
+        let source_hash = crate::hash::hash_dir_tree(source_dir)?;
+        self.write_skill_dir(name, source_dir, meta, true, source_hash)
     }
 
     // -- agent installation ------------------------------------------------
@@ -417,19 +492,11 @@ impl KiroProject {
             .join(format!("_installing-agent-{name}-{pid}-{seq}"))
     }
 
-    /// Install a parsed agent: emit its Kiro JSON + externalized prompt
-    /// markdown under `.kiro/agents/`, and record metadata in
-    /// `installed-agents.json`.
+    /// Install a parsed agent into the Kiro project.
     ///
-    /// The caller is responsible for parsing the source file and mapping the
-    /// tool list — the service layer does both upstream so warnings can be
-    /// surfaced before the install lock is acquired. This method is purely
-    /// the on-disk write step.
-    ///
-    /// File writes use a staging-and-rename pattern: prompt + JSON are
-    /// written to `_installing-agent-<name>-<pid>-<seq>/` under `.kiro/`,
-    /// renamed into place after the duplicate check, then tracking is
-    /// written last. The whole flow runs under the agent tracking lock.
+    /// Pass `source_path` as the `.md` file the definition was parsed from to
+    /// populate `source_hash` in the tracking entry. Pass `None` to leave it
+    /// unrecorded (e.g. for synthetic test agents).
     ///
     /// # Errors
     ///
@@ -441,13 +508,18 @@ impl KiroProject {
         def: &AgentDefinition,
         mapped_tools: &[MappedTool],
         meta: InstalledAgentMeta,
+        source_path: Option<&Path>,
     ) -> crate::error::Result<()> {
-        self.install_agent_inner(def, mapped_tools, meta, false)
+        self.install_agent_inner(def, mapped_tools, meta, false, source_path)
     }
 
     /// Install a parsed agent, overwriting any existing agent of the same
     /// name. Mirrors [`install_skill_from_dir_force`] for the agent path so
     /// the CLI's `--force` flag can honor its documented contract.
+    ///
+    /// Pass `source_path` as the `.md` file the definition was parsed from to
+    /// populate `source_hash` in the tracking entry. Pass `None` to leave it
+    /// unrecorded (e.g. for synthetic test agents).
     ///
     /// If an agent with the same name is already tracked, its JSON + prompt
     /// files are removed before the new ones are renamed into place. Orphaned
@@ -463,22 +535,47 @@ impl KiroProject {
         def: &AgentDefinition,
         mapped_tools: &[MappedTool],
         meta: InstalledAgentMeta,
+        source_path: Option<&Path>,
     ) -> crate::error::Result<()> {
-        self.install_agent_inner(def, mapped_tools, meta, true)
+        self.install_agent_inner(def, mapped_tools, meta, true, source_path)
     }
 
     fn install_agent_inner(
         &self,
         def: &AgentDefinition,
         mapped_tools: &[MappedTool],
-        meta: InstalledAgentMeta,
+        mut meta: InstalledAgentMeta,
         force: bool,
+        source_path: Option<&Path>,
     ) -> crate::error::Result<()> {
         validation::validate_name(&def.name)?;
 
         // CPU-bound work outside the lock to keep the critical section short.
         let json = crate::agent::emit::build_kiro_json(def, mapped_tools)?;
         let json_bytes = serde_json::to_vec_pretty(&json)?;
+
+        // Compute source_hash outside the lock — it's a read-only I/O
+        // operation on the source file and need not block other installers.
+        let source_hash: Option<String> = source_path
+            .map(|p| -> crate::error::Result<String> {
+                let parent = p.parent().ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!("source path `{}` has no parent dir", p.display()),
+                    )
+                })?;
+                let filename = p.file_name().ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!("source path `{}` has no file name", p.display()),
+                    )
+                })?;
+                Ok(crate::hash::hash_artifact(
+                    parent,
+                    &[std::path::PathBuf::from(filename)],
+                )?)
+            })
+            .transpose()?;
 
         crate::file_lock::with_file_lock(
             &self.agent_tracking_path(),
@@ -496,82 +593,38 @@ impl KiroProject {
                 // of this agent is currently running.
                 self.cleanup_leftover_agent_staging(&def.name)?;
 
-                let staging = self.fresh_agent_staging_dir(&def.name);
-                let staging_json = staging.join("agent.json");
-                let staging_prompt_dir = staging.join("prompts");
-                let staging_prompt = staging_prompt_dir.join(format!("{}.md", def.name));
+                let (staging, json_rel, prompt_rel, installed_hash) =
+                    self.stage_agent_files(&def.name, &json_bytes, def.prompt_body.as_bytes())?;
 
-                // Stage both files.
-                fs::create_dir_all(&staging_prompt_dir)?;
-                if let Err(e) = fs::write(&staging_json, &json_bytes)
-                    .and_then(|()| fs::write(&staging_prompt, def.prompt_body.as_bytes()))
-                {
-                    remove_staging_dir(&staging);
-                    return Err(e.into());
-                }
+                let (json_target, prompt_target) =
+                    self.promote_staged_agent(&def.name, &staging, &json_rel, &prompt_rel, force)?;
 
-                fs::create_dir_all(self.agent_prompts_dir())?;
+                // installed_hash was computed pre-destructive (against staging).
+                let agents_root = self.agents_dir(); // needed for companion hash below
 
-                let json_target = self.agents_dir().join(format!("{}.json", def.name));
-                let prompt_target = self.agent_prompts_dir().join(format!("{}.md", def.name));
+                meta.source_hash = source_hash;
+                meta.installed_hash = Some(installed_hash);
 
-                if force {
-                    // Remove existing targets before rename. Required for
-                    // Windows (rename fails on existing dest) and makes the
-                    // Unix path explicit rather than relying on rename's
-                    // replace-on-Unix behaviour. Missing-file is fine.
-                    for p in [&json_target, &prompt_target] {
-                        if let Err(e) = fs::remove_file(p)
-                            && e.kind() != std::io::ErrorKind::NotFound
-                        {
-                            remove_staging_dir(&staging);
-                            return Err(e.into());
-                        }
-                    }
-                } else if json_target.exists() || prompt_target.exists() {
-                    // Non-force install: a prior crash could leave orphaned
-                    // files on disk without a tracking entry. Refuse to
-                    // silently clobber — the user either manually cleans up
-                    // or re-invokes with `install_agent_force`.
-                    remove_staging_dir(&staging);
-                    return Err(std::io::Error::new(
-                        std::io::ErrorKind::AlreadyExists,
-                        format!(
-                            "agent files for `{}` exist on disk but have no tracking entry; \
-                             remove {} and {} manually before re-installing",
-                            def.name,
-                            json_target.display(),
-                            prompt_target.display(),
-                        ),
-                    )
-                    .into());
-                }
+                // Capture plugin identity before moving meta into the map.
+                let marketplace = meta.marketplace.clone();
+                let plugin = meta.plugin.clone();
+                let version = meta.version.clone();
 
-                // Rename JSON first. If the prompt rename fails afterwards,
-                // roll back the JSON rename so we never leave an agent with
-                // only half its files on disk.
-                if let Err(e) = fs::rename(&staging_json, &json_target) {
-                    remove_staging_dir(&staging);
-                    return Err(e.into());
-                }
-                if let Err(e) = fs::rename(&staging_prompt, &prompt_target) {
-                    if let Err(rb_err) = fs::remove_file(&json_target) {
-                        warn!(
-                            path = %json_target.display(),
-                            error = %rb_err,
-                            "failed to roll back agent JSON after prompt-rename failure"
-                        );
-                    }
-                    remove_staging_dir(&staging);
-                    return Err(e.into());
-                }
-
-                // Staging directory should now be empty (or contain the empty
-                // prompts subdir).
-                remove_staging_dir(&staging);
-
-                // Tracking last. On failure, roll back both files.
                 installed.agents.insert(def.name.clone(), meta);
+
+                Self::synthesize_companion_entry(
+                    &mut installed,
+                    &CompanionInput {
+                        marketplace: &marketplace,
+                        plugin: &plugin,
+                        version: version.as_deref(),
+                        agents_root: &agents_root,
+                        prompt_rel: &prompt_rel,
+                        json_target: &json_target,
+                        prompt_target: &prompt_target,
+                    },
+                )?;
+
                 if let Err(e) = self.write_agent_tracking(&installed) {
                     warn!(
                         name = %def.name,
@@ -600,6 +653,218 @@ impl KiroProject {
                 Ok(())
             },
         )
+    }
+
+    /// Move staged agent files from `staging` into their final locations under
+    /// `agents_root`. In force mode, existing targets are unlinked first. In
+    /// non-force mode, any pre-existing target file (e.g. from a prior crash)
+    /// causes an `AlreadyExists` error without touching `agents_root`.
+    ///
+    /// On any error, `staging` is cleaned up before returning. JSON is renamed
+    /// first; if the prompt rename then fails, the JSON rename is rolled back so
+    /// neither target is left half-populated.
+    ///
+    /// Returns `(json_target, prompt_target)` on success.
+    fn promote_staged_agent(
+        &self,
+        name: &str,
+        staging: &Path,
+        json_rel: &Path,
+        prompt_rel: &Path,
+        force: bool,
+    ) -> crate::error::Result<(PathBuf, PathBuf)> {
+        let staging_json = staging.join(json_rel);
+        let staging_prompt = staging.join(prompt_rel);
+
+        fs::create_dir_all(self.agent_prompts_dir())?;
+
+        let json_target = self.agents_dir().join(format!("{name}.json"));
+        let prompt_target = self.agent_prompts_dir().join(format!("{name}.md"));
+
+        if force {
+            // Remove existing targets before rename. Required for Windows
+            // (rename fails on existing dest) and makes the Unix path
+            // explicit rather than relying on rename's replace-on-Unix
+            // behaviour. Missing-file is fine.
+            for p in [&json_target, &prompt_target] {
+                if let Err(e) = fs::remove_file(p)
+                    && e.kind() != std::io::ErrorKind::NotFound
+                {
+                    remove_staging_dir(staging);
+                    return Err(e.into());
+                }
+            }
+        } else if json_target.exists() || prompt_target.exists() {
+            // Non-force install: a prior crash could leave orphaned files
+            // on disk without a tracking entry. Refuse to silently clobber
+            // — the user either manually cleans up or re-invokes with
+            // `install_agent_force`.
+            remove_staging_dir(staging);
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::AlreadyExists,
+                format!(
+                    "agent files for `{name}` exist on disk but have no tracking entry; \
+                     remove {} and {} manually before re-installing",
+                    json_target.display(),
+                    prompt_target.display(),
+                ),
+            )
+            .into());
+        }
+
+        // Rename JSON first. If the prompt rename fails afterwards, roll
+        // back the JSON rename so we never leave an agent with only half
+        // its files on disk.
+        if let Err(e) = fs::rename(&staging_json, &json_target) {
+            remove_staging_dir(staging);
+            return Err(e.into());
+        }
+        if let Err(e) = fs::rename(&staging_prompt, &prompt_target) {
+            if let Err(rb_err) = fs::remove_file(&json_target) {
+                warn!(
+                    path = %json_target.display(),
+                    error = %rb_err,
+                    "failed to roll back agent JSON after prompt-rename failure"
+                );
+            }
+            remove_staging_dir(staging);
+            return Err(e.into());
+        }
+
+        // Staging directory should now be empty (or contain the empty prompts subdir).
+        remove_staging_dir(staging);
+        Ok((json_target, prompt_target))
+    }
+
+    /// Write agent JSON and prompt into a fresh staging directory, then compute
+    /// `installed_hash` against the staged copies BEFORE any destructive
+    /// operations on `agents_root`. Returns `(staging, json_rel, prompt_rel,
+    /// installed_hash)`. On any failure the staging directory is cleaned up and
+    /// an error is returned — `agents_root` is guaranteed untouched.
+    ///
+    /// Staging mirrors the final layout (`<name>.json` + `prompts/<name>.md`)
+    /// so hashing staging with `agents_root`-relative paths yields the same
+    /// value as hashing after rename.
+    fn stage_agent_files(
+        &self,
+        name: &str,
+        json_bytes: &[u8],
+        prompt_bytes: &[u8],
+    ) -> crate::error::Result<(PathBuf, PathBuf, PathBuf, String)> {
+        let staging = self.fresh_agent_staging_dir(name);
+        let json_rel = PathBuf::from(format!("{name}.json"));
+        let prompt_rel = PathBuf::from(format!("prompts/{name}.md"));
+        let staging_json = staging.join(&json_rel);
+        let staging_prompt_dir = staging.join("prompts");
+        let staging_prompt = staging.join(&prompt_rel);
+
+        fs::create_dir_all(&staging_prompt_dir)?;
+        if let Err(e) = fs::write(&staging_json, json_bytes)
+            .and_then(|()| fs::write(&staging_prompt, prompt_bytes))
+        {
+            remove_staging_dir(&staging);
+            return Err(e.into());
+        }
+
+        let installed_hash =
+            match crate::hash::hash_artifact(&staging, &[json_rel.clone(), prompt_rel.clone()]) {
+                Ok(h) => h,
+                Err(e) => {
+                    warn!(
+                        name,
+                        error = %e,
+                        "installed_hash computation failed on staging; removing staging dir"
+                    );
+                    remove_staging_dir(&staging);
+                    return Err(e.into());
+                }
+            };
+
+        Ok((staging, json_rel, prompt_rel, installed_hash))
+    }
+
+    /// Synthesize/update the per-plugin `native_companions` tracking entry
+    /// to register this agent's prompt file as plugin-owned. Called from
+    /// the translated agent install path; Stage 2's native install path
+    /// will call this with its own companion bundle.
+    ///
+    /// Recomputes the per-plugin companion hash over the full union of
+    /// prompt files for this plugin. On hash failure, rolls back the
+    /// just-placed json/prompt files.
+    ///
+    /// # Residual risk (force mode)
+    /// The companion hash runs post-rename because it must hash prompt files
+    /// from prior installs that live at their real `agents_root` locations.
+    /// A hash failure in force mode will try to remove the newly placed files,
+    /// but the previously existing files were already unlinked. A full
+    /// backup-then-swap atomic install is deferred to a follow-up PR.
+    fn synthesize_companion_entry(
+        installed: &mut InstalledAgents,
+        input: &CompanionInput<'_>,
+    ) -> crate::error::Result<()> {
+        // Synthesize/update the companion entry for this plugin's prompt
+        // files. We track the union of installed prompt paths so the
+        // native install path (Stage 2) sees them as plugin-owned, not
+        // orphaned.
+        //
+        // Hash semantics: source_hash == installed_hash because the
+        // translated path does not separately track original .md source
+        // files; both equal the hash over the prompt-bundle bytes.
+        let companion_entry = installed
+            .native_companions
+            .entry(input.plugin.to_owned())
+            .or_insert_with(|| InstalledNativeCompanionsMeta {
+                marketplace: input.marketplace.to_owned(),
+                plugin: input.plugin.to_owned(),
+                version: input.version.map(str::to_owned),
+                installed_at: chrono::Utc::now(),
+                files: Vec::new(),
+                source_hash: String::new(),
+                installed_hash: String::new(),
+            });
+        // Refresh marketplace/version/timestamp on every install.
+        input
+            .marketplace
+            .clone_into(&mut companion_entry.marketplace);
+        companion_entry.version = input.version.map(str::to_owned);
+        companion_entry.installed_at = chrono::Utc::now();
+        if !companion_entry
+            .files
+            .contains(&input.prompt_rel.to_path_buf())
+        {
+            companion_entry.files.push(input.prompt_rel.to_path_buf());
+        }
+        // Recompute hashes over the full prompt set for this plugin.
+        let companion_files_snapshot = companion_entry.files.clone();
+        let companion_hash =
+            match crate::hash::hash_artifact(input.agents_root, &companion_files_snapshot) {
+                Ok(h) => h,
+                Err(e) => {
+                    warn!(
+                        plugin = input.plugin,
+                        error = %e,
+                        "companion hash computation failed; rolling back files"
+                    );
+                    if let Err(rb_err) = fs::remove_file(input.json_target) {
+                        warn!(
+                            path = %input.json_target.display(),
+                            error = %rb_err,
+                            "failed to roll back agent JSON after companion-hash failure"
+                        );
+                    }
+                    if let Err(rb_err) = fs::remove_file(input.prompt_target) {
+                        warn!(
+                            path = %input.prompt_target.display(),
+                            error = %rb_err,
+                            "failed to roll back agent prompt after companion-hash failure"
+                        );
+                    }
+                    return Err(e.into());
+                }
+            };
+        companion_entry.source_hash = companion_hash.clone();
+        companion_entry.installed_hash = companion_hash;
+        Ok(())
     }
 
     /// Remove any `_installing-agent-<name>-*` staging directories left over
@@ -670,8 +935,9 @@ impl KiroProject {
         &self,
         name: &str,
         source_dir: &Path,
-        meta: InstalledSkillMeta,
+        mut meta: InstalledSkillMeta,
         force: bool,
+        source_hash: String,
     ) -> crate::error::Result<()> {
         crate::file_lock::with_file_lock(&self.tracking_path(), || -> crate::error::Result<()> {
             let dir = self.skill_dir(name);
@@ -705,8 +971,35 @@ impl KiroProject {
                 return Err(e.into());
             }
 
-            // For force installs, remove the old directory now that the new
-            // content is safely staged.
+            // Compute installed_hash on the staged copy BEFORE the destructive
+            // rename. Any hash failure here leaves the previous install (if
+            // force mode) intact on disk — the rename hasn't happened yet.
+            // Staging contains the same bytes that will land, so the hash value
+            // is identical to what we'd compute post-rename. This is the
+            // correct TOCTOU stance: `installed_hash` is the source of truth
+            // for what the user has, computed over the bytes we're about to
+            // commit to disk.
+            let installed_hash = match crate::hash::hash_dir_tree(&staging_dir) {
+                Ok(h) => h,
+                Err(e) => {
+                    warn!(
+                        name,
+                        error = %e,
+                        "installed_hash computation failed on staging; removing staging dir"
+                    );
+                    if let Err(cleanup_err) = fs::remove_dir_all(&staging_dir) {
+                        warn!(
+                            path = %staging_dir.display(),
+                            error = %cleanup_err,
+                            "failed to clean up staging directory after hash failure"
+                        );
+                    }
+                    return Err(e.into());
+                }
+            };
+
+            // Only now do the destructive swap — hash is already in hand so
+            // any failure from here is unrelated to the hash computation.
             if dir.exists() {
                 debug!(name, "removing existing skill directory for force install");
                 fs::remove_dir_all(&dir)?;
@@ -714,6 +1007,8 @@ impl KiroProject {
 
             // Rename staging to final location.
             fs::rename(&staging_dir, &dir)?;
+            meta.source_hash = Some(source_hash);
+            meta.installed_hash = Some(installed_hash);
 
             // Update tracking. If this fails, roll back the rename so the
             // filesystem and tracking file stay consistent.
@@ -830,6 +1125,8 @@ mod tests {
             plugin: "test-plugin".into(),
             version: Some("1.0.0".into()),
             installed_at: Utc::now(),
+            source_hash: None,
+            installed_hash: None,
         }
     }
 
@@ -841,6 +1138,8 @@ mod tests {
             version: Some("1.2.3".into()),
             installed_at: Utc::now(),
             dialect: AgentDialect::Claude,
+            source_hash: None,
+            installed_hash: None,
         };
         let json = serde_json::to_string(&meta).unwrap();
         let back: InstalledAgentMeta = serde_json::from_str(&json).unwrap();
@@ -861,6 +1160,8 @@ mod tests {
             version: None,
             installed_at: Utc::now(),
             dialect: AgentDialect::Copilot,
+            source_hash: None,
+            installed_hash: None,
         };
         let json = serde_json::to_string(&meta).unwrap();
         assert!(json.contains("\"dialect\":\"copilot\""));
@@ -896,6 +1197,8 @@ mod tests {
             version: None,
             installed_at: Utc::now(),
             dialect: AgentDialect::Claude,
+            source_hash: None,
+            installed_hash: None,
         }
     }
 
@@ -911,7 +1214,7 @@ mod tests {
         let (def, mapped) = parse_and_map(&src);
 
         project
-            .install_agent(&def, &mapped, sample_agent_meta())
+            .install_agent(&def, &mapped, sample_agent_meta(), None)
             .expect("install");
 
         let json_path = project.root.join(".kiro/agents/reviewer.json");
@@ -940,10 +1243,10 @@ mod tests {
         let (def, mapped) = parse_and_map(&src);
 
         project
-            .install_agent(&def, &mapped, sample_agent_meta())
+            .install_agent(&def, &mapped, sample_agent_meta(), None)
             .unwrap();
         let err = project
-            .install_agent(&def, &mapped, sample_agent_meta())
+            .install_agent(&def, &mapped, sample_agent_meta(), None)
             .unwrap_err();
         assert!(matches!(
             err,
@@ -962,7 +1265,7 @@ mod tests {
         );
         let (def_v1, mapped_v1) = parse_and_map(&src_v1);
         project
-            .install_agent(&def_v1, &mapped_v1, sample_agent_meta())
+            .install_agent(&def_v1, &mapped_v1, sample_agent_meta(), None)
             .expect("first install");
 
         let src_v2 = write_agent(
@@ -972,7 +1275,7 @@ mod tests {
         );
         let (def_v2, mapped_v2) = parse_and_map(&src_v2);
         project
-            .install_agent_force(&def_v2, &mapped_v2, sample_agent_meta())
+            .install_agent_force(&def_v2, &mapped_v2, sample_agent_meta(), None)
             .expect("force install should overwrite");
 
         let prompt = fs::read_to_string(project.root.join(".kiro/agents/prompts/rev.md")).unwrap();
@@ -1004,7 +1307,7 @@ mod tests {
         let (def, mapped) = parse_and_map(&src);
 
         project
-            .install_agent_force(&def, &mapped, sample_agent_meta())
+            .install_agent_force(&def, &mapped, sample_agent_meta(), None)
             .expect("force install should overwrite orphans");
 
         let prompt =
@@ -1029,7 +1332,7 @@ mod tests {
         };
 
         let err = project
-            .install_agent_force(&def, &[], sample_agent_meta())
+            .install_agent_force(&def, &[], sample_agent_meta(), None)
             .expect_err("unsafe name must be rejected under force");
         assert!(
             matches!(
@@ -1048,7 +1351,7 @@ mod tests {
         let (def, mapped) = parse_and_map(&src);
 
         project
-            .install_agent(&def, &mapped, sample_agent_meta())
+            .install_agent(&def, &mapped, sample_agent_meta(), None)
             .unwrap();
 
         let tracking_path = project.root.join(".kiro/installed-agents.json");
@@ -1066,7 +1369,7 @@ mod tests {
         let (mut def, mapped) = parse_and_map(&src);
         def.name = "../escape".into();
         let err = project
-            .install_agent(&def, &mapped, sample_agent_meta())
+            .install_agent(&def, &mapped, sample_agent_meta(), None)
             .unwrap_err();
         assert!(matches!(err, crate::error::Error::Validation(_)));
     }
@@ -1084,7 +1387,7 @@ mod tests {
         assert_eq!(mapped.len(), 2, "sanity: both tools mapped");
 
         project
-            .install_agent(&def, &mapped, sample_agent_meta())
+            .install_agent(&def, &mapped, sample_agent_meta(), None)
             .expect("install");
 
         let json_path = project.root.join(".kiro/agents/mixed.json");
@@ -1105,7 +1408,7 @@ mod tests {
         let (def, mapped) = parse_and_map(&src);
 
         project
-            .install_agent(&def, &mapped, sample_agent_meta())
+            .install_agent(&def, &mapped, sample_agent_meta(), None)
             .unwrap();
 
         // Staging lives directly under .kiro/, not under agents/.
@@ -1139,7 +1442,7 @@ mod tests {
         fs::write(ghost.join("agent.json"), b"{}").unwrap();
 
         project
-            .install_agent(&def, &mapped, sample_agent_meta())
+            .install_agent(&def, &mapped, sample_agent_meta(), None)
             .expect("install should succeed and sweep leftover");
 
         assert!(!ghost.exists(), "leftover staging should have been swept");
@@ -1160,7 +1463,7 @@ mod tests {
         fs::write(agents_dir.join("orphan.json"), b"{}").unwrap();
 
         let err = project
-            .install_agent(&def, &mapped, sample_agent_meta())
+            .install_agent(&def, &mapped, sample_agent_meta(), None)
             .unwrap_err();
         // Surfaced as an Io error (AlreadyExists) with a message pointing at
         // the offending files.
@@ -1184,7 +1487,7 @@ mod tests {
         fs::write(prompts_dir.join("rb.md").join("inside.txt"), b"x").unwrap();
 
         let err = project
-            .install_agent(&def, &mapped, sample_agent_meta())
+            .install_agent(&def, &mapped, sample_agent_meta(), None)
             .unwrap_err();
         assert!(matches!(err, crate::error::Error::Io(_)));
 
@@ -1223,7 +1526,7 @@ mod tests {
                 let mapped = std::sync::Arc::clone(&mapped);
                 std::thread::spawn(move || {
                     barrier.wait();
-                    project.install_agent(&def, &mapped, sample_agent_meta())
+                    project.install_agent(&def, &mapped, sample_agent_meta(), None)
                 })
             })
             .collect();
@@ -1273,7 +1576,7 @@ mod tests {
         fs::create_dir_all(project.root.join(".kiro/installed-agents.json")).unwrap();
 
         let err = project
-            .install_agent(&def, &mapped, sample_agent_meta())
+            .install_agent(&def, &mapped, sample_agent_meta(), None)
             .unwrap_err();
         assert!(matches!(err, crate::error::Error::Io(_)));
 
@@ -1855,5 +2158,244 @@ mod tests {
         assert!(!legacy.exists(), "legacy staging dir should be removed");
         assert!(!new_format.exists(), "new staging dir should be removed");
         assert!(unrelated.exists(), "unrelated skill's staging is untouched");
+    }
+
+    #[test]
+    fn installed_skill_meta_loads_legacy_json_without_hash_fields() {
+        // Old tracking files (pre-Stage-1) lack source_hash / installed_hash.
+        // The new schema must deserialize them with both fields = None.
+        let legacy = br#"{
+            "marketplace": "m",
+            "plugin": "p",
+            "version": "1.0.0",
+            "installed_at": "2026-01-01T00:00:00Z"
+        }"#;
+
+        let meta: InstalledSkillMeta = serde_json::from_slice(legacy).unwrap();
+
+        assert_eq!(meta.marketplace, "m");
+        assert_eq!(meta.plugin, "p");
+        assert!(meta.source_hash.is_none());
+        assert!(meta.installed_hash.is_none());
+    }
+
+    #[test]
+    fn installed_agent_meta_loads_legacy_json_without_hash_fields() {
+        let legacy = br#"{
+            "marketplace": "m",
+            "plugin": "p",
+            "version": "0.1.0",
+            "installed_at": "2026-01-01T00:00:00Z",
+            "dialect": "claude"
+        }"#;
+
+        let meta: InstalledAgentMeta = serde_json::from_slice(legacy).unwrap();
+
+        assert_eq!(meta.dialect, AgentDialect::Claude);
+        assert!(meta.source_hash.is_none());
+        assert!(meta.installed_hash.is_none());
+    }
+
+    #[test]
+    fn installed_agents_loads_legacy_json_without_native_companions() {
+        // Old tracking files (pre-Stage-1) lack the native_companions map.
+        // The new schema must deserialize them with native_companions = empty.
+        let legacy = br#"{
+            "agents": {
+                "x": {
+                    "marketplace": "m",
+                    "plugin": "p",
+                    "version": null,
+                    "installed_at": "2026-01-01T00:00:00Z",
+                    "dialect": "claude"
+                }
+            }
+        }"#;
+
+        let installed: InstalledAgents = serde_json::from_slice(legacy).unwrap();
+        assert_eq!(installed.agents.len(), 1);
+        assert!(installed.native_companions.is_empty());
+    }
+
+    #[test]
+    fn installed_native_companions_meta_round_trips_through_serde() {
+        let meta = InstalledNativeCompanionsMeta {
+            marketplace: "m".into(),
+            plugin: "p".into(),
+            version: Some("0.1.0".into()),
+            installed_at: chrono::Utc::now(),
+            files: vec![
+                std::path::PathBuf::from("prompts/a.md"),
+                std::path::PathBuf::from("prompts/b.md"),
+            ],
+            source_hash: "blake3:abc".into(),
+            installed_hash: "blake3:abc".into(),
+        };
+        let bytes = serde_json::to_vec(&meta).unwrap();
+        let back: InstalledNativeCompanionsMeta = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(back.files.len(), 2);
+    }
+
+    #[test]
+    fn installed_agents_with_empty_native_companions_does_not_serialize_the_field() {
+        // Regression guard: a legacy tracking file (no native_companions key)
+        // must round-trip byte-identical when no companions exist. Without
+        // skip_serializing_if = "HashMap::is_empty", the empty default would
+        // serialize as `"native_companions": {}` and silently mutate the file.
+        let installed = InstalledAgents {
+            agents: std::collections::HashMap::new(),
+            native_companions: std::collections::HashMap::new(),
+        };
+
+        let json = serde_json::to_string(&installed).unwrap();
+        assert!(
+            !json.contains("native_companions"),
+            "empty native_companions must be omitted from serialized output, got: {json}"
+        );
+    }
+
+    #[test]
+    fn install_skill_from_dir_populates_source_and_installed_hashes() {
+        let (tmp, project) = temp_project();
+
+        // Create a tiny source skill directory.
+        let skill_src = tmp.path().join("source");
+        fs::create_dir_all(&skill_src).unwrap();
+        fs::write(skill_src.join("SKILL.md"), b"# test skill\n\nbody").unwrap();
+
+        let meta = InstalledSkillMeta {
+            marketplace: "m".into(),
+            plugin: "p".into(),
+            version: Some("1.0.0".into()),
+            installed_at: chrono::Utc::now(),
+            source_hash: None,
+            installed_hash: None,
+        };
+
+        project
+            .install_skill_from_dir("test", &skill_src, meta)
+            .unwrap();
+
+        let installed = project.load_installed().unwrap();
+        let entry = installed.skills.get("test").expect("entry persisted");
+
+        let src_hash = entry.source_hash.as_ref().expect("source_hash populated");
+        let inst_hash = entry
+            .installed_hash
+            .as_ref()
+            .expect("installed_hash populated");
+
+        assert!(src_hash.starts_with("blake3:"));
+        assert!(inst_hash.starts_with("blake3:"));
+        // Source and installed contents are identical (we just copied), so the
+        // hashes match.
+        assert_eq!(src_hash, inst_hash);
+    }
+
+    #[test]
+    fn install_agent_translated_populates_source_and_installed_hashes() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = KiroProject::new(tmp.path().to_path_buf());
+
+        let source_md = write_agent(tmp.path(), "rev", "You are a reviewer.");
+        let def = crate::agent::AgentDefinition {
+            name: "rev".into(),
+            description: None,
+            prompt_body: "You are a reviewer.".into(),
+            model: None,
+            source_tools: vec![],
+            mcp_servers: std::collections::BTreeMap::new(),
+            dialect: crate::agent::AgentDialect::Claude,
+        };
+        let mapped: Vec<crate::agent::tools::MappedTool> = vec![];
+        let mut meta = sample_agent_meta();
+        meta.source_hash = None;
+        meta.installed_hash = None;
+        let plugin_name = meta.plugin.clone();
+
+        project
+            .install_agent(&def, &mapped, meta, Some(&source_md))
+            .expect("install succeeds");
+
+        let installed = project.load_installed_agents().unwrap();
+        let entry = installed.agents.get("rev").expect("entry persisted");
+
+        let src = entry.source_hash.as_ref().expect("source_hash set");
+        let inst = entry.installed_hash.as_ref().expect("installed_hash set");
+        assert!(src.starts_with("blake3:"));
+        assert!(inst.starts_with("blake3:"));
+        // Translated path: source bytes (raw .md) differ from installed bytes
+        // (emitted .json + prompt body), so the two hashes ARE different here.
+        assert_ne!(src, inst);
+
+        // Sanity: re-hashing the source file directly matches the recorded
+        // source_hash.
+        let recomputed_src = crate::hash::hash_artifact(
+            source_md.parent().unwrap(),
+            &[std::path::PathBuf::from(source_md.file_name().unwrap())],
+        )
+        .unwrap();
+        assert_eq!(src, &recomputed_src);
+
+        // Companion-entry synthesis: this plugin should now own
+        // `prompts/rev.md` in the native_companions map.
+        let companion = installed
+            .native_companions
+            .get(&plugin_name)
+            .expect("native_companions entry synthesized");
+        assert!(
+            companion
+                .files
+                .contains(&std::path::PathBuf::from("prompts/rev.md")),
+            "prompt file must be tracked under native_companions: {:?}",
+            companion.files
+        );
+        assert!(companion.source_hash.starts_with("blake3:"));
+        assert_eq!(companion.source_hash, companion.installed_hash);
+    }
+
+    #[test]
+    fn install_agent_translated_appends_to_existing_companion_entry() {
+        // A plugin that installs TWO translated agents must end up with a
+        // single native_companions entry listing BOTH prompt files.
+        let tmp = tempfile::tempdir().unwrap();
+        let project = KiroProject::new(tmp.path().to_path_buf());
+        let plugin_name = sample_agent_meta().plugin.clone();
+
+        for name in ["alpha", "beta"] {
+            let source_md = write_agent(tmp.path(), name, "body");
+            let def = crate::agent::AgentDefinition {
+                name: name.into(),
+                description: None,
+                prompt_body: "body".into(),
+                model: None,
+                source_tools: vec![],
+                mcp_servers: std::collections::BTreeMap::new(),
+                dialect: crate::agent::AgentDialect::Claude,
+            };
+            let mut meta = sample_agent_meta();
+            meta.source_hash = None;
+            meta.installed_hash = None;
+            project
+                .install_agent(&def, &[], meta, Some(&source_md))
+                .expect("install succeeds");
+        }
+
+        let installed = project.load_installed_agents().unwrap();
+        let companion = installed
+            .native_companions
+            .get(&plugin_name)
+            .expect("entry exists");
+        assert_eq!(companion.files.len(), 2);
+        assert!(
+            companion
+                .files
+                .contains(&std::path::PathBuf::from("prompts/alpha.md"))
+        );
+        assert!(
+            companion
+                .files
+                .contains(&std::path::PathBuf::from("prompts/beta.md"))
+        );
     }
 }

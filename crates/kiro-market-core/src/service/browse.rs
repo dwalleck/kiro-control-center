@@ -1715,6 +1715,8 @@ mod tests {
                 plugin: plugin.to_owned(),
                 version: None,
                 installed_at: Utc::now(),
+                source_hash: None,
+                installed_hash: None,
             },
         );
         InstalledSkills { skills }
