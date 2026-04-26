@@ -226,6 +226,134 @@ pub fn discover_native_kiro_agents_in_dirs(
     out
 }
 
+/// Find companion file candidates: any regular (non-symlink) file inside
+/// subdirectories of a scan path, exactly one level deep.
+///
+/// Plugin-wide — not attributed to any specific agent. The install layer
+/// treats the result as one atomic bundle owned by the plugin.
+///
+/// `scan_paths` are the same agent scan paths used by
+/// [`discover_native_kiro_agents_in_dirs`]. README/CONTRIBUTING/CHANGELOG
+/// are excluded by basename (case-insensitive).
+#[must_use]
+pub fn discover_native_companion_files(
+    plugin_dir: &Path,
+    scan_paths: &[String],
+) -> Vec<DiscoveredNativeFile> {
+    let mut out = Vec::new();
+    for rel in scan_paths {
+        if let Err(e) = crate::validation::validate_relative_path(rel) {
+            warn!(
+                path = %rel,
+                error = %e,
+                "skipping native companion scan path that fails validation"
+            );
+            continue;
+        }
+        let scan_root = plugin_dir.join(rel.trim_start_matches("./"));
+        let entries = match fs::read_dir(&scan_root) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+            Err(e) => {
+                warn!(
+                    path = %scan_root.display(),
+                    error = %e,
+                    "failed to read native companion scan directory; skipping"
+                );
+                continue;
+            }
+        };
+        for entry in entries {
+            let entry = match entry {
+                Ok(e) => e,
+                Err(e) => {
+                    warn!(
+                        dir = %scan_root.display(),
+                        error = %e,
+                        "failed to read directory entry; skipping"
+                    );
+                    continue;
+                }
+            };
+            let subdir = entry.path();
+            let md = match fs::symlink_metadata(&subdir) {
+                Ok(m) => m,
+                Err(e) => {
+                    warn!(
+                        path = %subdir.display(),
+                        error = %e,
+                        "failed to stat companion subdir candidate; skipping"
+                    );
+                    continue;
+                }
+            };
+            if md.file_type().is_symlink() || !md.file_type().is_dir() {
+                continue;
+            }
+            let inner = match fs::read_dir(&subdir) {
+                Ok(i) => i,
+                Err(e) => {
+                    warn!(
+                        path = %subdir.display(),
+                        error = %e,
+                        "failed to read companion subdir; skipping"
+                    );
+                    continue;
+                }
+            };
+            for inner_entry in inner {
+                let inner_entry = match inner_entry {
+                    Ok(e) => e,
+                    Err(e) => {
+                        warn!(
+                            dir = %subdir.display(),
+                            error = %e,
+                            "failed to read companion entry; skipping"
+                        );
+                        continue;
+                    }
+                };
+                let inner_path = inner_entry.path();
+                let inner_md = match fs::symlink_metadata(&inner_path) {
+                    Ok(m) => m,
+                    Err(e) => {
+                        warn!(
+                            path = %inner_path.display(),
+                            error = %e,
+                            "failed to stat companion file; skipping"
+                        );
+                        continue;
+                    }
+                };
+                if inner_md.file_type().is_symlink() {
+                    debug!(
+                        path = %inner_path.display(),
+                        "skipping symlink in companion subdir"
+                    );
+                    continue;
+                }
+                if !inner_md.file_type().is_file() {
+                    continue;
+                }
+                let Some(name) = inner_path.file_name().and_then(|n| n.to_str()) else {
+                    continue;
+                };
+                if EXCLUDED_FILENAMES
+                    .iter()
+                    .any(|excluded| excluded.eq_ignore_ascii_case(name))
+                {
+                    continue;
+                }
+                out.push(DiscoveredNativeFile {
+                    source: inner_path,
+                    scan_root: scan_root.clone(),
+                });
+            }
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -503,5 +631,82 @@ mod tests {
 
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].scan_root, agents);
+    }
+
+    // -------------------------------------------------------------------
+    // Companion discovery
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn companion_discovery_finds_files_one_level_deep() {
+        let tmp = tempdir().unwrap();
+        let agents = tmp.path().join("agents");
+        let prompts = agents.join("prompts");
+        fs::create_dir_all(&prompts).unwrap();
+        fs::write(prompts.join("a.md"), b"prompt a").unwrap();
+        fs::write(prompts.join("b.md"), b"prompt b").unwrap();
+        // A top-level .json (would be an agent, NOT a companion).
+        fs::write(agents.join("agent.json"), b"{}").unwrap();
+
+        let found = discover_native_companion_files(tmp.path(), &["./agents/".to_string()]);
+
+        let names: Vec<_> = found
+            .iter()
+            .map(|f| f.source.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert!(names.contains(&"a.md".to_string()));
+        assert!(names.contains(&"b.md".to_string()));
+        assert!(!names.contains(&"agent.json".to_string()));
+    }
+
+    #[test]
+    fn companion_discovery_does_not_recurse_more_than_one_level() {
+        let tmp = tempdir().unwrap();
+        let agents = tmp.path().join("agents");
+        let nested = agents.join("prompts").join("nested");
+        fs::create_dir_all(&nested).unwrap();
+        fs::write(agents.join("prompts/top.md"), b"top").unwrap();
+        fs::write(nested.join("deep.md"), b"deep").unwrap();
+
+        let found = discover_native_companion_files(tmp.path(), &["./agents/".to_string()]);
+
+        let names: Vec<_> = found
+            .iter()
+            .map(|f| f.source.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert!(names.contains(&"top.md".to_string()));
+        assert!(!names.contains(&"deep.md".to_string()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn companion_discovery_skips_symlinks_in_subdir() {
+        use std::os::unix::fs::symlink;
+        let tmp = tempdir().unwrap();
+        let prompts = tmp.path().join("agents/prompts");
+        fs::create_dir_all(&prompts).unwrap();
+        fs::write(prompts.join("real.md"), b"real").unwrap();
+        let outside = tmp.path().join("outside.md");
+        fs::write(&outside, b"outside").unwrap();
+        symlink(&outside, prompts.join("evil.md")).unwrap();
+
+        let found = discover_native_companion_files(tmp.path(), &["./agents/".to_string()]);
+
+        let names: Vec<_> = found
+            .iter()
+            .map(|f| f.source.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec!["real.md"]);
+    }
+
+    #[test]
+    fn companion_discovery_returns_empty_when_no_subdirs() {
+        let tmp = tempdir().unwrap();
+        let agents = tmp.path().join("agents");
+        fs::create_dir_all(&agents).unwrap();
+        fs::write(agents.join("only.json"), b"{}").unwrap();
+
+        let found = discover_native_companion_files(tmp.path(), &["./agents/".to_string()]);
+        assert!(found.is_empty());
     }
 }
