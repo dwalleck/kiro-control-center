@@ -43,6 +43,11 @@ pub fn parse_agent_file(path: &Path) -> Result<AgentDefinition, AgentError> {
     let result = match dialect {
         AgentDialect::Claude => parse_claude_agent(&content),
         AgentDialect::Copilot => parse_copilot_agent(&content),
+        AgentDialect::Native => Err(ParseFailure::IoError(
+            "native dialect routed to translated parser; \
+             native agents go through parse_native_kiro_agent_file"
+                .to_string(),
+        )),
     };
     result.map_err(|failure| AgentError::ParseFailed {
         path: path.to_path_buf(),

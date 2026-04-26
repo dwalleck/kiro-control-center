@@ -1186,6 +1186,7 @@ mod tests {
         let (mapped, _unmapped) = match def.dialect {
             AgentDialect::Claude => crate::agent::tools::map_claude_tools(&def.source_tools),
             AgentDialect::Copilot => crate::agent::tools::map_copilot_tools(&def.source_tools),
+            AgentDialect::Native => panic!("translated test helper does not support Native"),
         };
         (def, mapped)
     }

@@ -1234,6 +1234,11 @@ impl MarketplaceService {
                 crate::agent::AgentDialect::Copilot => {
                     crate::agent::tools::map_copilot_tools(&def.source_tools)
                 }
+                // Native dialect is installed via the validate-and-copy
+                // path (`install_native_kiro_cli_agents_inner`), which never
+                // produces an `AgentDefinition`. Falling through here would
+                // be a routing bug; treat as a no-op tool mapping.
+                crate::agent::AgentDialect::Native => (Vec::new(), Vec::new()),
             };
             for u in unmapped {
                 result.warnings.push(InstallWarning::UnmappedTool {

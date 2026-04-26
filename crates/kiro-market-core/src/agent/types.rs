@@ -88,6 +88,22 @@ impl McpServerConfig {
 pub enum AgentDialect {
     Claude,
     Copilot,
+    /// Plugin authored in Kiro's native JSON format. Installed via
+    /// validate-and-copy (no parse-and-translate).
+    Native,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn agent_dialect_native_serializes_to_native() {
+        let json = serde_json::to_string(&AgentDialect::Native).expect("serialize");
+        assert_eq!(json, "\"native\"");
+        let round: AgentDialect = serde_json::from_str("\"native\"").expect("deserialize");
+        assert_eq!(round, AgentDialect::Native);
+    }
 }
 
 /// Agent definition normalized across Claude and Copilot source formats.
