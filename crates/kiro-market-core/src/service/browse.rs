@@ -468,7 +468,7 @@ impl MarketplaceService {
     ///
     /// # Errors
     ///
-    /// - [`Error::Marketplace`] / [`Error::Plugin`] / [`Error::Io`] from
+    /// - [`Error::Marketplace`] / [`Error::Io`] from
     ///   [`Self::list_plugin_entries`] (unknown marketplace, corrupt or
     ///   unreadable registry).
     /// - [`Error::Plugin`] ([`PluginError::NotFound`]) if `plugin`
@@ -535,8 +535,7 @@ impl MarketplaceService {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Marketplace`] / [`Error::Plugin`] /
-    /// [`Error::Io`] / [`Error::Json`] from
+    /// Returns [`Error::Marketplace`] / [`Error::Io`] from
     /// [`Self::list_plugin_entries`] when the marketplace is unknown
     /// or its registry is corrupt / unreadable. Non-plugin-level
     /// errors during iteration propagate; plugin-level errors
