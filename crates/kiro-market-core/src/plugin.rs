@@ -23,6 +23,21 @@ pub struct PluginManifest {
     /// ([`crate::DEFAULT_AGENT_PATHS`]).
     #[serde(default)]
     pub agents: Vec<String>,
+    /// Authoring format for this plugin. See [`PluginFormat`].
+    #[serde(default)]
+    pub format: Option<PluginFormat>,
+}
+
+/// The plugin's native authoring format. Drives dispatch in
+/// `MarketplaceService::install_plugin_agents`: `KiroCli` skips
+/// parse-and-translate and validates-and-copies native JSON agents.
+/// Absent means the plugin uses Claude / Copilot markdown agents that
+/// require translation (the existing default flow).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+#[non_exhaustive]
+pub enum PluginFormat {
+    KiroCli,
 }
 
 impl PluginManifest {
@@ -755,6 +770,31 @@ mod tests {
         assert!(
             PluginManifest::from_json(json).is_err(),
             "missing `name` field should produce an error"
+        );
+    }
+
+    #[test]
+    fn manifest_parses_format_kiro_cli() {
+        let json = br#"{"name": "p", "format": "kiro-cli"}"#;
+        let manifest = PluginManifest::from_json(json).expect("should parse");
+        assert_eq!(manifest.format, Some(PluginFormat::KiroCli));
+    }
+
+    #[test]
+    fn manifest_format_absent_is_none() {
+        let json = br#"{"name": "p"}"#;
+        let manifest = PluginManifest::from_json(json).expect("should parse");
+        assert!(manifest.format.is_none());
+    }
+
+    #[test]
+    fn manifest_unknown_format_value_fails_loudly() {
+        let json = br#"{"name": "p", "format": "kiro-ide"}"#;
+        let err = PluginManifest::from_json(json).expect_err("unknown variant should fail");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("kiro-ide") || msg.contains("unknown variant"),
+            "error must mention the unknown variant; got: {msg}"
         );
     }
 
