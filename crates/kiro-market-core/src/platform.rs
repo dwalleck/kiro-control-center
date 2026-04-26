@@ -85,7 +85,7 @@ mod sys {
     use std::ffi::OsString;
     use std::io;
     use std::os::windows::fs::MetadataExt;
-    use std::path::{Path, PathBuf};
+    use std::path::Path;
 
     use super::LinkResult;
 
