@@ -355,9 +355,7 @@ pub enum AgentError {
     /// single scan root only — companion ownership tracking would otherwise
     /// have to disambiguate which scan root each companion belongs to,
     /// expanding the tracking schema. Out of scope for v1.
-    #[error(
-        "native plugin spans multiple agent scan roots; v1 supports a single scan root only"
-    )]
+    #[error("native plugin spans multiple agent scan roots; v1 supports a single scan root only")]
     MultipleScanRootsNotSupported { roots: Vec<PathBuf> },
 
     // -----------------------------------------------------------------
@@ -880,7 +878,7 @@ mod tests {
     fn content_changed_requires_force_renders_useful_message() {
         let err = AgentError::ContentChangedRequiresForce { name: "x".into() };
         let msg = err.to_string();
-        assert!(msg.contains("x"));
+        assert!(msg.contains('x'));
         assert!(msg.contains("--force"));
     }
 
@@ -925,10 +923,7 @@ mod tests {
         let err = AgentError::MultipleScanRootsNotSupported {
             roots: vec![PathBuf::from("./agents/"), PathBuf::from("./extra/")],
         };
-        assert!(
-            err.to_string()
-                .contains("multiple agent scan roots")
-        );
+        assert!(err.to_string().contains("multiple agent scan roots"));
     }
 
     #[test]

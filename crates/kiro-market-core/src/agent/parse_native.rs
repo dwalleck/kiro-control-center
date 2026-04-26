@@ -95,8 +95,7 @@ pub fn parse_native_kiro_agent_file(
         serde_json::from_slice(&raw_bytes).map_err(NativeParseFailure::InvalidJson)?;
 
     let name = projection.name.ok_or(NativeParseFailure::MissingName)?;
-    validation::validate_name(&name)
-        .map_err(|e| NativeParseFailure::InvalidName(e.to_string()))?;
+    validation::validate_name(&name).map_err(|e| NativeParseFailure::InvalidName(e.to_string()))?;
 
     Ok(NativeAgentBundle {
         agent_json_source: json_path.to_path_buf(),
@@ -123,7 +122,11 @@ mod tests {
     #[test]
     fn parses_minimal_valid_kiro_agent() {
         let tmp = tempdir().unwrap();
-        let p = write_json(tmp.path(), "rev.json", r#"{"name": "rev", "prompt": "..."}"#);
+        let p = write_json(
+            tmp.path(),
+            "rev.json",
+            r#"{"name": "rev", "prompt": "..."}"#,
+        );
         let b = parse_native_kiro_agent_file(&p, tmp.path()).expect("parse");
         assert_eq!(b.name, "rev");
         assert!(b.mcp_servers.is_empty());
@@ -155,7 +158,7 @@ mod tests {
     #[test]
     fn malformed_json_returns_invalid_json_failure() {
         let tmp = tempdir().unwrap();
-        let p = write_json(tmp.path(), "x.json", r#"{not json"#);
+        let p = write_json(tmp.path(), "x.json", r"{not json");
         let err = parse_native_kiro_agent_file(&p, tmp.path()).expect_err("must fail");
         assert!(matches!(err, NativeParseFailure::InvalidJson(_)));
     }
