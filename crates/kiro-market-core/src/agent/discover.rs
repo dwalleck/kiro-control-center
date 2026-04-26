@@ -117,6 +117,115 @@ pub fn discover_agents_in_dirs(plugin_dir: &Path, scan_paths: &[String]) -> Vec<
     out
 }
 
+/// A file produced by native discovery. Carries the source path along with
+/// the resolved scan-root the file was discovered under, so the install
+/// layer can compute destination-relative paths without re-doing the join.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DiscoveredNativeFile {
+    /// Absolute path to the source file inside the plugin.
+    pub source: PathBuf,
+    /// The resolved scan-path directory (e.g. `<plugin>/agents/`).
+    pub scan_root: PathBuf,
+}
+
+/// Find native Kiro agent JSON candidates: `.json` files at the root of
+/// each scan path. Mirrors the security model of [`discover_agents_in_dirs`]:
+/// validates each scan path, refuses symlinks, excludes README/CONTRIBUTING/
+/// CHANGELOG, non-recursive at the scan-path level.
+#[must_use]
+pub fn discover_native_kiro_agents_in_dirs(
+    plugin_dir: &Path,
+    scan_paths: &[String],
+) -> Vec<DiscoveredNativeFile> {
+    let mut out = Vec::new();
+    for rel in scan_paths {
+        if let Err(e) = crate::validation::validate_relative_path(rel) {
+            warn!(
+                path = %rel,
+                error = %e,
+                "skipping native agent scan path that fails validation"
+            );
+            continue;
+        }
+        let dir = plugin_dir.join(rel.trim_start_matches("./"));
+        let entries = match fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+            Err(e) => {
+                warn!(
+                    path = %dir.display(),
+                    error = %e,
+                    "failed to read native agent scan directory; skipping"
+                );
+                continue;
+            }
+        };
+        for entry in entries {
+            let entry = match entry {
+                Ok(e) => e,
+                Err(e) => {
+                    warn!(
+                        dir = %dir.display(),
+                        error = %e,
+                        "failed to read directory entry; skipping"
+                    );
+                    continue;
+                }
+            };
+            let path = entry.path();
+            let file_type = match fs::symlink_metadata(&path) {
+                Ok(m) => m.file_type(),
+                Err(e) => {
+                    warn!(
+                        path = %path.display(),
+                        error = %e,
+                        "failed to stat native agent candidate; skipping"
+                    );
+                    continue;
+                }
+            };
+            if file_type.is_symlink() {
+                debug!(
+                    path = %path.display(),
+                    "skipping symlink in native agent scan directory"
+                );
+                continue;
+            }
+            if !file_type.is_file() {
+                continue;
+            }
+            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            // README/CONTRIBUTING/CHANGELOG with .json extension are excluded
+            // case-insensitively by stem to mirror the .md exclusion.
+            if EXCLUDED_FILENAMES.iter().any(|excluded| {
+                let stem_excl = Path::new(excluded)
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or(excluded);
+                let stem_name = Path::new(name)
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or(name);
+                stem_excl.eq_ignore_ascii_case(stem_name)
+            }) {
+                continue;
+            }
+            if Path::new(name)
+                .extension()
+                .is_some_and(|ext| ext.eq_ignore_ascii_case("json"))
+            {
+                out.push(DiscoveredNativeFile {
+                    source: path,
+                    scan_root: dir.clone(),
+                });
+            }
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -298,5 +407,101 @@ mod tests {
 
         let found = discover_agents_in_dirs(tmp.path(), &["./a/".to_string(), "./b/".to_string()]);
         assert_eq!(found.len(), 2);
+    }
+
+    // -------------------------------------------------------------------
+    // Native discovery
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn native_discovery_finds_json_files_at_scan_root() {
+        let tmp = tempdir().unwrap();
+        let agents = tmp.path().join("agents");
+        fs::create_dir_all(&agents).unwrap();
+        fs::write(agents.join("a.json"), b"{}").unwrap();
+        fs::write(agents.join("b.json"), b"{}").unwrap();
+        fs::write(agents.join("ignore.md"), b"---\nname: ignore\n---\n").unwrap();
+
+        let found =
+            discover_native_kiro_agents_in_dirs(tmp.path(), &["./agents/".to_string()]);
+
+        let names: Vec<_> = found
+            .iter()
+            .map(|f| f.source.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert!(names.contains(&"a.json".to_string()));
+        assert!(names.contains(&"b.json".to_string()));
+        assert!(!names.contains(&"ignore.md".to_string()));
+    }
+
+    #[test]
+    fn native_discovery_excludes_readme_case_insensitive() {
+        let tmp = tempdir().unwrap();
+        let agents = tmp.path().join("agents");
+        fs::create_dir_all(&agents).unwrap();
+        fs::write(agents.join("README.json"), b"{}").unwrap();
+        fs::write(agents.join("readme.json"), b"{}").unwrap();
+        fs::write(agents.join("real.json"), b"{}").unwrap();
+
+        let found =
+            discover_native_kiro_agents_in_dirs(tmp.path(), &["./agents/".to_string()]);
+
+        let names: Vec<_> = found
+            .iter()
+            .map(|f| f.source.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec!["real.json"]);
+    }
+
+    #[test]
+    fn native_discovery_rejects_path_traversal() {
+        let tmp = tempdir().unwrap();
+        let plugin = tmp.path().join("plugin");
+        fs::create_dir_all(&plugin).unwrap();
+        let escape = tmp.path().join("secrets");
+        fs::create_dir_all(&escape).unwrap();
+        fs::write(escape.join("loot.json"), b"{}").unwrap();
+
+        let found =
+            discover_native_kiro_agents_in_dirs(&plugin, &["../secrets/".to_string()]);
+
+        assert!(found.is_empty(), "path traversal must be rejected");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_discovery_skips_symlinks() {
+        use std::os::unix::fs::symlink;
+        let tmp = tempdir().unwrap();
+        let agents = tmp.path().join("agents");
+        fs::create_dir_all(&agents).unwrap();
+        fs::write(agents.join("real.json"), b"{}").unwrap();
+
+        let outside = tmp.path().join("outside.json");
+        fs::write(&outside, b"{}").unwrap();
+        symlink(&outside, agents.join("evil.json")).unwrap();
+
+        let found =
+            discover_native_kiro_agents_in_dirs(tmp.path(), &["./agents/".to_string()]);
+
+        let names: Vec<_> = found
+            .iter()
+            .map(|f| f.source.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec!["real.json"]);
+    }
+
+    #[test]
+    fn native_discovery_returns_scan_root_for_dest_path_computation() {
+        let tmp = tempdir().unwrap();
+        let agents = tmp.path().join("agents");
+        fs::create_dir_all(&agents).unwrap();
+        fs::write(agents.join("a.json"), b"{}").unwrap();
+
+        let found =
+            discover_native_kiro_agents_in_dirs(tmp.path(), &["./agents/".to_string()]);
+
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].scan_root, agents);
     }
 }
