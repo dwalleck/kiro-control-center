@@ -362,7 +362,7 @@ pub enum FailedSkillReason {
 /// collected so a single broken agent never aborts the rest of the batch,
 /// and accumulated warnings always reach the caller even when some agents
 /// fail.
-#[derive(Clone, Debug, Default, Serialize)]
+#[derive(Debug, Default, Serialize)]
 #[cfg_attr(feature = "specta", derive(specta::Type))]
 pub struct InstallAgentsResult {
     /// Agent names successfully installed.
@@ -375,14 +375,41 @@ pub struct InstallAgentsResult {
     pub warnings: Vec<InstallWarning>,
 }
 
-/// An agent that failed to install, with the reason.
-#[derive(Clone, Debug, Serialize)]
+/// An agent that failed to install, with the typed error.
+///
+/// Pre-Stage-2 this carried `name: String` (falling back to source path)
+/// and `error: String` (pre-rendered via `error_full_chain`). Stage 2
+/// upgrades to a typed shape so frontends can branch on cause rather than
+/// substring-matching the rendered message:
+///
+/// - `name: Option<String>` — agent name when parsing reached that point;
+///   `None` for pre-parse failures (caller falls back to `source_path`).
+/// - `source_path: PathBuf` — always available; the originating file or
+///   directory.
+/// - `error: AgentError` — typed error; render via
+///   [`crate::error::error_full_chain`] for human display.
+#[derive(Debug, Serialize)]
 #[cfg_attr(feature = "specta", derive(specta::Type))]
 pub struct FailedAgent {
-    /// Best-known identifier — the agent name if parse reached that far,
-    /// otherwise the source file path.
-    pub name: String,
-    pub error: String,
+    pub name: Option<String>,
+    pub source_path: std::path::PathBuf,
+    /// Typed error. `Serialize` renders it as a string via
+    /// [`crate::error::error_full_chain`] so the wire shape stays string;
+    /// in-process consumers can match on the typed variants directly.
+    #[serde(serialize_with = "serialize_agent_error")]
+    #[cfg_attr(feature = "specta", specta(type = String))]
+    pub error: crate::error::AgentError,
+}
+
+/// Wire-format projection of [`AgentError`] for [`FailedAgent`]. The typed
+/// error carries `io::Error` / `serde_json::Error` payloads that don't
+/// implement `Serialize`; the wire format is the rendered chain so existing
+/// CLI / Tauri consumers (and `specta` bindings) keep a stable shape.
+fn serialize_agent_error<S: serde::Serializer>(
+    err: &crate::error::AgentError,
+    serializer: S,
+) -> std::result::Result<S::Ok, S::Error> {
+    serializer.serialize_str(&crate::error::error_full_chain(err))
 }
 
 /// Non-fatal issue produced during install. Surfaced in install results
@@ -1199,8 +1226,9 @@ impl MarketplaceService {
                     // shouldn't come from parse_agent_file, but we collect
                     // them as failures rather than crashing the batch.
                     result.failed.push(FailedAgent {
-                        name: path.display().to_string(),
-                        error: crate::error::error_full_chain(&e),
+                        name: None,
+                        source_path: path.clone(),
+                        error: e,
                     });
                     continue;
                 }
@@ -1268,9 +1296,17 @@ impl MarketplaceService {
                     result.skipped.push(name);
                 }
                 Err(e) => {
+                    let agent_err = match e {
+                        Error::Agent(agent_err) => agent_err,
+                        other => crate::error::AgentError::InstallFailed {
+                            path: path.clone(),
+                            source: Box::new(other),
+                        },
+                    };
                     result.failed.push(FailedAgent {
-                        name: def.name,
-                        error: crate::error::error_full_chain(&e),
+                        name: Some(def.name),
+                        source_path: path.clone(),
+                        error: agent_err,
                     });
                 }
             }
@@ -1703,7 +1739,7 @@ mod tests {
         // surfaces despite B's failure.
         assert_eq!(result.installed, vec!["aaa".to_string()]);
         assert_eq!(result.failed.len(), 1);
-        assert_eq!(result.failed[0].name, "bbb");
+        assert_eq!(result.failed[0].name.as_deref(), Some("bbb"));
         let has_unmapped = result.warnings.iter().any(|w| {
             matches!(
                 w,

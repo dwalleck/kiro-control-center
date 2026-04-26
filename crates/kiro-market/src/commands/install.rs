@@ -2,14 +2,13 @@
 
 use std::path::{Path, PathBuf};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{bail, Context, Result};
 use colored::Colorize;
 use kiro_market_core::cache::CacheDir;
 use kiro_market_core::git::{GitProtocol, GixCliBackend};
 use kiro_market_core::project::KiroProject;
 use kiro_market_core::service::{
-    FailedAgent, InstallAgentsResult, InstallFilter, InstallMode, InstallSkillsResult,
-    MarketplaceService,
+    InstallAgentsResult, InstallFilter, InstallMode, InstallSkillsResult, MarketplaceService,
 };
 use tracing::{debug, warn};
 
@@ -242,11 +241,16 @@ fn print_agent_outcome(result: &InstallAgentsResult) {
             name.bold()
         );
     }
-    for FailedAgent { name, error } in &result.failed {
+    for failed in &result.failed {
+        let label = failed
+            .name
+            .as_deref()
+            .map_or_else(|| failed.source_path.display().to_string(), str::to_owned);
+        let rendered = kiro_market_core::error::error_full_chain(&failed.error);
         eprintln!(
-            "  {} Failed to install agent '{}': {error}",
+            "  {} Failed to install agent '{}': {rendered}",
             "✗".red().bold(),
-            name
+            label
         );
     }
     for w in &result.warnings {
