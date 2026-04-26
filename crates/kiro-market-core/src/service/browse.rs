@@ -341,7 +341,7 @@ pub enum SkillCount {
     /// - [`SkippedReason::DirectoryUnreadable`] — stat failed for any
     ///   other reason (permission denied, transient I/O, etc.).
     ///
-    /// From [`load_plugin_manifest`]:
+    /// From the `plugin.json` load:
     /// - [`SkippedReason::InvalidManifest`] — `plugin.json` malformed.
     /// - [`SkippedReason::ManifestReadFailed`] — `plugin.json` read
     ///   failed after a successful stat.
@@ -468,9 +468,9 @@ impl MarketplaceService {
     ///
     /// # Errors
     ///
-    /// - [`Error::Marketplace`] / [`Error::Plugin`] / [`Error::Io`] /
-    ///   [`Error::Json`] from [`Self::list_plugin_entries`] (unknown
-    ///   marketplace, corrupt or unreadable registry).
+    /// - [`Error::Marketplace`] / [`Error::Io`] from
+    ///   [`Self::list_plugin_entries`] (unknown marketplace, corrupt or
+    ///   unreadable registry).
     /// - [`Error::Plugin`] ([`PluginError::NotFound`]) if `plugin`
     ///   does not appear in the marketplace.
     /// - [`Error::Plugin`] ([`PluginError::DirectoryMissing`] /
@@ -535,8 +535,7 @@ impl MarketplaceService {
     ///
     /// # Errors
     ///
-    /// Returns [`Error::Marketplace`] / [`Error::Plugin`] /
-    /// [`Error::Io`] / [`Error::Json`] from
+    /// Returns [`Error::Marketplace`] / [`Error::Io`] from
     /// [`Self::list_plugin_entries`] when the marketplace is unknown
     /// or its registry is corrupt / unreadable. Non-plugin-level
     /// errors during iteration propagate; plugin-level errors
@@ -666,7 +665,7 @@ impl MarketplaceService {
     ///
     /// # Errors
     ///
-    /// - [`Error::Marketplace`] / [`Error::Io`] / [`Error::Json`] from
+    /// - [`Error::Marketplace`] / [`Error::Io`] from
     ///   [`Self::list_plugin_entries`] (unknown marketplace, corrupt or
     ///   unreadable registry).
     /// - [`Error::Plugin`] ([`PluginError::NotFound`]) if `plugin` is not
@@ -1055,6 +1054,7 @@ fn load_plugin_manifest(plugin_dir: &Path) -> Result<Option<PluginManifest>, Err
 mod tests {
     use std::path::Path;
 
+    #[cfg(unix)]
     use tempfile::tempdir;
 
     use super::*;
