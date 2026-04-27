@@ -105,13 +105,31 @@ pub enum SteeringError {
         source: io::Error,
     },
 
+    /// Steering tracking JSON failed to parse. `reason` carries the full
+    /// `serde_json` error chain materialized at the adapter boundary
+    /// (`tracking_malformed` constructor) — the source type does not leak
+    /// through the public API. Mirrors `AgentError::NativeManifestParseFailed`
+    /// per CLAUDE.md "map external errors at the adapter boundary".
     #[non_exhaustive]
-    #[error("steering tracking JSON malformed at `{path}`")]
-    TrackingMalformed {
-        path: PathBuf,
-        #[source]
-        source: serde_json::Error,
-    },
+    #[error("steering tracking JSON malformed at `{path}`: {reason}")]
+    TrackingMalformed { path: PathBuf, reason: String },
+}
+
+/// Construct a [`SteeringError::TrackingMalformed`] from a `serde_json::Error`,
+/// materializing the full source chain into the variant's `reason` field at
+/// the adapter boundary.
+///
+/// This is the only in-tree constructor for the variant; every call site
+/// goes through it so the documented invariant — `reason` always carries
+/// the materialized chain rather than an arbitrary string — is structural,
+/// not just prose. The enum is `#[non_exhaustive]`, so external crates
+/// cannot bypass this constructor with a struct literal.
+#[must_use]
+pub(crate) fn tracking_malformed(path: PathBuf, err: &serde_json::Error) -> SteeringError {
+    SteeringError::TrackingMalformed {
+        path,
+        reason: crate::error::error_full_chain(err),
+    }
 }
 
 /// Per-call outcome of `KiroProject::install_steering_file`.
@@ -216,4 +234,34 @@ pub struct InstallSteeringResult {
     pub installed: Vec<InstalledSteeringOutcome>,
     pub failed: Vec<FailedSteeringFile>,
     pub warnings: Vec<SteeringWarning>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tracking_malformed_renders_path_and_reason() {
+        use std::error::Error as _;
+        let parse_err = serde_json::from_str::<serde_json::Value>("{not").unwrap_err();
+        let err = tracking_malformed(PathBuf::from(".kiro/installed-steering.json"), &parse_err);
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains("installed-steering.json"),
+            "path missing: {rendered}"
+        );
+        // The serde_json line/column survives the materialization.
+        assert!(rendered.contains("line 1"), "reason missing: {rendered}");
+        // Wire-format contract: the variant exposes no `source()` chain,
+        // so downstream FFI surfaces (Tauri, CLI text) cannot accidentally
+        // re-introduce the `serde_json::Error` type by walking `.source()`.
+        // Re-introducing `#[source]` would silently break this assertion.
+        // Mirrors the same lock at
+        // `crate::error::tests::native_manifest_parse_failed_renders_path_and_reason`.
+        assert!(
+            err.source().is_none(),
+            "TrackingMalformed must not expose a source chain — \
+             reason: String is the only carrier of the materialized serde_json detail"
+        );
+    }
 }

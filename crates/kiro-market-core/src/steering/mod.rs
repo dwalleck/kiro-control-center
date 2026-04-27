@@ -9,6 +9,7 @@ pub mod discover;
 pub mod types;
 
 pub use discover::discover_steering_files_in_dirs;
+pub(crate) use types::tracking_malformed;
 pub use types::{
     FailedSteeringFile, InstallSteeringResult, InstalledSteeringOutcome, SteeringError,
     SteeringInstallContext, SteeringWarning,

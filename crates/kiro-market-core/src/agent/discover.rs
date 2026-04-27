@@ -211,7 +211,10 @@ pub fn discover_native_kiro_agents_in_dirs(
             };
             // README/CONTRIBUTING/CHANGELOG with .json extension are excluded
             // case-insensitively by stem to mirror the .md exclusion.
-            let stem = Path::new(name).file_stem().and_then(|s| s.to_str()).unwrap_or(name);
+            let stem = Path::new(name)
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or(name);
             if EXCLUDED_STEMS
                 .iter()
                 .any(|excluded| excluded.eq_ignore_ascii_case(stem))

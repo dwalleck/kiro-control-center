@@ -1049,10 +1049,7 @@ impl KiroProject {
         result.map_err(|e| match e {
             crate::error::Error::Steering(steering_err) => steering_err,
             crate::error::Error::Json(json_err) => {
-                crate::steering::SteeringError::TrackingMalformed {
-                    path: tracking_path,
-                    source: json_err,
-                }
+                crate::steering::tracking_malformed(tracking_path, &json_err)
             }
             other => crate::steering::SteeringError::TrackingIoFailed {
                 path: tracking_path,
@@ -1082,10 +1079,7 @@ impl KiroProject {
             // from "couldn't read the file at all" — give it the typed
             // variant the steering error surface declares.
             crate::error::Error::Json(json_err) => {
-                crate::steering::SteeringError::TrackingMalformed {
-                    path: tracking_path.clone(),
-                    source: json_err,
-                }
+                crate::steering::tracking_malformed(tracking_path.clone(), &json_err)
             }
             other => crate::steering::SteeringError::TrackingIoFailed {
                 path: tracking_path.clone(),
