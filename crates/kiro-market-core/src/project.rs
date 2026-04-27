@@ -326,22 +326,29 @@ pub struct KiroProject {
 }
 
 /// Input bundle for [`KiroProject::synthesize_companion_entry`]. Groups the
-/// 7 immutable refs that the helper needs so the public-ish signature stays
-/// at two parameters (the `&mut InstalledAgents` plus the bundle), avoiding
-/// a `#[allow(clippy::too_many_arguments)]` waiver that would otherwise be
-/// required.
+/// 5 immutable refs that the helper needs so the public-ish signature stays
+/// at two parameters (the `&mut InstalledAgents` plus the bundle).
+///
+/// Rollback on hash failure is the caller's responsibility: this helper
+/// does not touch `agents_root` (it only mutates `installed`), so the
+/// caller — which still holds the `(json_target, prompt_target, backups)`
+/// from the promote phase — is the right place to restore on error.
 struct CompanionInput<'a> {
     marketplace: &'a str,
     plugin: &'a str,
     version: Option<&'a str>,
     agents_root: &'a Path,
     prompt_rel: &'a Path,
-    /// Final destination of the agent JSON; used by the rollback path on
-    /// companion-hash failure to remove just-renamed files.
-    json_target: &'a Path,
-    /// Final destination of the agent prompt body; used by the rollback path
-    /// on companion-hash failure.
-    prompt_target: &'a Path,
+}
+
+/// Output of [`KiroProject::promote_staged_agent`]: paths placed at their
+/// final destinations plus a list of `(original, backup)` pairs the caller
+/// must restore on later failure or delete on success. Mirrors
+/// [`CompanionPromotion`] for the 2-file translated agent install path.
+struct PromotedAgent {
+    json_target: PathBuf,
+    prompt_target: PathBuf,
+    backups: Vec<(PathBuf, PathBuf)>,
 }
 
 impl KiroProject {
@@ -653,7 +660,11 @@ impl KiroProject {
                 let (staging, json_rel, prompt_rel, installed_hash) =
                     self.stage_agent_files(&def.name, &json_bytes, def.prompt_body.as_bytes())?;
 
-                let (json_target, prompt_target) = self.promote_staged_agent(
+                let PromotedAgent {
+                    json_target,
+                    prompt_target,
+                    backups,
+                } = self.promote_staged_agent(
                     &def.name,
                     staging.path(),
                     &json_rel,
@@ -676,7 +687,9 @@ impl KiroProject {
 
                 installed.agents.insert(def.name.clone(), meta);
 
-                Self::synthesize_companion_entry(
+                let placed = [json_target.clone(), prompt_target.clone()];
+
+                if let Err(e) = Self::synthesize_companion_entry(
                     &mut installed,
                     &CompanionInput {
                         marketplace: &marketplace,
@@ -684,33 +697,39 @@ impl KiroProject {
                         version: version.as_deref(),
                         agents_root: &agents_root,
                         prompt_rel: &prompt_rel,
-                        json_target: &json_target,
-                        prompt_target: &prompt_target,
                     },
-                )?;
+                ) {
+                    warn!(
+                        name = %def.name,
+                        error = %e,
+                        "companion entry synthesis failed after rename; restoring backups"
+                    );
+                    Self::rollback_companion_promotion(&placed, &backups);
+                    return Err(e);
+                }
 
                 if let Err(e) = self.write_agent_tracking(&installed) {
                     warn!(
                         name = %def.name,
                         error = %e,
-                        "agent tracking update failed after rename; rolling back files"
+                        "agent tracking update failed after rename; restoring backups"
                     );
-                    if let Err(rb_err) = fs::remove_file(&json_target) {
-                        warn!(
-                            path = %json_target.display(),
-                            error = %rb_err,
-                            "failed to roll back agent JSON after tracking failure — \
-                             agent is on disk but not tracked"
-                        );
-                    }
-                    if let Err(rb_err) = fs::remove_file(&prompt_target) {
-                        warn!(
-                            path = %prompt_target.display(),
-                            error = %rb_err,
-                            "failed to roll back agent prompt after tracking failure"
-                        );
-                    }
+                    Self::rollback_companion_promotion(&placed, &backups);
                     return Err(e);
+                }
+
+                // Success — drop the backup files. Best-effort; an orphan
+                // .kiro-bak left here is a curiosity, not a correctness issue.
+                for (_orig, backup) in &backups {
+                    if let Err(e) = fs::remove_file(backup)
+                        && e.kind() != std::io::ErrorKind::NotFound
+                    {
+                        warn!(
+                            path = %backup.display(),
+                            error = %e,
+                            "failed to remove install backup after success"
+                        );
+                    }
                 }
 
                 debug!(name = %def.name, force, "agent installed");
@@ -719,16 +738,21 @@ impl KiroProject {
         )
     }
 
-    /// Move staged agent files from `staging` into their final locations under
-    /// `agents_root`. In force mode, existing targets are unlinked first. In
-    /// non-force mode, any pre-existing target file (e.g. from a prior crash)
-    /// causes an `AlreadyExists` error without touching `agents_root`.
+    /// Move staged agent files from `staging` into their final locations
+    /// under `agents_root` using a backup-then-swap promote. In force mode,
+    /// each existing target is renamed to `<dest>.kiro-bak` before the
+    /// staging-rename so a later failure (companion hash, tracking write)
+    /// can restore the user's prior install rather than leaving the
+    /// destination empty. In non-force mode, any pre-existing target file
+    /// (e.g. from a prior crash) causes an `AlreadyExists` error without
+    /// touching `agents_root`.
     ///
-    /// On any error, `staging` is cleaned up before returning. JSON is renamed
-    /// first; if the prompt rename then fails, the JSON rename is rolled back so
-    /// neither target is left half-populated.
+    /// On any rename failure, partially-promoted state is rolled back via
+    /// [`Self::rollback_companion_promotion`] before returning.
     ///
-    /// Returns `(json_target, prompt_target)` on success.
+    /// Returns the [`PromotedAgent`] (target paths plus original→backup
+    /// pairs) so the caller can restore on later failure or drop the
+    /// backups on success.
     fn promote_staged_agent(
         &self,
         name: &str,
@@ -736,7 +760,7 @@ impl KiroProject {
         json_rel: &Path,
         prompt_rel: &Path,
         force: bool,
-    ) -> crate::error::Result<(PathBuf, PathBuf)> {
+    ) -> crate::error::Result<PromotedAgent> {
         // The caller passes `staging.path()` from a `tempfile::TempDir`
         // that drops at the caller's scope exit, so any error return
         // below propagates and the caller's TempDir Drop cleans up.
@@ -748,19 +772,7 @@ impl KiroProject {
         let json_target = self.agents_dir().join(format!("{name}.json"));
         let prompt_target = self.agent_prompts_dir().join(format!("{name}.md"));
 
-        if force {
-            // Remove existing targets before rename. Required for Windows
-            // (rename fails on existing dest) and makes the Unix path
-            // explicit rather than relying on rename's replace-on-Unix
-            // behaviour. Missing-file is fine.
-            for p in [&json_target, &prompt_target] {
-                if let Err(e) = fs::remove_file(p)
-                    && e.kind() != std::io::ErrorKind::NotFound
-                {
-                    return Err(e.into());
-                }
-            }
-        } else if json_target.exists() || prompt_target.exists() {
+        if !force && (json_target.exists() || prompt_target.exists()) {
             // Non-force install: a prior crash could leave orphaned files
             // on disk without a tracking entry. Refuse to silently clobber
             // — the user either manually cleans up or re-invokes with
@@ -777,21 +789,41 @@ impl KiroProject {
             .into());
         }
 
-        // Rename JSON first. If the prompt rename fails afterwards, roll
-        // back the JSON rename so we never leave an agent with only half
-        // its files on disk.
-        fs::rename(&staging_json, &json_target)?;
-        if let Err(e) = fs::rename(&staging_prompt, &prompt_target) {
-            if let Err(rb_err) = fs::remove_file(&json_target) {
-                warn!(
-                    path = %json_target.display(),
-                    error = %rb_err,
-                    "failed to roll back agent JSON after prompt-rename failure"
-                );
+        // Backup phase — back up each existing target so a later failure
+        // can restore the user's prior install. Reuses the
+        // `companion_backup_path` / `rollback_companion_promotion` helpers
+        // so the backup-suffix convention stays uniform across install
+        // paths.
+        let mut backups: Vec<(PathBuf, PathBuf)> = Vec::new();
+        if force {
+            for target in [&json_target, &prompt_target] {
+                if target.exists() {
+                    let backup = Self::companion_backup_path(target);
+                    if let Err(e) = fs::rename(target, &backup) {
+                        Self::rollback_companion_promotion(&[], &backups);
+                        return Err(e.into());
+                    }
+                    backups.push((target.clone(), backup));
+                }
             }
+        }
+
+        // Promote phase — rename JSON first, then prompt. On any failure,
+        // roll back already-placed files and restore backups.
+        if let Err(e) = fs::rename(&staging_json, &json_target) {
+            Self::rollback_companion_promotion(&[], &backups);
             return Err(e.into());
         }
-        Ok((json_target, prompt_target))
+        if let Err(e) = fs::rename(&staging_prompt, &prompt_target) {
+            Self::rollback_companion_promotion(std::slice::from_ref(&json_target), &backups);
+            return Err(e.into());
+        }
+
+        Ok(PromotedAgent {
+            json_target,
+            prompt_target,
+            backups,
+        })
     }
 
     /// Write agent JSON and prompt into a fresh staging directory, then compute
@@ -844,19 +876,21 @@ impl KiroProject {
 
     /// Synthesize/update the per-plugin `native_companions` tracking entry
     /// to register this agent's prompt file as plugin-owned. Called from
-    /// the translated agent install path; the native install path
-    /// will call this with its own companion bundle.
+    /// the translated agent install path.
     ///
     /// Recomputes the per-plugin companion hash over the full union of
-    /// prompt files for this plugin. On hash failure, rolls back the
-    /// just-placed json/prompt files.
+    /// prompt files for this plugin. On hash failure, returns the error
+    /// without touching `agents_root` — the caller (`install_agent_inner`)
+    /// owns the backup-restore path because it's the only frame that
+    /// holds the [`PromotedAgent::backups`] from the promote phase.
     ///
-    /// # Residual risk (force mode)
-    /// The companion hash runs post-rename because it must hash prompt files
-    /// from prior installs that live at their real `agents_root` locations.
-    /// A hash failure in force mode will try to remove the newly placed files,
-    /// but the previously existing files were already unlinked. A full
-    /// backup-then-swap atomic install is deferred to a follow-up PR.
+    /// # Atomicity
+    ///
+    /// Pairs with [`Self::promote_staged_agent`]'s backup-then-swap to
+    /// give force-mode translated installs the same all-or-nothing
+    /// guarantee the native install paths have: a hash failure here
+    /// triggers a backup restore in the caller, leaving the user's prior
+    /// install on disk.
     fn synthesize_companion_entry(
         installed: &mut InstalledAgents,
         input: &CompanionInput<'_>,
@@ -895,31 +929,7 @@ impl KiroProject {
         // Recompute hashes over the full prompt set for this plugin.
         let companion_files_snapshot = companion_entry.files.clone();
         let companion_hash =
-            match crate::hash::hash_artifact(input.agents_root, &companion_files_snapshot) {
-                Ok(h) => h,
-                Err(e) => {
-                    warn!(
-                        plugin = input.plugin,
-                        error = %e,
-                        "companion hash computation failed; rolling back files"
-                    );
-                    if let Err(rb_err) = fs::remove_file(input.json_target) {
-                        warn!(
-                            path = %input.json_target.display(),
-                            error = %rb_err,
-                            "failed to roll back agent JSON after companion-hash failure"
-                        );
-                    }
-                    if let Err(rb_err) = fs::remove_file(input.prompt_target) {
-                        warn!(
-                            path = %input.prompt_target.display(),
-                            error = %rb_err,
-                            "failed to roll back agent prompt after companion-hash failure"
-                        );
-                    }
-                    return Err(e.into());
-                }
-            };
+            crate::hash::hash_artifact(input.agents_root, &companion_files_snapshot)?;
         companion_entry.source_hash = companion_hash.clone();
         companion_entry.installed_hash = companion_hash;
         Ok(())
@@ -2242,6 +2252,99 @@ mod tests {
                 .exists(),
             "prompt file should have been rolled back after tracking failure"
         );
+    }
+
+    #[test]
+    fn install_agent_force_restores_backups_when_companion_hash_fails() {
+        // Regression test for the P-6 (backup-then-swap) atomicity gap that
+        // used to live in `synthesize_companion_entry`. Setup:
+        //   1. Install agent `keepme` (plugin P, content v1).
+        //   2. Install agent `gone` (plugin P) — extends companion_entry.files
+        //      to [prompts/keepme.md, prompts/gone.md].
+        //   3. Delete `agents/prompts/gone.md` from disk by hand.
+        //   4. Force-reinstall `keepme` with new content v2.
+        //
+        // The promote phase backs up A's existing JSON + prompt to .kiro-bak.
+        // synthesize_companion_entry then walks the full companion file set
+        // — but `prompts/gone.md` is missing, so hash_artifact errors. The
+        // caller must restore the backups so `keepme`'s prior install
+        // (v1 content) survives intact rather than being clobbered.
+        let (_dir, project) = temp_project();
+        let src_tmp = tempfile::tempdir().unwrap();
+
+        // Step 1: install keepme v1.
+        let src_v1 = write_agent(
+            src_tmp.path(),
+            "keepme",
+            "---\nname: keepme\n---\nv1 prompt body\n",
+        );
+        let (def_v1, mapped_v1) = parse_and_map(&src_v1);
+        project
+            .install_agent(&def_v1, &mapped_v1, sample_agent_meta(), None)
+            .expect("v1 install");
+
+        let json_target = project.root.join(".kiro/agents/keepme.json");
+        let prompt_target = project.root.join(".kiro/agents/prompts/keepme.md");
+        let prompt_v1_bytes = fs::read(&prompt_target).unwrap();
+        let json_v1_bytes = fs::read(&json_target).unwrap();
+
+        // Step 2: install a second agent under the same plugin so the
+        // companion entry's files vec grows to two entries.
+        let src_gone = write_agent(src_tmp.path(), "gone", "---\nname: gone\n---\nbody\n");
+        let (def_gone, mapped_gone) = parse_and_map(&src_gone);
+        project
+            .install_agent(&def_gone, &mapped_gone, sample_agent_meta(), None)
+            .expect("gone install");
+
+        // Step 3: delete the second agent's prompt file from disk so the
+        // companion-hash walk will fail mid-install on the next force call.
+        fs::remove_file(project.root.join(".kiro/agents/prompts/gone.md"))
+            .expect("remove gone prompt");
+
+        // Step 4: force-reinstall keepme with v2 content. The hash failure
+        // should trigger backup restoration.
+        let src_v2 = src_tmp.path().join("keepme_v2.md");
+        fs::write(&src_v2, "---\nname: keepme\n---\nv2 prompt body\n").unwrap();
+        let (def_v2, mapped_v2) = parse_and_map(&src_v2);
+
+        let err = project
+            .install_agent_force(&def_v2, &mapped_v2, sample_agent_meta(), None)
+            .expect_err("force install must fail when companion hash fails");
+        assert!(
+            matches!(err, crate::error::Error::Hash(_)),
+            "expected Error::Hash, got {err:?}"
+        );
+
+        // The user's prior install must be intact — backups restored.
+        assert!(
+            json_target.exists(),
+            "keepme.json must survive the failed force install"
+        );
+        assert!(
+            prompt_target.exists(),
+            "prompts/keepme.md must survive the failed force install"
+        );
+        assert_eq!(
+            fs::read(&json_target).unwrap(),
+            json_v1_bytes,
+            "keepme.json content must match v1 (backup restored, not v2)"
+        );
+        assert_eq!(
+            fs::read(&prompt_target).unwrap(),
+            prompt_v1_bytes,
+            "prompts/keepme.md content must match v1 (backup restored, not v2)"
+        );
+
+        // No leftover .kiro-bak files — rollback path renamed them back.
+        let agents_dir = project.root.join(".kiro/agents");
+        for entry in fs::read_dir(&agents_dir).unwrap() {
+            let path = entry.unwrap().path();
+            assert!(
+                !path.to_string_lossy().ends_with(".kiro-bak"),
+                "no leftover backup file expected: {}",
+                path.display()
+            );
+        }
     }
 
     #[test]
