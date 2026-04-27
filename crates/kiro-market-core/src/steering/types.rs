@@ -146,6 +146,11 @@ pub struct FailedSteeringFile {
 /// clear surfacing every README would teach users to ignore warnings,
 /// and that symlink/junction refusals are by-design security behaviour
 /// rather than actionable feedback for plugin authors.
+///
+/// The `reason: String` payloads on both variants are pre-rendered;
+/// upgrading them to typed payloads (`ValidationError` / `io::Error`)
+/// is tracked at
+/// <https://github.com/dwalleck/kiro-control-center/issues/66>.
 #[derive(Clone, Debug, Serialize)]
 #[cfg_attr(feature = "specta", derive(specta::Type))]
 #[non_exhaustive]

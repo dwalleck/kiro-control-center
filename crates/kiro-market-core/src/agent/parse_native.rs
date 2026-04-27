@@ -133,7 +133,8 @@ struct NativeAgentProjection {
 /// this fully requires opening with `O_NOFOLLOW` on Unix and
 /// `FILE_FLAG_OPEN_REPARSE_POINT` on Windows; neither has portable
 /// std support, so a `libc` direct dep or hardcoded ABI constants
-/// would be needed. Tracked as a known low-priority gap: the
+/// would be needed. Tracked at
+/// <https://github.com/dwalleck/kiro-control-center/issues/65>: the
 /// practical exploit requires filesystem-race timing precision
 /// against a parse that completes in tens of microseconds, and the
 /// upstream discovery filter
