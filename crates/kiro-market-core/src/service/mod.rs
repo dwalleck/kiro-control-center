@@ -487,9 +487,10 @@ fn native_parse_failure_to_agent_error(
                 "native agent JSON exceeds size cap: {size} bytes (limit: {limit})"
             )))),
         },
-        F::InvalidJson(source) => {
-            crate::error::native_manifest_parse_failed(path.to_path_buf(), &source)
-        }
+        F::InvalidJson { reason } => A::NativeManifestParseFailed {
+            path: path.to_path_buf(),
+            reason,
+        },
         F::NulByteInJsonString { json_pointer } => A::InstallFailed {
             path: path.to_path_buf(),
             source: Box::new(crate::error::Error::Io(std::io::Error::other(format!(

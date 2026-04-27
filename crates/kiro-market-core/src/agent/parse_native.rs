@@ -57,9 +57,12 @@ pub const MAX_NATIVE_AGENT_BYTES: u64 = 1024 * 1024;
 /// [`super::ParseFailure`] for translated agents — structured variants
 /// instead of free-form strings, so callers can branch on the semantic.
 ///
-/// `IoError` and `InvalidJson` carry their underlying cause via `#[source]`
-/// so [`crate::error::error_full_chain`] walks past the wrapper at terminal
-/// rendering surfaces.
+/// `IoError` carries its underlying cause via `#[source]` (`io::Error` is
+/// std-library, allowed in the public chain). `InvalidJson` materializes
+/// the `serde_json` chain into `reason: String` at the adapter boundary
+/// (`Self::invalid_json`) so the external crate's error type does not leak
+/// through this enum's public API. CLAUDE.md "Map external errors at the
+/// adapter boundary" — this is the canonical example.
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum NativeParseFailure {
@@ -89,9 +92,12 @@ pub enum NativeParseFailure {
     /// allocation to avoid OOM on hostile manifests.
     #[error("agent JSON exceeds size cap: {size} bytes (limit: {limit})")]
     FileTooLarge { size: u64, limit: u64 },
-    /// File is not valid JSON.
-    #[error("invalid JSON")]
-    InvalidJson(#[source] serde_json::Error),
+    /// File is not valid JSON. `reason` carries the materialized
+    /// `serde_json` error chain (line/column, expected token, etc.); the
+    /// `serde_json::Error` type itself never escapes — see
+    /// [`Self::invalid_json`].
+    #[error("invalid JSON: {reason}")]
+    InvalidJson { reason: String },
     /// JSON parsed but a string value contains a NUL byte (the JSON
     /// `\u0000` escape). Carries the JSON pointer of the offending field.
     /// NUL bytes break C-string boundaries in downstream tooling and have
@@ -105,6 +111,28 @@ pub enum NativeParseFailure {
     /// Carries the validator's reason.
     #[error("invalid `name`: {0}")]
     InvalidName(String),
+}
+
+impl NativeParseFailure {
+    /// Construct a [`NativeParseFailure::InvalidJson`] from a
+    /// `serde_json::Error`, materializing the full source chain into the
+    /// variant's `reason` field at the adapter boundary.
+    ///
+    /// This is the only in-tree constructor for the variant; every call
+    /// site goes through it so the documented invariant — `reason` always
+    /// carries the materialized chain — is structural, not just prose.
+    /// The enum is `#[non_exhaustive]`, so external crates cannot bypass
+    /// this constructor with a struct literal.
+    ///
+    /// CLAUDE.md "Map external errors at the adapter boundary" — this is
+    /// the canonical example for `serde_json::Error` (paired with
+    /// `SteeringError::tracking_malformed`).
+    #[must_use]
+    pub(crate) fn invalid_json(err: &serde_json::Error) -> Self {
+        Self::InvalidJson {
+            reason: crate::error::error_full_chain(err),
+        }
+    }
 }
 
 /// The minimal projection we read out of the JSON to validate + classify
@@ -191,12 +219,12 @@ pub fn parse_native_kiro_agent_file(
 
     let raw_bytes = std::fs::read(json_path).map_err(NativeParseFailure::IoError)?;
     let raw_json: serde_json::Value =
-        serde_json::from_slice(&raw_bytes).map_err(NativeParseFailure::InvalidJson)?;
+        serde_json::from_slice(&raw_bytes).map_err(|e| NativeParseFailure::invalid_json(&e))?;
     if let Some(json_pointer) = first_nul_in_strings(&raw_json) {
         return Err(NativeParseFailure::NulByteInJsonString { json_pointer });
     }
     let projection: NativeAgentProjection =
-        serde_json::from_slice(&raw_bytes).map_err(NativeParseFailure::InvalidJson)?;
+        serde_json::from_slice(&raw_bytes).map_err(|e| NativeParseFailure::invalid_json(&e))?;
 
     // Two-step routing keeps MissingName / InvalidName / InvalidJson as
     // distinct failure variants. `AgentName::new` is the same validator
@@ -352,7 +380,7 @@ mod tests {
         let tmp = tempdir().unwrap();
         let p = write_json(tmp.path(), "x.json", r"{not json");
         let err = parse_native_kiro_agent_file(&p, tmp.path()).expect_err("must fail");
-        assert!(matches!(err, NativeParseFailure::InvalidJson(_)));
+        assert!(matches!(err, NativeParseFailure::InvalidJson { .. }));
     }
 
     #[test]
@@ -393,15 +421,29 @@ mod tests {
     }
 
     #[test]
-    fn invalid_json_exposes_source_chain() {
+    fn invalid_json_materializes_chain_into_reason_and_hides_source() {
         use std::error::Error as _;
         let tmp = tempdir().unwrap();
         let p = write_json(tmp.path(), "x.json", r"{not json");
         let err = parse_native_kiro_agent_file(&p, tmp.path()).expect_err("must fail");
-        assert_eq!(err.to_string(), "invalid JSON");
-        let source = err.source().expect("source chain populated by #[source]");
-        // serde_json error message references the line / column.
-        assert!(!source.to_string().is_empty());
+
+        // The Display includes the materialized reason — line/column from
+        // the underlying serde_json error survives at the wrapper level.
+        let rendered = err.to_string();
+        assert!(rendered.starts_with("invalid JSON: "), "got: {rendered}");
+        assert!(rendered.contains("line 1"), "got: {rendered}");
+
+        // Wire-format contract: the variant exposes no `source()` chain.
+        // CLAUDE.md "Map external errors at the adapter boundary" — the
+        // serde_json::Error type does not leak. Re-introducing
+        // `#[source] serde_json::Error` would silently break this assert,
+        // and the `gate-4-external-error-boundary` xtask check would
+        // catch it at lint time.
+        assert!(
+            err.source().is_none(),
+            "InvalidJson must not expose a source chain — `reason: String` \
+             is the only carrier of the materialized serde_json detail"
+        );
     }
 
     #[test]
@@ -571,6 +613,6 @@ mod tests {
         let p = tmp.path().join("rev.json");
         fs::write(&p, body).expect("write fixture");
         let err = parse_native_kiro_agent_file(&p, tmp.path()).expect_err("must fail");
-        assert!(matches!(err, NativeParseFailure::InvalidJson(_)));
+        assert!(matches!(err, NativeParseFailure::InvalidJson { .. }));
     }
 }
