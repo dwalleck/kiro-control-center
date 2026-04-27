@@ -474,6 +474,13 @@ fn native_parse_failure_to_agent_error(
                 p.display()
             )))),
         },
+        F::HardlinkRefused { path: p, nlink } => A::InstallFailed {
+            path: p.clone(),
+            source: Box::new(crate::error::Error::Io(std::io::Error::other(format!(
+                "refusing hardlinked native agent at {} (nlink={nlink})",
+                p.display()
+            )))),
+        },
         F::FileTooLarge { size, limit } => A::InstallFailed {
             path: path.to_path_buf(),
             source: Box::new(crate::error::Error::Io(std::io::Error::other(format!(

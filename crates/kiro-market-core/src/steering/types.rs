@@ -42,6 +42,14 @@ pub enum SteeringError {
         source: io::Error,
     },
 
+    /// Source file is a hardlink (Unix `nlink > 1`). The other path(s)
+    /// sharing the inode could be sensitive host files (`~/.ssh/id_rsa`,
+    /// etc.); the install refuses rather than write inode contents to
+    /// `.kiro/steering/`. `symlink_metadata` doesn't catch this —
+    /// hardlinks share the inode itself, not the path.
+    #[error("refusing hardlinked steering source at `{path}` (nlink={nlink})")]
+    SourceHardlinked { path: PathBuf, nlink: u64 },
+
     #[error(
         "steering file `{rel}` would clobber a file owned by plugin `{owner}`; \
          pass --force to transfer ownership"

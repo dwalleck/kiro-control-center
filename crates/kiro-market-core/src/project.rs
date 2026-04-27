@@ -742,6 +742,32 @@ impl KiroProject {
                 }
             })?;
         }
+        // Refuse hardlinked sources before allocating the read. A hardlink
+        // shares an inode with some other path that could be a sensitive
+        // host file (`~/.ssh/id_rsa`); writing the inode's bytes into
+        // `.kiro/steering/` would exfiltrate them. Discovery's
+        // symlink/junction filter does not catch hardlinks (the share is
+        // at the inode level, not the path). Windows hardlinks lack a
+        // portable nlink accessor in std — platform.rs's reparse-point
+        // check covers junctions, which is the analogous Windows risk.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let md = fs::symlink_metadata(source).map_err(|src| {
+                crate::steering::SteeringError::SourceReadFailed {
+                    path: source.to_path_buf(),
+                    source: src,
+                }
+            })?;
+            if md.is_file() && md.nlink() > 1 {
+                return Err(crate::steering::SteeringError::SourceHardlinked {
+                    path: source.to_path_buf(),
+                    nlink: md.nlink(),
+                }
+                .into());
+            }
+        }
+
         let source_bytes =
             fs::read(source).map_err(|src| crate::steering::SteeringError::SourceReadFailed {
                 path: source.to_path_buf(),
@@ -2031,6 +2057,26 @@ impl KiroProject {
 
         for rel in rel_paths {
             let src = scan_root.join(rel);
+            // Refuse hardlinked sources before fs::copy. Same threat
+            // model as stage_steering_file: a hardlink shares an inode
+            // with another path that could be sensitive (`~/.ssh/id_rsa`).
+            // Discovery's symlink/junction filter doesn't catch this.
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                let md = fs::symlink_metadata(&src)?;
+                if md.is_file() && md.nlink() > 1 {
+                    return Err(AgentError::InstallFailed {
+                        path: src.clone(),
+                        source: Box::new(crate::error::Error::Io(std::io::Error::other(format!(
+                            "refusing hardlinked native companion at {} (nlink={})",
+                            src.display(),
+                            md.nlink()
+                        )))),
+                    }
+                    .into());
+                }
+            }
             let dest = staging.path().join(rel);
             if let Some(parent) = dest.parent() {
                 fs::create_dir_all(parent)?;
@@ -2653,6 +2699,60 @@ mod tests {
         assert_eq!(
             entry.plugin, "plugin-b",
             "ownership must transfer to plugin-b under force"
+        );
+    }
+
+    #[cfg(unix)]
+    #[rstest]
+    fn install_steering_refuses_hardlinked_source(steering_file: SteeringFile) {
+        // A hardlinked steering source could exfiltrate sensitive host
+        // files (`~/.ssh/id_rsa`) into `.kiro/steering/`. Discovery's
+        // symlink/junction filter doesn't catch hardlinks (the share is
+        // at the inode level, not the path).
+        let target = steering_file.scratch.path().join("real.md");
+        fs::write(&target, b"sensitive").unwrap();
+        let linked = steering_file.scan_root.join("linked.md");
+        fs::hard_link(&target, &linked).expect("create hardlink");
+
+        let source_hash = crate::hash::hash_artifact(
+            &steering_file.scan_root,
+            std::slice::from_ref(&PathBuf::from("linked.md")),
+        )
+        .unwrap();
+        let discovered = crate::agent::DiscoveredNativeFile {
+            source: linked.clone(),
+            scan_root: steering_file.scan_root.clone(),
+        };
+
+        let err = steering_file
+            .project
+            .install_steering_file(
+                &discovered,
+                &source_hash,
+                crate::steering::SteeringInstallContext {
+                    mode: crate::service::InstallMode::New,
+                    marketplace: "m",
+                    plugin: "p",
+                    version: None,
+                },
+            )
+            .expect_err("hardlinked source must be refused");
+        match err {
+            crate::steering::SteeringError::SourceHardlinked { path, nlink } => {
+                assert_eq!(path, linked);
+                assert!(nlink >= 2, "nlink must reflect the hardlink share");
+            }
+            other => panic!("expected SourceHardlinked, got {other:?}"),
+        }
+
+        // Hardlinked source must NOT have landed in the project.
+        assert!(
+            !steering_file
+                .project
+                .steering_dir()
+                .join("linked.md")
+                .exists(),
+            "destination must remain untouched after hardlink rejection"
         );
     }
 
@@ -4438,6 +4538,53 @@ mod tests {
         assert!(
             !tracking.native_companions.contains_key("p"),
             "empty bundle must NOT create a tracking entry"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn install_native_companions_refuses_hardlinked_source() {
+        // A hardlinked companion source shares an inode with another
+        // path that could be sensitive. Discovery's symlink/junction
+        // filter doesn't catch hardlinks. Refuse at staging-time
+        // before fs::copy.
+        let (_dir, project) = temp_project();
+        let scratch = tempfile::tempdir().unwrap();
+        let scan_root = scratch.path().join("src");
+        fs::create_dir_all(scan_root.join("prompts")).unwrap();
+
+        // The hardlink target lives outside the plugin tree to model
+        // the "exfil sensitive host file" threat. Both paths point at
+        // the same inode.
+        let outside = scratch.path().join("sensitive.md");
+        fs::write(&outside, b"sensitive").unwrap();
+        let linked = scan_root.join("prompts/a.md");
+        fs::hard_link(&outside, &linked).expect("create hardlink");
+
+        let rel_paths = vec![PathBuf::from("prompts/a.md")];
+        let h = crate::hash::hash_artifact(&scan_root, &rel_paths).unwrap();
+
+        let err = project
+            .install_native_companions(&NativeCompanionsInput {
+                scan_root: &scan_root,
+                rel_paths: &rel_paths,
+                marketplace: "m",
+                plugin: "p",
+                version: None,
+                source_hash: &h,
+                mode: crate::service::InstallMode::New,
+            })
+            .expect_err("hardlinked source must be refused");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("hardlinked"),
+            "expected hardlinked-rejection error, got: {msg}"
+        );
+
+        // Destination must remain untouched.
+        assert!(
+            !project.root.join(".kiro/agents/prompts/a.md").exists(),
+            "destination must not exist after hardlink rejection"
         );
     }
 
