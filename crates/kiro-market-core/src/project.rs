@@ -3693,4 +3693,241 @@ mod tests {
             "empty bundle must NOT create a tracking entry"
         );
     }
+
+    /// Fixture: a tempdir, a project, a single-file companion bundle
+    /// staged under `companions-src/prompts/a.md`, plus the precomputed
+    /// `source_hash`. Reused across the three collision tests.
+    struct CompanionBundle {
+        /// Owns the tempdir lifetime AND exposes its path for tests that
+        /// need to stage sibling source trees (e.g. cross-plugin transfer).
+        scratch: tempfile::TempDir,
+        project: KiroProject,
+        scan_root: PathBuf,
+        rel_paths: Vec<PathBuf>,
+        source_hash: String,
+    }
+
+    impl CompanionBundle {
+        /// Re-stage the source with new content and recompute the hash,
+        /// preserving the same `rel_paths`. Used by the content-changed
+        /// test to bump the body without rebuilding the whole fixture.
+        fn rewrite_source(&mut self, body: &[u8]) {
+            for rel in &self.rel_paths {
+                fs::write(self.scan_root.join(rel), body).expect("rewrite source");
+            }
+            self.source_hash =
+                crate::hash::hash_artifact(&self.scan_root, &self.rel_paths).expect("re-hash");
+        }
+    }
+
+    #[fixture]
+    fn companion_bundle() -> CompanionBundle {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let project = KiroProject::new(dir.path().to_path_buf());
+        let (scan_root, rel_paths, source_hash) =
+            stage_companion_source(dir.path(), &[("a.md", b"prompt a")]);
+        CompanionBundle {
+            scratch: dir,
+            project,
+            scan_root,
+            rel_paths,
+            source_hash,
+        }
+    }
+
+    /// Convenience: install the fixture's bundle under `(marketplace,
+    /// plugin)`. Wraps the seven-arg `install_native_companions` call.
+    fn install_companions(
+        f: &CompanionBundle,
+        marketplace: &str,
+        plugin: &str,
+        mode: crate::service::InstallMode,
+    ) -> Result<InstalledNativeCompanionsOutcome, AgentError> {
+        f.project.install_native_companions(&NativeCompanionsInput {
+            scan_root: &f.scan_root,
+            rel_paths: &f.rel_paths,
+            marketplace,
+            plugin,
+            version: None,
+            source_hash: &f.source_hash,
+            mode,
+        })
+    }
+
+    #[rstest]
+    fn install_native_companions_idempotent_when_source_hash_matches(
+        companion_bundle: CompanionBundle,
+    ) {
+        let first = install_companions(
+            &companion_bundle,
+            "m",
+            "p",
+            crate::service::InstallMode::New,
+        )
+        .expect("first");
+        assert!(!first.was_idempotent);
+
+        let first_installed_at = companion_bundle
+            .project
+            .load_installed_agents()
+            .expect("load")
+            .native_companions
+            .get("p")
+            .expect("entry")
+            .installed_at;
+
+        let second = install_companions(
+            &companion_bundle,
+            "m",
+            "p",
+            crate::service::InstallMode::New,
+        )
+        .expect("second");
+        assert!(second.was_idempotent);
+
+        // Idempotent path must NOT touch tracking.
+        let second_installed_at = companion_bundle
+            .project
+            .load_installed_agents()
+            .expect("load")
+            .native_companions
+            .get("p")
+            .expect("entry")
+            .installed_at;
+        assert_eq!(first_installed_at, second_installed_at);
+    }
+
+    #[rstest]
+    fn install_native_companions_content_changed_requires_force(
+        mut companion_bundle: CompanionBundle,
+    ) {
+        // v1 install seeds tracking.
+        let h_v1 = companion_bundle.source_hash.clone();
+        install_companions(
+            &companion_bundle,
+            "m",
+            "p",
+            crate::service::InstallMode::New,
+        )
+        .expect("first");
+
+        // Bump source content.
+        companion_bundle.rewrite_source(b"prompt v2");
+        assert_ne!(h_v1, companion_bundle.source_hash);
+
+        // Without --force: must fail with ContentChangedRequiresForce.
+        let err = install_companions(
+            &companion_bundle,
+            "m",
+            "p",
+            crate::service::InstallMode::New,
+        )
+        .expect_err("must refuse");
+        match err {
+            AgentError::ContentChangedRequiresForce { name } => {
+                assert!(
+                    name.contains('p') && name.contains("companions"),
+                    "ContentChangedRequiresForce name should reference plugin and \
+                     'companions' to disambiguate from agent collisions; got: {name}"
+                );
+            }
+            other => panic!("expected ContentChangedRequiresForce, got {other:?}"),
+        }
+
+        // With --force: succeeds, content updates, forced_overwrite flagged.
+        let outcome = install_companions(
+            &companion_bundle,
+            "m",
+            "p",
+            crate::service::InstallMode::Force,
+        )
+        .expect("force install");
+        assert!(outcome.forced_overwrite);
+        assert_eq!(outcome.source_hash, companion_bundle.source_hash);
+
+        let dest_a = companion_bundle
+            .project
+            .kiro_dir()
+            .join("agents/prompts/a.md");
+        assert_eq!(fs::read(&dest_a).expect("read"), b"prompt v2");
+    }
+
+    #[rstest]
+    fn install_native_companions_cross_plugin_overlap_fails_loudly(
+        companion_bundle: CompanionBundle,
+    ) {
+        // plugin-a installs first; the dest path becomes plugin-a-owned.
+        install_companions(
+            &companion_bundle,
+            "m",
+            "plugin-a",
+            crate::service::InstallMode::New,
+        )
+        .expect("plugin-a install");
+
+        // plugin-b stages a different body at the SAME rel path. Without
+        // --force, the path conflict must fail loudly with
+        // PathOwnedByOtherPlugin.
+        let scratch_b = companion_bundle.scratch.path().join("plugin-b-src");
+        fs::create_dir_all(scratch_b.join("prompts")).expect("create");
+        fs::write(scratch_b.join("prompts/a.md"), b"from-b").expect("write");
+        let rel_paths_b = vec![PathBuf::from("prompts/a.md")];
+        let h_b = crate::hash::hash_artifact(&scratch_b, &rel_paths_b).expect("hash b");
+
+        let err = companion_bundle
+            .project
+            .install_native_companions(&NativeCompanionsInput {
+                scan_root: &scratch_b,
+                rel_paths: &rel_paths_b,
+                marketplace: "m",
+                plugin: "plugin-b",
+                version: None,
+                source_hash: &h_b,
+                mode: crate::service::InstallMode::New,
+            })
+            .expect_err("must refuse");
+        match err {
+            AgentError::PathOwnedByOtherPlugin { path, owner } => {
+                assert!(path.ends_with("prompts/a.md"), "path: {}", path.display());
+                assert_eq!(owner, "plugin-a");
+            }
+            other => panic!("expected PathOwnedByOtherPlugin, got {other:?}"),
+        }
+
+        // With --force: plugin-b takes ownership, plugin-a's tracking
+        // entry loses the file (and is removed entirely since it had
+        // only the one file).
+        let outcome = companion_bundle
+            .project
+            .install_native_companions(&NativeCompanionsInput {
+                scan_root: &scratch_b,
+                rel_paths: &rel_paths_b,
+                marketplace: "m",
+                plugin: "plugin-b",
+                version: None,
+                source_hash: &h_b,
+                mode: crate::service::InstallMode::Force,
+            })
+            .expect("force transfer");
+        assert!(outcome.forced_overwrite);
+
+        let tracking = companion_bundle
+            .project
+            .load_installed_agents()
+            .expect("load");
+        assert!(
+            !tracking.native_companions.contains_key("plugin-a"),
+            "plugin-a's entry should be removed (its only file was transferred)"
+        );
+        assert!(
+            tracking.native_companions.contains_key("plugin-b"),
+            "plugin-b should now own the path"
+        );
+
+        let dest = companion_bundle
+            .project
+            .kiro_dir()
+            .join("agents/prompts/a.md");
+        assert_eq!(fs::read(&dest).expect("read installed"), b"from-b");
+    }
 }
