@@ -118,10 +118,29 @@ struct NativeAgentProjection {
 /// Parse a candidate native Kiro agent JSON file.
 ///
 /// Hardening steps before allocation:
-/// 1. `symlink_metadata` re-check refuses symlinks (closes the TOCTOU
+/// 1. `symlink_metadata` re-check refuses symlinks (narrows the TOCTOU
 ///    window between discovery's filter and this read).
-/// 2. Size cap rejects files exceeding [`MAX_NATIVE_AGENT_BYTES`] before
+/// 2. `nlink > 1` rejects hardlinked sources on Unix (see
+///    [`NativeParseFailure::HardlinkRefused`] for the threat model).
+/// 3. Size cap rejects files exceeding [`MAX_NATIVE_AGENT_BYTES`] before
 ///    `fs::read` allocates a `Vec<u8>` for them.
+///
+/// # Residual TOCTOU window
+///
+/// A microsecond-scale window exists between the `symlink_metadata`
+/// re-check and `fs::read` where a sub-process attacker could swap a
+/// regular file for a symlink and have the read follow it. Closing
+/// this fully requires opening with `O_NOFOLLOW` on Unix and
+/// `FILE_FLAG_OPEN_REPARSE_POINT` on Windows; neither has portable
+/// std support, so a `libc` direct dep or hardcoded ABI constants
+/// would be needed. Tracked as a known low-priority gap: the
+/// practical exploit requires filesystem-race timing precision
+/// against a parse that completes in tens of microseconds, and the
+/// upstream discovery filter
+/// ([`crate::platform::is_reparse_or_symlink`] + `read_dir`) already
+/// removes symlinks at scan time, so a successful attack would have
+/// to pre-place a regular file AND time the swap inside the parse
+/// window.
 ///
 /// Then reads the bytes, parses into both `serde_json::Value` (preserved
 /// for projection / install) and [`NativeAgentProjection`] (typed field
