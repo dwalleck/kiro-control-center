@@ -259,13 +259,31 @@ fn first_nul_in_strings(value: &serde_json::Value) -> Option<String> {
                     // parent, with `/<key>` appended — accurate even
                     // though the failure isn't on a value.
                     if k.as_bytes().contains(&0) {
-                        let escaped = k.replace('~', "~0").replace('/', "~1");
+                        // RFC 6901 escape `~`/`/`, plus a sentinel for the
+                        // NUL byte itself — without this, the diagnostic
+                        // string carried back through `error_full_chain`
+                        // contains the raw NUL the check was built to
+                        // detect, which truncates at C-string boundaries
+                        // in downstream consumers (terminals, log
+                        // aggregators) and hides which key triggered.
+                        let escaped = k
+                            .replace('~', "~0")
+                            .replace('/', "~1")
+                            .replace('\0', "<NUL>");
                         return Some(format!("{path}/{escaped}"));
                     }
                     let saved_len = path.len();
                     path.push('/');
-                    // RFC 6901: escape `~` and `/` in keys.
-                    let escaped = k.replace('~', "~0").replace('/', "~1");
+                    // RFC 6901: escape `~` and `/` in keys. The defensive
+                    // NUL replacement is a no-op here because the check
+                    // above already returned for NUL-containing keys; it
+                    // stays in sync with the rejection path so the two
+                    // escapings can't drift if the upstream check
+                    // changes.
+                    let escaped = k
+                        .replace('~', "~0")
+                        .replace('/', "~1")
+                        .replace('\0', "<NUL>");
                     path.push_str(&escaped);
                     if let Some(p) = walk(v, path) {
                         return Some(p);
@@ -491,10 +509,18 @@ mod tests {
         let err = parse_native_kiro_agent_file(&p, tmp.path()).expect_err("must fail");
         match err {
             NativeParseFailure::NulByteInJsonString { json_pointer } => {
-                // Pointer ends at the offending key inside mcpServers.
+                // Pointer ends at the offending key inside mcpServers,
+                // with the NUL byte rendered as the `<NUL>` sentinel rather
+                // than the raw byte — otherwise the diagnostic itself
+                // would carry the threat (truncating at C-string
+                // boundaries in terminals / log aggregators).
+                assert_eq!(
+                    json_pointer, "/mcpServers/tool<NUL>evil",
+                    "pointer must escape the NUL via the `<NUL>` sentinel, got: {json_pointer}"
+                );
                 assert!(
-                    json_pointer.starts_with("/mcpServers/tool"),
-                    "pointer must reference the offending key, got: {json_pointer}"
+                    !json_pointer.as_bytes().contains(&0),
+                    "diagnostic must not contain the raw NUL byte it was built to detect"
                 );
             }
             other => panic!("expected NulByteInJsonString, got {other:?}"),

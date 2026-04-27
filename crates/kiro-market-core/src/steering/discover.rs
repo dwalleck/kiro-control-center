@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 use tracing::{debug, warn};
 
 use crate::agent::DiscoveredNativeFile;
+use crate::error::error_full_chain;
 use crate::steering::SteeringWarning;
 
 /// Filenames excluded from steering discovery (case-insensitive).
@@ -82,7 +83,10 @@ pub fn discover_steering_files_in_dirs(
                 );
                 warnings.push(SteeringWarning::ScanDirUnreadable {
                     path: dir.clone(),
-                    reason: e.to_string(),
+                    // SteeringWarning crosses Tauri FFI via specta; preserve
+                    // any io::Error source chain (OS errno wraps, etc.) per
+                    // CLAUDE.md FFI rule rather than collapsing via to_string.
+                    reason: error_full_chain(&e),
                 });
                 continue;
             }
@@ -106,9 +110,10 @@ pub fn discover_steering_files_in_dirs(
                     // entry failed. Saying "could not read steering scan
                     // directory <dir>: entry read failed: ..." misled users
                     // into checking the directory rather than the entry.
+                    let chain = error_full_chain(&e);
                     warnings.push(SteeringWarning::ScanDirUnreadable {
                         path: dir.clone(),
-                        reason: format!("failed to read an entry in this directory: {e}"),
+                        reason: format!("failed to read an entry in this directory: {chain}"),
                     });
                     continue;
                 }
@@ -127,7 +132,7 @@ pub fn discover_steering_files_in_dirs(
                     // warning is the user-facing channel.
                     warnings.push(SteeringWarning::ScanDirUnreadable {
                         path: path.clone(),
-                        reason: format!("stat failed: {e}"),
+                        reason: format!("stat failed: {}", error_full_chain(&e)),
                     });
                     continue;
                 }
