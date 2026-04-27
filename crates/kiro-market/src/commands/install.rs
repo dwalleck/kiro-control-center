@@ -234,14 +234,60 @@ fn summarize_outcome(
 /// failures. Warnings and failures go to stderr so they don't pollute
 /// stdout piping, matching the skill flow.
 fn print_agent_outcome(result: &InstallAgentsResult) {
+    // Build a lookup from agent name to its rich native outcome so the
+    // legacy `installed: Vec<String>` rendering can append a `(forced)`
+    // suffix where the native install path overwrote a tracked path.
+    // Translated installs leave installed_native empty, so the lookup is
+    // a no-op for that path.
+    let native_by_name: std::collections::HashMap<&str, &_> = result
+        .installed_native
+        .iter()
+        .map(|o| (o.name.as_str(), o))
+        .collect();
+
     for name in &result.installed {
-        println!("  {} Installed agent '{}'", "✓".green().bold(), name.bold());
+        let suffix = native_by_name
+            .get(name.as_str())
+            .filter(|o| o.forced_overwrite)
+            .map_or("", |_| " (forced)");
+        println!(
+            "  {} Installed agent '{}'{}",
+            "✓".green().bold(),
+            name.bold(),
+            suffix.yellow()
+        );
     }
     for name in &result.skipped {
+        // Native idempotent reinstalls land here with a typed outcome
+        // already in installed_native — render "(unchanged)" so the
+        // user can tell the difference from a translated already-installed
+        // skip.
+        let suffix = native_by_name
+            .get(name.as_str())
+            .filter(|o| o.was_idempotent)
+            .map_or("", |_| " (unchanged)");
         println!(
-            "  {} Agent '{}' already installed",
+            "  {} Agent '{}' already installed{}",
             "·".yellow().bold(),
-            name.bold()
+            name.bold(),
+            suffix.dimmed()
+        );
+    }
+    if let Some(companions) = &result.installed_companions {
+        let suffix = if companions.was_idempotent {
+            " (unchanged)".dimmed()
+        } else if companions.forced_overwrite {
+            " (forced)".yellow()
+        } else {
+            "".normal()
+        };
+        let plural = if companions.files.len() == 1 { "" } else { "s" };
+        println!(
+            "  {} Installed {} companion file{plural} for '{}'{}",
+            "✓".green().bold(),
+            companions.files.len(),
+            companions.plugin.bold(),
+            suffix
         );
     }
     for failed in &result.failed {
