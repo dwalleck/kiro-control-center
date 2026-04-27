@@ -7,7 +7,6 @@
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::AtomicU64;
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
@@ -17,11 +16,6 @@ use crate::agent::tools::MappedTool;
 use crate::agent::{AgentDefinition, AgentDialect};
 use crate::error::{AgentError, SkillError};
 use crate::validation;
-
-/// Process-local sequence used to disambiguate concurrent staging directories.
-/// Combined with `process::id()` to guarantee unique paths even when two
-/// threads in the same process race past the file lock.
-static STAGING_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 // ---------------------------------------------------------------------------
 // Types
@@ -217,22 +211,6 @@ const INSTALLED_SKILLS_FILE: &str = "installed-skills.json";
 
 /// Name of the agent tracking file inside `.kiro/`.
 const INSTALLED_AGENTS_FILE: &str = "installed-agents.json";
-
-/// Best-effort removal of a staging directory, logging on failure instead
-/// of propagating the error. Used in rollback paths where the caller is
-/// already returning a more meaningful error and the staging dir is
-/// unreachable user-facing state.
-fn remove_staging_dir(staging: &Path) {
-    if let Err(e) = fs::remove_dir_all(staging)
-        && e.kind() != std::io::ErrorKind::NotFound
-    {
-        warn!(
-            path = %staging.display(),
-            error = %e,
-            "failed to remove staging directory"
-        );
-    }
-}
 
 /// Recursively copy a directory tree from `src` to `dest`.
 ///
@@ -567,15 +545,6 @@ impl KiroProject {
         Ok(())
     }
 
-    /// Generate a per-attempt staging directory path for an agent install.
-    fn fresh_agent_staging_dir(&self, name: &str) -> PathBuf {
-        use std::sync::atomic::Ordering;
-        let pid = std::process::id();
-        let seq = STAGING_COUNTER.fetch_add(1, Ordering::Relaxed);
-        self.kiro_dir()
-            .join(format!("_installing-agent-{name}-{pid}-{seq}"))
-    }
-
     /// Install a parsed agent into the Kiro project.
     ///
     /// Pass `source_path` as the `.md` file the definition was parsed from to
@@ -672,16 +641,18 @@ impl KiroProject {
                     .into());
                 }
 
-                // Sweep leftover staging dirs for THIS agent from prior crashed
-                // attempts. Safe because we hold the lock — no other installer
-                // of this agent is currently running.
-                self.cleanup_leftover_agent_staging(&def.name)?;
-
                 let (staging, json_rel, prompt_rel, installed_hash) =
                     self.stage_agent_files(&def.name, &json_bytes, def.prompt_body.as_bytes())?;
 
-                let (json_target, prompt_target) =
-                    self.promote_staged_agent(&def.name, &staging, &json_rel, &prompt_rel, force)?;
+                let (json_target, prompt_target) = self.promote_staged_agent(
+                    &def.name,
+                    staging.path(),
+                    &json_rel,
+                    &prompt_rel,
+                    force,
+                )?;
+                // staging is a TempDir and drops at end of scope, cleaning
+                // up the now-empty staging directory.
 
                 // installed_hash was computed pre-destructive (against staging).
                 let agents_root = self.agents_dir(); // needed for companion hash below
@@ -757,6 +728,9 @@ impl KiroProject {
         prompt_rel: &Path,
         force: bool,
     ) -> crate::error::Result<(PathBuf, PathBuf)> {
+        // The caller passes `staging.path()` from a `tempfile::TempDir`
+        // that drops at the caller's scope exit, so any error return
+        // below propagates and the caller's TempDir Drop cleans up.
         let staging_json = staging.join(json_rel);
         let staging_prompt = staging.join(prompt_rel);
 
@@ -774,7 +748,6 @@ impl KiroProject {
                 if let Err(e) = fs::remove_file(p)
                     && e.kind() != std::io::ErrorKind::NotFound
                 {
-                    remove_staging_dir(staging);
                     return Err(e.into());
                 }
             }
@@ -783,7 +756,6 @@ impl KiroProject {
             // on disk without a tracking entry. Refuse to silently clobber
             // — the user either manually cleans up or re-invokes with
             // `install_agent_force`.
-            remove_staging_dir(staging);
             return Err(std::io::Error::new(
                 std::io::ErrorKind::AlreadyExists,
                 format!(
@@ -799,10 +771,7 @@ impl KiroProject {
         // Rename JSON first. If the prompt rename fails afterwards, roll
         // back the JSON rename so we never leave an agent with only half
         // its files on disk.
-        if let Err(e) = fs::rename(&staging_json, &json_target) {
-            remove_staging_dir(staging);
-            return Err(e.into());
-        }
+        fs::rename(&staging_json, &json_target)?;
         if let Err(e) = fs::rename(&staging_prompt, &prompt_target) {
             if let Err(rb_err) = fs::remove_file(&json_target) {
                 warn!(
@@ -811,12 +780,8 @@ impl KiroProject {
                     "failed to roll back agent JSON after prompt-rename failure"
                 );
             }
-            remove_staging_dir(staging);
             return Err(e.into());
         }
-
-        // Staging directory should now be empty (or contain the empty prompts subdir).
-        remove_staging_dir(staging);
         Ok((json_target, prompt_target))
     }
 
@@ -834,35 +799,36 @@ impl KiroProject {
         name: &str,
         json_bytes: &[u8],
         prompt_bytes: &[u8],
-    ) -> crate::error::Result<(PathBuf, PathBuf, PathBuf, String)> {
-        let staging = self.fresh_agent_staging_dir(name);
+    ) -> crate::error::Result<(tempfile::TempDir, PathBuf, PathBuf, String)> {
+        // TempDir RAII: any `?` propagation below cleans up the staging
+        // dir on Drop, so error branches don't need explicit cleanup.
+        let staging = tempfile::Builder::new()
+            .prefix(&format!("_installing-agent-{name}-"))
+            .tempdir_in(self.kiro_dir())?;
         let json_rel = PathBuf::from(format!("{name}.json"));
         let prompt_rel = PathBuf::from(format!("prompts/{name}.md"));
-        let staging_json = staging.join(&json_rel);
-        let staging_prompt_dir = staging.join("prompts");
-        let staging_prompt = staging.join(&prompt_rel);
+        let staging_json = staging.path().join(&json_rel);
+        let staging_prompt_dir = staging.path().join("prompts");
+        let staging_prompt = staging.path().join(&prompt_rel);
 
         fs::create_dir_all(&staging_prompt_dir)?;
-        if let Err(e) = fs::write(&staging_json, json_bytes)
-            .and_then(|()| fs::write(&staging_prompt, prompt_bytes))
-        {
-            remove_staging_dir(&staging);
-            return Err(e.into());
-        }
+        fs::write(&staging_json, json_bytes)
+            .and_then(|()| fs::write(&staging_prompt, prompt_bytes))?;
 
-        let installed_hash =
-            match crate::hash::hash_artifact(&staging, &[json_rel.clone(), prompt_rel.clone()]) {
-                Ok(h) => h,
-                Err(e) => {
-                    warn!(
-                        name,
-                        error = %e,
-                        "installed_hash computation failed on staging; removing staging dir"
-                    );
-                    remove_staging_dir(&staging);
-                    return Err(e.into());
-                }
-            };
+        let installed_hash = match crate::hash::hash_artifact(
+            staging.path(),
+            &[json_rel.clone(), prompt_rel.clone()],
+        ) {
+            Ok(h) => h,
+            Err(e) => {
+                warn!(
+                    name,
+                    error = %e,
+                    "installed_hash computation failed on staging; removing staging dir"
+                );
+                return Err(e.into());
+            }
+        };
 
         Ok((staging, json_rel, prompt_rel, installed_hash))
     }
@@ -1088,15 +1054,6 @@ impl KiroProject {
             crate::file_lock::with_file_lock(&self.agent_tracking_path(), || {
                 let mut installed = self.load_installed_agents()?;
 
-                // Sweep stale staging dirs for this name from prior crashed runs.
-                if let Err(e) = self.cleanup_leftover_agent_staging(&agent_name) {
-                    warn!(
-                        name = %agent_name,
-                        error = %e,
-                        "leftover-staging cleanup failed; proceeding with install anyway"
-                    );
-                }
-
                 // Collision matrix — return early or set `forced_overwrite`.
                 let forced_overwrite = match Self::classify_native_collision(
                     &installed,
@@ -1113,8 +1070,14 @@ impl KiroProject {
                 let (staging, json_rel, installed_hash) =
                     self.stage_native_agent_file(&agent_name, &bundle.raw_bytes)?;
 
-                let had_backup =
-                    self.promote_native_agent(&staging, &json_rel, &json_target, forced_overwrite)?;
+                let had_backup = self.promote_native_agent(
+                    staging.path(),
+                    &json_rel,
+                    &json_target,
+                    forced_overwrite,
+                )?;
+                // staging is a TempDir; drops at scope exit and cleans
+                // up the now-empty staging directory.
 
                 installed.agents.insert(
                     agent_name.clone(),
@@ -1206,19 +1169,17 @@ impl KiroProject {
         &self,
         name: &str,
         raw_bytes: &[u8],
-    ) -> crate::error::Result<(PathBuf, PathBuf, String)> {
-        let staging = self.fresh_agent_staging_dir(name);
+    ) -> crate::error::Result<(tempfile::TempDir, PathBuf, String)> {
+        let staging = tempfile::Builder::new()
+            .prefix(&format!("_installing-agent-{name}-"))
+            .tempdir_in(self.kiro_dir())?;
         let json_rel = PathBuf::from(format!("{name}.json"));
-        let staging_json = staging.join(&json_rel);
+        let staging_json = staging.path().join(&json_rel);
 
-        fs::create_dir_all(&staging)?;
-        if let Err(e) = fs::write(&staging_json, raw_bytes) {
-            remove_staging_dir(&staging);
-            return Err(e.into());
-        }
+        fs::write(&staging_json, raw_bytes)?;
 
         let installed_hash =
-            match crate::hash::hash_artifact(&staging, std::slice::from_ref(&json_rel)) {
+            match crate::hash::hash_artifact(staging.path(), std::slice::from_ref(&json_rel)) {
                 Ok(h) => h,
                 Err(e) => {
                     warn!(
@@ -1226,7 +1187,6 @@ impl KiroProject {
                         error = %e,
                         "installed_hash computation failed on staging; removing staging dir"
                     );
-                    remove_staging_dir(&staging);
                     return Err(e.into());
                 }
             };
@@ -1241,7 +1201,9 @@ impl KiroProject {
     ///
     /// Pre-conditions: caller has already done the collision check; under
     /// `forced_overwrite == false` the destination is guaranteed to not
-    /// exist (no tracking entry, no orphan on disk).
+    /// exist (no tracking entry, no orphan on disk). Caller's
+    /// `tempfile::TempDir` drops at scope exit, cleaning up the (now
+    /// empty) staging directory.
     fn promote_native_agent(
         &self,
         staging: &Path,
@@ -1251,19 +1213,13 @@ impl KiroProject {
     ) -> crate::error::Result<bool> {
         let staging_json = staging.join(json_rel);
 
-        if let Err(e) = fs::create_dir_all(self.agents_dir()) {
-            remove_staging_dir(staging);
-            return Err(e.into());
-        }
+        fs::create_dir_all(self.agents_dir())?;
 
         // Backup phase — only when overwriting an existing file.
         let backup_target = json_target.with_extension("json.kiro-bak");
         let mut had_backup = false;
         if forced_overwrite && json_target.exists() {
-            if let Err(e) = fs::rename(json_target, &backup_target) {
-                remove_staging_dir(staging);
-                return Err(e.into());
-            }
+            fs::rename(json_target, &backup_target)?;
             had_backup = true;
         }
 
@@ -1278,10 +1234,8 @@ impl KiroProject {
                     "failed to restore backup after rename failure"
                 );
             }
-            remove_staging_dir(staging);
             return Err(e.into());
         }
-        remove_staging_dir(staging);
         Ok(had_backup)
     }
 
@@ -1363,14 +1317,6 @@ impl KiroProject {
     ) -> crate::error::Result<InstalledNativeCompanionsOutcome> {
         let mut installed = self.load_installed_agents()?;
 
-        if let Err(e) = self.cleanup_leftover_companion_staging(input.plugin) {
-            warn!(
-                plugin = %input.plugin,
-                error = %e,
-                "leftover-staging cleanup failed; proceeding with install anyway"
-            );
-        }
-
         let forced_overwrite =
             match Self::classify_companion_collision(&installed, input, agents_dir)? {
                 CompanionCollisionDecision::Idempotent(outcome) => return Ok(*outcome),
@@ -1381,11 +1327,13 @@ impl KiroProject {
             self.stage_native_companion_files(input.plugin, input.scan_root, input.rel_paths)?;
 
         let (placed, backups) = self.promote_native_companions(
-            &staging,
+            staging.path(),
             input.rel_paths,
             agents_dir,
             forced_overwrite,
         )?;
+        // staging is a TempDir; drops at scope exit and cleans up the
+        // now-empty (or partially-promoted-out-of) staging directory.
 
         if forced_overwrite {
             Self::strip_transferred_paths_from_other_plugins(
@@ -1529,26 +1477,21 @@ impl KiroProject {
         plugin: &str,
         scan_root: &Path,
         rel_paths: &[PathBuf],
-    ) -> crate::error::Result<(PathBuf, String)> {
-        let staging = self.fresh_companion_staging_dir(plugin);
-        fs::create_dir_all(&staging)?;
+    ) -> crate::error::Result<(tempfile::TempDir, String)> {
+        let staging = tempfile::Builder::new()
+            .prefix(&format!("_installing-companions-{plugin}-"))
+            .tempdir_in(self.kiro_dir())?;
 
         for rel in rel_paths {
             let src = scan_root.join(rel);
-            let dest = staging.join(rel);
-            if let Some(parent) = dest.parent()
-                && let Err(e) = fs::create_dir_all(parent)
-            {
-                remove_staging_dir(&staging);
-                return Err(e.into());
+            let dest = staging.path().join(rel);
+            if let Some(parent) = dest.parent() {
+                fs::create_dir_all(parent)?;
             }
-            if let Err(e) = fs::copy(&src, &dest) {
-                remove_staging_dir(&staging);
-                return Err(e.into());
-            }
+            fs::copy(&src, &dest)?;
         }
 
-        let installed_hash = match crate::hash::hash_artifact(&staging, rel_paths) {
+        let installed_hash = match crate::hash::hash_artifact(staging.path(), rel_paths) {
             Ok(h) => h,
             Err(e) => {
                 warn!(
@@ -1556,7 +1499,6 @@ impl KiroProject {
                     error = %e,
                     "installed_hash computation failed on staging; removing staging dir"
                 );
-                remove_staging_dir(&staging);
                 return Err(e.into());
             }
         };
@@ -1589,7 +1531,6 @@ impl KiroProject {
                 && let Err(e) = fs::create_dir_all(parent)
             {
                 Self::rollback_companion_promotion(&placed, &backups);
-                remove_staging_dir(staging);
                 return Err(e.into());
             }
             // Backup the existing destination if we'll overwrite it.
@@ -1597,20 +1538,17 @@ impl KiroProject {
                 let backup = Self::companion_backup_path(&dest);
                 if let Err(e) = fs::rename(&dest, &backup) {
                     Self::rollback_companion_promotion(&placed, &backups);
-                    remove_staging_dir(staging);
                     return Err(e.into());
                 }
                 backups.push((dest.clone(), backup));
             }
             if let Err(e) = fs::rename(&src, &dest) {
                 Self::rollback_companion_promotion(&placed, &backups);
-                remove_staging_dir(staging);
                 return Err(e.into());
             }
             placed.push(dest);
         }
 
-        remove_staging_dir(staging);
         Ok((placed, backups))
     }
 
@@ -1708,108 +1646,6 @@ impl KiroProject {
         }
     }
 
-    fn fresh_companion_staging_dir(&self, plugin: &str) -> PathBuf {
-        use std::sync::atomic::Ordering;
-        let pid = std::process::id();
-        let seq = STAGING_COUNTER.fetch_add(1, Ordering::Relaxed);
-        self.kiro_dir()
-            .join(format!("_installing-companions-{plugin}-{pid}-{seq}"))
-    }
-
-    /// Mirror of [`Self::cleanup_leftover_agent_staging`] for companion
-    /// staging directories from prior crashed installs.
-    fn cleanup_leftover_companion_staging(&self, plugin: &str) -> std::io::Result<()> {
-        let prefix = format!("_installing-companions-{plugin}-");
-        let kiro_dir = self.kiro_dir();
-        let entries = match fs::read_dir(&kiro_dir) {
-            Ok(e) => e,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            Err(e) => return Err(e),
-        };
-        for entry in entries {
-            let entry = match entry {
-                Ok(e) => e,
-                Err(e) => {
-                    warn!(
-                        dir = %kiro_dir.display(),
-                        error = %e,
-                        "failed to read .kiro entry during companion staging cleanup; skipping"
-                    );
-                    continue;
-                }
-            };
-            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
-                continue;
-            };
-            if !name.starts_with(&prefix) {
-                continue;
-            }
-            let path = entry.path();
-            if let Err(e) = fs::remove_dir_all(&path)
-                && e.kind() != std::io::ErrorKind::NotFound
-            {
-                warn!(
-                    path = %path.display(),
-                    error = %e,
-                    "failed to remove leftover companion staging dir; continuing"
-                );
-            }
-        }
-        Ok(())
-    }
-
-    /// Remove any `_installing-agent-<name>-*` staging directories left over
-    /// from prior crashed installs. Caller must hold the agent tracking lock.
-    ///
-    /// Best-effort: per-entry iteration errors are logged via `warn!` and
-    /// skipped rather than aborting the install. A transient filesystem
-    /// glitch reading one entry under `.kiro/` should not prevent the
-    /// install — the staging dir is unreachable user-facing state, and
-    /// the subsequent `fresh_agent_staging_dir` uses a unique per-attempt
-    /// path regardless of whether cleanup fully succeeded.
-    fn cleanup_leftover_agent_staging(&self, name: &str) -> std::io::Result<()> {
-        let prefix = format!("_installing-agent-{name}-");
-        let kiro_dir = self.kiro_dir();
-        let entries = match fs::read_dir(&kiro_dir) {
-            Ok(e) => e,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            Err(e) => return Err(e),
-        };
-        for entry in entries {
-            let entry = match entry {
-                Ok(e) => e,
-                Err(e) => {
-                    warn!(
-                        dir = %kiro_dir.display(),
-                        error = %e,
-                        "failed to read entry during agent staging cleanup; skipping"
-                    );
-                    continue;
-                }
-            };
-            let file_name = entry.file_name();
-            let Some(name_str) = file_name.to_str() else {
-                continue;
-            };
-            if !name_str.starts_with(&prefix) {
-                continue;
-            }
-            let path = entry.path();
-            debug!(
-                path = %path.display(),
-                "removing leftover agent staging directory from prior install"
-            );
-            if let Err(e) = fs::remove_dir_all(&path) {
-                warn!(
-                    path = %path.display(),
-                    error = %e,
-                    "failed to remove leftover agent staging directory"
-                );
-            }
-        }
-        Ok(())
-    }
-
     // -- internal helpers --------------------------------------------------
 
     /// Copy a source skill directory and update tracking.
@@ -1843,24 +1679,13 @@ impl KiroProject {
             // Ensure the skills parent directory exists.
             fs::create_dir_all(self.skills_dir())?;
 
-            // Sweep any leftover staging dirs for THIS skill from prior
-            // crashed attempts. Safe because we hold the lock — no other
-            // installer of this skill is currently running.
-            self.cleanup_leftover_staging(name)?;
-
-            let staging_dir = self.fresh_staging_dir(name);
-
-            // Stage the copy into the temp directory.
-            if let Err(e) = copy_dir_recursive(source_dir, &staging_dir) {
-                if let Err(cleanup_err) = fs::remove_dir_all(&staging_dir) {
-                    warn!(
-                        path = %staging_dir.display(),
-                        error = %cleanup_err,
-                        "failed to clean up partial staging directory"
-                    );
-                }
-                return Err(e.into());
-            }
+            // Stage the copy into a fresh temp dir. TempDir RAII cleans
+            // up on Drop, so any `?`-propagation below (or panic) leaves
+            // no orphan staging dir behind.
+            let staging = tempfile::Builder::new()
+                .prefix(&format!("_installing-skill-{name}-"))
+                .tempdir_in(self.skills_dir())?;
+            copy_dir_recursive(source_dir, staging.path())?;
 
             // Compute installed_hash on the staged copy BEFORE the destructive
             // rename. Any hash failure here leaves the previous install (if
@@ -1870,7 +1695,7 @@ impl KiroProject {
             // correct TOCTOU stance: `installed_hash` is the source of truth
             // for what the user has, computed over the bytes we're about to
             // commit to disk.
-            let installed_hash = match crate::hash::hash_dir_tree(&staging_dir) {
+            let installed_hash = match crate::hash::hash_dir_tree(staging.path()) {
                 Ok(h) => h,
                 Err(e) => {
                     warn!(
@@ -1878,13 +1703,6 @@ impl KiroProject {
                         error = %e,
                         "installed_hash computation failed on staging; removing staging dir"
                     );
-                    if let Err(cleanup_err) = fs::remove_dir_all(&staging_dir) {
-                        warn!(
-                            path = %staging_dir.display(),
-                            error = %cleanup_err,
-                            "failed to clean up staging directory after hash failure"
-                        );
-                    }
                     return Err(e.into());
                 }
             };
@@ -1896,8 +1714,10 @@ impl KiroProject {
                 fs::remove_dir_all(&dir)?;
             }
 
-            // Rename staging to final location.
-            fs::rename(&staging_dir, &dir)?;
+            // Rename staging to final location. After this, the directory
+            // entry that staging.path() pointed at is gone; TempDir's Drop
+            // will see NotFound and silently skip cleanup.
+            fs::rename(staging.path(), &dir)?;
             meta.source_hash = Some(source_hash);
             meta.installed_hash = Some(installed_hash);
 
@@ -1928,59 +1748,6 @@ impl KiroProject {
             debug!(name, "skill installed from directory");
             Ok(())
         })
-    }
-
-    /// Generate a per-attempt staging directory path for a skill install.
-    ///
-    /// Encoding the pid and a process-local atomic sequence guarantees two
-    /// threads (or two processes) computing this for the same skill name get
-    /// different paths.
-    fn fresh_staging_dir(&self, name: &str) -> PathBuf {
-        use std::sync::atomic::Ordering;
-        let pid = std::process::id();
-        let seq = STAGING_COUNTER.fetch_add(1, Ordering::Relaxed);
-        self.skills_dir()
-            .join(format!("_installing-{name}-{pid}-{seq}"))
-    }
-
-    /// Remove any staging directories left over for this skill from prior
-    /// crashed attempts. Matches both the new `_installing-<name>-<pid>-<seq>`
-    /// form and the legacy `_installing-<name>` form. Caller must hold the
-    /// tracking-file lock.
-    fn cleanup_leftover_staging(&self, name: &str) -> std::io::Result<()> {
-        let exact = format!("_installing-{name}");
-        let prefix = format!("_installing-{name}-");
-        let skills_dir = self.skills_dir();
-
-        let entries = match fs::read_dir(&skills_dir) {
-            Ok(entries) => entries,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            Err(e) => return Err(e),
-        };
-
-        for entry in entries {
-            let entry = entry?;
-            let file_name = entry.file_name();
-            let Some(name_str) = file_name.to_str() else {
-                continue;
-            };
-            if name_str != exact && !name_str.starts_with(&prefix) {
-                continue;
-            }
-            let path = entry.path();
-            debug!(
-                path = %path.display(),
-                "removing leftover staging directory from prior install"
-            );
-            if let Err(e) = fs::remove_dir_all(&path) {
-                warn!(
-                    path = %path.display(),
-                    error = %e,
-                    "failed to remove leftover staging directory"
-                );
-            }
-        }
-        Ok(())
     }
 
     /// Persist the tracking file to disk atomically.
@@ -2318,27 +2085,6 @@ mod tests {
             leftovers.is_empty(),
             "no staging directories should remain after successful install"
         );
-    }
-
-    #[test]
-    fn install_agent_sweeps_leftover_staging_from_prior_crash() {
-        let (_dir, project) = temp_project();
-        let src_tmp = tempfile::tempdir().unwrap();
-        let src = write_agent(src_tmp.path(), "sweep", "---\nname: sweep\n---\nbody\n");
-        let (def, mapped) = parse_and_map(&src);
-
-        // Simulate a crashed prior attempt that left staging around.
-        fs::create_dir_all(project.root.join(".kiro")).unwrap();
-        let ghost = project.root.join(".kiro/_installing-agent-sweep-99999-0");
-        fs::create_dir_all(ghost.join("prompts")).unwrap();
-        fs::write(ghost.join("agent.json"), b"{}").unwrap();
-
-        project
-            .install_agent(&def, &mapped, sample_agent_meta(), None)
-            .expect("install should succeed and sweep leftover");
-
-        assert!(!ghost.exists(), "leftover staging should have been swept");
-        assert!(project.root.join(".kiro/agents/sweep.json").exists());
     }
 
     #[test]
@@ -2762,33 +2508,6 @@ mod tests {
     }
 
     #[test]
-    fn install_skill_from_dir_recovers_from_leftover_staging_dir() {
-        let (_dir, project) = temp_project();
-
-        // Simulate a previous crash that left a staging directory behind.
-        let staging_dir = project.skills_dir().join("_installing-recovered");
-        fs::create_dir_all(&staging_dir).expect("create staging dir");
-        fs::write(staging_dir.join("SKILL.md"), "stale content").expect("write stale");
-
-        // A fresh install of the same skill should clean up and succeed.
-        let src = tempfile::tempdir().expect("tempdir");
-        fs::write(
-            src.path().join("SKILL.md"),
-            "---\nname: recovered\ndescription: Fresh\n---\nFresh content.\n",
-        )
-        .expect("write");
-
-        project
-            .install_skill_from_dir("recovered", src.path(), sample_meta())
-            .expect("install should succeed despite leftover staging dir");
-
-        let content =
-            fs::read_to_string(project.skill_dir("recovered").join("SKILL.md")).expect("read");
-        assert!(content.contains("Fresh content."));
-        assert!(!staging_dir.exists(), "staging dir should be cleaned up");
-    }
-
-    #[test]
     fn install_skill_from_dir_force_removes_stale_files_from_old_version() {
         let (_dir, project) = temp_project();
         let src1 = tempfile::tempdir().expect("tempdir");
@@ -3017,39 +2736,6 @@ mod tests {
         let installed = project.load_installed().expect("load");
         assert_eq!(installed.skills.len(), 1);
         assert!(installed.skills.contains_key("racey"));
-    }
-
-    #[test]
-    fn fresh_staging_dir_returns_unique_paths_within_process() {
-        let (_dir, project) = temp_project();
-        let p1 = project.fresh_staging_dir("foo");
-        let p2 = project.fresh_staging_dir("foo");
-        assert_ne!(
-            p1, p2,
-            "two staging dirs for the same skill name must be distinct"
-        );
-    }
-
-    #[test]
-    fn cleanup_leftover_staging_handles_legacy_format() {
-        let (_dir, project) = temp_project();
-        fs::create_dir_all(project.skills_dir()).expect("mkdir");
-
-        // Both formats: legacy bare and new pid-suffixed.
-        let legacy = project.skills_dir().join("_installing-skillX");
-        fs::create_dir_all(&legacy).expect("create legacy staging");
-        let new_format = project.skills_dir().join("_installing-skillX-9999-42");
-        fs::create_dir_all(&new_format).expect("create new staging");
-        let unrelated = project.skills_dir().join("_installing-other-1-2");
-        fs::create_dir_all(&unrelated).expect("create unrelated staging");
-
-        project
-            .cleanup_leftover_staging("skillX")
-            .expect("cleanup should succeed");
-
-        assert!(!legacy.exists(), "legacy staging dir should be removed");
-        assert!(!new_format.exists(), "new staging dir should be removed");
-        assert!(unrelated.exists(), "unrelated skill's staging is untouched");
     }
 
     #[test]
