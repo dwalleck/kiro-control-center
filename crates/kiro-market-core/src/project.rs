@@ -742,14 +742,11 @@ impl KiroProject {
                 }
             })?;
         }
-        // Refuse hardlinked sources before allocating the read. A hardlink
-        // shares an inode with some other path that could be a sensitive
-        // host file (`~/.ssh/id_rsa`); writing the inode's bytes into
-        // `.kiro/steering/` would exfiltrate them. Discovery's
-        // symlink/junction filter does not catch hardlinks (the share is
-        // at the inode level, not the path). Windows hardlinks lack a
-        // portable nlink accessor in std — platform.rs's reparse-point
-        // check covers junctions, which is the analogous Windows risk.
+        // Refuse hardlinked sources before allocating the read; see
+        // `SteeringError::SourceHardlinked` (and the canonical statement
+        // on `NativeParseFailure::HardlinkRefused`) for the threat model.
+        // Windows lacks a portable nlink accessor in std — platform.rs's
+        // reparse-point check covers junctions, the analogous Windows risk.
         #[cfg(unix)]
         {
             use std::os::unix::fs::MetadataExt;
@@ -1128,12 +1125,18 @@ impl KiroProject {
     /// Hash a translated-agent source file against its parent
     /// directory + filename. Returns `Ok(None)` for `None` input
     /// (test fixtures sometimes synthesize an `AgentDefinition` from
-    /// thin air); otherwise the blake3-prefixed hash. Lifted out of
-    /// `install_agent_inner` to keep that function under the line cap.
+    /// thin air); otherwise delegates to [`crate::hash::hash_artifact`]
+    /// for the canonical hash format. Lifted out of `install_agent_inner`
+    /// to keep that function under the line cap.
     fn hash_translated_source(source_path: Option<&Path>) -> crate::error::Result<Option<String>> {
         let Some(p) = source_path else {
             return Ok(None);
         };
+        // Production callers always pass a fully-qualified file path so
+        // both `parent()` and `file_name()` are guaranteed `Some`. The
+        // typed error branches exist so test fixtures and any future
+        // exotic caller (e.g. `Path::new("/")`, a bare filename) get a
+        // structured error instead of a panic.
         let parent = p.parent().ok_or_else(|| {
             std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
@@ -2084,9 +2087,9 @@ impl KiroProject {
         for rel in rel_paths {
             let src = scan_root.join(rel);
             // Refuse hardlinked sources before fs::copy. Same threat
-            // model as stage_steering_file: a hardlink shares an inode
-            // with another path that could be sensitive (`~/.ssh/id_rsa`).
-            // Discovery's symlink/junction filter doesn't catch this.
+            // model as stage_steering_file; see
+            // `NativeParseFailure::HardlinkRefused` for the canonical
+            // statement.
             #[cfg(unix)]
             {
                 use std::os::unix::fs::MetadataExt;
@@ -2226,7 +2229,8 @@ impl KiroProject {
     /// transfer. Both `source_hash` and `installed_hash` are set to
     /// the hash of the surviving files at `agents_dir` — post-transfer
     /// the destination IS the canonical truth for what this plugin
-    /// owns, since the original source bundle is no longer accessible.
+    /// owns, since the prior plugin's original source bundle is no
+    /// longer accessible.
     ///
     /// # Errors
     ///
@@ -4865,9 +4869,9 @@ mod tests {
         let scan_root = scratch.path().join("src");
         fs::create_dir_all(scan_root.join("prompts")).unwrap();
 
-        // The hardlink target lives outside the plugin tree to model
-        // the "exfil sensitive host file" threat. Both paths point at
-        // the same inode.
+        // The hardlink target lives outside the scan_root subtree to
+        // model the "exfil sensitive host file" threat. Both paths
+        // point at the same inode.
         let outside = scratch.path().join("sensitive.md");
         fs::write(&outside, b"sensitive").unwrap();
         let linked = scan_root.join("prompts/a.md");

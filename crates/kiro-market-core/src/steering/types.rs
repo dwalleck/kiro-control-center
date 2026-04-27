@@ -42,11 +42,11 @@ pub enum SteeringError {
         source: io::Error,
     },
 
-    /// Source file is a hardlink (Unix `nlink > 1`). The other path(s)
-    /// sharing the inode could be sensitive host files (`~/.ssh/id_rsa`,
-    /// etc.); the install refuses rather than write inode contents to
-    /// `.kiro/steering/`. `symlink_metadata` doesn't catch this —
-    /// hardlinks share the inode itself, not the path.
+    /// Source file is a hardlink (Unix `nlink > 1`). See
+    /// [`crate::agent::parse_native::NativeParseFailure::HardlinkRefused`]
+    /// for the canonical threat-model statement; the steering install
+    /// fires the same defense at the staging boundary so a hostile
+    /// manifest can't exfiltrate inode contents into `.kiro/steering/`.
     #[error("refusing hardlinked steering source at `{path}` (nlink={nlink})")]
     SourceHardlinked { path: PathBuf, nlink: u64 },
 
@@ -133,7 +133,9 @@ pub struct FailedSteeringFile {
 ///
 /// Per the original S3-2 amendment this enum was scoped wider; the
 /// `Skipped` variant was retired during PR-64 review when it became
-/// clear surfacing every README would teach users to ignore warnings.
+/// clear surfacing every README would teach users to ignore warnings,
+/// and that symlink/junction refusals are by-design security behaviour
+/// rather than actionable feedback for plugin authors.
 #[derive(Clone, Debug, Serialize)]
 #[cfg_attr(feature = "specta", derive(specta::Type))]
 #[non_exhaustive]

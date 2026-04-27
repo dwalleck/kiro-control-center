@@ -69,6 +69,11 @@ pub enum NativeParseFailure {
     /// etc.); the parser refuses rather than write inode contents to
     /// `.kiro/agents/`. `symlink_metadata` doesn't catch this — symlinks
     /// redirect the path, hardlinks share the inode itself.
+    ///
+    /// This is the canonical statement of the hardlink threat model;
+    /// the same defense fires at the steering and companion install
+    /// staging boundaries (see `SteeringError::SourceHardlinked` and
+    /// `stage_native_companion_files`) and refers back here.
     #[error("refusing hardlinked source at `{path}` (nlink={nlink})")]
     HardlinkRefused { path: PathBuf, nlink: u64 },
     /// Source file exceeds [`MAX_NATIVE_AGENT_BYTES`]. Refused before
@@ -129,12 +134,9 @@ pub fn parse_native_kiro_agent_file(
     if crate::platform::is_reparse_or_symlink(&md) {
         return Err(NativeParseFailure::SymlinkRefused(json_path.to_path_buf()));
     }
-    // Refuse hardlinked sources on Unix. A hardlink shares an inode with
-    // some other path; that path could be `~/.ssh/id_rsa` or another
-    // sensitive file, and writing the inode's bytes to `.kiro/agents/`
-    // would exfiltrate them. Mirror copy_dir_recursive's defense at the
-    // skill source path. Windows has no portable nlink accessor in std;
-    // the platform.rs reparse-point check covers Windows hardlinks via
+    // Refuse hardlinked sources on Unix; see `NativeParseFailure::HardlinkRefused`
+    // for the threat model. Windows has no portable nlink accessor in std;
+    // platform.rs's reparse-point check covers Windows hardlinks via
     // junction handling.
     #[cfg(unix)]
     {
@@ -221,11 +223,8 @@ fn first_nul_in_strings(value: &serde_json::Value) -> Option<String> {
                         path.push('/');
                         let escaped = k.replace('~', "~0").replace('/', "~1");
                         path.push_str(&escaped);
-                        let result = if path.is_empty() {
-                            "/".to_string()
-                        } else {
-                            path.clone()
-                        };
+                        // path is non-empty here: we just pushed '/' + escaped key.
+                        let result = path.clone();
                         path.truncate(saved_len);
                         return Some(result);
                     }

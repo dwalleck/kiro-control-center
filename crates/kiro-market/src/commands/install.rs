@@ -317,9 +317,6 @@ fn print_agent_outcome(result: &InstallAgentsResult) {
         let suffix = match companions.kind {
             kiro_market_core::project::InstallOutcomeKind::Idempotent => " (unchanged)".dimmed(),
             kiro_market_core::project::InstallOutcomeKind::ForceOverwrote => " (forced)".yellow(),
-            // Installed today + any future variant render neutrally
-            // until explicitly handled. Wildcard required by
-            // InstallOutcomeKind's #[non_exhaustive].
             _ => "".normal(),
         };
         let plural = if companions.files.len() == 1 { "" } else { "s" };
@@ -363,9 +360,6 @@ fn print_steering_outcome(result: &InstallSteeringResult, project: &KiroProject)
         let suffix = match outcome.kind {
             kiro_market_core::project::InstallOutcomeKind::Idempotent => " (unchanged)".dimmed(),
             kiro_market_core::project::InstallOutcomeKind::ForceOverwrote => " (forced)".yellow(),
-            // Installed today + any future variant render neutrally
-            // until explicitly handled. Wildcard required by
-            // InstallOutcomeKind's #[non_exhaustive].
             _ => "".normal(),
         };
         let rel = outcome
