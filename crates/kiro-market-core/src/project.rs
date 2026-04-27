@@ -4614,6 +4614,144 @@ mod tests {
 
         let installed_bytes = fs::read(&outcome.json_path).expect("read installed");
         assert_eq!(installed_bytes.as_slice(), body.as_slice());
+
+        // Closes pr-test-analyzer C5: native install writes bytes
+        // verbatim, so installed_hash must equal source_hash exactly.
+        // A future bug where staging accidentally normalizes / re-encodes
+        // before the hash would only surface as silent hash drift.
+        assert_eq!(
+            outcome.installed_hash, source_hash,
+            "native install must produce installed_hash == source_hash (verbatim copy invariant)"
+        );
+    }
+
+    #[test]
+    fn install_native_agent_rollback_restores_when_tracking_write_fails() {
+        // Closes pr-test-analyzer C3 (native agent half).
+        let (_dir, project) = temp_project();
+        let scratch = tempfile::tempdir().unwrap();
+        let body_v1 = br#"{"name":"rev","prompt":"v1"}"#;
+        let (bundle_v1, src_dir, _) = stage_native_source(scratch.path(), "rev", body_v1);
+        let h_v1 =
+            crate::hash::hash_artifact(&src_dir, &[std::path::PathBuf::from("rev.json")]).unwrap();
+        project
+            .install_native_agent(
+                &bundle_v1,
+                "m",
+                "p",
+                None,
+                &h_v1,
+                crate::service::InstallMode::New,
+            )
+            .expect("v1 install");
+
+        let dest = project.root.join(".kiro/agents/rev.json");
+        let v1_bytes = fs::read(&dest).unwrap();
+        assert_eq!(v1_bytes.as_slice(), body_v1.as_slice());
+
+        // Poison tracking so write fails: replace with a directory.
+        let tracking_path = project.root.join(".kiro/installed-agents.json");
+        fs::remove_file(&tracking_path).unwrap();
+        fs::create_dir_all(&tracking_path).unwrap();
+
+        // Force-install v2 (stage_native_source overwrites the source).
+        let body_v2 = br#"{"name":"rev","prompt":"v2"}"#;
+        let (bundle_v2, _, _) = stage_native_source(scratch.path(), "rev", body_v2);
+        let h_v2 =
+            crate::hash::hash_artifact(&src_dir, &[std::path::PathBuf::from("rev.json")]).unwrap();
+        let err = project
+            .install_native_agent(
+                &bundle_v2,
+                "m",
+                "p",
+                None,
+                &h_v2,
+                crate::service::InstallMode::Force,
+            )
+            .expect_err("tracking write must fail");
+        assert!(matches!(err, AgentError::InstallFailed { .. }));
+
+        // V1 bytes must be restored (backup-then-swap rollback).
+        assert_eq!(
+            fs::read(&dest).unwrap(),
+            v1_bytes,
+            "v1 must be restored from backup after tracking-write failure"
+        );
+        // No leftover .kiro-bak.
+        assert!(
+            !project.root.join(".kiro/agents/rev.json.kiro-bak").exists(),
+            "backup must be consumed by the restore"
+        );
+    }
+
+    #[test]
+    fn install_steering_file_rollback_restores_when_tracking_write_fails() {
+        // Closes pr-test-analyzer C3 (steering half).
+        let (_dir, project) = temp_project();
+        let scratch = tempfile::tempdir().unwrap();
+        let scan_root = scratch.path().join("src");
+        fs::create_dir_all(&scan_root).unwrap();
+        fs::write(scan_root.join("guide.md"), b"v1").unwrap();
+        let h_v1 = crate::hash::hash_artifact(&scan_root, &[PathBuf::from("guide.md")]).unwrap();
+
+        let discovered = crate::agent::DiscoveredNativeFile {
+            source: scan_root.join("guide.md"),
+            scan_root: scan_root.clone(),
+        };
+        project
+            .install_steering_file(
+                &discovered,
+                &h_v1,
+                crate::steering::SteeringInstallContext {
+                    mode: crate::service::InstallMode::New,
+                    marketplace: "m",
+                    plugin: "p",
+                    version: None,
+                },
+            )
+            .expect("v1 install");
+
+        let dest = project.root.join(".kiro/steering/guide.md");
+        assert_eq!(fs::read(&dest).unwrap(), b"v1");
+
+        // Poison the steering tracking path.
+        let tracking_path = project.root.join(".kiro/installed-steering.json");
+        fs::remove_file(&tracking_path).unwrap();
+        fs::create_dir_all(&tracking_path).unwrap();
+
+        // Force-install v2.
+        fs::write(scan_root.join("guide.md"), b"v2").unwrap();
+        let h_v2 = crate::hash::hash_artifact(&scan_root, &[PathBuf::from("guide.md")]).unwrap();
+        let err = project
+            .install_steering_file(
+                &discovered,
+                &h_v2,
+                crate::steering::SteeringInstallContext {
+                    mode: crate::service::InstallMode::Force,
+                    marketplace: "m",
+                    plugin: "p",
+                    version: None,
+                },
+            )
+            .expect_err("tracking write must fail");
+        assert!(matches!(
+            err,
+            crate::steering::SteeringError::TrackingIoFailed { .. }
+        ));
+
+        // V1 bytes must be restored.
+        assert_eq!(
+            fs::read(&dest).unwrap(),
+            b"v1",
+            "v1 must be restored from backup after tracking-write failure"
+        );
+        assert!(
+            !project
+                .root
+                .join(".kiro/steering/guide.md.kiro-bak")
+                .exists(),
+            "backup must be consumed by the restore"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -4990,6 +5128,42 @@ mod tests {
             .kiro_dir()
             .join("agents/prompts/a.md");
         assert_eq!(fs::read(&dest_a).expect("read"), b"prompt v2");
+    }
+
+    #[rstest]
+    fn install_native_companions_orphan_at_destination_fails_loudly(
+        companion_bundle: CompanionBundle,
+    ) {
+        // Closes pr-test-analyzer C1: classify_companion_collision
+        // raises OrphanFileAtDestination when a companion file exists
+        // on disk with no plugin owning it. Mirrors install_native_agent's
+        // orphan test for the companion path.
+        let dest = companion_bundle
+            .project
+            .root
+            .join(".kiro/agents/prompts/a.md");
+        fs::create_dir_all(dest.parent().unwrap()).unwrap();
+        fs::write(&dest, b"orphan").unwrap();
+
+        let err = install_companions(
+            &companion_bundle,
+            "m",
+            "p",
+            crate::service::InstallMode::New,
+        )
+        .expect_err("orphan must fail without --force");
+        assert!(matches!(err, AgentError::OrphanFileAtDestination { .. }));
+
+        // --force overwrites the orphan and tracks ownership.
+        let outcome = install_companions(
+            &companion_bundle,
+            "m",
+            "p",
+            crate::service::InstallMode::Force,
+        )
+        .expect("force install over orphan");
+        assert_eq!(outcome.kind, InstallOutcomeKind::ForceOverwrote);
+        assert_eq!(fs::read(&dest).unwrap(), b"prompt a");
     }
 
     #[rstest]
