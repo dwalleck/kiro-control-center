@@ -15,8 +15,16 @@ use thiserror::Error;
 use crate::agent::types::McpServerConfig;
 use crate::validation;
 
-/// A parsed native Kiro agent ready for install.
+/// A parsed native Kiro agent ready for install. The only producer is
+/// [`parse_native_kiro_agent_file`], which validates the JSON +
+/// security-checks the source file before constructing this struct.
+///
+/// `#[non_exhaustive]` blocks external crates from forging instances
+/// via struct literals — anyone outside this crate that needs a
+/// `NativeAgentBundle` must go through the parser, getting the
+/// validation guarantees with it.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct NativeAgentBundle {
     /// Absolute path to the source `.json` file.
     pub agent_json_source: PathBuf,

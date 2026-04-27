@@ -117,10 +117,18 @@ pub fn discover_agents_in_dirs(plugin_dir: &Path, scan_paths: &[String]) -> Vec<
     out
 }
 
-/// A file produced by native discovery. Carries the source path along with
-/// the resolved scan-root the file was discovered under, so the install
-/// layer can compute destination-relative paths without re-doing the join.
+/// A file produced by native discovery. Carries the source path along
+/// with the resolved scan-root the file was discovered under, so the
+/// install layer can compute destination-relative paths without
+/// re-doing the join.
+///
+/// `#[non_exhaustive]` blocks external crates from constructing
+/// arbitrary instances via struct literals. Production producers are
+/// the discover functions in this module; tests in this crate
+/// construct directly. Cross-crate consumers of this type only ever
+/// receive instances from those producers.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct DiscoveredNativeFile {
     /// Absolute path to the source file inside the plugin.
     pub source: PathBuf,

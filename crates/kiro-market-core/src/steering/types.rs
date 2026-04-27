@@ -35,6 +35,7 @@ pub struct SteeringInstallContext<'a> {
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum SteeringError {
+    #[non_exhaustive]
     #[error("steering source `{path}` could not be read")]
     SourceReadFailed {
         path: PathBuf,
@@ -47,27 +48,32 @@ pub enum SteeringError {
     /// for the canonical threat-model statement; the steering install
     /// fires the same defense at the staging boundary so a hostile
     /// manifest can't exfiltrate inode contents into `.kiro/steering/`.
+    #[non_exhaustive]
     #[error("refusing hardlinked steering source at `{path}` (nlink={nlink})")]
     SourceHardlinked { path: PathBuf, nlink: u64 },
 
+    #[non_exhaustive]
     #[error(
         "steering file `{rel}` would clobber a file owned by plugin `{owner}`; \
          pass --force to transfer ownership"
     )]
     PathOwnedByOtherPlugin { rel: PathBuf, owner: String },
 
+    #[non_exhaustive]
     #[error(
         "steering file exists at `{path}` but has no tracking entry; \
          remove it manually or pass --force"
     )]
     OrphanFileAtDestination { path: PathBuf },
 
+    #[non_exhaustive]
     #[error(
         "steering file `{rel}` content has changed since last install; \
          pass --force to overwrite"
     )]
     ContentChangedRequiresForce { rel: PathBuf },
 
+    #[non_exhaustive]
     #[error("steering tracking I/O failed at `{path}`")]
     TrackingIoFailed {
         path: PathBuf,
@@ -75,6 +81,7 @@ pub enum SteeringError {
         source: io::Error,
     },
 
+    #[non_exhaustive]
     #[error("hash computation failed at `{path}`")]
     HashFailed {
         path: PathBuf,
@@ -82,6 +89,7 @@ pub enum SteeringError {
         source: crate::hash::HashError,
     },
 
+    #[non_exhaustive]
     #[error("steering staging file `{path}` could not be written")]
     StagingWriteFailed {
         path: PathBuf,
@@ -89,6 +97,7 @@ pub enum SteeringError {
         source: io::Error,
     },
 
+    #[non_exhaustive]
     #[error("steering destination directory `{path}` could not be prepared")]
     DestinationDirFailed {
         path: PathBuf,
@@ -96,6 +105,7 @@ pub enum SteeringError {
         source: io::Error,
     },
 
+    #[non_exhaustive]
     #[error("steering tracking JSON malformed at `{path}`")]
     TrackingMalformed {
         path: PathBuf,
