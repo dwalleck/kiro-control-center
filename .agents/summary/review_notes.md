@@ -2,56 +2,59 @@
 
 ## Consistency Check
 
-### ✅ Passed
+All documentation files were cross-referenced for consistency. Findings:
 
-- **Terminology**: All documents consistently use "marketplace", "plugin", "skill", "agent" hierarchy
-- **Type names**: Types referenced across documents match actual Rust source (verified against `error.rs`, `service.rs`, `project.rs`, `cache.rs`)
-- **Architecture claims**: The shared-core pattern described in architecture.md is confirmed by Cargo.toml dependency declarations
-- **CLI commands**: Commands listed in interfaces.md match the `cli.rs` clap definitions exactly
-- **Tauri commands**: IPC functions listed match `lib.rs` `collect_commands!` macro invocation
-- **File paths**: Cache structure, project structure, and config paths are consistent across all documents
-- **Security model**: Path traversal prevention, MCP gating, and TLS enforcement are described consistently in architecture.md, components.md, and workflows.md
+### ✅ Consistent
+
+- **Crate names and paths** — consistent across all files (kiro-market-core, kiro-market, kiro-control-center)
+- **Feature flags** — `cli`, `specta`, `test-support` documented identically in codebase_info.md and architecture.md
+- **Security invariants** — path validation, MCP opt-in, TLS enforcement documented consistently in architecture.md and data_models.md
+- **Dependency versions** — match Cargo.toml workspace definitions
+- **IPC command list** — matches actual `collect_commands!` registration in lib.rs (17 commands)
+- **CLI command structure** — matches clap derive definitions in cli.rs
+- **On-disk file formats** — JSON schemas in data_models.md match actual serde derives in source
 
 ### ⚠️ Minor Notes
 
-- **GitBackend trait**: Documented as a trait in interfaces.md but the actual implementation uses a generic parameter `impl GitBackend` rather than trait objects. This is accurate but could be clearer about the compile-time dispatch.
-- **Error type `Io` and `Json`**: The data_models.md error diagram shows `Io(io::Error)` and `Json(serde_json::Error)` as variants. These are `From` conversions rather than named variants in the actual enum — the diagram is a simplification.
+1. **Workspace lint level**: AGENTS.md says `unsafe_code = "deny"` but Cargo.toml actually uses `unsafe_code = "forbid"` (stricter). The documentation should use "forbid" consistently.
+   - **Affected files**: Existing AGENTS.md (will be corrected in consolidation step)
+
+---
 
 ## Completeness Check
 
 ### Well-Documented Areas
 
-- Core library architecture and module responsibilities
-- CLI command structure and arguments
-- Tauri IPC interface
-- Security model and validation
-- Git operations and dual-backend strategy
-- CI pipeline structure
-- File format specifications
-- Dependency rationale
+- ✅ Core service layer (MarketplaceService) — thoroughly covered
+- ✅ Agent parsing pipeline (all dialects) — complete
+- ✅ Installation workflows — detailed sequence diagrams
+- ✅ Error hierarchy — full type tree documented
+- ✅ Security model — all invariants captured
+- ✅ CI pipeline — all jobs listed
+- ✅ Dependencies — rationale provided for non-obvious choices
 
 ### Gaps Identified
 
 | Area | Gap | Severity | Recommendation |
 |------|-----|----------|----------------|
-| Frontend components | Individual Svelte component props/events not documented | Low | Components are straightforward UI; bindings.ts provides the contract |
-| E2E tests | Playwright test coverage and patterns not described | Low | Only one test file exists; document when test suite grows |
-| Release workflow | `release.yml` not analyzed | Medium | Document release process (likely tag-triggered builds) |
-| `claude.yml` / `claude-code-review.yml` | Claude Code automation workflows not documented | Low | These are likely PR review automation; document if relevant to contributors |
-| Agent tool mapping | Specific Claude→Kiro and Copilot→Kiro tool mappings not enumerated | Medium | Would help contributors understand what tools are supported |
-| Kiro settings registry | Specific setting keys, categories, and defaults not listed | Medium | Would help frontend contributors understand available settings |
-| Error recovery | How the system recovers from partial failures (leftover staging, interrupted clones) | Low | Covered at high level in workflows; implementation details in code comments |
-| Multi-file skill merging | The process of merging companion `.md` references into a single SKILL.md | Medium | Mentioned in README but not detailed in workflows |
+| E2E tests | Playwright test structure not documented | Low | Add test patterns section to components.md if test coverage grows |
+| `.claude/` directory | Claude Code skills, commands, and agents in this repo not documented | Low | These are development aids, not part of the product. Document if they become part of the workflow |
+| `.kiro/` project agents | The 7 installed Kiro agents (code-reviewer, etc.) are not documented as project tooling | Low | These are operational tooling; mention in AGENTS.md Custom Instructions if relevant |
+| Hash change detection | The BLAKE3 source/installed hash comparison workflow could be more explicit | Low | Add a subsection to workflows.md explaining when hashes are compared |
+| Svelte 5 state patterns | The `$state` module pattern in `project.svelte.ts` is mentioned but not explained | Low | Add a brief pattern explanation to components.md frontend section |
+| Release workflow | `.github/workflows/release.yml` exists but release process not documented | Medium | Document release tagging and artifact generation |
+| `kiro-review.yml` workflow | Review automation workflow with `post-review-comments.py` not documented | Medium | Document the automated PR review pipeline |
 
 ### Language Support Limitations
 
-- **Svelte 5**: Runes-mode `$state`/`$derived` syntax is relatively new; tooling support for deep analysis is limited
-- **Tauri-specta**: RC-version library; API may shift before stable release
+- **Python scripts** (`.github/scripts/`): Analyzed structurally but not deeply. These are CI support scripts for posting review comments, not core product code.
+- **Svelte components**: Analyzed by file structure and naming. Deep component logic (reactive state, event handling) would require reading each `.svelte` file.
+
+---
 
 ## Recommendations
 
-1. **Document release workflow** — Analyze `release.yml` and add a release process section to workflows.md
-2. **Enumerate tool mappings** — Add a table of Claude/Copilot tool names → Kiro equivalents in interfaces.md
-3. **List settings registry** — Document available setting keys with their types and defaults
-4. **Detail skill merging** — Add a workflow diagram showing how multi-file skills are consolidated
-5. **Keep docs updated** — Re-run documentation generation after significant architectural changes
+1. **Correct `unsafe_code` level** in AGENTS.md consolidation: use "forbid" (matches Cargo.toml)
+2. **Document release process** if the project reaches regular release cadence
+3. **Document the review automation pipeline** (`kiro-review.yml` + `post-review-comments.py`) as it's a significant piece of project infrastructure
+4. **Consider adding a testing.md** if test patterns become complex enough to warrant separate documentation

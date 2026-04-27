@@ -2,70 +2,92 @@
 
 ## Project Identity
 
-- **Name**: kiro-marketplace-cli (Kiro Control Center)
+- **Name**: Kiro Control Center (kiro-control-center)
 - **Repository**: https://github.com/dwalleck/kiro-marketplace-cli
 - **License**: MIT
-- **Version**: 0.1.0
-
-## Purpose
-
-A desktop app and CLI for browsing, installing, and managing Claude Code marketplace skills in Kiro projects. Bridges the gap between Claude Code's marketplace skill format and Kiro's `.kiro/skills/<name>/SKILL.md` layout.
+- **Rust Edition**: 2024
+- **MSRV**: 1.85.0
+- **Description**: Desktop app and CLI for browsing, installing, and managing Claude Code marketplace skills and agents in Kiro projects.
 
 ## Technology Stack
 
 | Layer | Technology | Version |
 |-------|-----------|---------|
-| Core library | Rust | Edition 2024, MSRV 1.85.0 |
-| CLI | Rust + clap 4 (derive) | — |
-| Desktop backend | Tauri 2 | — |
-| Desktop frontend | Svelte 5 + SvelteKit | — |
-| Styling | TailwindCSS 4 | — |
-| Type bindings | tauri-specta 2 | — |
-| Git operations | gix 0.81 + CLI fallback | — |
-| Build system | Cargo (workspace) + npm | — |
-| CI/CD | GitHub Actions | — |
+| Core library | Rust | 1.85.0+ |
+| CLI | Rust + Clap 4 | derive-based |
+| Desktop backend | Tauri 2 | 2.x |
+| Desktop frontend | Svelte 5 + SvelteKit | 5.x |
+| Styling | Tailwind CSS 4 | 4.2.x |
+| TypeScript bindings | tauri-specta | 2.0.0-rc.24 |
+| Build tooling | Vite 6 | 6.x |
+| E2E testing | Playwright | 1.59+ |
+| Git operations | gix (primary) + git CLI (fallback) | 0.81 |
+| Hashing | BLAKE3 | 1.5 |
+| File locking | fs4 | 0.13 |
+| Platform linking | junction (Windows) | 1.x |
+
+## Languages
+
+| Language | Usage | Location |
+|----------|-------|----------|
+| Rust | Core logic, CLI, Tauri backend | `crates/` |
+| TypeScript | Frontend UI, bindings | `crates/kiro-control-center/src/` |
+| Svelte | UI components | `src/lib/components/` |
+| Python | CI review comment posting | `.github/scripts/` |
+| YAML | CI workflows, config | `.github/workflows/` |
 
 ## Workspace Structure
 
 ```
-kiro-marketplace-cli/
-├── Cargo.toml                    # Workspace root
+kiro-control-center/
 ├── crates/
-│   ├── kiro-market-core/         # Shared library (types, git, cache, project state)
-│   ├── kiro-market/              # CLI binary (kiro-market)
-│   └── kiro-control-center/      # Tauri desktop app (kcc)
-│       ├── src-tauri/            #   Rust backend
-│       └── src/                  #   Svelte 5 frontend
-├── .claude/                      # Claude Code hooks and skills
-└── .github/workflows/            # CI pipelines
+│   ├── kiro-market-core/       # Shared library (all business logic)
+│   ├── kiro-market/            # CLI binary (thin clap wrapper)
+│   └── kiro-control-center/    # Desktop app (Tauri 2 + Svelte 5)
+│       ├── src-tauri/          #   Rust backend
+│       └── src/                #   Svelte frontend
+├── xtask/                      # Dev tooling (hooks, formatting)
+├── .github/                    # CI workflows and scripts
+├── .claude/                    # Claude Code hooks config
+└── .kiro/                      # Kiro steering files
 ```
+
+## Crate Dependency Graph
+
+```mermaid
+graph TD
+    CLI["kiro-market<br/>(CLI binary)"] --> Core["kiro-market-core<br/>(shared library)"]
+    Desktop["kiro-control-center<br/>(Tauri app)"] --> Core
+    Core --> gix["gix (git)"]
+    Core --> fs4["fs4 (file locks)"]
+    Core --> blake3["blake3 (hashing)"]
+    Core --> serde["serde/serde_json"]
+    Core --> curl["curl (TLS shim)"]
+    Desktop --> tauri["tauri 2"]
+    Desktop --> specta["tauri-specta"]
+    CLI --> clap["clap 4"]
+    xtask["xtask<br/>(dev tools)"] -.-> Core
+```
+
+## Feature Flags (kiro-market-core)
+
+| Feature | Purpose | Consumer |
+|---------|---------|----------|
+| `cli` | Enables clap derives on types | kiro-market (CLI) |
+| `specta` | Enables TypeScript binding derives | kiro-control-center (Tauri) |
+| `test-support` | Exposes test utilities and mock backends | Integration tests |
 
 ## Key Metrics
 
-- **Workspace members**: 3 Rust crates + 1 frontend package
-- **Primary languages**: Rust, TypeScript, Svelte
-- **Test count**: 147+ across workspace
+- **Workspace members**: 4 crates
+- **Frontend components**: 10 Svelte components
+- **Tauri IPC commands**: 17 registered commands
+- **CI jobs**: 10+ (commitlint, format, lint, test, frontend, build-cli, build-tauri, cargo-deny, assert-curl-tls, coverage)
 
-## Build & Run
+## Build Outputs
 
-| Task | Command |
-|------|---------|
-| Build all | `cargo build` |
-| Test all | `cargo test` |
-| Lint | `cargo clippy --workspace -- -D warnings` |
-| Format | `cargo fmt --all` |
-| Frontend dev | `cd crates/kiro-control-center && npm run dev` |
-| Tauri dev | `cd crates/kiro-control-center && npx tauri dev` |
-| Regenerate TS bindings | `cargo test -p kiro-control-center --lib -- --ignored generate_types` |
-
-## Configuration Files
-
-| File | Purpose |
-|------|---------|
-| `Cargo.toml` (root) | Workspace definition, shared deps, lints |
-| `deny.toml` | cargo-deny license/advisory audit config |
-| `.claude/settings.json` | Claude Code hooks (rustfmt, clippy, block Cargo.lock) |
-| `.github/workflows/ci.yml` | Full CI pipeline |
-| `crates/kiro-control-center/package.json` | Frontend deps and scripts |
-| `crates/kiro-control-center/vite.config.js` | Vite bundler config |
-| `crates/kiro-control-center/svelte.config.js` | SvelteKit config (static adapter) |
+| Crate | Binary | Description |
+|-------|--------|-------------|
+| kiro-market | `kiro-market` | CLI tool |
+| kiro-control-center | `kcc` | Desktop application |
+| xtask | `xtask` | Dev tooling (hooks) |
