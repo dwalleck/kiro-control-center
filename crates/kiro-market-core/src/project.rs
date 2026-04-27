@@ -158,12 +158,12 @@ enum NativeCollisionDecision {
 
 /// Input bundle for [`KiroProject::install_native_companions`]. Groups the
 /// immutable refs the install needs so the public signature stays at one
-/// parameter (P-2 — avoiding `#[allow(clippy::too_many_arguments)]`).
+/// parameter.
 ///
 /// The caller is responsible for verifying that all `rel_paths` belong to
 /// a single `scan_root` — multi-scan-root native plugins are rejected at
-/// the service layer (see `MultipleScanRootsNotSupported`) before this
-/// function is called, so the install can assume the invariant.
+/// the service layer (see [`AgentError::MultipleScanRootsNotSupported`])
+/// before this function is called, so the install can assume the invariant.
 #[derive(Debug)]
 pub struct NativeCompanionsInput<'a> {
     /// The plugin's agents/ scan root. Used as the hashing base.
@@ -955,7 +955,7 @@ impl KiroProject {
     /// idempotent outcome or a `forced_overwrite` flag for the caller
     /// to thread through staging + promote.
     ///
-    /// The classifier is exhaustive over the four possible states:
+    /// The classifier is exhaustive over the five possible states:
     /// (a) tracked + same plugin + same hash → idempotent no-op,
     /// (b) tracked + same plugin + different hash → `ContentChanged`,
     /// (c) tracked + different plugin → `NameClash`,
@@ -1040,8 +1040,7 @@ impl KiroProject {
     /// - **Same plugin, different `source_hash`**: returns
     ///   [`AgentError::ContentChangedRequiresForce`] under
     ///   [`InstallMode::New`]; under [`InstallMode::Force`] the existing
-    ///   file is backed up, replaced, and the backup deleted on success
-    ///   (P-6).
+    ///   file is backed up, replaced, and the backup deleted on success.
     /// - **Different plugin**: returns
     ///   [`AgentError::NameClashWithOtherPlugin`] under
     ///   [`InstallMode::New`]; under [`InstallMode::Force`] ownership
@@ -1235,10 +1234,10 @@ impl KiroProject {
         Ok((staging, json_rel, installed_hash))
     }
 
-    /// Move a staged native agent JSON into its final destination using
-    /// the backup-then-swap pattern (P-6) when `forced_overwrite` is set.
-    /// Returns `had_backup` so the caller can restore on tracking failure
-    /// or drop the backup on success.
+    /// Move a staged native agent JSON into its final destination, backing
+    /// the existing file up to a `.kiro-bak` sibling when `forced_overwrite`
+    /// is set. Returns `had_backup` so the caller can restore on tracking
+    /// failure or drop the backup on success.
     ///
     /// Pre-conditions: caller has already done the collision check; under
     /// `forced_overwrite == false` the destination is guaranteed to not
@@ -1297,12 +1296,11 @@ impl KiroProject {
     /// [`AgentError::OrphanFileAtDestination`]. All three are upgraded to
     /// proceed-with-`forced_overwrite` under [`InstallMode::Force`].
     ///
-    /// Adopts the staging-before-rename + per-file backup-then-swap
-    /// pattern (P-1 + P-6): each file is staged at its rel layout under
-    /// a per-plugin staging dir, hashed there, then promoted with backups.
-    /// On any later failure (rename, tracking write) the backups are
-    /// restored — the bundle is either fully installed or fully rolled
-    /// back.
+    /// Each file is staged at its rel layout under a per-plugin staging
+    /// dir, hashed there before any destructive op, then promoted with
+    /// per-file backups. On any later failure (rename, tracking write)
+    /// the backups are restored — the bundle is either fully installed
+    /// or fully rolled back.
     ///
     /// Diff-and-removes orphans from a prior install of *this* plugin
     /// when the file set shrinks (e.g. a companion `prompts/old.md`
@@ -1567,9 +1565,9 @@ impl KiroProject {
     }
 
     /// Move every staged companion file into its destination under
-    /// `agents_root`, using backup-then-swap (P-6) when the destination
-    /// already exists. Returns `(placed_paths, backups)` so the caller
-    /// can roll back on later failure.
+    /// `agents_root`, backing each existing file up to a `.kiro-bak`
+    /// sibling when `forced_overwrite` is set. Returns `(placed_paths,
+    /// backups)` so the caller can roll back on later failure.
     ///
     /// `backups` is a `Vec<(original_path, backup_path)>` — restoring
     /// is `fs::rename(backup, original)`.
@@ -1580,7 +1578,7 @@ impl KiroProject {
         agents_dir: &Path,
         forced_overwrite: bool,
     ) -> crate::error::Result<CompanionPromotion> {
-        let _ = self; // method may grow lock-aware behavior later
+        let _ = self;
         let mut placed: Vec<PathBuf> = Vec::with_capacity(rel_paths.len());
         let mut backups: Vec<(PathBuf, PathBuf)> = Vec::new();
 

@@ -409,15 +409,34 @@ pub struct FailedAgent {
     pub error: crate::error::AgentError,
 }
 
+/// If the discovered `companion_files` span more than one scan root,
+/// return the set of roots so the caller can surface
+/// [`AgentError::MultipleScanRootsNotSupported`]. Companion ownership
+/// is plugin-scoped and tracking files are recorded relative to a
+/// single scan root; v1 doesn't disambiguate cross-root files.
+fn multiple_companion_scan_roots(
+    companion_files: &[crate::agent::DiscoveredNativeFile],
+) -> Option<Vec<PathBuf>> {
+    let unique_roots: std::collections::HashSet<&Path> = companion_files
+        .iter()
+        .map(|f| f.scan_root.as_path())
+        .collect();
+    if unique_roots.len() > 1 {
+        Some(unique_roots.into_iter().map(Path::to_path_buf).collect())
+    } else {
+        None
+    }
+}
+
 /// Project a [`crate::agent::NativeParseFailure`] into the right
 /// [`crate::error::AgentError`] variant for [`FailedAgent`]. Exhaustive
 /// over the parse-failure enum so a new variant forces a compile-time
 /// classification decision (CLAUDE.md classifier discipline).
 ///
-/// The post-Stage-1 hardening variants (`SymlinkRefused`, `FileTooLarge`,
+/// Security rejection variants (`SymlinkRefused`, `FileTooLarge`,
 /// `NulByteInJsonString`) are routed through [`AgentError::InstallFailed`]
-/// rather than getting their own typed variants — they're security
-/// rejections at parse time, not user-facing collision modes.
+/// rather than typed variants — they're parse-time refusals, not
+/// user-facing collision modes.
 fn native_parse_failure_to_agent_error(
     path: &Path,
     failure: crate::agent::NativeParseFailure,
@@ -1425,17 +1444,18 @@ impl MarketplaceService {
 
     /// Native install path: discovers `.json` agents under `scan_paths`,
     /// parses each via `parse_native_kiro_agent_file`, applies the MCP
-    /// opt-in gate (warning route per S2-12, parity with translated),
-    /// computes per-agent `source_hash`, and installs via
-    /// [`crate::project::KiroProject::install_native_agent`]. After all
-    /// per-agent installs, discovers companion files and installs them
-    /// as one atomic plugin-scoped bundle via
+    /// opt-in gate (matching the translated path's warning route so a
+    /// user installing both translated and native plugins sees one MCP
+    /// UX convention), computes per-agent `source_hash`, and installs
+    /// via [`crate::project::KiroProject::install_native_agent`]. After
+    /// all per-agent installs, discovers companion files and installs
+    /// them as one atomic plugin-scoped bundle via
     /// [`crate::project::KiroProject::install_native_companions`].
     ///
     /// Multi-scan-root native plugins (where companion files come from
     /// different `scan_paths` entries) are rejected via
-    /// `MultipleScanRootsNotSupported` per S2-11 — v1 supports a single
-    /// scan root only.
+    /// [`crate::error::AgentError::MultipleScanRootsNotSupported`] —
+    /// v1 supports a single scan root only.
     #[allow(clippy::too_many_arguments)] // mirrors install_plugin_agents
     fn install_native_kiro_cli_agents_inner(
         project: &crate::project::KiroProject,
@@ -1453,6 +1473,20 @@ impl MarketplaceService {
             crate::agent::discover::discover_native_kiro_agents_in_dirs(plugin_dir, scan_paths);
         let companion_files =
             crate::agent::discover::discover_native_companion_files(plugin_dir, scan_paths);
+
+        // Reject multi-scan-root companion bundles BEFORE installing any
+        // agents. Otherwise agents from one scan root commit to disk
+        // before the companion bundle from a second scan root fails the
+        // whole install — leaving the user with a partial install they
+        // didn't ask for.
+        if let Some(roots) = multiple_companion_scan_roots(&companion_files) {
+            result.failed.push(FailedAgent {
+                name: None,
+                source_path: plugin_dir.to_path_buf(),
+                error: crate::error::AgentError::MultipleScanRootsNotSupported { roots },
+            });
+            return result;
+        }
 
         for f in &agent_files {
             Self::install_one_native_agent(
@@ -1511,7 +1545,10 @@ impl MarketplaceService {
             }
         };
 
-        // MCP opt-in gate (S2-12: warning route, parity with translated).
+        // MCP opt-in gate — warning route, matching the translated path
+        // so a user installing both kinds of plugins sees one UX
+        // convention. Subprocess-spawning agents always require explicit
+        // --accept-mcp.
         if !accept_mcp && !bundle.mcp_servers.is_empty() {
             let transports: Vec<String> = bundle
                 .mcp_servers
@@ -1577,10 +1614,11 @@ impl MarketplaceService {
         }
     }
 
-    /// Companion install body. Rejects multi-scan-root plugins per S2-11
-    /// (v1 supports a single scan root only — companion ownership tracking
-    /// would otherwise need to disambiguate which scan root each file
-    /// belongs to).
+    /// Companion install body. Caller (`install_native_kiro_cli_agents_inner`)
+    /// must verify single-scan-root upstream via `multiple_companion_scan_roots`
+    /// before calling this — otherwise the `rel_paths` derivation below
+    /// would silently project cross-root files into the wrong
+    /// `agents_root` namespace.
     #[allow(clippy::too_many_arguments)] // each arg is independent upstream context
     fn install_native_companions_for_plugin(
         project: &crate::project::KiroProject,
@@ -1592,18 +1630,6 @@ impl MarketplaceService {
         version: Option<&str>,
         result: &mut InstallAgentsResult,
     ) {
-        let unique_roots: std::collections::HashSet<&PathBuf> =
-            companion_files.iter().map(|f| &f.scan_root).collect();
-        if unique_roots.len() > 1 {
-            let roots: Vec<PathBuf> = unique_roots.into_iter().cloned().collect();
-            result.failed.push(FailedAgent {
-                name: None,
-                source_path: plugin_dir.to_path_buf(),
-                error: crate::error::AgentError::MultipleScanRootsNotSupported { roots },
-            });
-            return;
-        }
-
         let scan_root = companion_files[0].scan_root.clone();
         let mut rel_paths: Vec<PathBuf> = Vec::with_capacity(companion_files.len());
         for f in companion_files {
@@ -2557,8 +2583,10 @@ mod tests {
     #[test]
     fn install_plugin_agents_dispatches_to_native_when_format_kiro_cli() {
         // End-to-end: a plugin with format: "kiro-cli" gets routed to the
-        // native install path. Verifies the dispatcher (Task 18) wires
-        // format: Some(KiroCli) → install_native_kiro_cli_agents_inner.
+        // native install path. Pins that format: Some(KiroCli) →
+        // install_native_kiro_cli_agents_inner so a future dispatcher
+        // change can't silently route native plugins through the
+        // translated parser.
 
         // Plugin source: a single native JSON agent + a companion file.
         let plugin_tmp = tempfile::tempdir().expect("plugin tempdir");
@@ -2620,10 +2648,10 @@ mod tests {
 
     #[test]
     fn install_plugin_agents_native_path_routes_mcp_to_warning() {
-        // S2-12: native MCP gate must use InstallWarning::McpServersRequireOptIn
-        // (parity with translated path), NOT a hard failure. Pinned because
-        // the original Stage 2 plan had it as failed.push(...) and the
-        // amendment reverted to warning-route for UX consistency.
+        // Native MCP gate must use InstallWarning::McpServersRequireOptIn
+        // (parity with the translated path), NOT a hard failure. A user
+        // installing both kinds of plugins should see one MCP UX
+        // convention.
         let plugin_tmp = tempfile::tempdir().expect("plugin tempdir");
         let agents = plugin_tmp.path().join("agents");
         std::fs::create_dir_all(&agents).expect("create agents");
@@ -2674,6 +2702,64 @@ mod tests {
             "expected McpServersRequireOptIn warning, got: {:?}",
             result.warnings
         );
+    }
+
+    #[test]
+    fn install_plugin_agents_native_multi_scan_root_rejects_before_any_agent_lands() {
+        // Two scan paths each containing an agent + companion. Companion
+        // files come from two distinct scan roots, which v1 rejects. The
+        // critical invariant: NO agents commit to disk before the
+        // rejection fires — otherwise the user is left with a partial
+        // install they didn't ask for.
+        let plugin_tmp = tempfile::tempdir().expect("plugin tempdir");
+        for scan in ["agents", "extras"] {
+            let dir = plugin_tmp.path().join(scan);
+            let prompts = dir.join("prompts");
+            std::fs::create_dir_all(&prompts).expect("create scan dir");
+            std::fs::write(
+                dir.join(format!("{scan}-agent.json")),
+                format!(r#"{{"name":"{scan}-agent","prompt":"x"}}"#),
+            )
+            .expect("write agent");
+            std::fs::write(prompts.join(format!("{scan}.md")), b"prompt body")
+                .expect("write companion");
+        }
+
+        let project_tmp = tempfile::tempdir().expect("project tempdir");
+        let project = crate::project::KiroProject::new(project_tmp.path().to_path_buf());
+        let (_dir, svc) = crate::service::test_support::temp_service();
+
+        let result = svc.install_plugin_agents(
+            &project,
+            plugin_tmp.path(),
+            &["./agents/".to_string(), "./extras/".to_string()],
+            InstallMode::New,
+            false,
+            "m",
+            "p",
+            None,
+            Some(crate::plugin::PluginFormat::KiroCli),
+        );
+
+        // The bundle is rejected wholesale.
+        assert_eq!(result.failed.len(), 1);
+        assert!(matches!(
+            &result.failed[0].error,
+            crate::error::AgentError::MultipleScanRootsNotSupported { .. }
+        ));
+
+        // No agents commit, no companions commit.
+        assert!(
+            result.installed.is_empty(),
+            "agents must NOT install when multi-scan-root is rejected: {:?}",
+            result.installed
+        );
+        assert!(result.installed_native.is_empty());
+        assert!(result.installed_companions.is_none());
+
+        // Tracking file was never written for either agent.
+        let tracking = project.load_installed_agents().expect("load tracking");
+        assert!(tracking.agents.is_empty(), "no agents should be tracked");
     }
 
     /// Mock git backend that records calls and creates a minimal marketplace
