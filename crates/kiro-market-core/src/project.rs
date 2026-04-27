@@ -1873,7 +1873,14 @@ impl KiroProject {
                 input.rel_paths,
             );
         }
-        Self::remove_diffed_prior_files(&installed, input.plugin, input.rel_paths, agents_dir);
+
+        // Capture the prior file set BEFORE replacing the tracking entry
+        // so we can remove diffed-out files post-tracking-write (atomicity
+        // fix per code-reviewer #1 / silent-failure-hunter #2). Removing
+        // them here would leave the user with deleted files AND phantom
+        // tracking on a write failure.
+        let diffed_prior_files =
+            Self::diff_prior_companion_files(&installed, input.plugin, input.rel_paths);
 
         installed.native_companions.insert(
             input.plugin.to_string(),
@@ -1897,6 +1904,13 @@ impl KiroProject {
             Self::rollback_companion_promotion(&placed, &backups);
             return Err(e);
         }
+
+        // Tracking succeeded — NOW remove any prior-install files the
+        // shrunk file set doesn't claim. Best-effort: a failure here
+        // leaves slightly more files on disk than tracking claims, which
+        // is strictly better than removing them before the tracking
+        // write and losing them if the write fails.
+        Self::remove_companion_files_best_effort(&diffed_prior_files, agents_dir, input.plugin);
 
         // Success — drop the backup files. Best-effort.
         for (_orig, backup) in &backups {
@@ -2150,24 +2164,37 @@ impl KiroProject {
             .retain(|_, meta| !meta.files.is_empty());
     }
 
-    /// When the same plugin reinstalls with a different file set, walk
-    /// the prior tracked files NOT in the new set and remove them from
-    /// disk. Best-effort — failures are logged. The new tracking entry
-    /// will be written next, replacing the prior `files` list.
-    fn remove_diffed_prior_files(
+    /// Compute the prior tracked companion files for `plugin` that are
+    /// NOT present in the new `rel_paths` set. Pure: doesn't touch disk
+    /// or mutate `installed`. Caller should compute this BEFORE
+    /// replacing the plugin's tracking entry, then remove the files
+    /// AFTER `write_agent_tracking` succeeds — see
+    /// [`Self::remove_companion_files_best_effort`] for the removal
+    /// half.
+    fn diff_prior_companion_files(
         installed: &InstalledAgents,
         plugin: &str,
         rel_paths: &[PathBuf],
-        agents_dir: &Path,
-    ) {
+    ) -> Vec<PathBuf> {
         let Some(prior) = installed.native_companions.get(plugin) else {
-            return;
+            return Vec::new();
         };
         let new_set: std::collections::HashSet<&PathBuf> = rel_paths.iter().collect();
-        for rel in &prior.files {
-            if new_set.contains(rel) {
-                continue;
-            }
+        prior
+            .files
+            .iter()
+            .filter(|f| !new_set.contains(*f))
+            .cloned()
+            .collect()
+    }
+
+    /// Best-effort removal of prior-install companion files that have
+    /// dropped out of the new tracking entry. Failures are logged but
+    /// don't propagate — the file set is already canonical in
+    /// tracking, and a stray on-disk file is strictly less harmful
+    /// than rolling back a successful install.
+    fn remove_companion_files_best_effort(rel_paths: &[PathBuf], agents_dir: &Path, plugin: &str) {
+        for rel in rel_paths {
             let abs = agents_dir.join(rel);
             if let Err(e) = fs::remove_file(&abs)
                 && e.kind() != std::io::ErrorKind::NotFound
@@ -2176,7 +2203,7 @@ impl KiroProject {
                     plugin,
                     path = %abs.display(),
                     error = %e,
-                    "failed to remove orphaned prior companion file"
+                    "failed to remove orphaned prior companion file post-success"
                 );
             }
         }
@@ -4412,6 +4439,78 @@ mod tests {
             !tracking.native_companions.contains_key("p"),
             "empty bundle must NOT create a tracking entry"
         );
+    }
+
+    #[test]
+    fn install_native_companions_force_shrink_preserves_files_when_tracking_write_fails() {
+        // Atomicity regression test (code-reviewer #1 / silent-failure-hunter #2).
+        // Pre-fix flow removed diffed prior files BEFORE write_agent_tracking,
+        // so a tracking-write failure left the user with files removed AND
+        // tracking still claiming them. Now diff captured pre-mutation,
+        // removed only AFTER successful tracking write.
+        let (_dir, project) = temp_project();
+
+        // Stage a 2-file bundle for plugin P.
+        let scratch = tempfile::tempdir().unwrap();
+        let scan_root = scratch.path().join("src");
+        fs::create_dir_all(scan_root.join("prompts")).unwrap();
+        fs::write(scan_root.join("prompts/a.md"), b"a v1").unwrap();
+        fs::write(scan_root.join("prompts/b.md"), b"b v1").unwrap();
+        let rel_paths_v1 = vec![PathBuf::from("prompts/a.md"), PathBuf::from("prompts/b.md")];
+        let h_v1 = crate::hash::hash_artifact(&scan_root, &rel_paths_v1).unwrap();
+
+        project
+            .install_native_companions(&NativeCompanionsInput {
+                scan_root: &scan_root,
+                rel_paths: &rel_paths_v1,
+                marketplace: "m",
+                plugin: "p",
+                version: None,
+                source_hash: &h_v1,
+                mode: crate::service::InstallMode::New,
+            })
+            .expect("v1 install");
+
+        let dest_a = project.root.join(".kiro/agents/prompts/a.md");
+        let dest_b = project.root.join(".kiro/agents/prompts/b.md");
+        assert!(dest_a.exists() && dest_b.exists());
+
+        // Poison tracking so write_agent_tracking fails: replace the
+        // tracking file with a directory of the same name.
+        let tracking_path = project.root.join(".kiro/installed-agents.json");
+        fs::remove_file(&tracking_path).unwrap();
+        fs::create_dir_all(&tracking_path).unwrap();
+
+        // Bump a.md content + drop b.md from the new bundle. This is
+        // the shrink case: prior tracking owned [a.md, b.md], new
+        // bundle owns [a.md] only. Force install needed because
+        // a.md content changed.
+        fs::write(scan_root.join("prompts/a.md"), b"a v2").unwrap();
+        let rel_paths_v2 = vec![PathBuf::from("prompts/a.md")];
+        let h_v2 = crate::hash::hash_artifact(&scan_root, &rel_paths_v2).unwrap();
+
+        let err = project
+            .install_native_companions(&NativeCompanionsInput {
+                scan_root: &scan_root,
+                rel_paths: &rel_paths_v2,
+                marketplace: "m",
+                plugin: "p",
+                version: None,
+                source_hash: &h_v2,
+                mode: crate::service::InstallMode::Force,
+            })
+            .expect_err("tracking write must fail");
+        assert!(matches!(err, AgentError::InstallFailed { .. }));
+
+        // Critical: b.md must still exist on disk. Pre-fix it would be
+        // gone (removed before the failed tracking write).
+        assert!(
+            dest_b.exists(),
+            "b.md must survive tracking-write failure on shrink — pre-fix \
+             behaviour removed it before the write attempt"
+        );
+        // a.md must contain v1 content (rollback restored from backup).
+        assert_eq!(fs::read(&dest_a).unwrap(), b"a v1");
     }
 
     /// Fixture: a tempdir, a project, a single-file companion bundle
