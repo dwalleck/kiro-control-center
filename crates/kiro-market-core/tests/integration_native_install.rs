@@ -21,6 +21,7 @@ use kiro_market_core::service::test_support::temp_service;
 use kiro_market_core::service::{
     AgentInstallContext, InstallAgentsResult, InstallMode, MarketplaceService,
 };
+use kiro_market_core::steering::{InstallSteeringResult, SteeringInstallContext};
 use rstest::{fixture, rstest};
 use tempfile::{TempDir, tempdir};
 
@@ -72,6 +73,32 @@ impl IntegrationHarness {
             install_ctx,
         );
         (ctx.format, result)
+    }
+
+    /// Install steering files for `plugin_dir` under `(marketplace, plugin)`.
+    /// Reads the steering scan paths from the resolved install context so
+    /// the manifest's declared steering paths drive the scan.
+    fn install_steering(
+        &self,
+        plugin_dir: &Path,
+        marketplace: &str,
+        plugin: &str,
+        mode: InstallMode,
+    ) -> InstallSteeringResult {
+        let ctx = MarketplaceService::resolve_plugin_install_context_from_dir(plugin_dir)
+            .expect("resolve plugin install context");
+        let steering_ctx = SteeringInstallContext {
+            mode,
+            marketplace,
+            plugin,
+            version: None,
+        };
+        self.svc.install_plugin_steering(
+            &self.project,
+            plugin_dir,
+            &ctx.steering_scan_paths,
+            steering_ctx,
+        )
     }
 }
 
@@ -273,5 +300,177 @@ fn end_to_end_translated_plugin_unaffected_by_native_dispatch(harness: Integrati
     assert_eq!(
         tracking.agents.get("rev").unwrap().dialect,
         AgentDialect::Claude
+    );
+}
+
+/// Stage a starter-kit-shaped plugin tree with both agents/companions
+/// AND a steering directory:
+///
+/// ```text
+/// <plugin-name>/
+///   plugin.json                # format: "kiro-cli"
+///   agents/
+///     <name>.json
+///     prompts/<name>.md
+///   steering/
+///     <steering-file>          # e.g. process.md
+/// ```
+fn stage_starter_kit_plugin_with_steering(
+    plugin_root: &Path,
+    plugin_name: &str,
+    agent_names: &[&str],
+    steering_files: &[(&str, &[u8])],
+) -> PathBuf {
+    let plugin_dir = stage_starter_kit_plugin(plugin_root, plugin_name, agent_names);
+    let steering = plugin_dir.join("steering");
+    fs::create_dir_all(&steering).expect("create steering dir");
+    for (name, body) in steering_files {
+        fs::write(steering.join(name), body).expect("write steering file");
+    }
+    plugin_dir
+}
+
+#[rstest]
+fn end_to_end_native_plugin_with_agents_companions_and_steering(harness: IntegrationHarness) {
+    let agent_names = ["reviewer", "tester"];
+    let steering_files: &[(&str, &[u8])] = &[("process.md", b"# Process\n\nshared rules\n")];
+    let plugin_dir = stage_starter_kit_plugin_with_steering(
+        harness.plugin_root.path(),
+        "fake-reviewers",
+        &agent_names,
+        steering_files,
+    );
+
+    // Agents + companions install first.
+    let (format, agent_result) = harness.install(
+        &plugin_dir,
+        "test-marketplace",
+        "fake-reviewers",
+        InstallMode::New,
+    );
+    assert_eq!(format, Some(PluginFormat::KiroCli));
+    assert!(
+        agent_result.failed.is_empty(),
+        "no agent failures: {:?}",
+        agent_result.failed
+    );
+    assert_eq!(agent_result.installed.len(), 2);
+
+    // Steering install runs in its own pass.
+    let steering_result = harness.install_steering(
+        &plugin_dir,
+        "test-marketplace",
+        "fake-reviewers",
+        InstallMode::New,
+    );
+    assert!(
+        steering_result.failed.is_empty(),
+        "no steering failures: {:?}",
+        steering_result.failed
+    );
+    assert_eq!(steering_result.installed.len(), 1);
+    assert_eq!(
+        steering_result.installed[0].kind,
+        InstallOutcomeKind::Installed
+    );
+
+    // All three destinations present.
+    assert_starter_kit_landed(
+        harness.project_root.path(),
+        &harness.project,
+        "fake-reviewers",
+        &agent_names,
+    );
+    assert!(
+        harness
+            .project_root
+            .path()
+            .join(".kiro/steering/process.md")
+            .exists(),
+        "steering file must land at .kiro/steering/"
+    );
+
+    // Tracking entry for the steering file.
+    let steering_tracking = harness
+        .project
+        .load_installed_steering()
+        .expect("load steering tracking");
+    let entry = steering_tracking
+        .files
+        .get(std::path::Path::new("process.md"))
+        .expect("steering tracking entry written");
+    assert_eq!(entry.plugin, "fake-reviewers");
+    assert_eq!(entry.marketplace, "test-marketplace");
+
+    // Idempotent reinstall of all three install targets.
+    let (_, agents_again) = harness.install(
+        &plugin_dir,
+        "test-marketplace",
+        "fake-reviewers",
+        InstallMode::New,
+    );
+    assert!(
+        agents_again
+            .installed_native
+            .iter()
+            .all(|o| o.kind == InstallOutcomeKind::Idempotent),
+        "every native agent outcome must be idempotent on reinstall"
+    );
+
+    let steering_again = harness.install_steering(
+        &plugin_dir,
+        "test-marketplace",
+        "fake-reviewers",
+        InstallMode::New,
+    );
+    assert!(
+        steering_again
+            .installed
+            .iter()
+            .all(|o| o.kind == InstallOutcomeKind::Idempotent),
+        "every steering outcome must be idempotent on reinstall: {:?}",
+        steering_again.installed
+    );
+}
+
+#[rstest]
+fn end_to_end_steering_multi_scan_root_installs_all_files(harness: IntegrationHarness) {
+    // S3-11: multi-scan-root steering is supported. A plugin manifest
+    // declaring `steering: ["./a/", "./b/"]` with distinct .md files
+    // in each must install all of them — no upstream rejection like
+    // the companion bundle's MultipleScanRootsNotSupported.
+    let plugin_name = "multi-root";
+    let plugin_dir = harness.plugin_root.path().join(plugin_name);
+    fs::create_dir_all(plugin_dir.join("a")).unwrap();
+    fs::create_dir_all(plugin_dir.join("b")).unwrap();
+    fs::write(plugin_dir.join("a/alpha.md"), b"alpha body").unwrap();
+    fs::write(plugin_dir.join("b/beta.md"), b"beta body").unwrap();
+    fs::write(
+        plugin_dir.join("plugin.json"),
+        format!(r#"{{"name":"{plugin_name}","steering":["./a/","./b/"]}}"#),
+    )
+    .unwrap();
+
+    let result = harness.install_steering(&plugin_dir, "m", plugin_name, InstallMode::New);
+
+    assert!(
+        result.failed.is_empty(),
+        "no failures expected: {:?}",
+        result.failed
+    );
+    assert_eq!(result.installed.len(), 2);
+    assert!(
+        harness
+            .project_root
+            .path()
+            .join(".kiro/steering/alpha.md")
+            .exists()
+    );
+    assert!(
+        harness
+            .project_root
+            .path()
+            .join(".kiro/steering/beta.md")
+            .exists()
     );
 }
