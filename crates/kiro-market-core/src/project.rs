@@ -2373,7 +2373,8 @@ impl KiroProject {
         rel_paths: &[PathBuf],
         agents_dir: &Path,
     ) -> crate::error::Result<()> {
-        let new_set: std::collections::HashSet<&PathBuf> = rel_paths.iter().collect();
+        let new_set: std::collections::HashSet<&Path> =
+            rel_paths.iter().map(PathBuf::as_path).collect();
         let other_plugins: Vec<String> = installed
             .native_companions
             .keys()
@@ -2384,7 +2385,7 @@ impl KiroProject {
         for p in other_plugins {
             if let Some(meta) = installed.native_companions.get_mut(&p) {
                 let len_before = meta.files.len();
-                meta.files.retain(|f| !new_set.contains(f));
+                meta.files.retain(|f| !new_set.contains(f.as_path()));
                 if meta.files.len() != len_before {
                     modified.push(p);
                 }
@@ -2424,11 +2425,12 @@ impl KiroProject {
         let Some(prior) = installed.native_companions.get(plugin) else {
             return Vec::new();
         };
-        let new_set: std::collections::HashSet<&PathBuf> = rel_paths.iter().collect();
+        let new_set: std::collections::HashSet<&Path> =
+            rel_paths.iter().map(PathBuf::as_path).collect();
         prior
             .files
             .iter()
-            .filter(|f| !new_set.contains(*f))
+            .filter(|f| !new_set.contains(f.as_path()))
             .cloned()
             .collect()
     }
