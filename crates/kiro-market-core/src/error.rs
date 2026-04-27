@@ -286,7 +286,7 @@ pub enum AgentError {
     },
 
     // -----------------------------------------------------------------
-    // Native-import parsing failures (Stage 2).
+    // Native-import parsing failures.
     // Mirror translated-path `ParseFailed` but with structured payloads
     // matching the JSON parse pipeline (no frontmatter / YAML stages).
     // -----------------------------------------------------------------
@@ -317,7 +317,7 @@ pub enum AgentError {
     },
 
     // -----------------------------------------------------------------
-    // Cross-plugin / collision errors (Stage 2).
+    // Cross-plugin / collision errors.
     // -----------------------------------------------------------------
     /// Native agent install would clobber an agent owned by another plugin.
     /// Without `--force`, ownership is preserved by the existing owner.
@@ -360,7 +360,7 @@ pub enum AgentError {
 
     // -----------------------------------------------------------------
     // Catch-all for non-AgentError infrastructure failures that surface
-    // through the install pipeline (S2-6).
+    // through the install pipeline.
     // -----------------------------------------------------------------
     /// An infrastructure error (I/O, hash, JSON) bubbled up through an
     /// install attempt. Used at the boundary where a top-level [`Error`]

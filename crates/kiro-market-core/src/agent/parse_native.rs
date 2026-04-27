@@ -10,6 +10,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
+use thiserror::Error;
 
 use crate::agent::types::McpServerConfig;
 use crate::validation;
@@ -40,28 +41,26 @@ pub struct NativeAgentBundle {
 /// Failure modes for [`parse_native_kiro_agent_file`]. Mirrors the existing
 /// [`super::ParseFailure`] for translated agents — structured variants
 /// instead of free-form strings, so callers can branch on the semantic.
-#[derive(Debug)]
+///
+/// `IoError` and `InvalidJson` carry their underlying cause via `#[source]`
+/// so [`crate::error::error_full_chain`] walks past the wrapper at terminal
+/// rendering surfaces.
+#[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum NativeParseFailure {
     /// File could not be read (permission denied, racy delete, etc.).
-    IoError(io::Error),
+    #[error("read failed")]
+    IoError(#[source] io::Error),
     /// File is not valid JSON.
-    InvalidJson(serde_json::Error),
+    #[error("invalid JSON")]
+    InvalidJson(#[source] serde_json::Error),
     /// JSON parsed but the required `name` field is missing.
+    #[error("missing required `name` field")]
     MissingName,
     /// `name` field is present but failed [`validation::validate_name`].
     /// Carries the validator's reason.
+    #[error("invalid `name`: {0}")]
     InvalidName(String),
-}
-
-impl std::fmt::Display for NativeParseFailure {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            Self::IoError(e) => write!(f, "read failed: {e}"),
-            Self::InvalidJson(e) => write!(f, "invalid JSON: {e}"),
-            Self::MissingName => f.write_str("missing required `name` field"),
-            Self::InvalidName(r) => write!(f, "invalid `name`: {r}"),
-        }
-    }
 }
 
 /// The minimal projection we read out of the JSON to validate + classify
@@ -187,6 +186,29 @@ mod tests {
         let nonexistent = tmp.path().join("nope.json");
         let err = parse_native_kiro_agent_file(&nonexistent, tmp.path()).expect_err("must fail");
         assert!(matches!(err, NativeParseFailure::IoError(_)));
+    }
+
+    #[test]
+    fn io_error_exposes_source_chain() {
+        use std::error::Error as _;
+        let tmp = tempdir().unwrap();
+        let nonexistent = tmp.path().join("nope.json");
+        let err = parse_native_kiro_agent_file(&nonexistent, tmp.path()).expect_err("must fail");
+        assert_eq!(err.to_string(), "read failed");
+        let source = err.source().expect("source chain populated by #[source]");
+        assert!(source.to_string().to_lowercase().contains("file"));
+    }
+
+    #[test]
+    fn invalid_json_exposes_source_chain() {
+        use std::error::Error as _;
+        let tmp = tempdir().unwrap();
+        let p = write_json(tmp.path(), "x.json", r"{not json");
+        let err = parse_native_kiro_agent_file(&p, tmp.path()).expect_err("must fail");
+        assert_eq!(err.to_string(), "invalid JSON");
+        let source = err.source().expect("source chain populated by #[source]");
+        // serde_json error message references the line / column.
+        assert!(!source.to_string().is_empty());
     }
 
     #[test]

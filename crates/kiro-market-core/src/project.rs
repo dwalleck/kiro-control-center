@@ -93,7 +93,7 @@ pub struct InstalledAgentMeta {
 ///   bundle entry. This makes the file plugin-owned from day one, so a
 ///   later native plugin install at the same path is correctly flagged
 ///   as a cross-plugin clash rather than a free-for-the-taking orphan.
-/// - The native-agent install path (Stage 2): plugin-wide companion
+/// - The native-agent install path: plugin-wide companion
 ///   bundles discovered alongside native agent JSONs.
 ///
 /// Ownership is at the plugin level (not per-agent), so this entry
@@ -785,7 +785,7 @@ impl KiroProject {
 
     /// Synthesize/update the per-plugin `native_companions` tracking entry
     /// to register this agent's prompt file as plugin-owned. Called from
-    /// the translated agent install path; Stage 2's native install path
+    /// the translated agent install path; the native install path
     /// will call this with its own companion bundle.
     ///
     /// Recomputes the per-plugin companion hash over the full union of
@@ -804,8 +804,7 @@ impl KiroProject {
     ) -> crate::error::Result<()> {
         // Synthesize/update the companion entry for this plugin's prompt
         // files. We track the union of installed prompt paths so the
-        // native install path (Stage 2) sees them as plugin-owned, not
-        // orphaned.
+        // native install path sees them as plugin-owned, not orphaned.
         //
         // Hash semantics: source_hash == installed_hash because the
         // translated path does not separately track original .md source

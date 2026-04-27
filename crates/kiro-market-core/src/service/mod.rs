@@ -377,17 +377,11 @@ pub struct InstallAgentsResult {
 
 /// An agent that failed to install, with the typed error.
 ///
-/// Pre-Stage-2 this carried `name: String` (falling back to source path)
-/// and `error: String` (pre-rendered via `error_full_chain`). Stage 2
-/// upgrades to a typed shape so frontends can branch on cause rather than
-/// substring-matching the rendered message:
-///
-/// - `name: Option<String>` — agent name when parsing reached that point;
-///   `None` for pre-parse failures (caller falls back to `source_path`).
-/// - `source_path: PathBuf` — always available; the originating file or
-///   directory.
-/// - `error: AgentError` — typed error; render via
-///   [`crate::error::error_full_chain`] for human display.
+/// `name` is `Some` once parsing has identified the agent; pre-parse
+/// failures use `source_path` as the fallback identifier. `error` is the
+/// typed [`AgentError`] so frontends can branch on cause without
+/// substring-matching the rendered message; a custom `Serialize` impl
+/// projects it to the chain string for the wire format.
 #[derive(Debug, Serialize)]
 #[cfg_attr(feature = "specta", derive(specta::Type))]
 pub struct FailedAgent {
