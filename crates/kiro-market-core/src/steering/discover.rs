@@ -10,11 +10,12 @@
 
 use std::fs;
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use tracing::{debug, warn};
 
 use crate::agent::DiscoveredNativeFile;
+use crate::steering::SteeringWarning;
 
 /// Filenames excluded from steering discovery (case-insensitive).
 const EXCLUDED_FILENAMES: &[&str] = &["README.md", "CONTRIBUTING.md", "CHANGELOG.md"];
@@ -23,10 +24,18 @@ const EXCLUDED_FILENAMES: &[&str] = &["README.md", "CONTRIBUTING.md", "CHANGELOG
 /// scan path. Reuses [`DiscoveredNativeFile`] so the install layer can
 /// compute destination-relative paths without re-doing the join.
 ///
+/// Returns `(files, warnings)`. `warnings` carries actionable
+/// discovery-time issues (invalid scan paths, unreadable scan dirs)
+/// the service layer threads into `InstallSteeringResult.warnings`
+/// so the CLI can surface them. By-design exclusions (README files,
+/// refused symlinks) stay as `tracing::debug!` only — surfacing them
+/// would just be CLI noise.
+///
 /// Mirrors the security primitives of
 /// [`crate::agent::discover_native_kiro_agents_in_dirs`]:
 /// - Each scan path is validated by [`crate::validation::validate_relative_path`].
-/// - `read_dir` `NotFound` silently yields empty; other I/O errors warn.
+/// - `read_dir` `NotFound` silently yields empty; other I/O errors emit
+///   a `ScanDirUnreadable` warning.
 /// - `symlink_metadata` + [`crate::platform::is_reparse_or_symlink`] refuse
 ///   symlinks and Windows directory junctions.
 /// - README / CONTRIBUTING / CHANGELOG `.md` excluded case-insensitively.
@@ -35,8 +44,9 @@ const EXCLUDED_FILENAMES: &[&str] = &["README.md", "CONTRIBUTING.md", "CHANGELOG
 pub fn discover_steering_files_in_dirs(
     plugin_dir: &Path,
     scan_paths: &[String],
-) -> Vec<DiscoveredNativeFile> {
+) -> (Vec<DiscoveredNativeFile>, Vec<SteeringWarning>) {
     let mut out = Vec::new();
+    let mut warnings = Vec::new();
     for rel in scan_paths {
         if let Err(e) = crate::validation::validate_relative_path(rel) {
             warn!(
@@ -44,6 +54,10 @@ pub fn discover_steering_files_in_dirs(
                 error = %e,
                 "skipping steering scan path that fails validation"
             );
+            warnings.push(SteeringWarning::ScanPathInvalid {
+                path: PathBuf::from(rel),
+                reason: e.to_string(),
+            });
             continue;
         }
         let dir = plugin_dir.join(rel.trim_start_matches("./"));
@@ -56,6 +70,10 @@ pub fn discover_steering_files_in_dirs(
                     error = %e,
                     "failed to read steering scan directory; skipping"
                 );
+                warnings.push(SteeringWarning::ScanDirUnreadable {
+                    path: dir.clone(),
+                    reason: e.to_string(),
+                });
                 continue;
             }
         };
@@ -113,7 +131,7 @@ pub fn discover_steering_files_in_dirs(
             }
         }
     }
-    out
+    (out, warnings)
 }
 
 #[cfg(test)]
@@ -129,7 +147,8 @@ mod tests {
         fs::write(steering.join("guide.md"), b"guide").unwrap();
         fs::write(steering.join("not.txt"), b"ignored").unwrap();
 
-        let found = discover_steering_files_in_dirs(tmp.path(), &["./steering/".to_string()]);
+        let (found, _warnings) =
+            discover_steering_files_in_dirs(tmp.path(), &["./steering/".to_string()]);
         let names: Vec<_> = found
             .iter()
             .map(|f| f.source.file_name().unwrap().to_string_lossy().into_owned())
@@ -139,9 +158,17 @@ mod tests {
 
     #[test]
     fn returns_empty_when_directory_missing() {
+        // A plugin commonly declares `./steering/` without authoring
+        // any files; missing-directory must be a silent no-op (no
+        // warning), distinct from `ScanDirUnreadable`.
         let tmp = tempdir().unwrap();
-        let found = discover_steering_files_in_dirs(tmp.path(), &["./missing/".to_string()]);
+        let (found, warnings) =
+            discover_steering_files_in_dirs(tmp.path(), &["./missing/".to_string()]);
         assert!(found.is_empty());
+        assert!(
+            warnings.is_empty(),
+            "missing scan dir must not emit a warning: {warnings:?}"
+        );
     }
 
     #[test]
@@ -153,7 +180,8 @@ mod tests {
         fs::write(steering.join("readme.md"), b"lowercase").unwrap();
         fs::write(steering.join("real.md"), b"real").unwrap();
 
-        let found = discover_steering_files_in_dirs(tmp.path(), &["./steering/".to_string()]);
+        let (found, _warnings) =
+            discover_steering_files_in_dirs(tmp.path(), &["./steering/".to_string()]);
         let names: Vec<_> = found
             .iter()
             .map(|f| f.source.file_name().unwrap().to_string_lossy().into_owned())
@@ -162,7 +190,7 @@ mod tests {
     }
 
     #[test]
-    fn rejects_path_traversal() {
+    fn rejects_path_traversal_and_emits_scan_path_invalid_warning() {
         let tmp = tempdir().unwrap();
         let plugin = tmp.path().join("plugin");
         fs::create_dir_all(&plugin).unwrap();
@@ -170,8 +198,22 @@ mod tests {
         fs::create_dir_all(&escape).unwrap();
         fs::write(escape.join("loot.md"), b"loot").unwrap();
 
-        let found = discover_steering_files_in_dirs(&plugin, &["../escape/".to_string()]);
+        let (found, warnings) =
+            discover_steering_files_in_dirs(&plugin, &["../escape/".to_string()]);
         assert!(found.is_empty());
+        // Triple-flagged review finding: ScanPathInvalid must reach the
+        // user via result.warnings rather than vanishing into tracing!.
+        assert_eq!(warnings.len(), 1, "expected one warning, got: {warnings:?}");
+        match &warnings[0] {
+            SteeringWarning::ScanPathInvalid { path, reason } => {
+                assert_eq!(path, std::path::Path::new("../escape/"));
+                assert!(
+                    !reason.is_empty(),
+                    "validation reason must carry information"
+                );
+            }
+            other => panic!("expected ScanPathInvalid, got {other:?}"),
+        }
     }
 
     #[cfg(unix)]
@@ -187,7 +229,8 @@ mod tests {
         fs::write(&outside, b"outside").unwrap();
         symlink(&outside, steering.join("evil.md")).unwrap();
 
-        let found = discover_steering_files_in_dirs(tmp.path(), &["./steering/".to_string()]);
+        let (found, _warnings) =
+            discover_steering_files_in_dirs(tmp.path(), &["./steering/".to_string()]);
         let names: Vec<_> = found
             .iter()
             .map(|f| f.source.file_name().unwrap().to_string_lossy().into_owned())
@@ -202,7 +245,8 @@ mod tests {
         fs::create_dir_all(&steering).unwrap();
         fs::write(steering.join("a.md"), b"a").unwrap();
 
-        let found = discover_steering_files_in_dirs(tmp.path(), &["./steering/".to_string()]);
+        let (found, _warnings) =
+            discover_steering_files_in_dirs(tmp.path(), &["./steering/".to_string()]);
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].scan_root, steering);
     }
@@ -219,7 +263,7 @@ mod tests {
         fs::write(tmp.path().join("a/alpha.md"), b"alpha").unwrap();
         fs::write(tmp.path().join("b/beta.md"), b"beta").unwrap();
 
-        let found =
+        let (found, _warnings) =
             discover_steering_files_in_dirs(tmp.path(), &["./a/".to_string(), "./b/".to_string()]);
         let names: Vec<_> = found
             .iter()
@@ -227,5 +271,33 @@ mod tests {
             .collect();
         assert!(names.contains(&"alpha.md".to_string()));
         assert!(names.contains(&"beta.md".to_string()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unreadable_scan_dir_emits_scan_dir_unreadable_warning() {
+        // Permission-denied on the scan dir is a system-level failure
+        // the user can act on (chmod, ACL); surface it via warnings,
+        // not just tracing logs. Unix-only because chmod doesn't
+        // translate to Windows ACLs.
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempdir().unwrap();
+        let steering = tmp.path().join("steering");
+        fs::create_dir_all(&steering).unwrap();
+        // 0o000 strips read+exec so read_dir errors with PermissionDenied.
+        fs::set_permissions(&steering, fs::Permissions::from_mode(0o000)).unwrap();
+
+        let (found, warnings) =
+            discover_steering_files_in_dirs(tmp.path(), &["./steering/".to_string()]);
+
+        // Restore permissions so the tempdir cleanup can recurse.
+        fs::set_permissions(&steering, fs::Permissions::from_mode(0o700)).unwrap();
+
+        assert!(found.is_empty());
+        assert_eq!(warnings.len(), 1, "expected one warning, got: {warnings:?}");
+        assert!(matches!(
+            &warnings[0],
+            SteeringWarning::ScanDirUnreadable { path, .. } if path == &steering
+        ));
     }
 }

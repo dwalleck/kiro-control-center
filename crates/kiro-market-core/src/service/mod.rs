@@ -1326,7 +1326,9 @@ impl MarketplaceService {
         let _ = self;
         let mut result = crate::steering::InstallSteeringResult::default();
 
-        let files = crate::steering::discover_steering_files_in_dirs(plugin_dir, scan_paths);
+        let (files, warnings) =
+            crate::steering::discover_steering_files_in_dirs(plugin_dir, scan_paths);
+        result.warnings = warnings;
 
         for f in &files {
             let Ok(rel_ref) = f.source.strip_prefix(&f.scan_root) else {
@@ -2967,6 +2969,50 @@ mod tests {
             "all reinstalls must be idempotent: {:?}",
             again.installed
         );
+    }
+
+    #[test]
+    fn install_plugin_steering_surfaces_scan_path_invalid_warning() {
+        // Closes the triple-flagged review finding: SteeringWarning was
+        // declared in S3-2 but never populated. A manifest typo
+        // (path traversal scan path) used to silently drop with only a
+        // tracing::warn! line. Now the structured warning reaches
+        // result.warnings and the CLI presenter renders it.
+        let plugin_tmp = tempfile::tempdir().expect("plugin tempdir");
+        let steering = plugin_tmp.path().join("steering");
+        std::fs::create_dir_all(&steering).expect("create steering dir");
+        std::fs::write(steering.join("ok.md"), b"ok").unwrap();
+
+        let (_dir, svc) = crate::service::test_support::temp_service();
+        let project_tmp = tempfile::tempdir().expect("project tempdir");
+        let project = crate::project::KiroProject::new(project_tmp.path().to_path_buf());
+
+        // Mix one legitimate scan path with one path-traversal attempt:
+        // the legitimate one still installs, the traversal surfaces as
+        // a warning without aborting the batch.
+        let scan_paths = vec!["./steering/".to_string(), "../escape/".to_string()];
+        let ctx = crate::steering::SteeringInstallContext {
+            mode: InstallMode::New,
+            marketplace: "m",
+            plugin: "p",
+            version: None,
+        };
+
+        let result = svc.install_plugin_steering(&project, plugin_tmp.path(), &scan_paths, ctx);
+
+        assert_eq!(result.installed.len(), 1, "legitimate file still installs");
+        assert!(result.failed.is_empty(), "no failures expected");
+        assert_eq!(
+            result.warnings.len(),
+            1,
+            "traversal must surface as a warning: {:?}",
+            result.warnings
+        );
+        assert!(matches!(
+            &result.warnings[0],
+            crate::steering::SteeringWarning::ScanPathInvalid { path, .. }
+                if path == std::path::Path::new("../escape/")
+        ));
     }
 
     #[test]

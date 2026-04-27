@@ -118,19 +118,30 @@ pub struct FailedSteeringFile {
     pub error: SteeringError,
 }
 
-/// Non-fatal issues raised during steering install. Discovery-time
-/// problems (invalid scan paths, skipped candidates) get surfaced as
-/// warnings rather than errors so the batch keeps making progress.
+/// Non-fatal issues raised during steering discovery. Surface
+/// actionable signals only — by-design exclusions (README-style files,
+/// symlinks refused for security) stay as `tracing::debug!` so the
+/// CLI doesn't spam users with normal product behaviour.
+///
+/// Per the original S3-2 amendment this enum was scoped wider; the
+/// `Skipped` variant was retired during PR-64 review when it became
+/// clear surfacing every README would teach users to ignore warnings.
 #[derive(Clone, Debug, Serialize)]
 #[cfg_attr(feature = "specta", derive(specta::Type))]
 #[non_exhaustive]
 pub enum SteeringWarning {
-    /// A steering scan path was declared but failed validation
-    /// (path-traversal, absolute, non-utf-8 component, etc.).
+    /// A steering scan path declared in the manifest failed validation
+    /// (path-traversal, absolute, embedded NUL, non-utf-8 component).
+    /// `path` carries the raw manifest value — almost always a typo
+    /// worth surfacing to the plugin author. The validation rejection
+    /// is also logged at `tracing::warn!` for operators.
     ScanPathInvalid { path: PathBuf, reason: String },
-    /// A discovered candidate looked like steering but was excluded at
-    /// discovery time (README-style markdown skipped, symlink refused).
-    Skipped { path: PathBuf, reason: String },
+    /// A steering scan directory exists but couldn't be read
+    /// (permission denied, I/O error). Distinct from `NotFound` —
+    /// missing directories are a silent no-op since plugins commonly
+    /// declare `./steering/` without authoring any files. This variant
+    /// fires only for system-level failures the user can act on.
+    ScanDirUnreadable { path: PathBuf, reason: String },
 }
 
 impl std::fmt::Display for SteeringWarning {
@@ -139,9 +150,9 @@ impl std::fmt::Display for SteeringWarning {
             Self::ScanPathInvalid { path, reason } => {
                 write!(f, "skipped scan path {}: {}", path.display(), reason)
             }
-            Self::Skipped { path, reason } => write!(
+            Self::ScanDirUnreadable { path, reason } => write!(
                 f,
-                "skipped steering candidate {}: {}",
+                "could not read steering scan directory {}: {}",
                 path.display(),
                 reason
             ),
