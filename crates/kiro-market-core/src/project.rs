@@ -155,6 +155,41 @@ enum NativeCollisionDecision {
     Proceed { forced_overwrite: bool },
 }
 
+/// Input bundle for [`KiroProject::install_native_companions`]. Groups the
+/// immutable refs the install needs so the public signature stays at one
+/// parameter (P-2 — avoiding `#[allow(clippy::too_many_arguments)]`).
+///
+/// The caller is responsible for verifying that all `rel_paths` belong to
+/// a single `scan_root` — multi-scan-root native plugins are rejected at
+/// the service layer (see `MultipleScanRootsNotSupported`) before this
+/// function is called, so the install can assume the invariant.
+#[derive(Debug)]
+pub struct NativeCompanionsInput<'a> {
+    /// The plugin's agents/ scan root. Used as the hashing base.
+    pub scan_root: &'a Path,
+    /// Companion file paths relative to `scan_root` (e.g.
+    /// `prompts/reviewer.md`). Also the relative paths under
+    /// `.kiro/agents/` they install to.
+    pub rel_paths: &'a [PathBuf],
+    pub marketplace: &'a str,
+    pub plugin: &'a str,
+    pub version: Option<&'a str>,
+    pub source_hash: &'a str,
+    pub mode: crate::service::InstallMode,
+}
+
+/// Output of `classify_companion_collision`: either return the idempotent
+/// outcome immediately, or proceed with install and apply `forced_overwrite`.
+enum CompanionCollisionDecision {
+    Idempotent(Box<InstalledNativeCompanionsOutcome>),
+    Proceed { forced_overwrite: bool },
+}
+
+/// Output of `promote_native_companions`: paths placed at their final
+/// destinations, plus a list of `(original, backup)` pairs the caller
+/// must restore on later failure or delete on success.
+type CompanionPromotion = (Vec<PathBuf>, Vec<(PathBuf, PathBuf)>);
+
 /// In-memory outcome of one [`KiroProject::install_native_companions`] call.
 ///
 /// Plugin-scoped (companion bundles are owned per-plugin, not per-agent),
@@ -1247,6 +1282,480 @@ impl KiroProject {
         }
         remove_staging_dir(staging);
         Ok(had_backup)
+    }
+
+    /// Install a plugin's native companion file bundle as one atomic unit.
+    ///
+    /// The bundle's files are validated against tracking BEFORE any writes:
+    /// a same-plugin idempotent reinstall is a verified no-op; an
+    /// idempotent-mismatch under [`InstallMode::New`] returns
+    /// [`AgentError::ContentChangedRequiresForce`]; a cross-plugin path
+    /// conflict returns [`AgentError::PathOwnedByOtherPlugin`]; a file on
+    /// disk with no tracking entry returns
+    /// [`AgentError::OrphanFileAtDestination`]. All three are upgraded to
+    /// proceed-with-`forced_overwrite` under [`InstallMode::Force`].
+    ///
+    /// Adopts the staging-before-rename + per-file backup-then-swap
+    /// pattern (P-1 + P-6): each file is staged at its rel layout under
+    /// a per-plugin staging dir, hashed there, then promoted with backups.
+    /// On any later failure (rename, tracking write) the backups are
+    /// restored — the bundle is either fully installed or fully rolled
+    /// back.
+    ///
+    /// Diff-and-removes orphans from a prior install of *this* plugin
+    /// when the file set shrinks (e.g. a companion `prompts/old.md`
+    /// removed from the source manifest).
+    ///
+    /// In force mode, cross-plugin transfers update the previous owner's
+    /// tracking entry to drop the transferred paths; if that empties the
+    /// owner's `files`, the entry is removed entirely.
+    ///
+    /// Empty `rel_paths` returns an idempotent no-op outcome with no
+    /// tracking write — the bundle has nothing to install.
+    ///
+    /// [`InstallMode::New`]: crate::service::InstallMode::New
+    /// [`InstallMode::Force`]: crate::service::InstallMode::Force
+    ///
+    /// # Errors
+    ///
+    /// See the collision matrix above for the user-facing variants;
+    /// [`AgentError::InstallFailed`] wraps any underlying I/O / hash /
+    /// tracking failure.
+    pub fn install_native_companions(
+        &self,
+        input: &NativeCompanionsInput<'_>,
+    ) -> Result<InstalledNativeCompanionsOutcome, AgentError> {
+        let agents_dir = self.agents_dir();
+
+        if input.rel_paths.is_empty() {
+            return Ok(InstalledNativeCompanionsOutcome {
+                plugin: input.plugin.to_string(),
+                files: Vec::new(),
+                forced_overwrite: false,
+                was_idempotent: true,
+                source_hash: input.source_hash.to_string(),
+                installed_hash: input.source_hash.to_string(),
+            });
+        }
+
+        let plugin_for_err = input.plugin.to_string();
+        let result: crate::error::Result<InstalledNativeCompanionsOutcome> =
+            crate::file_lock::with_file_lock(&self.agent_tracking_path(), || {
+                self.install_native_companions_locked(input, &agents_dir)
+            });
+
+        result.map_err(|e| match e {
+            crate::error::Error::Agent(agent_err) => agent_err,
+            other => AgentError::InstallFailed {
+                path: agents_dir.join(format!("_companions-{plugin_for_err}")),
+                source: Box::new(other),
+            },
+        })
+    }
+
+    /// Inside-the-lock body of [`Self::install_native_companions`].
+    /// Extracted so the outer function stays under the line cap; the
+    /// closure-with-lock dance and the error-projection live there.
+    fn install_native_companions_locked(
+        &self,
+        input: &NativeCompanionsInput<'_>,
+        agents_dir: &Path,
+    ) -> crate::error::Result<InstalledNativeCompanionsOutcome> {
+        let mut installed = self.load_installed_agents()?;
+
+        if let Err(e) = self.cleanup_leftover_companion_staging(input.plugin) {
+            warn!(
+                plugin = %input.plugin,
+                error = %e,
+                "leftover-staging cleanup failed; proceeding with install anyway"
+            );
+        }
+
+        let forced_overwrite =
+            match Self::classify_companion_collision(&installed, input, agents_dir)? {
+                CompanionCollisionDecision::Idempotent(outcome) => return Ok(*outcome),
+                CompanionCollisionDecision::Proceed { forced_overwrite } => forced_overwrite,
+            };
+
+        let (staging, installed_hash) =
+            self.stage_native_companion_files(input.plugin, input.scan_root, input.rel_paths)?;
+
+        let (placed, backups) = self.promote_native_companions(
+            &staging,
+            input.rel_paths,
+            agents_dir,
+            forced_overwrite,
+        )?;
+
+        if forced_overwrite {
+            Self::strip_transferred_paths_from_other_plugins(
+                &mut installed,
+                input.plugin,
+                input.rel_paths,
+            );
+        }
+        Self::remove_diffed_prior_files(&installed, input.plugin, input.rel_paths, agents_dir);
+
+        installed.native_companions.insert(
+            input.plugin.to_string(),
+            InstalledNativeCompanionsMeta {
+                marketplace: input.marketplace.to_string(),
+                plugin: input.plugin.to_string(),
+                version: input.version.map(String::from),
+                installed_at: chrono::Utc::now(),
+                files: input.rel_paths.to_vec(),
+                source_hash: input.source_hash.to_string(),
+                installed_hash: installed_hash.clone(),
+            },
+        );
+
+        if let Err(e) = self.write_agent_tracking(&installed) {
+            warn!(
+                plugin = %input.plugin,
+                error = %e,
+                "companion tracking update failed; rolling back files"
+            );
+            Self::rollback_companion_promotion(&placed, &backups);
+            return Err(e);
+        }
+
+        // Success — drop the backup files. Best-effort.
+        for (_orig, backup) in &backups {
+            if let Err(e) = fs::remove_file(backup)
+                && e.kind() != std::io::ErrorKind::NotFound
+            {
+                warn!(
+                    path = %backup.display(),
+                    error = %e,
+                    "failed to remove companion backup after success"
+                );
+            }
+        }
+
+        debug!(
+            plugin = %input.plugin,
+            files = placed.len(),
+            force = input.mode.is_force(),
+            "native companions installed"
+        );
+
+        Ok(InstalledNativeCompanionsOutcome {
+            plugin: input.plugin.to_string(),
+            files: placed,
+            forced_overwrite,
+            was_idempotent: false,
+            source_hash: input.source_hash.to_string(),
+            installed_hash,
+        })
+    }
+
+    /// Decide whether the companion install proceeds, idempotently no-ops,
+    /// or rejects. Exhaustive over the same-plugin / cross-plugin / orphan
+    /// states.
+    fn classify_companion_collision(
+        installed: &InstalledAgents,
+        input: &NativeCompanionsInput<'_>,
+        agents_dir: &Path,
+    ) -> crate::error::Result<CompanionCollisionDecision> {
+        let mut forced_overwrite = false;
+
+        // Same-plugin check first — idempotent or content-changed.
+        if let Some(existing) = installed.native_companions.get(input.plugin) {
+            if existing.source_hash == input.source_hash {
+                return Ok(CompanionCollisionDecision::Idempotent(Box::new(
+                    InstalledNativeCompanionsOutcome {
+                        plugin: input.plugin.to_string(),
+                        files: existing.files.iter().map(|p| agents_dir.join(p)).collect(),
+                        forced_overwrite: false,
+                        was_idempotent: true,
+                        source_hash: input.source_hash.to_string(),
+                        installed_hash: existing.installed_hash.clone(),
+                    },
+                )));
+            }
+            if !input.mode.is_force() {
+                return Err(AgentError::ContentChangedRequiresForce {
+                    name: format!("{}/companions", input.plugin),
+                }
+                .into());
+            }
+            forced_overwrite = true;
+        }
+
+        // Cross-plugin path conflict + orphan-on-disk checks.
+        for rel in input.rel_paths {
+            for (other_plugin, other_meta) in &installed.native_companions {
+                if other_plugin == input.plugin {
+                    continue;
+                }
+                if other_meta.files.contains(rel) {
+                    if !input.mode.is_force() {
+                        return Err(AgentError::PathOwnedByOtherPlugin {
+                            path: agents_dir.join(rel),
+                            owner: other_plugin.clone(),
+                        }
+                        .into());
+                    }
+                    forced_overwrite = true;
+                }
+            }
+            // Orphan check: file exists on disk but no plugin owns it.
+            let dest = agents_dir.join(rel);
+            if dest.exists() {
+                let owned_by_any = installed
+                    .native_companions
+                    .values()
+                    .any(|m| m.files.contains(rel));
+                if !owned_by_any {
+                    if !input.mode.is_force() {
+                        return Err(AgentError::OrphanFileAtDestination { path: dest }.into());
+                    }
+                    forced_overwrite = true;
+                }
+            }
+        }
+
+        Ok(CompanionCollisionDecision::Proceed { forced_overwrite })
+    }
+
+    /// Stage every companion file at its relative layout under a fresh
+    /// per-plugin staging dir, then compute `installed_hash` against the
+    /// staged copies BEFORE any destructive op on `agents_root`. A hash
+    /// failure leaves `agents_root` untouched.
+    ///
+    /// Returns `(staging_dir, installed_hash)` on success.
+    fn stage_native_companion_files(
+        &self,
+        plugin: &str,
+        scan_root: &Path,
+        rel_paths: &[PathBuf],
+    ) -> crate::error::Result<(PathBuf, String)> {
+        let staging = self.fresh_companion_staging_dir(plugin);
+        fs::create_dir_all(&staging)?;
+
+        for rel in rel_paths {
+            let src = scan_root.join(rel);
+            let dest = staging.join(rel);
+            if let Some(parent) = dest.parent()
+                && let Err(e) = fs::create_dir_all(parent)
+            {
+                remove_staging_dir(&staging);
+                return Err(e.into());
+            }
+            if let Err(e) = fs::copy(&src, &dest) {
+                remove_staging_dir(&staging);
+                return Err(e.into());
+            }
+        }
+
+        let installed_hash = match crate::hash::hash_artifact(&staging, rel_paths) {
+            Ok(h) => h,
+            Err(e) => {
+                warn!(
+                    plugin,
+                    error = %e,
+                    "installed_hash computation failed on staging; removing staging dir"
+                );
+                remove_staging_dir(&staging);
+                return Err(e.into());
+            }
+        };
+
+        Ok((staging, installed_hash))
+    }
+
+    /// Move every staged companion file into its destination under
+    /// `agents_root`, using backup-then-swap (P-6) when the destination
+    /// already exists. Returns `(placed_paths, backups)` so the caller
+    /// can roll back on later failure.
+    ///
+    /// `backups` is a `Vec<(original_path, backup_path)>` — restoring
+    /// is `fs::rename(backup, original)`.
+    fn promote_native_companions(
+        &self,
+        staging: &Path,
+        rel_paths: &[PathBuf],
+        agents_dir: &Path,
+        forced_overwrite: bool,
+    ) -> crate::error::Result<CompanionPromotion> {
+        let _ = self; // method may grow lock-aware behavior later
+        let mut placed: Vec<PathBuf> = Vec::with_capacity(rel_paths.len());
+        let mut backups: Vec<(PathBuf, PathBuf)> = Vec::new();
+
+        for rel in rel_paths {
+            let src = staging.join(rel);
+            let dest = agents_dir.join(rel);
+            if let Some(parent) = dest.parent()
+                && let Err(e) = fs::create_dir_all(parent)
+            {
+                Self::rollback_companion_promotion(&placed, &backups);
+                remove_staging_dir(staging);
+                return Err(e.into());
+            }
+            // Backup the existing destination if we'll overwrite it.
+            if forced_overwrite && dest.exists() {
+                let backup = Self::companion_backup_path(&dest);
+                if let Err(e) = fs::rename(&dest, &backup) {
+                    Self::rollback_companion_promotion(&placed, &backups);
+                    remove_staging_dir(staging);
+                    return Err(e.into());
+                }
+                backups.push((dest.clone(), backup));
+            }
+            if let Err(e) = fs::rename(&src, &dest) {
+                Self::rollback_companion_promotion(&placed, &backups);
+                remove_staging_dir(staging);
+                return Err(e.into());
+            }
+            placed.push(dest);
+        }
+
+        remove_staging_dir(staging);
+        Ok((placed, backups))
+    }
+
+    /// Compute the `.kiro-bak` sibling path for a companion file. Splices
+    /// the suffix between the file stem and extension so a `.md` file
+    /// becomes `.md.kiro-bak` rather than just `.kiro-bak`.
+    fn companion_backup_path(dest: &Path) -> PathBuf {
+        let mut bak = dest.as_os_str().to_owned();
+        bak.push(".kiro-bak");
+        PathBuf::from(bak)
+    }
+
+    /// Rollback helper: remove every newly-placed file and restore each
+    /// backup to its original path. Best-effort — failures are logged but
+    /// don't abort the rollback.
+    fn rollback_companion_promotion(placed: &[PathBuf], backups: &[(PathBuf, PathBuf)]) {
+        for p in placed {
+            if let Err(e) = fs::remove_file(p)
+                && e.kind() != std::io::ErrorKind::NotFound
+            {
+                warn!(
+                    path = %p.display(),
+                    error = %e,
+                    "failed to remove placed companion file during rollback"
+                );
+            }
+        }
+        for (orig, backup) in backups {
+            if let Err(e) = fs::rename(backup, orig) {
+                warn!(
+                    backup = %backup.display(),
+                    target = %orig.display(),
+                    error = %e,
+                    "failed to restore companion backup during rollback — \
+                     user may need to rename .kiro-bak file manually"
+                );
+            }
+        }
+    }
+
+    /// In force mode: drop transferred `rel_paths` from any other plugin's
+    /// tracking entry, and remove emptied entries entirely. Caller has
+    /// just promoted the files, so the previous owner has lost ownership.
+    fn strip_transferred_paths_from_other_plugins(
+        installed: &mut InstalledAgents,
+        plugin: &str,
+        rel_paths: &[PathBuf],
+    ) {
+        let new_set: std::collections::HashSet<&PathBuf> = rel_paths.iter().collect();
+        let other_plugins: Vec<String> = installed
+            .native_companions
+            .keys()
+            .filter(|p| p.as_str() != plugin)
+            .cloned()
+            .collect();
+        for p in other_plugins {
+            if let Some(meta) = installed.native_companions.get_mut(&p) {
+                meta.files.retain(|f| !new_set.contains(f));
+            }
+        }
+        installed
+            .native_companions
+            .retain(|_, meta| !meta.files.is_empty());
+    }
+
+    /// When the same plugin reinstalls with a different file set, walk
+    /// the prior tracked files NOT in the new set and remove them from
+    /// disk. Best-effort — failures are logged. The new tracking entry
+    /// will be written next, replacing the prior `files` list.
+    fn remove_diffed_prior_files(
+        installed: &InstalledAgents,
+        plugin: &str,
+        rel_paths: &[PathBuf],
+        agents_dir: &Path,
+    ) {
+        let Some(prior) = installed.native_companions.get(plugin) else {
+            return;
+        };
+        let new_set: std::collections::HashSet<&PathBuf> = rel_paths.iter().collect();
+        for rel in &prior.files {
+            if new_set.contains(rel) {
+                continue;
+            }
+            let abs = agents_dir.join(rel);
+            if let Err(e) = fs::remove_file(&abs)
+                && e.kind() != std::io::ErrorKind::NotFound
+            {
+                warn!(
+                    plugin,
+                    path = %abs.display(),
+                    error = %e,
+                    "failed to remove orphaned prior companion file"
+                );
+            }
+        }
+    }
+
+    fn fresh_companion_staging_dir(&self, plugin: &str) -> PathBuf {
+        use std::sync::atomic::Ordering;
+        let pid = std::process::id();
+        let seq = STAGING_COUNTER.fetch_add(1, Ordering::Relaxed);
+        self.kiro_dir()
+            .join(format!("_installing-companions-{plugin}-{pid}-{seq}"))
+    }
+
+    /// Mirror of [`Self::cleanup_leftover_agent_staging`] for companion
+    /// staging directories from prior crashed installs.
+    fn cleanup_leftover_companion_staging(&self, plugin: &str) -> std::io::Result<()> {
+        let prefix = format!("_installing-companions-{plugin}-");
+        let kiro_dir = self.kiro_dir();
+        let entries = match fs::read_dir(&kiro_dir) {
+            Ok(e) => e,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e),
+        };
+        for entry in entries {
+            let entry = match entry {
+                Ok(e) => e,
+                Err(e) => {
+                    warn!(
+                        dir = %kiro_dir.display(),
+                        error = %e,
+                        "failed to read .kiro entry during companion staging cleanup; skipping"
+                    );
+                    continue;
+                }
+            };
+            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            if !name.starts_with(&prefix) {
+                continue;
+            }
+            let path = entry.path();
+            if let Err(e) = fs::remove_dir_all(&path)
+                && e.kind() != std::io::ErrorKind::NotFound
+            {
+                warn!(
+                    path = %path.display(),
+                    error = %e,
+                    "failed to remove leftover companion staging dir; continuing"
+                );
+            }
+        }
+        Ok(())
     }
 
     /// Remove any `_installing-agent-<name>-*` staging directories left over
@@ -3083,5 +3592,105 @@ mod tests {
 
         let installed_bytes = fs::read(&outcome.json_path).expect("read installed");
         assert_eq!(installed_bytes.as_slice(), body.as_slice());
+    }
+
+    // -----------------------------------------------------------------------
+    // install_native_companions
+    // -----------------------------------------------------------------------
+
+    /// Stage two companion files at `<scratch>/companions-src/prompts/{a,b}.md`
+    /// with the given body bytes. Returns `(scan_root, rel_paths, source_hash)`.
+    fn stage_companion_source(
+        scratch: &Path,
+        bodies: &[(&str, &[u8])],
+    ) -> (PathBuf, Vec<PathBuf>, String) {
+        let scan_root = scratch.join("companions-src");
+        let prompts = scan_root.join("prompts");
+        fs::create_dir_all(&prompts).expect("create prompts dir");
+        let mut rel_paths = Vec::new();
+        for (name, body) in bodies {
+            let rel = PathBuf::from(format!("prompts/{name}"));
+            fs::write(scan_root.join(&rel), body).expect("write companion source");
+            rel_paths.push(rel);
+        }
+        let source_hash =
+            crate::hash::hash_artifact(&scan_root, &rel_paths).expect("companion source hash");
+        (scan_root, rel_paths, source_hash)
+    }
+
+    #[test]
+    fn install_native_companions_copies_files_and_writes_tracking() {
+        let (dir, project) = temp_project();
+        let (scan_root, rel_paths, source_hash) =
+            stage_companion_source(dir.path(), &[("a.md", b"prompt a"), ("b.md", b"prompt b")]);
+
+        let outcome = project
+            .install_native_companions(&NativeCompanionsInput {
+                scan_root: &scan_root,
+                rel_paths: &rel_paths,
+                marketplace: "marketplace-x",
+                plugin: "plugin-y",
+                version: Some("0.1.0"),
+                source_hash: &source_hash,
+                mode: crate::service::InstallMode::New,
+            })
+            .expect("install companions");
+
+        assert_eq!(outcome.plugin, "plugin-y");
+        assert_eq!(outcome.files.len(), 2);
+        assert!(!outcome.was_idempotent);
+        assert!(!outcome.forced_overwrite);
+        assert_eq!(outcome.source_hash, source_hash);
+        assert!(outcome.installed_hash.starts_with("blake3:"));
+
+        // Files landed at the right destinations with original content.
+        let dest_a = project.kiro_dir().join("agents/prompts/a.md");
+        let dest_b = project.kiro_dir().join("agents/prompts/b.md");
+        assert!(dest_a.exists(), "a.md must land at {}", dest_a.display());
+        assert!(dest_b.exists(), "b.md must land at {}", dest_b.display());
+        assert_eq!(fs::read(&dest_a).expect("read a"), b"prompt a");
+        assert_eq!(fs::read(&dest_b).expect("read b"), b"prompt b");
+
+        // Tracking entry records the bundle.
+        let tracking = project.load_installed_agents().expect("load");
+        let entry = tracking
+            .native_companions
+            .get("plugin-y")
+            .expect("native_companions entry written");
+        assert_eq!(entry.plugin, "plugin-y");
+        assert_eq!(entry.marketplace, "marketplace-x");
+        assert_eq!(entry.version.as_deref(), Some("0.1.0"));
+        assert_eq!(entry.files.len(), 2);
+        assert_eq!(entry.source_hash, source_hash);
+        assert_eq!(entry.installed_hash, outcome.installed_hash);
+    }
+
+    #[test]
+    fn install_native_companions_empty_files_is_idempotent_no_op() {
+        // Empty rel_paths returns an idempotent outcome with no tracking
+        // write — the bundle has nothing to install, and we shouldn't
+        // create a tracking entry for an empty file set.
+        let (_dir, project) = temp_project();
+        let scan_root = std::path::PathBuf::from("/tmp/unused");
+
+        let outcome = project
+            .install_native_companions(&NativeCompanionsInput {
+                scan_root: &scan_root,
+                rel_paths: &[],
+                marketplace: "m",
+                plugin: "p",
+                version: None,
+                source_hash: "blake3:empty",
+                mode: crate::service::InstallMode::New,
+            })
+            .expect("empty install");
+        assert!(outcome.was_idempotent);
+        assert!(outcome.files.is_empty());
+
+        let tracking = project.load_installed_agents().expect("load");
+        assert!(
+            !tracking.native_companions.contains_key("p"),
+            "empty bundle must NOT create a tracking entry"
+        );
     }
 }
