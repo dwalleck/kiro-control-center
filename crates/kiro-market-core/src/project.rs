@@ -118,6 +118,36 @@ pub struct InstalledAgents {
     pub native_companions: HashMap<String, InstalledNativeCompanionsMeta>,
 }
 
+/// Tracking entry for one installed steering file.
+///
+/// One entry per file under `.kiro/steering/`, keyed in
+/// [`InstalledSteering::files`] by the relative path under that
+/// directory (which is also the file's user-facing identity — there's
+/// no synthetic id). `source_hash` and `installed_hash` are the
+/// blake3-prefixed hashes computed against the source file's bytes
+/// and the installed bytes respectively; for steering they're
+/// always equal because there is no parse-and-translate step.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InstalledSteeringMeta {
+    pub marketplace: String,
+    pub plugin: String,
+    pub version: Option<String>,
+    pub installed_at: DateTime<Utc>,
+    pub source_hash: String,
+    pub installed_hash: String,
+}
+
+/// On-disk structure of `installed-steering.json`. Map key is the
+/// file's relative path under `.kiro/steering/`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct InstalledSteering {
+    /// Per-file ownership. Defaults to empty for backward compat with
+    /// projects that pre-date steering install; omitted from serialized
+    /// output when empty so round-trips are byte-identical.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub files: HashMap<PathBuf, InstalledSteeringMeta>,
+}
+
 /// What happened during one native install call. The three reachable
 /// states are encoded as distinct variants so the previous
 /// `(was_idempotent, forced_overwrite)` bool pair's unrepresentable
@@ -220,6 +250,9 @@ const INSTALLED_SKILLS_FILE: &str = "installed-skills.json";
 
 /// Name of the agent tracking file inside `.kiro/`.
 const INSTALLED_AGENTS_FILE: &str = "installed-agents.json";
+
+/// Name of the steering tracking file inside `.kiro/`.
+const INSTALLED_STEERING_FILE: &str = "installed-steering.json";
 
 /// Recursively copy a directory tree from `src` to `dest`.
 ///
@@ -559,6 +592,439 @@ impl KiroProject {
         let json = serde_json::to_string_pretty(installed)?;
         crate::cache::atomic_write(&path, json.as_bytes())?;
         Ok(())
+    }
+
+    // -- steering installation ---------------------------------------------
+
+    /// The `.kiro/steering/` directory.
+    #[must_use]
+    pub fn steering_dir(&self) -> PathBuf {
+        self.kiro_dir().join("steering")
+    }
+
+    /// Path to the steering tracking file.
+    fn steering_tracking_path(&self) -> PathBuf {
+        self.kiro_dir().join(INSTALLED_STEERING_FILE)
+    }
+
+    /// Load the installed-steering tracking file.
+    ///
+    /// Returns a default (empty) [`InstalledSteering`] if the file does
+    /// not exist — pre-steering projects have no `installed-steering.json`,
+    /// and that's a valid starting state, not an error.
+    ///
+    /// # Errors
+    ///
+    /// I/O failures (other than `NotFound`) or JSON parse failures.
+    pub fn load_installed_steering(&self) -> crate::error::Result<InstalledSteering> {
+        let path = self.steering_tracking_path();
+        match fs::read(&path) {
+            Ok(bytes) => {
+                let installed: InstalledSteering = serde_json::from_slice(&bytes)?;
+                Ok(installed)
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                debug!(
+                    path = %path.display(),
+                    "steering tracking file not found, returning default"
+                );
+                Ok(InstalledSteering::default())
+            }
+            Err(e) => Err(e.into()),
+        }
+    }
+
+    /// Persist the steering tracking file to disk atomically.
+    fn write_steering_tracking(&self, installed: &InstalledSteering) -> crate::error::Result<()> {
+        let path = self.steering_tracking_path();
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let json = serde_json::to_string_pretty(installed)?;
+        crate::cache::atomic_write(&path, json.as_bytes())?;
+        Ok(())
+    }
+
+    /// Promote a staged steering file into its final destination using
+    /// the backup-then-swap pattern. In `forced_overwrite` mode any
+    /// existing destination is renamed to `<dest>.kiro-bak` before the
+    /// staging-rename so a later failure (tracking write) can restore
+    /// the user's prior install.
+    ///
+    /// Returns the `(original, backup)` pairs the caller must restore on
+    /// later failure or delete on success. Empty when nothing was backed
+    /// up (clean install or non-existent destination).
+    ///
+    /// On rename failure, partially-promoted state is rolled back via
+    /// [`Self::rollback_companion_promotion`] before returning.
+    fn promote_staged_steering(
+        staged_file: &Path,
+        dest: &Path,
+        forced_overwrite: bool,
+    ) -> Result<Vec<(PathBuf, PathBuf)>, crate::steering::SteeringError> {
+        if let Some(parent) = dest.parent() {
+            fs::create_dir_all(parent).map_err(|src| {
+                crate::steering::SteeringError::DestinationDirFailed {
+                    path: parent.to_path_buf(),
+                    source: src,
+                }
+            })?;
+        }
+
+        let mut backups: Vec<(PathBuf, PathBuf)> = Vec::new();
+        if forced_overwrite && dest.exists() {
+            let backup = Self::companion_backup_path(dest);
+            if let Err(src) = fs::rename(dest, &backup) {
+                return Err(crate::steering::SteeringError::DestinationDirFailed {
+                    path: dest.to_path_buf(),
+                    source: src,
+                });
+            }
+            backups.push((dest.to_path_buf(), backup));
+        }
+
+        if let Err(src) = fs::rename(staged_file, dest) {
+            Self::rollback_companion_promotion(&[], &backups);
+            return Err(crate::steering::SteeringError::DestinationDirFailed {
+                path: dest.to_path_buf(),
+                source: src,
+            });
+        }
+
+        Ok(backups)
+    }
+
+    /// Stage a steering source file into a fresh [`tempfile::TempDir`]
+    /// rooted under `.kiro/`, then compute `installed_hash` against the
+    /// staged copy BEFORE any destructive op on `.kiro/steering/` (P-1).
+    ///
+    /// Staging mirrors the final layout (the file lands at `rel_path`
+    /// under the staging dir) so hashing the staged copy yields the
+    /// same value as hashing after promotion.
+    ///
+    /// Returns `(staging_dir, staged_file_path, installed_hash)` on
+    /// success. The `TempDir` is RAII — on any later error the caller's
+    /// `?` propagation triggers Drop which cleans up the staging dir.
+    fn stage_steering_file(
+        &self,
+        source: &Path,
+        rel_path: &Path,
+    ) -> crate::error::Result<(tempfile::TempDir, PathBuf, String)> {
+        let kiro_dir = self.kiro_dir();
+        fs::create_dir_all(&kiro_dir).map_err(|src| {
+            crate::steering::SteeringError::DestinationDirFailed {
+                path: kiro_dir.clone(),
+                source: src,
+            }
+        })?;
+        let stem = rel_path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("steering");
+        let staging = tempfile::Builder::new()
+            .prefix(&format!("_installing-steering-{stem}-"))
+            .tempdir_in(&kiro_dir)
+            .map_err(|src| crate::steering::SteeringError::StagingWriteFailed {
+                path: kiro_dir.clone(),
+                source: src,
+            })?;
+
+        let staged_file = staging.path().join(rel_path);
+        if let Some(parent) = staged_file.parent() {
+            fs::create_dir_all(parent).map_err(|src| {
+                crate::steering::SteeringError::DestinationDirFailed {
+                    path: parent.to_path_buf(),
+                    source: src,
+                }
+            })?;
+        }
+        let source_bytes =
+            fs::read(source).map_err(|src| crate::steering::SteeringError::SourceReadFailed {
+                path: source.to_path_buf(),
+                source: src,
+            })?;
+        fs::write(&staged_file, &source_bytes).map_err(|src| {
+            crate::steering::SteeringError::StagingWriteFailed {
+                path: staged_file.clone(),
+                source: src,
+            }
+        })?;
+
+        let installed_hash = crate::hash::hash_artifact(
+            staging.path(),
+            std::slice::from_ref(&rel_path.to_path_buf()),
+        )
+        .map_err(|src| crate::steering::SteeringError::HashFailed {
+            path: staged_file.clone(),
+            source: src,
+        })?;
+
+        Ok((staging, staged_file, installed_hash))
+    }
+
+    /// Decide what `install_steering_file` should do given the existing
+    /// tracking state and on-disk state. Mirrors
+    /// [`Self::classify_native_collision`] over steering's collision matrix:
+    ///
+    /// 1. Tracked + same plugin + same hash → idempotent no-op.
+    /// 2. Tracked + same plugin + different hash → `ContentChangedRequiresForce`
+    ///    (or proceed-with-`forced_overwrite` under [`InstallMode::Force`]).
+    /// 3. Tracked + different plugin → `PathOwnedByOtherPlugin`
+    ///    (or proceed-with-`forced_overwrite`).
+    /// 4. Untracked + on-disk → `OrphanFileAtDestination`
+    ///    (or proceed-with-`forced_overwrite`).
+    /// 5. Untracked + clean → `Proceed { forced_overwrite: false }`.
+    ///
+    /// Exhaustive over the same-plugin / cross-plugin / orphan / clean
+    /// states — no `_ => default` arms.
+    ///
+    /// [`InstallMode::Force`]: crate::service::InstallMode::Force
+    fn classify_steering_collision(
+        installed: &InstalledSteering,
+        rel_path: &Path,
+        plugin: &str,
+        source_hash: &str,
+        dest: &Path,
+        mode: crate::service::InstallMode,
+    ) -> Result<
+        CollisionDecision<crate::steering::InstalledSteeringOutcome>,
+        crate::steering::SteeringError,
+    > {
+        match installed.files.get(rel_path) {
+            Some(existing) if existing.plugin == plugin => {
+                if existing.source_hash == source_hash {
+                    return Ok(CollisionDecision::Idempotent(Box::new(
+                        crate::steering::InstalledSteeringOutcome {
+                            source: dest.to_path_buf(),
+                            destination: dest.to_path_buf(),
+                            kind: InstallOutcomeKind::Idempotent,
+                            source_hash: source_hash.to_owned(),
+                            installed_hash: existing.installed_hash.clone(),
+                        },
+                    )));
+                }
+                if !mode.is_force() {
+                    return Err(
+                        crate::steering::SteeringError::ContentChangedRequiresForce {
+                            rel: rel_path.to_path_buf(),
+                        },
+                    );
+                }
+                Ok(CollisionDecision::Proceed {
+                    forced_overwrite: true,
+                })
+            }
+            Some(existing) => {
+                if !mode.is_force() {
+                    return Err(crate::steering::SteeringError::PathOwnedByOtherPlugin {
+                        rel: rel_path.to_path_buf(),
+                        owner: existing.plugin.clone(),
+                    });
+                }
+                Ok(CollisionDecision::Proceed {
+                    forced_overwrite: true,
+                })
+            }
+            None if dest.exists() => {
+                if !mode.is_force() {
+                    return Err(crate::steering::SteeringError::OrphanFileAtDestination {
+                        path: dest.to_path_buf(),
+                    });
+                }
+                Ok(CollisionDecision::Proceed {
+                    forced_overwrite: true,
+                })
+            }
+            None => Ok(CollisionDecision::Proceed {
+                forced_overwrite: false,
+            }),
+        }
+    }
+
+    /// Install one steering file into `.kiro/steering/`.
+    ///
+    /// `source.scan_root` is the plugin's steering scan directory; the
+    /// file's relative path under that root is also its tracking key under
+    /// `.kiro/steering/`. The same path-as-key invariant means cross-plugin
+    /// collisions surface naturally without any plugin-wide bundle concept.
+    ///
+    /// # Collision semantics
+    ///
+    /// - **Idempotent reinstall** (same plugin + same `source_hash`): no
+    ///   bytes written, returns the prior `installed_hash`.
+    /// - **Same plugin, different `source_hash`**:
+    ///   [`SteeringError::ContentChangedRequiresForce`] under
+    ///   [`InstallMode::New`]; under [`InstallMode::Force`] the existing
+    ///   file is backed up, replaced, and the backup deleted on success.
+    /// - **Different plugin**: [`SteeringError::PathOwnedByOtherPlugin`]
+    ///   under [`InstallMode::New`]; under [`InstallMode::Force`]
+    ///   ownership transfers and the previous owner's tracking entry is
+    ///   overwritten.
+    /// - **Untracked file on disk**:
+    ///   [`SteeringError::OrphanFileAtDestination`] under
+    ///   [`InstallMode::New`]; under [`InstallMode::Force`] the orphan is
+    ///   overwritten and ownership recorded.
+    ///
+    /// # Atomicity
+    ///
+    /// Adopts the staging-before-rename + backup-then-swap pattern:
+    /// `installed_hash` is computed against the staged copy *before* any
+    /// destructive op on `.kiro/steering/`. In force mode, the existing
+    /// destination is renamed to `<dest>.kiro-bak` before the staging
+    /// rename; on tracking-write failure the backup is restored and the
+    /// new file removed. Same guarantee as
+    /// [`Self::install_native_agent`].
+    ///
+    /// Staging lives under `.kiro/` (NOT inside `.kiro/steering/`) via
+    /// [`tempfile::TempDir`] — RAII Drop cleans up on every code path,
+    /// including panics.
+    ///
+    /// # Errors
+    ///
+    /// See the collision matrix above for user-facing errors. All
+    /// infrastructure failures (I/O, hash, JSON) carry the offending
+    /// `path: PathBuf` for easier debugging.
+    ///
+    /// [`InstallMode::New`]: crate::service::InstallMode::New
+    /// [`InstallMode::Force`]: crate::service::InstallMode::Force
+    pub fn install_steering_file(
+        &self,
+        source: &crate::agent::DiscoveredNativeFile,
+        source_hash: &str,
+        ctx: crate::steering::SteeringInstallContext<'_>,
+    ) -> Result<crate::steering::InstalledSteeringOutcome, crate::steering::SteeringError> {
+        let rel_path = match source.source.strip_prefix(&source.scan_root) {
+            Ok(p) => p.to_path_buf(),
+            Err(_) => {
+                return Err(crate::steering::SteeringError::SourceReadFailed {
+                    path: source.source.clone(),
+                    source: std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "steering source not under scan_root",
+                    ),
+                });
+            }
+        };
+        let dest = self.steering_dir().join(&rel_path);
+        let tracking_path = self.steering_tracking_path();
+
+        let result: crate::error::Result<crate::steering::InstalledSteeringOutcome> =
+            crate::file_lock::with_file_lock(&tracking_path, || {
+                self.install_steering_file_locked(source, &rel_path, &dest, source_hash, ctx)
+            });
+
+        result.map_err(|e| match e {
+            crate::error::Error::Steering(steering_err) => steering_err,
+            other => crate::steering::SteeringError::TrackingIoFailed {
+                path: tracking_path,
+                source: std::io::Error::other(other.to_string()),
+            },
+        })
+    }
+
+    /// Inside-the-lock body of [`Self::install_steering_file`]. Extracted
+    /// to keep the public entry point small; the closure-with-lock dance
+    /// and the error-projection live in the caller.
+    fn install_steering_file_locked(
+        &self,
+        source: &crate::agent::DiscoveredNativeFile,
+        rel_path: &Path,
+        dest: &Path,
+        source_hash: &str,
+        ctx: crate::steering::SteeringInstallContext<'_>,
+    ) -> crate::error::Result<crate::steering::InstalledSteeringOutcome> {
+        let mut installed = self.load_installed_steering().map_err(|e| {
+            crate::steering::SteeringError::TrackingIoFailed {
+                path: self.steering_tracking_path(),
+                source: std::io::Error::other(e.to_string()),
+            }
+        })?;
+
+        let forced_overwrite = match Self::classify_steering_collision(
+            &installed,
+            rel_path,
+            ctx.plugin,
+            source_hash,
+            dest,
+            ctx.mode,
+        )? {
+            CollisionDecision::Idempotent(outcome) => return Ok(*outcome),
+            CollisionDecision::Proceed { forced_overwrite } => forced_overwrite,
+        };
+
+        // `_staging` is held as a RAII guard so its TempDir Drop sweeps
+        // the staging directory at end-of-scope, including on early
+        // returns from the rest of this function.
+        let (_staging, staged_file, installed_hash) =
+            self.stage_steering_file(&source.source, rel_path)?;
+
+        let backups = Self::promote_staged_steering(&staged_file, dest, forced_overwrite)?;
+        let placed = [dest.to_path_buf()];
+
+        // If we're transferring ownership from another plugin, scrub the
+        // prior owner's entry so the same path isn't tracked twice.
+        if let Some(existing) = installed.files.get(rel_path)
+            && existing.plugin != ctx.plugin
+        {
+            installed.files.remove(rel_path);
+        }
+
+        installed.files.insert(
+            rel_path.to_path_buf(),
+            InstalledSteeringMeta {
+                marketplace: ctx.marketplace.to_owned(),
+                plugin: ctx.plugin.to_owned(),
+                version: ctx.version.map(str::to_owned),
+                installed_at: chrono::Utc::now(),
+                source_hash: source_hash.to_owned(),
+                installed_hash: installed_hash.clone(),
+            },
+        );
+
+        if let Err(e) = self.write_steering_tracking(&installed) {
+            warn!(
+                rel = %rel_path.display(),
+                error = %e,
+                "steering tracking update failed; restoring backups"
+            );
+            Self::rollback_companion_promotion(&placed, &backups);
+            return Err(crate::steering::SteeringError::TrackingIoFailed {
+                path: self.steering_tracking_path(),
+                source: std::io::Error::other(e.to_string()),
+            }
+            .into());
+        }
+
+        // Success — drop backup files. Best-effort.
+        for (_orig, backup) in &backups {
+            if let Err(e) = fs::remove_file(backup)
+                && e.kind() != std::io::ErrorKind::NotFound
+            {
+                warn!(
+                    path = %backup.display(),
+                    error = %e,
+                    "failed to remove steering backup after success"
+                );
+            }
+        }
+
+        debug!(
+            rel = %rel_path.display(),
+            force = ctx.mode.is_force(),
+            "steering file installed"
+        );
+
+        Ok(crate::steering::InstalledSteeringOutcome {
+            source: source.source.clone(),
+            destination: dest.to_path_buf(),
+            kind: if forced_overwrite {
+                InstallOutcomeKind::ForceOverwrote
+            } else {
+                InstallOutcomeKind::Installed
+            },
+            source_hash: source_hash.to_owned(),
+            installed_hash,
+        })
     }
 
     /// Install a parsed agent into the Kiro project.
@@ -1854,6 +2320,129 @@ mod tests {
     fn installed_agents_default_is_empty() {
         let ia = InstalledAgents::default();
         assert!(ia.agents.is_empty());
+    }
+
+    #[test]
+    fn installed_steering_loads_legacy_empty_object() {
+        // Old projects without any steering install: file may not exist,
+        // or may be `{}`. Both must deserialize to an empty wrapper.
+        let from_empty: InstalledSteering = serde_json::from_slice(b"{}").unwrap();
+        assert!(from_empty.files.is_empty());
+    }
+
+    #[test]
+    fn installed_steering_round_trips_through_serde() {
+        let mut steering = InstalledSteering::default();
+        steering.files.insert(
+            std::path::PathBuf::from("review-process.md"),
+            InstalledSteeringMeta {
+                marketplace: "m".into(),
+                plugin: "p".into(),
+                version: Some("0.1.0".into()),
+                installed_at: chrono::Utc::now(),
+                source_hash: "blake3:abc".into(),
+                installed_hash: "blake3:abc".into(),
+            },
+        );
+        let bytes = serde_json::to_vec(&steering).unwrap();
+        let back: InstalledSteering = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(back.files.len(), 1);
+        assert!(
+            back.files
+                .contains_key(std::path::Path::new("review-process.md"))
+        );
+    }
+
+    #[test]
+    fn installed_steering_skips_serializing_empty_files_map() {
+        // P-4: empty `files` must not appear in the wire format. Pre-steering
+        // tracking files round-trip byte-identical through this type.
+        let empty = InstalledSteering::default();
+        let bytes = serde_json::to_vec(&empty).unwrap();
+        let s = std::str::from_utf8(&bytes).unwrap();
+        assert!(
+            !s.contains("files"),
+            "empty InstalledSteering must omit the `files` key, got: {s}"
+        );
+    }
+
+    #[test]
+    fn load_installed_steering_returns_default_when_file_missing() {
+        let (_dir, project) = temp_project();
+        let installed = project.load_installed_steering().unwrap();
+        assert!(installed.files.is_empty());
+    }
+
+    #[test]
+    fn load_installed_steering_round_trips_through_disk() {
+        let (_dir, project) = temp_project();
+
+        let mut to_save = InstalledSteering::default();
+        to_save.files.insert(
+            PathBuf::from("guide.md"),
+            InstalledSteeringMeta {
+                marketplace: "m".into(),
+                plugin: "p".into(),
+                version: None,
+                installed_at: chrono::Utc::now(),
+                source_hash: "blake3:abc".into(),
+                installed_hash: "blake3:abc".into(),
+            },
+        );
+        project.write_steering_tracking(&to_save).unwrap();
+
+        let loaded = project.load_installed_steering().unwrap();
+        assert_eq!(loaded.files.len(), 1);
+        assert!(loaded.files.contains_key(std::path::Path::new("guide.md")));
+    }
+
+    #[test]
+    fn install_steering_file_writes_to_kiro_steering_with_hashes() {
+        let (_dir, project) = temp_project();
+
+        let scan_root = project.root.join("source-steering");
+        fs::create_dir_all(&scan_root).unwrap();
+        let src = scan_root.join("guide.md");
+        fs::write(&src, b"# Steering Guide\n\nbody").unwrap();
+
+        let source_hash =
+            crate::hash::hash_artifact(&scan_root, &[PathBuf::from("guide.md")]).unwrap();
+
+        let discovered = crate::agent::DiscoveredNativeFile {
+            source: src.clone(),
+            scan_root: scan_root.clone(),
+        };
+
+        let outcome = project
+            .install_steering_file(
+                &discovered,
+                &source_hash,
+                crate::steering::SteeringInstallContext {
+                    mode: crate::service::InstallMode::New,
+                    marketplace: "marketplace-x",
+                    plugin: "plugin-y",
+                    version: Some("0.1.0"),
+                },
+            )
+            .expect("install_steering_file");
+
+        let dest = project.steering_dir().join("guide.md");
+        assert_eq!(outcome.destination, dest);
+        assert!(dest.exists(), "destination file must exist on disk");
+        assert_eq!(fs::read(&dest).unwrap(), b"# Steering Guide\n\nbody");
+        assert_eq!(outcome.source_hash, source_hash);
+        assert!(outcome.installed_hash.starts_with("blake3:"));
+        assert_eq!(outcome.kind, InstallOutcomeKind::Installed);
+
+        // Tracking entry must be present.
+        let tracking = project.load_installed_steering().unwrap();
+        let entry = tracking
+            .files
+            .get(std::path::Path::new("guide.md"))
+            .expect("tracking entry written");
+        assert_eq!(entry.plugin, "plugin-y");
+        assert_eq!(entry.marketplace, "marketplace-x");
+        assert_eq!(entry.version.as_deref(), Some("0.1.0"));
     }
 
     fn write_agent(tmp: &Path, name: &str, body: &str) -> PathBuf {

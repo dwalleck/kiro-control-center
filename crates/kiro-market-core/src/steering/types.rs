@@ -15,6 +15,21 @@ use serde::Serialize;
 use thiserror::Error;
 
 use crate::project::InstallOutcomeKind;
+use crate::service::InstallMode;
+
+/// Bundled non-source-specific install identity threaded through the
+/// per-file steering install chain. Mirrors
+/// [`crate::service::AgentInstallContext`] (no `accept_mcp` because
+/// steering files have no execution semantics — see plan rationale).
+///
+/// `Copy` because every field is already a cheap reference / primitive.
+#[derive(Debug, Clone, Copy)]
+pub struct SteeringInstallContext<'a> {
+    pub mode: InstallMode,
+    pub marketplace: &'a str,
+    pub plugin: &'a str,
+    pub version: Option<&'a str>,
+}
 
 /// Errors that can occur during steering install.
 #[derive(Debug, Error)]
