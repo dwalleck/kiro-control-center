@@ -10,6 +10,10 @@ use tracing::{debug, warn};
 /// not agents. Compared case-insensitively so `readme.md` is also excluded.
 const EXCLUDED_FILENAMES: &[&str] = &["README.md", "CONTRIBUTING.md", "CHANGELOG.md"];
 
+/// Stems of [`EXCLUDED_FILENAMES`] for extension-agnostic exclusion in
+/// native agent discovery (where files are `.json`, not `.md`).
+const EXCLUDED_STEMS: &[&str] = &["README", "CONTRIBUTING", "CHANGELOG"];
+
 /// Find agent markdown files inside `plugin_dir` according to `scan_paths`.
 ///
 /// `scan_paths` are relative to `plugin_dir`. Each entry is first validated
@@ -207,17 +211,11 @@ pub fn discover_native_kiro_agents_in_dirs(
             };
             // README/CONTRIBUTING/CHANGELOG with .json extension are excluded
             // case-insensitively by stem to mirror the .md exclusion.
-            if EXCLUDED_FILENAMES.iter().any(|excluded| {
-                let stem_excl = Path::new(excluded)
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or(excluded);
-                let stem_name = Path::new(name)
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or(name);
-                stem_excl.eq_ignore_ascii_case(stem_name)
-            }) {
+            let stem = Path::new(name).file_stem().and_then(|s| s.to_str()).unwrap_or(name);
+            if EXCLUDED_STEMS
+                .iter()
+                .any(|excluded| excluded.eq_ignore_ascii_case(stem))
+            {
                 continue;
             }
             if Path::new(name)

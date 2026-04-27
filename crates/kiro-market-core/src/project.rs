@@ -1763,7 +1763,7 @@ impl KiroProject {
                 let (staging, json_rel, installed_hash) =
                     self.stage_native_agent_file(&agent_name, &bundle.raw_bytes)?;
 
-                let had_backup = self.promote_native_agent(
+                let backup = self.promote_native_agent(
                     staging.path(),
                     &json_rel,
                     &json_target,
@@ -1800,34 +1800,31 @@ impl KiroProject {
                             "failed to remove placed agent JSON during rollback"
                         );
                     }
-                    if had_backup {
-                        let backup = json_target.with_extension("json.kiro-bak");
-                        if let Err(restore_err) = fs::rename(&backup, &json_target) {
-                            warn!(
-                                backup = %backup.display(),
-                                target = %json_target.display(),
-                                error = %restore_err,
-                                "failed to restore backup after tracking write failure — \
-                                 user may need to rename .kiro-bak file manually"
-                            );
-                        }
+                    if let Some(ref bak) = backup
+                        && let Err(restore_err) = fs::rename(bak, &json_target)
+                    {
+                        warn!(
+                            backup = %bak.display(),
+                            target = %json_target.display(),
+                            error = %restore_err,
+                            "failed to restore backup after tracking write failure — \
+                             user may need to rename .kiro-bak file manually"
+                        );
                     }
                     return Err(e);
                 }
 
                 // Success — drop the backup file. Best-effort; an orphan
                 // .kiro-bak left here is a curiosity, not a correctness issue.
-                if had_backup {
-                    let backup = json_target.with_extension("json.kiro-bak");
-                    if let Err(e) = fs::remove_file(&backup)
-                        && e.kind() != std::io::ErrorKind::NotFound
-                    {
-                        warn!(
-                            path = %backup.display(),
-                            error = %e,
-                            "failed to remove install backup after success"
-                        );
-                    }
+                if let Some(ref bak) = backup
+                    && let Err(e) = fs::remove_file(bak)
+                    && e.kind() != std::io::ErrorKind::NotFound
+                {
+                    warn!(
+                        path = %bak.display(),
+                        error = %e,
+                        "failed to remove install backup after success"
+                    );
                 }
 
                 debug!(name = %agent_name, force = mode.is_force(), "native agent installed");
@@ -1892,8 +1889,8 @@ impl KiroProject {
 
     /// Move a staged native agent JSON into its final destination, backing
     /// the existing file up to a `.kiro-bak` sibling when `forced_overwrite`
-    /// is set. Returns `had_backup` so the caller can restore on tracking
-    /// failure or drop the backup on success.
+    /// is set. Returns the backup path if one was made, so the caller can
+    /// restore on tracking failure or drop the backup on success.
     ///
     /// Pre-conditions: caller has already done the collision check; under
     /// `forced_overwrite == false` the destination is guaranteed to not
@@ -1906,23 +1903,26 @@ impl KiroProject {
         json_rel: &Path,
         json_target: &Path,
         forced_overwrite: bool,
-    ) -> crate::error::Result<bool> {
+    ) -> crate::error::Result<Option<PathBuf>> {
         let staging_json = staging.join(json_rel);
 
         fs::create_dir_all(self.agents_dir())?;
 
         // Backup phase — only when overwriting an existing file.
-        let backup_target = json_target.with_extension("json.kiro-bak");
-        let mut had_backup = false;
-        if forced_overwrite && json_target.exists() {
+        let backup_target = Self::companion_backup_path(json_target);
+        let backup = if forced_overwrite && json_target.exists() {
             fs::rename(json_target, &backup_target)?;
-            had_backup = true;
-        }
+            Some(backup_target.clone())
+        } else {
+            None
+        };
 
         // Promote phase.
         if let Err(e) = fs::rename(&staging_json, json_target) {
             // Restore backup if we made one.
-            if had_backup && let Err(restore_err) = fs::rename(&backup_target, json_target) {
+            if backup.is_some()
+                && let Err(restore_err) = fs::rename(&backup_target, json_target)
+            {
                 warn!(
                     backup = %backup_target.display(),
                     target = %json_target.display(),
@@ -1932,7 +1932,7 @@ impl KiroProject {
             }
             return Err(e.into());
         }
-        Ok(had_backup)
+        Ok(backup)
     }
 
     /// Install a plugin's native companion file bundle as one atomic unit.

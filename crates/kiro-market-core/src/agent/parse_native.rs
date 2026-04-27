@@ -259,14 +259,8 @@ fn first_nul_in_strings(value: &serde_json::Value) -> Option<String> {
                     // parent, with `/<key>` appended — accurate even
                     // though the failure isn't on a value.
                     if k.as_bytes().contains(&0) {
-                        let saved_len = path.len();
-                        path.push('/');
                         let escaped = k.replace('~', "~0").replace('/', "~1");
-                        path.push_str(&escaped);
-                        // path is non-empty here: we just pushed '/' + escaped key.
-                        let result = path.clone();
-                        path.truncate(saved_len);
-                        return Some(result);
+                        return Some(format!("{path}/{escaped}"));
                     }
                     let saved_len = path.len();
                     path.push('/');
