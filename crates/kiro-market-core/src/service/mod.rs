@@ -1300,6 +1300,77 @@ impl MarketplaceService {
         }
     }
 
+    /// Install every steering file declared by a plugin into the
+    /// project's `.kiro/steering/` directory. Per-file failures land
+    /// in `result.failed`; the batch keeps making progress so a single
+    /// bad file doesn't break the rest.
+    ///
+    /// # Multi-scan-root semantics
+    ///
+    /// Multi-scan-root is supported — each file's relative path under
+    /// its own `scan_root` is the tracking key. Same-name files from
+    /// different scan roots surface as a normal cross-rel collision via
+    /// the standard collision matrix, no upstream rejection needed
+    /// (S3-11). This is the intentional asymmetry with the native
+    /// companion bundle path, which DOES require a single scan root
+    /// because companion `rel_paths` derivation would otherwise be
+    /// ambiguous.
+    #[must_use = "the install result carries per-file failures and warnings; losing it drops the user-facing summary"]
+    pub fn install_plugin_steering(
+        &self,
+        project: &crate::project::KiroProject,
+        plugin_dir: &Path,
+        scan_paths: &[String],
+        ctx: crate::steering::SteeringInstallContext<'_>,
+    ) -> crate::steering::InstallSteeringResult {
+        let _ = self;
+        let mut result = crate::steering::InstallSteeringResult::default();
+
+        let files = crate::steering::discover_steering_files_in_dirs(plugin_dir, scan_paths);
+
+        for f in &files {
+            let Ok(rel_ref) = f.source.strip_prefix(&f.scan_root) else {
+                result.failed.push(crate::steering::FailedSteeringFile {
+                    source: f.source.clone(),
+                    error: crate::steering::SteeringError::SourceReadFailed {
+                        path: f.source.clone(),
+                        source: std::io::Error::new(
+                            std::io::ErrorKind::InvalidInput,
+                            "source not under scan_root",
+                        ),
+                    },
+                });
+                continue;
+            };
+            let rel = rel_ref.to_path_buf();
+
+            let source_hash =
+                match crate::hash::hash_artifact(&f.scan_root, std::slice::from_ref(&rel)) {
+                    Ok(h) => h,
+                    Err(e) => {
+                        result.failed.push(crate::steering::FailedSteeringFile {
+                            source: f.source.clone(),
+                            error: crate::steering::SteeringError::HashFailed {
+                                path: f.source.clone(),
+                                source: e,
+                            },
+                        });
+                        continue;
+                    }
+                };
+
+            match project.install_steering_file(f, &source_hash, ctx) {
+                Ok(outcome) => result.installed.push(outcome),
+                Err(error) => result.failed.push(crate::steering::FailedSteeringFile {
+                    source: f.source.clone(),
+                    error,
+                }),
+            }
+        }
+
+        result
+    }
+
     /// Translated install path: discovers `.md` agents under `scan_paths`,
     /// parses each via `parse_agent_file`, applies the MCP opt-in gate,
     /// maps tools per dialect, and installs into the project. Per-agent
@@ -2853,6 +2924,82 @@ mod tests {
             matches!(err, Error::Plugin(PluginError::DirectoryMissing { .. })),
             "expected PluginError::DirectoryMissing, got: {err:?}"
         );
+    }
+
+    #[test]
+    fn install_plugin_steering_discovers_and_installs_all_files() {
+        let plugin_tmp = tempfile::tempdir().expect("plugin tempdir");
+        let steering = plugin_tmp.path().join("steering");
+        std::fs::create_dir_all(&steering).expect("create steering dir");
+        std::fs::write(steering.join("alpha.md"), b"alpha").unwrap();
+        std::fs::write(steering.join("beta.md"), b"beta").unwrap();
+
+        let (_dir, svc) = crate::service::test_support::temp_service();
+        let project_tmp = tempfile::tempdir().expect("project tempdir");
+        let project = crate::project::KiroProject::new(project_tmp.path().to_path_buf());
+
+        let scan_paths = vec!["./steering/".to_string()];
+        let ctx = crate::steering::SteeringInstallContext {
+            mode: InstallMode::New,
+            marketplace: "marketplace-x",
+            plugin: "p",
+            version: None,
+        };
+
+        let result = svc.install_plugin_steering(&project, plugin_tmp.path(), &scan_paths, ctx);
+
+        assert_eq!(result.installed.len(), 2);
+        assert!(
+            result.failed.is_empty(),
+            "no failures expected, got {:?}",
+            result.failed
+        );
+        assert!(project_tmp.path().join(".kiro/steering/alpha.md").exists());
+        assert!(project_tmp.path().join(".kiro/steering/beta.md").exists());
+
+        // Idempotent reinstall.
+        let again = svc.install_plugin_steering(&project, plugin_tmp.path(), &scan_paths, ctx);
+        assert!(
+            again
+                .installed
+                .iter()
+                .all(|o| o.kind == crate::project::InstallOutcomeKind::Idempotent),
+            "all reinstalls must be idempotent: {:?}",
+            again.installed
+        );
+    }
+
+    #[test]
+    fn install_plugin_steering_handles_multi_scan_root_without_special_case() {
+        // S3-11: steering does NOT require a single scan_root the way
+        // companion bundles do. Distinct files from different scan
+        // roots all install; same-name conflicts surface through the
+        // standard collision matrix at install time, not as an
+        // upstream rejection.
+        let plugin_tmp = tempfile::tempdir().expect("plugin tempdir");
+        std::fs::create_dir_all(plugin_tmp.path().join("a")).unwrap();
+        std::fs::create_dir_all(plugin_tmp.path().join("b")).unwrap();
+        std::fs::write(plugin_tmp.path().join("a/alpha.md"), b"alpha").unwrap();
+        std::fs::write(plugin_tmp.path().join("b/beta.md"), b"beta").unwrap();
+
+        let (_dir, svc) = crate::service::test_support::temp_service();
+        let project_tmp = tempfile::tempdir().expect("project tempdir");
+        let project = crate::project::KiroProject::new(project_tmp.path().to_path_buf());
+
+        let scan_paths = vec!["./a/".to_string(), "./b/".to_string()];
+        let ctx = crate::steering::SteeringInstallContext {
+            mode: InstallMode::New,
+            marketplace: "m",
+            plugin: "p",
+            version: None,
+        };
+
+        let result = svc.install_plugin_steering(&project, plugin_tmp.path(), &scan_paths, ctx);
+
+        assert_eq!(result.installed.len(), 2);
+        assert!(result.failed.is_empty(), "no failures expected");
+        assert!(project_tmp.path().join(".kiro/steering/alpha.md").exists());
+        assert!(project_tmp.path().join(".kiro/steering/beta.md").exists());
     }
 
     #[test]

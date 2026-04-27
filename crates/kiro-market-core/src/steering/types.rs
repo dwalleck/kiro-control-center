@@ -150,7 +150,7 @@ impl std::fmt::Display for SteeringWarning {
 }
 
 /// Aggregate result of `MarketplaceService::install_plugin_steering`.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 pub struct InstallSteeringResult {
     pub installed: Vec<InstalledSteeringOutcome>,
     pub failed: Vec<FailedSteeringFile>,
