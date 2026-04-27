@@ -124,6 +124,44 @@ pub struct InstalledAgents {
     pub native_companions: HashMap<String, InstalledNativeCompanionsMeta>,
 }
 
+/// In-memory outcome of one [`KiroProject::install_native_agent`] call.
+///
+/// Carries enough detail for the service layer to render an install-summary
+/// row without re-reading tracking — name, the resolved destination JSON
+/// path, whether `--force` overwrote a tracked path, whether the call was
+/// a no-op idempotent reinstall, and both content hashes.
+#[derive(Debug, Clone)]
+pub struct InstalledNativeAgentOutcome {
+    pub name: String,
+    pub json_path: PathBuf,
+    /// `true` if `--force` overwrote a tracked path (orphan, prior
+    /// version of the same plugin's content, or another plugin's
+    /// ownership transferred). `false` for a clean first install or
+    /// idempotent reinstall.
+    pub forced_overwrite: bool,
+    /// `true` if `source_hash` matched the tracked entry exactly and
+    /// nothing was written — the install was a verified no-op.
+    pub was_idempotent: bool,
+    pub source_hash: String,
+    pub installed_hash: String,
+}
+
+/// In-memory outcome of one [`KiroProject::install_native_companions`] call.
+///
+/// Plugin-scoped (companion bundles are owned per-plugin, not per-agent),
+/// so callers see one entry for the whole bundle rather than one per file.
+/// `files` is the absolute destination paths of every companion file
+/// installed for this plugin.
+#[derive(Debug, Clone)]
+pub struct InstalledNativeCompanionsOutcome {
+    pub plugin: String,
+    pub files: Vec<PathBuf>,
+    pub forced_overwrite: bool,
+    pub was_idempotent: bool,
+    pub source_hash: String,
+    pub installed_hash: String,
+}
+
 // ---------------------------------------------------------------------------
 // KiroProject
 // ---------------------------------------------------------------------------
