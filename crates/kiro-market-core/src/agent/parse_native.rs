@@ -38,6 +38,12 @@ pub struct NativeAgentBundle {
     pub raw_bytes: Vec<u8>,
 }
 
+/// Maximum size in bytes of a native Kiro agent JSON file. 1 MiB is ~10x
+/// the largest realistic agent JSON (multi-prompt embeds rarely exceed
+/// 100 KB). The cap is enforced before [`std::fs::read`] allocates, so a
+/// hostile multi-GB `agents/big.json` cannot OOM the parser.
+pub const MAX_NATIVE_AGENT_BYTES: u64 = 1024 * 1024;
+
 /// Failure modes for [`parse_native_kiro_agent_file`]. Mirrors the existing
 /// [`super::ParseFailure`] for translated agents — structured variants
 /// instead of free-form strings, so callers can branch on the semantic.
@@ -51,9 +57,26 @@ pub enum NativeParseFailure {
     /// File could not be read (permission denied, racy delete, etc.).
     #[error("read failed")]
     IoError(#[source] io::Error),
+    /// Source path resolved to a symlink. Following it could leak host
+    /// files into the install pipeline (the bytes get written verbatim to
+    /// `.kiro/agents/`), so the parser refuses. Discovery already filters
+    /// these, but the re-check here closes the TOCTOU window between
+    /// discovery's stat and parse's read.
+    #[error("refusing to follow symlink at `{0}`")]
+    SymlinkRefused(PathBuf),
+    /// Source file exceeds [`MAX_NATIVE_AGENT_BYTES`]. Refused before
+    /// allocation to avoid OOM on hostile manifests.
+    #[error("agent JSON exceeds size cap: {size} bytes (limit: {limit})")]
+    FileTooLarge { size: u64, limit: u64 },
     /// File is not valid JSON.
     #[error("invalid JSON")]
     InvalidJson(#[source] serde_json::Error),
+    /// JSON parsed but a string value contains a NUL byte (the JSON
+    /// `\u0000` escape). Carries the JSON pointer of the offending field.
+    /// NUL bytes break C-string boundaries in downstream tooling and have
+    /// no legitimate use in Kiro agent JSON.
+    #[error("NUL byte in JSON string at `{json_pointer}`")]
+    NulByteInJsonString { json_pointer: String },
     /// JSON parsed but the required `name` field is missing.
     #[error("missing required `name` field")]
     MissingName,
@@ -74,22 +97,44 @@ struct NativeAgentProjection {
 
 /// Parse a candidate native Kiro agent JSON file.
 ///
-/// Reads the file once, parses the JSON twice (into `serde_json::Value` for
-/// preservation and into [`NativeAgentProjection`] for typed field access).
-/// The two-parse cost is negligible vs. I/O and avoids manual `Value` walks.
+/// Hardening steps before allocation:
+/// 1. `symlink_metadata` re-check refuses symlinks (closes the TOCTOU
+///    window between discovery's filter and this read).
+/// 2. Size cap rejects files exceeding [`MAX_NATIVE_AGENT_BYTES`] before
+///    `fs::read` allocates a `Vec<u8>` for them.
+///
+/// Then reads the bytes, parses into both `serde_json::Value` (preserved
+/// for projection / install) and [`NativeAgentProjection`] (typed field
+/// access). Walks the parsed value for NUL bytes inside string values —
+/// `serde_json` permits the `\u0000` escape, but NUL has no legitimate use in
+/// agent JSON and breaks C-string boundaries in downstream tooling.
 ///
 /// # Errors
 ///
-/// Returns [`NativeParseFailure`] for any failure: I/O, malformed JSON,
-/// missing `name`, or invalid `name`. Callers route the failure into a
-/// typed [`crate::error::AgentError`] variant at the install boundary.
+/// Returns [`NativeParseFailure`] for any failure. Callers route the
+/// failure into a typed [`crate::error::AgentError`] variant at the
+/// install boundary.
 pub fn parse_native_kiro_agent_file(
     json_path: &Path,
     scan_root: &Path,
 ) -> Result<NativeAgentBundle, NativeParseFailure> {
+    let md = std::fs::symlink_metadata(json_path).map_err(NativeParseFailure::IoError)?;
+    if md.file_type().is_symlink() {
+        return Err(NativeParseFailure::SymlinkRefused(json_path.to_path_buf()));
+    }
+    if md.len() > MAX_NATIVE_AGENT_BYTES {
+        return Err(NativeParseFailure::FileTooLarge {
+            size: md.len(),
+            limit: MAX_NATIVE_AGENT_BYTES,
+        });
+    }
+
     let raw_bytes = std::fs::read(json_path).map_err(NativeParseFailure::IoError)?;
     let raw_json: serde_json::Value =
         serde_json::from_slice(&raw_bytes).map_err(NativeParseFailure::InvalidJson)?;
+    if let Some(json_pointer) = first_nul_in_strings(&raw_json) {
+        return Err(NativeParseFailure::NulByteInJsonString { json_pointer });
+    }
     let projection: NativeAgentProjection =
         serde_json::from_slice(&raw_bytes).map_err(NativeParseFailure::InvalidJson)?;
 
@@ -104,6 +149,57 @@ pub fn parse_native_kiro_agent_file(
         raw_json,
         raw_bytes,
     })
+}
+
+/// Walk `value` and return the JSON pointer of the first string value
+/// containing a NUL byte, if any. Returns `None` if all string values are
+/// NUL-free. Recurses into objects and arrays; non-string scalars are
+/// skipped.
+fn first_nul_in_strings(value: &serde_json::Value) -> Option<String> {
+    fn walk(value: &serde_json::Value, path: &mut String) -> Option<String> {
+        match value {
+            serde_json::Value::String(s) => {
+                if s.as_bytes().contains(&0) {
+                    Some(if path.is_empty() {
+                        "/".to_string()
+                    } else {
+                        path.clone()
+                    })
+                } else {
+                    None
+                }
+            }
+            serde_json::Value::Array(arr) => {
+                for (i, v) in arr.iter().enumerate() {
+                    let saved_len = path.len();
+                    path.push('/');
+                    path.push_str(&i.to_string());
+                    if let Some(p) = walk(v, path) {
+                        return Some(p);
+                    }
+                    path.truncate(saved_len);
+                }
+                None
+            }
+            serde_json::Value::Object(map) => {
+                for (k, v) in map {
+                    let saved_len = path.len();
+                    path.push('/');
+                    // RFC 6901: escape `~` and `/` in keys.
+                    let escaped = k.replace('~', "~0").replace('/', "~1");
+                    path.push_str(&escaped);
+                    if let Some(p) = walk(v, path) {
+                        return Some(p);
+                    }
+                    path.truncate(saved_len);
+                }
+                None
+            }
+            _ => None,
+        }
+    }
+    let mut path = String::new();
+    walk(value, &mut path)
 }
 
 #[cfg(test)]
@@ -220,5 +316,106 @@ mod tests {
         fs::write(&p, body).expect("write");
         let b = parse_native_kiro_agent_file(&p, tmp.path()).expect("parse");
         assert_eq!(b.raw_bytes.as_slice(), body.as_slice());
+    }
+
+    #[test]
+    fn file_exceeding_size_cap_is_refused() {
+        let tmp = tempdir().unwrap();
+        let p = tmp.path().join("huge.json");
+        // The size check runs before fs::read allocates, so the bytes
+        // don't need to be valid JSON — just over the threshold.
+        let cap_usize = usize::try_from(MAX_NATIVE_AGENT_BYTES)
+            .expect("MAX_NATIVE_AGENT_BYTES fits in usize on test platforms");
+        let oversized = vec![b' '; cap_usize + 1];
+        fs::write(&p, &oversized).expect("write oversized fixture");
+        let err = parse_native_kiro_agent_file(&p, tmp.path()).expect_err("must fail");
+        match err {
+            NativeParseFailure::FileTooLarge { size, limit } => {
+                assert_eq!(limit, MAX_NATIVE_AGENT_BYTES);
+                assert!(size > limit);
+            }
+            other => panic!("expected FileTooLarge, got {other:?}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlink_at_parse_time_is_refused() {
+        use std::os::unix::fs::symlink;
+        let tmp = tempdir().unwrap();
+        let target = tmp.path().join("real.json");
+        fs::write(&target, br#"{"name":"real"}"#).expect("write target");
+        let link = tmp.path().join("link.json");
+        symlink(&target, &link).expect("create symlink");
+
+        let err = parse_native_kiro_agent_file(&link, tmp.path()).expect_err("must fail");
+        assert!(matches!(err, NativeParseFailure::SymlinkRefused(_)));
+    }
+
+    /// Six-char JSON escape sequence that parses to a NUL code point.
+    /// Embedded via `format!` so the source file never contains literal
+    /// raw NUL bytes — the threat vector is the JSON escape, not raw NUL
+    /// (which `serde_json` rejects at parse time per RFC 8259).
+    const NUL_ESC: &str = "\\u0000";
+
+    #[test]
+    fn nul_byte_in_top_level_string_field_is_refused() {
+        let tmp = tempdir().unwrap();
+        let body = format!(r#"{{"name":"rev","prompt":"hello{NUL_ESC}world"}}"#);
+        let p = write_json(tmp.path(), "rev.json", &body);
+        let err = parse_native_kiro_agent_file(&p, tmp.path()).expect_err("must fail");
+        match err {
+            NativeParseFailure::NulByteInJsonString { json_pointer } => {
+                assert_eq!(json_pointer, "/prompt");
+            }
+            other => panic!("expected NulByteInJsonString, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn nul_byte_in_mcp_command_is_refused() {
+        let tmp = tempdir().unwrap();
+        let body = format!(
+            r#"{{"name":"rev","mcpServers":{{"x":{{"type":"stdio","command":"sh{NUL_ESC}evil","args":[]}}}}}}"#
+        );
+        let p = write_json(tmp.path(), "rev.json", &body);
+        let err = parse_native_kiro_agent_file(&p, tmp.path()).expect_err("must fail");
+        match err {
+            NativeParseFailure::NulByteInJsonString { json_pointer } => {
+                assert_eq!(json_pointer, "/mcpServers/x/command");
+            }
+            other => panic!("expected NulByteInJsonString, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn json_pointer_escapes_slash_and_tilde_per_rfc6901() {
+        let tmp = tempdir().unwrap();
+        // Key contains `/` and `~` — RFC 6901 requires them escaped to
+        // `~1` and `~0` respectively in the JSON pointer.
+        let body = format!(r#"{{"name":"rev","a/b~c":"bad{NUL_ESC}"}}"#);
+        let p = write_json(tmp.path(), "rev.json", &body);
+        let err = parse_native_kiro_agent_file(&p, tmp.path()).expect_err("must fail");
+        match err {
+            NativeParseFailure::NulByteInJsonString { json_pointer } => {
+                assert_eq!(json_pointer, "/a~1b~0c");
+            }
+            other => panic!("expected NulByteInJsonString, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn raw_nul_byte_in_json_source_is_rejected_by_parser() {
+        // Sanity check: a literal NUL byte (not escape) inside a JSON
+        // string is invalid JSON per RFC 8259. serde_json rejects it
+        // before our NUL walk runs. This test pins that contract — if
+        // serde_json ever loosens its parser, our `first_nul_in_strings`
+        // check becomes load-bearing rather than belt-and-suspenders.
+        let tmp = tempdir().unwrap();
+        let body: &[u8] = b"{\"name\":\"rev\",\"prompt\":\"\x00\"}";
+        let p = tmp.path().join("rev.json");
+        fs::write(&p, body).expect("write fixture");
+        let err = parse_native_kiro_agent_file(&p, tmp.path()).expect_err("must fail");
+        assert!(matches!(err, NativeParseFailure::InvalidJson(_)));
     }
 }
