@@ -317,7 +317,16 @@ fn print_agent_outcome(result: &InstallAgentsResult) {
         let suffix = match companions.kind {
             kiro_market_core::project::InstallOutcomeKind::Idempotent => " (unchanged)".dimmed(),
             kiro_market_core::project::InstallOutcomeKind::ForceOverwrote => " (forced)".yellow(),
-            _ => "".normal(),
+            other => {
+                // Surface unhandled future variants at debug! so RUST_LOG=debug
+                // operators see the gap before users.
+                debug!(
+                    plugin = %companions.plugin,
+                    kind = ?other,
+                    "unhandled InstallOutcomeKind in companion render; falling back to neutral suffix"
+                );
+                "".normal()
+            }
         };
         let plural = if companions.files.len() == 1 { "" } else { "s" };
         println!(
@@ -360,7 +369,14 @@ fn print_steering_outcome(result: &InstallSteeringResult, project: &KiroProject)
         let suffix = match outcome.kind {
             kiro_market_core::project::InstallOutcomeKind::Idempotent => " (unchanged)".dimmed(),
             kiro_market_core::project::InstallOutcomeKind::ForceOverwrote => " (forced)".yellow(),
-            _ => "".normal(),
+            other => {
+                debug!(
+                    destination = %outcome.destination.display(),
+                    kind = ?other,
+                    "unhandled InstallOutcomeKind in steering render; falling back to neutral suffix"
+                );
+                "".normal()
+            }
         };
         let rel = outcome
             .destination

@@ -9,7 +9,7 @@
 //! a parallel enum.
 
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use serde::Serialize;
 use thiserror::Error;
@@ -164,16 +164,41 @@ pub enum SteeringWarning {
     ScanDirUnreadable { path: PathBuf, reason: String },
 }
 
+/// Wrapper for safe terminal rendering of paths from untrusted manifests.
+/// Replaces ASCII control bytes (`0x00..0x20`, `0x7f`) and the U+202E /
+/// U+202D RTL-override codepoints with `\x{NN}` / `\u{NNNN}` escapes so a
+/// malicious manifest can't inject ANSI escape sequences (clear screen,
+/// hide cursor, etc.) or display reordering tricks via warning render.
+struct SafeForTerminal<'a>(&'a Path);
+
+impl std::fmt::Display for SafeForTerminal<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        use std::fmt::Write;
+        for ch in self.0.to_string_lossy().chars() {
+            let cp = ch as u32;
+            if cp < 0x20 || cp == 0x7f {
+                write!(f, "\\x{cp:02x}")?;
+            } else if matches!(cp, 0x202d | 0x202e | 0x2066..=0x2069) {
+                // Bidirectional override / isolate codepoints.
+                write!(f, "\\u{{{cp:04x}}}")?;
+            } else {
+                f.write_char(ch)?;
+            }
+        }
+        Ok(())
+    }
+}
+
 impl std::fmt::Display for SteeringWarning {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::ScanPathInvalid { path, reason } => {
-                write!(f, "skipped scan path {}: {}", path.display(), reason)
+                write!(f, "skipped scan path {}: {}", SafeForTerminal(path), reason)
             }
             Self::ScanDirUnreadable { path, reason } => write!(
                 f,
                 "could not read steering scan directory {}: {}",
-                path.display(),
+                SafeForTerminal(path),
                 reason
             ),
         }

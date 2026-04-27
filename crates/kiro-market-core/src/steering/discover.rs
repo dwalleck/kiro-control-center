@@ -54,9 +54,19 @@ pub fn discover_steering_files_in_dirs(
                 error = %e,
                 "skipping steering scan path that fails validation"
             );
+            // Extract just the reason text — the full ValidationError
+            // Display embeds the raw path, which would re-introduce
+            // attacker-controlled bytes into the warning AFTER the
+            // SafeForTerminal wrapper sanitized the standalone path
+            // field. The variant's `reason` is plain English describing
+            // why the path was rejected.
+            let reason = match &e {
+                crate::error::ValidationError::InvalidRelativePath { reason, .. }
+                | crate::error::ValidationError::InvalidName { reason, .. } => reason.clone(),
+            };
             warnings.push(SteeringWarning::ScanPathInvalid {
                 path: PathBuf::from(rel),
-                reason: e.to_string(),
+                reason,
             });
             continue;
         }

@@ -3023,6 +3023,29 @@ mod tests {
     }
 
     #[test]
+    fn steering_warning_display_sanitizes_terminal_control_bytes() {
+        // Closes marketplace-security-reviewer Minor finding: a malicious
+        // manifest with ANSI escape sequences in a `steering` scan path
+        // could inject terminal commands (clear screen, hide cursor)
+        // when the warning rendered to a user TTY. SteeringWarning's
+        // Display now wraps paths in SafeForTerminal, which escapes
+        // ASCII control bytes to `\x{NN}` form.
+        let warning = crate::steering::SteeringWarning::ScanPathInvalid {
+            path: std::path::PathBuf::from("..\x1b[2J\x1b[H/escape"),
+            reason: "must not be an absolute path".into(),
+        };
+        let rendered = warning.to_string();
+        assert!(
+            !rendered.contains('\x1b'),
+            "ESC byte must be sanitized; got: {rendered:?}"
+        );
+        assert!(
+            rendered.contains("\\x1b"),
+            "sanitized form must use \\xNN escape; got: {rendered:?}"
+        );
+    }
+
+    #[test]
     fn install_plugin_steering_handles_multi_scan_root_without_special_case() {
         // S3-11: steering does NOT require a single scan_root the way
         // companion bundles do. Distinct files from different scan

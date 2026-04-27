@@ -2423,9 +2423,46 @@ impl KiroProject {
     /// don't propagate — the file set is already canonical in
     /// tracking, and a stray on-disk file is strictly less harmful
     /// than rolling back a successful install.
+    ///
+    /// Pair with [`Self::diff_prior_companion_files`] computed BEFORE
+    /// the tracking write — call this AFTER `write_agent_tracking`
+    /// succeeds so a tracking-write failure can't leave files removed
+    /// with phantom tracking still claiming them.
+    ///
+    /// Re-stats each path with `symlink_metadata` before removal and
+    /// skips reparse points / symlinks. Defense in depth: if some
+    /// out-of-band actor (or a stale tracking entry from a prior
+    /// install gone wrong) replaced a tracked path with a symlink,
+    /// `fs::remove_file` would remove the symlink itself, not the
+    /// target — operationally fine but the audit trail is murkier.
+    /// Skipping with a warn! makes the unusual state visible.
     fn remove_companion_files_best_effort(rel_paths: &[PathBuf], agents_dir: &Path, plugin: &str) {
         for rel in rel_paths {
             let abs = agents_dir.join(rel);
+            match fs::symlink_metadata(&abs) {
+                Ok(md) if crate::platform::is_reparse_or_symlink(&md) => {
+                    warn!(
+                        plugin,
+                        path = %abs.display(),
+                        "tracked companion is a symlink/reparse point; skipping orphan-removal"
+                    );
+                    continue;
+                }
+                Ok(_) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    // Already gone — nothing to do.
+                    continue;
+                }
+                Err(e) => {
+                    warn!(
+                        plugin,
+                        path = %abs.display(),
+                        error = %e,
+                        "failed to stat orphaned prior companion file; skipping"
+                    );
+                    continue;
+                }
+            }
             if let Err(e) = fs::remove_file(&abs)
                 && e.kind() != std::io::ErrorKind::NotFound
             {
