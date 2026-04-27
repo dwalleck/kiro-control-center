@@ -388,6 +388,99 @@ struct PromotedAgent {
     backups: Vec<(PathBuf, PathBuf)>,
 }
 
+/// Validate that a tracking-file path entry is safe for `base.join(rel)`
+/// resolution against the install root. Walks `Path::components` so the
+/// validation is platform-aware: on Windows a path like
+/// `prompts\..\..\etc\passwd` decomposes into `ParentDir` components which
+/// are rejected; on Unix the same string is a single `Normal` component
+/// (backslash is a literal filename char) which is harmless because no
+/// traversal can occur. The forward-slash form (`prompts/../etc`) is
+/// caught as `ParentDir` on both platforms.
+///
+/// Distinct from [`crate::validation::validate_relative_path`] which
+/// validates manifest-side strings and unconditionally rejects backslash
+/// (because manifests should be portable). Tracking paths come from
+/// `PathBuf` values the install code itself wrote and may carry the
+/// platform-native separator on Windows.
+fn validate_tracking_path_entry(rel: &Path) -> Result<(), &'static str> {
+    use std::path::Component;
+    if rel.as_os_str().is_empty() {
+        return Err("path must not be empty");
+    }
+    if rel.has_root() {
+        return Err("must not be an absolute path");
+    }
+    let bytes = rel.as_os_str().to_string_lossy();
+    if bytes.contains('\0') {
+        return Err("contains NUL byte");
+    }
+    for component in rel.components() {
+        match component {
+            Component::ParentDir => return Err("contains `..` (parent-dir) component"),
+            Component::RootDir | Component::Prefix(_) => return Err("absolute path component"),
+            Component::CurDir | Component::Normal(_) => {}
+        }
+    }
+    Ok(())
+}
+
+/// Validate every companion file path in a freshly-loaded
+/// [`InstalledAgents`] tracking record. Tracking files are user-owned —
+/// a tampered or hand-edited entry containing `prompts/../../etc/passwd`
+/// would, without this validation, flow into `agents_dir.join(rel)` at
+/// hash recompute time (`hash::hash_artifact`) or removal time
+/// (`fs::remove_file`) and read or delete files outside the install
+/// boundary.
+fn validate_tracking_companion_files(
+    installed: &InstalledAgents,
+    tracking_path: &Path,
+) -> crate::error::Result<()> {
+    for (plugin, meta) in &installed.native_companions {
+        for file in &meta.files {
+            if let Err(reason) = validate_tracking_path_entry(file) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "tracking file {} has invalid companion path for plugin `{}`: `{}`: {}",
+                        tracking_path.display(),
+                        plugin,
+                        file.display(),
+                        reason
+                    ),
+                )
+                .into());
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Validate every relative path key in a freshly-loaded
+/// [`InstalledSteering`] tracking record. Same rationale as
+/// [`validate_tracking_companion_files`]: a tampered key like
+/// `../../etc/passwd` would otherwise reach `steering_dir.join(rel)`
+/// at install / removal time and escape the install boundary.
+fn validate_tracking_steering_files(
+    installed: &InstalledSteering,
+    tracking_path: &Path,
+) -> crate::error::Result<()> {
+    for file_path in installed.files.keys() {
+        if let Err(reason) = validate_tracking_path_entry(file_path) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "tracking file {} has invalid steering path: `{}`: {}",
+                    tracking_path.display(),
+                    file_path.display(),
+                    reason
+                ),
+            )
+            .into());
+        }
+    }
+    Ok(())
+}
+
 impl KiroProject {
     /// Create a new project handle rooted at the given directory.
     #[must_use]
@@ -577,6 +670,7 @@ impl KiroProject {
         match fs::read(&path) {
             Ok(bytes) => {
                 let installed: InstalledAgents = serde_json::from_slice(&bytes)?;
+                validate_tracking_companion_files(&installed, &path)?;
                 Ok(installed)
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -625,6 +719,7 @@ impl KiroProject {
         match fs::read(&path) {
             Ok(bytes) => {
                 let installed: InstalledSteering = serde_json::from_slice(&bytes)?;
+                validate_tracking_steering_files(&installed, &path)?;
                 Ok(installed)
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -2563,6 +2658,96 @@ mod tests {
         let (_dir, project) = temp_project();
         let installed = project.load_installed_steering().unwrap();
         assert!(installed.files.is_empty());
+    }
+
+    #[test]
+    fn load_installed_steering_rejects_path_traversal_in_files_key() {
+        // Closes marketplace-security-reviewer Important finding: a
+        // tampered `installed-steering.json` containing a path-traversal
+        // key like `../../etc/passwd` would, without validation, flow
+        // into `steering_dir.join(rel)` at install / removal time and
+        // escape the install boundary.
+        let (_dir, project) = temp_project();
+        let tracking_path = project.root.join(".kiro/installed-steering.json");
+        fs::create_dir_all(tracking_path.parent().unwrap()).unwrap();
+        // Hand-craft a tampered tracking file. The invalid key bypasses
+        // the install path's validation entirely (it's never installed
+        // — the user fabricated it).
+        let tampered = serde_json::json!({
+            "files": {
+                "../../etc/passwd": {
+                    "marketplace": "m",
+                    "plugin": "p",
+                    "version": null,
+                    "installed_at": chrono::Utc::now(),
+                    "source_hash": "blake3:abc",
+                    "installed_hash": "blake3:abc",
+                }
+            }
+        });
+        fs::write(&tracking_path, tampered.to_string()).unwrap();
+
+        let err = project
+            .load_installed_steering()
+            .expect_err("traversal must be refused at load time");
+        match err {
+            crate::error::Error::Io(io_err) => {
+                assert_eq!(io_err.kind(), std::io::ErrorKind::InvalidData);
+                let msg = io_err.to_string();
+                assert!(
+                    msg.contains("../../etc/passwd"),
+                    "error must name the offending path, got: {msg}"
+                );
+            }
+            other => panic!("expected Error::Io(InvalidData), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn load_installed_agents_rejects_path_traversal_in_companion_files() {
+        // Closes marketplace-security-reviewer Important finding: a
+        // tampered `installed-agents.json` containing a traversal entry
+        // in `native_companions[*].files` would otherwise reach
+        // `hash_artifact(agents_dir, rel)` at cross-plugin transfer
+        // recompute time AND `agents_dir.join(rel)` at orphan-removal
+        // time, escaping the install boundary in both directions.
+        let (_dir, project) = temp_project();
+        let tracking_path = project.root.join(".kiro/installed-agents.json");
+        fs::create_dir_all(tracking_path.parent().unwrap()).unwrap();
+        let tampered = serde_json::json!({
+            "agents": {},
+            "native_companions": {
+                "evil-plugin": {
+                    "marketplace": "m",
+                    "plugin": "evil-plugin",
+                    "version": null,
+                    "installed_at": chrono::Utc::now(),
+                    "files": ["../../etc/passwd"],
+                    "source_hash": "blake3:abc",
+                    "installed_hash": "blake3:abc",
+                }
+            }
+        });
+        fs::write(&tracking_path, tampered.to_string()).unwrap();
+
+        let err = project
+            .load_installed_agents()
+            .expect_err("traversal must be refused at load time");
+        match err {
+            crate::error::Error::Io(io_err) => {
+                assert_eq!(io_err.kind(), std::io::ErrorKind::InvalidData);
+                let msg = io_err.to_string();
+                assert!(
+                    msg.contains("../../etc/passwd"),
+                    "error must name the offending path, got: {msg}"
+                );
+                assert!(
+                    msg.contains("evil-plugin"),
+                    "error must name the owning plugin, got: {msg}"
+                );
+            }
+            other => panic!("expected Error::Io(InvalidData), got {other:?}"),
+        }
     }
 
     #[test]
