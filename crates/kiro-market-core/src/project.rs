@@ -2396,6 +2396,215 @@ mod tests {
         assert!(loaded.files.contains_key(std::path::Path::new("guide.md")));
     }
 
+    /// `rstest` fixture for steering install collision tests. Stages a
+    /// single steering source file and the project root; tests reuse
+    /// the fixture's `install_steering` helper rather than re-typing
+    /// the `SteeringInstallContext` bundle. Mirrors the
+    /// [`CompanionBundle`] shape from
+    /// `install_native_companions_idempotent_when_source_hash_matches`.
+    struct SteeringFile {
+        /// Owns the tempdir lifetime AND exposes its path for tests
+        /// that need to stage sibling source trees (e.g. cross-plugin
+        /// transfer).
+        scratch: tempfile::TempDir,
+        project: KiroProject,
+        scan_root: PathBuf,
+        rel_path: PathBuf,
+        source_hash: String,
+    }
+
+    impl SteeringFile {
+        /// Re-stage the source with new content and recompute the hash,
+        /// preserving the same `rel_path`. Used by the content-changed
+        /// test to bump the body without rebuilding the whole fixture.
+        fn rewrite_source(&mut self, body: &[u8]) {
+            fs::write(self.scan_root.join(&self.rel_path), body).expect("rewrite source");
+            self.source_hash =
+                crate::hash::hash_artifact(&self.scan_root, std::slice::from_ref(&self.rel_path))
+                    .expect("re-hash");
+        }
+
+        /// Path to the absolute source file the discovered handle points at.
+        fn source_path(&self) -> PathBuf {
+            self.scan_root.join(&self.rel_path)
+        }
+    }
+
+    fn install_steering(
+        f: &SteeringFile,
+        plugin: &str,
+        mode: crate::service::InstallMode,
+    ) -> Result<crate::steering::InstalledSteeringOutcome, crate::steering::SteeringError> {
+        let discovered = crate::agent::DiscoveredNativeFile {
+            source: f.source_path(),
+            scan_root: f.scan_root.clone(),
+        };
+        f.project.install_steering_file(
+            &discovered,
+            &f.source_hash,
+            crate::steering::SteeringInstallContext {
+                mode,
+                marketplace: "m",
+                plugin,
+                version: None,
+            },
+        )
+    }
+
+    #[fixture]
+    fn steering_file() -> SteeringFile {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let project = KiroProject::new(dir.path().to_path_buf());
+        let scan_root = dir.path().join("steering-src");
+        fs::create_dir_all(&scan_root).expect("create scan_root");
+        let rel_path = PathBuf::from("guide.md");
+        fs::write(scan_root.join(&rel_path), b"v1 body").expect("write source");
+        let source_hash =
+            crate::hash::hash_artifact(&scan_root, std::slice::from_ref(&rel_path)).expect("hash");
+        SteeringFile {
+            scratch: dir,
+            project,
+            scan_root,
+            rel_path,
+            source_hash,
+        }
+    }
+
+    #[rstest]
+    fn install_steering_idempotent_when_source_hash_matches(steering_file: SteeringFile) {
+        let first = install_steering(&steering_file, "p", crate::service::InstallMode::New)
+            .expect("first install");
+        assert_eq!(first.kind, InstallOutcomeKind::Installed);
+
+        let second = install_steering(&steering_file, "p", crate::service::InstallMode::New)
+            .expect("second install");
+        assert_eq!(second.kind, InstallOutcomeKind::Idempotent);
+        assert_eq!(
+            second.installed_hash, first.installed_hash,
+            "idempotent reinstall must report the prior installed_hash"
+        );
+    }
+
+    #[rstest]
+    fn install_steering_content_changed_requires_force(mut steering_file: SteeringFile) {
+        install_steering(&steering_file, "p", crate::service::InstallMode::New)
+            .expect("first install");
+
+        steering_file.rewrite_source(b"v2 body");
+
+        let err = install_steering(&steering_file, "p", crate::service::InstallMode::New)
+            .expect_err("content change without force must fail");
+        assert!(
+            matches!(
+                err,
+                crate::steering::SteeringError::ContentChangedRequiresForce { .. }
+            ),
+            "expected ContentChangedRequiresForce, got {err:?}"
+        );
+
+        let outcome = install_steering(&steering_file, "p", crate::service::InstallMode::Force)
+            .expect("force install");
+        assert_eq!(outcome.kind, InstallOutcomeKind::ForceOverwrote);
+        // The new content must have landed on disk.
+        assert_eq!(
+            fs::read(steering_file.project.steering_dir().join("guide.md")).unwrap(),
+            b"v2 body"
+        );
+    }
+
+    #[rstest]
+    fn install_steering_cross_plugin_clash_fails_loudly(steering_file: SteeringFile) {
+        // Plugin A installs first, then plugin B tries to install at the
+        // same rel path.
+        install_steering(&steering_file, "plugin-a", crate::service::InstallMode::New)
+            .expect("plugin-a first install");
+
+        // Stage a sibling source for plugin-b with different content.
+        let scan_b = steering_file.scratch.path().join("b-src");
+        fs::create_dir_all(&scan_b).unwrap();
+        let rel_b = PathBuf::from("guide.md");
+        fs::write(scan_b.join(&rel_b), b"from-b").unwrap();
+        let source_hash_b =
+            crate::hash::hash_artifact(&scan_b, std::slice::from_ref(&rel_b)).unwrap();
+        let discovered_b = crate::agent::DiscoveredNativeFile {
+            source: scan_b.join(&rel_b),
+            scan_root: scan_b.clone(),
+        };
+
+        let err = steering_file
+            .project
+            .install_steering_file(
+                &discovered_b,
+                &source_hash_b,
+                crate::steering::SteeringInstallContext {
+                    mode: crate::service::InstallMode::New,
+                    marketplace: "m",
+                    plugin: "plugin-b",
+                    version: None,
+                },
+            )
+            .expect_err("cross-plugin clash must fail");
+        match err {
+            crate::steering::SteeringError::PathOwnedByOtherPlugin { rel, owner } => {
+                assert_eq!(rel, PathBuf::from("guide.md"));
+                assert_eq!(owner, "plugin-a");
+            }
+            other => panic!("expected PathOwnedByOtherPlugin, got {other:?}"),
+        }
+
+        // Force mode transfers ownership.
+        let outcome = steering_file
+            .project
+            .install_steering_file(
+                &discovered_b,
+                &source_hash_b,
+                crate::steering::SteeringInstallContext {
+                    mode: crate::service::InstallMode::Force,
+                    marketplace: "m",
+                    plugin: "plugin-b",
+                    version: None,
+                },
+            )
+            .expect("force-mode transfer");
+        assert_eq!(outcome.kind, InstallOutcomeKind::ForceOverwrote);
+
+        let tracking = steering_file.project.load_installed_steering().unwrap();
+        let entry = tracking
+            .files
+            .get(std::path::Path::new("guide.md"))
+            .expect("tracking entry");
+        assert_eq!(
+            entry.plugin, "plugin-b",
+            "ownership must transfer to plugin-b under force"
+        );
+    }
+
+    #[rstest]
+    fn install_steering_orphan_at_destination_fails_loudly(steering_file: SteeringFile) {
+        // Pre-create an unrelated file at the destination path with no
+        // tracking entry — should fail without --force.
+        fs::create_dir_all(steering_file.project.steering_dir()).unwrap();
+        fs::write(
+            steering_file.project.steering_dir().join("guide.md"),
+            b"orphan",
+        )
+        .unwrap();
+
+        let err = install_steering(&steering_file, "p", crate::service::InstallMode::New)
+            .expect_err("orphan must fail without force");
+        assert!(
+            matches!(
+                err,
+                crate::steering::SteeringError::OrphanFileAtDestination { .. }
+            ),
+            "expected OrphanFileAtDestination, got {err:?}"
+        );
+
+        let outcome = install_steering(&steering_file, "p", crate::service::InstallMode::Force)
+            .expect("force install over orphan");
+        assert_eq!(outcome.kind, InstallOutcomeKind::ForceOverwrote);
+    }
+
     #[test]
     fn install_steering_file_writes_to_kiro_steering_with_hashes() {
         let (_dir, project) = temp_project();
