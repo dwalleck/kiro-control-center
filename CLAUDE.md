@@ -28,9 +28,10 @@ Run all three before committing — CI enforces each:
 - `cargo test --workspace`
 - `cargo clippy --workspace --tests -- -D warnings`
 
-## Hooks (xtask)
+## xtask
 - `cargo xtask hook-post-edit` — wired into Claude Code `PostToolUse` for `.rs` edits. Runs `rustfmt` then `cargo clippy --package <derived> -- -D warnings`. The package is derived by walking up ancestors for the nearest `Cargo.toml` with a `[package]` table (`xtask::derive_package`), so new workspace crates are picked up automatically. Read/parse failures log to stderr; loop exhaust emits a "no usable Cargo.toml" diagnostic.
 - `cargo xtask hook-block-cargo-lock` — blocks direct `Cargo.lock` edits. Override for one session via `KIRO_ALLOW_LOCKFILE_EDIT=1`.
+- `cargo xtask plan-lint` — runs structural lint queries against the [tethys](https://github.com/dwalleck/rivets/tree/main/crates/tethys) index. First implemented gate is **gate-4-external-error-boundary**: a SQL query against the `attributes` and `symbols` tables that catches any `pub` enum variant carrying an external crate's error type (`serde_json`, `gix`, `reqwest`, `toml`) via `#[source]`. This is the rule the broken grep in `docs/plan-review-checklist.md` was supposed to enforce. Requires the `tethys` binary on PATH (or `TETHYS_BIN` env var); pass `--no-reindex` to query the existing `.rivets/index/tethys.db` without re-indexing first. Exits 1 on findings (CI gate fails).
 
 ## Project Structure
 - `crates/kiro-market-core/` — library crate (types, parsing, git, cache, project state)

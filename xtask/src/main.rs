@@ -11,14 +11,17 @@ use std::process::Command;
 
 use anyhow::{Context, Result, bail};
 
+mod plan_lint;
+
 fn main() -> Result<()> {
     let mut args = env::args().skip(1);
-    let cmd = args
-        .next()
-        .context("missing subcommand (expected: hook-post-edit | hook-block-cargo-lock)")?;
+    let cmd = args.next().context(
+        "missing subcommand (expected: hook-post-edit | hook-block-cargo-lock | plan-lint)",
+    )?;
     match cmd.as_str() {
         "hook-post-edit" => hook_post_edit(),
         "hook-block-cargo-lock" => hook_block_cargo_lock(),
+        "plan-lint" => plan_lint::run(args),
         other => bail!("unknown xtask subcommand: {other}"),
     }
 }

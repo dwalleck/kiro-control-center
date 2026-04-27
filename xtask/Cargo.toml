@@ -14,3 +14,6 @@ anyhow = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 toml = { workspace = true }
+# Used by plan-lint to query the tethys index DB. `bundled` ships SQLite's C
+# source so no system libsqlite3 is required.
+rusqlite = { version = "0.32", features = ["bundled"] }

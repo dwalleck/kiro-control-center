@@ -6,3 +6,7 @@
 # Python bytecode cache (tests under .github/scripts/)
 __pycache__/
 *.pyc
+
+# Tethys index built by `cargo xtask plan-lint` (and direct `tethys index`).
+# Never committed — recreated on demand from source.
+/.rivets/
