@@ -2188,7 +2188,13 @@ impl KiroProject {
             #[cfg(unix)]
             {
                 use std::os::unix::fs::MetadataExt;
-                let md = fs::symlink_metadata(&src)?;
+                // Attach src to the stat error so a permission-denied or
+                // racy-delete here surfaces with the failed path, not as
+                // a path-less `Error::Io`.
+                let md = fs::symlink_metadata(&src).map_err(|e| AgentError::InstallFailed {
+                    path: src.clone(),
+                    source: Box::new(crate::error::Error::Io(e)),
+                })?;
                 if md.is_file() && md.nlink() > 1 {
                     return Err(AgentError::InstallFailed {
                         path: src.clone(),
@@ -2203,9 +2209,15 @@ impl KiroProject {
             }
             let dest = staging.path().join(rel);
             if let Some(parent) = dest.parent() {
-                fs::create_dir_all(parent)?;
+                fs::create_dir_all(parent).map_err(|e| AgentError::InstallFailed {
+                    path: parent.to_path_buf(),
+                    source: Box::new(crate::error::Error::Io(e)),
+                })?;
             }
-            fs::copy(&src, &dest)?;
+            fs::copy(&src, &dest).map_err(|e| AgentError::InstallFailed {
+                path: src.clone(),
+                source: Box::new(crate::error::Error::Io(e)),
+            })?;
         }
 
         let installed_hash = match crate::hash::hash_artifact(staging.path(), rel_paths) {
@@ -2249,20 +2261,32 @@ impl KiroProject {
                 && let Err(e) = fs::create_dir_all(parent)
             {
                 Self::rollback_companion_promotion(&placed, &backups);
-                return Err(e.into());
+                return Err(AgentError::InstallFailed {
+                    path: parent.to_path_buf(),
+                    source: Box::new(crate::error::Error::Io(e)),
+                }
+                .into());
             }
             // Backup the existing destination if we'll overwrite it.
             if forced_overwrite && dest.exists() {
                 let backup = Self::companion_backup_path(&dest);
                 if let Err(e) = fs::rename(&dest, &backup) {
                     Self::rollback_companion_promotion(&placed, &backups);
-                    return Err(e.into());
+                    return Err(AgentError::InstallFailed {
+                        path: dest.clone(),
+                        source: Box::new(crate::error::Error::Io(e)),
+                    }
+                    .into());
                 }
                 backups.push((dest.clone(), backup));
             }
             if let Err(e) = fs::rename(&src, &dest) {
                 Self::rollback_companion_promotion(&placed, &backups);
-                return Err(e.into());
+                return Err(AgentError::InstallFailed {
+                    path: dest.clone(),
+                    source: Box::new(crate::error::Error::Io(e)),
+                }
+                .into());
             }
             placed.push(dest);
         }

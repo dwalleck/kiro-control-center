@@ -86,6 +86,15 @@ pub fn discover_steering_files_in_dirs(
                         error = %e,
                         "failed to read directory entry; skipping"
                     );
+                    // Surface as a structured warning too — a flaky FS or
+                    // intermittent EIO on a single entry shouldn't vanish
+                    // into tracing-only output. Using ScanDirUnreadable
+                    // because the failure points at the dir we were
+                    // iterating; the entry itself never resolved.
+                    warnings.push(SteeringWarning::ScanDirUnreadable {
+                        path: dir.clone(),
+                        reason: format!("entry read failed: {e}"),
+                    });
                     continue;
                 }
             };
@@ -98,6 +107,12 @@ pub fn discover_steering_files_in_dirs(
                         error = %e,
                         "failed to stat steering candidate; skipping"
                     );
+                    // Per-candidate stat failure is system-level and
+                    // user-actionable (perm, broken FS); surface it.
+                    warnings.push(SteeringWarning::ScanDirUnreadable {
+                        path: path.clone(),
+                        reason: format!("stat failed: {e}"),
+                    });
                     continue;
                 }
             };
