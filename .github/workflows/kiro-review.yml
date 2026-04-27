@@ -24,6 +24,7 @@ jobs:
       (github.event.action == 'labeled' &&
        github.event.label.name == 'safe-to-review')
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     env:
       BASE_REF: ${{ github.base_ref }}
       REPO: ${{ github.repository }}
@@ -56,6 +57,9 @@ jobs:
 
       - name: Install rust-analyzer
         run: rustup component add rust-analyzer
+
+      - name: Wait for rust-analyzer to index workspace
+        run: rust-analyzer analysis-stats . 2>/dev/null || true
 
       - name: Verify KIRO_API_KEY is configured
         env:
