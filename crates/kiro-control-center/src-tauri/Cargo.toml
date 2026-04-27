@@ -14,7 +14,7 @@ path = "src/main.rs"
 
 [lib]
 name = "kcc_lib"
-crate-type = ["staticlib", "cdylib", "rlib"]
+crate-type = ["rlib"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
