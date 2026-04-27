@@ -118,35 +118,49 @@ pub struct InstalledAgents {
     pub native_companions: HashMap<String, InstalledNativeCompanionsMeta>,
 }
 
+/// What happened during one native install call. The three reachable
+/// states are encoded as distinct variants so the previous
+/// `(was_idempotent, forced_overwrite)` bool pair's unrepresentable
+/// `(true, true)` state cannot be constructed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
+#[serde(rename_all = "snake_case")]
+pub enum InstallOutcomeKind {
+    /// Verified no-op — `source_hash` matched the existing tracking
+    /// entry's `source_hash`. No bytes were written.
+    Idempotent,
+    /// Clean first install — no prior tracking entry, no orphan on disk.
+    Installed,
+    /// Force-mode overwrote a tracked path (same plugin's prior content,
+    /// another plugin's content via ownership transfer, or an orphan
+    /// without tracking).
+    ForceOverwrote,
+}
+
 /// In-memory outcome of one [`KiroProject::install_native_agent`] call.
 ///
 /// Carries enough detail for the service layer to render an install-summary
 /// row without re-reading tracking — name, the resolved destination JSON
-/// path, whether `--force` overwrote a tracked path, whether the call was
-/// a no-op idempotent reinstall, and both content hashes.
+/// path, what kind of install happened, and both content hashes.
 #[derive(Debug, Clone, Serialize)]
 #[cfg_attr(feature = "specta", derive(specta::Type))]
 pub struct InstalledNativeAgentOutcome {
     pub name: String,
     pub json_path: PathBuf,
-    /// `true` if `--force` overwrote a tracked path (orphan, prior
-    /// version of the same plugin's content, or another plugin's
-    /// ownership transferred). `false` for a clean first install or
-    /// idempotent reinstall.
-    pub forced_overwrite: bool,
-    /// `true` if `source_hash` matched the tracked entry exactly and
-    /// nothing was written — the install was a verified no-op.
-    pub was_idempotent: bool,
+    pub kind: InstallOutcomeKind,
     pub source_hash: String,
     pub installed_hash: String,
 }
 
-/// Output of [`KiroProject::classify_native_collision`]: either return
-/// the idempotent outcome immediately (boxed to keep enum size small),
-/// or proceed with install and apply `forced_overwrite` to staging /
-/// promote.
-enum NativeCollisionDecision {
-    Idempotent(Box<InstalledNativeAgentOutcome>),
+/// Output of any classifier that decides between "early-return idempotent
+/// outcome" and "proceed with install, possibly with `forced_overwrite`".
+/// The idempotent variant boxes its payload to keep the enum size small
+/// when the outcome type is large. Used by both
+/// [`KiroProject::classify_native_collision`] (with
+/// [`InstalledNativeAgentOutcome`]) and `classify_companion_collision`
+/// (with [`InstalledNativeCompanionsOutcome`]).
+enum CollisionDecision<T> {
+    Idempotent(Box<T>),
     Proceed { forced_overwrite: bool },
 }
 
@@ -173,17 +187,13 @@ pub struct NativeCompanionsInput<'a> {
     pub mode: crate::service::InstallMode,
 }
 
-/// Output of `classify_companion_collision`: either return the idempotent
-/// outcome immediately, or proceed with install and apply `forced_overwrite`.
-enum CompanionCollisionDecision {
-    Idempotent(Box<InstalledNativeCompanionsOutcome>),
-    Proceed { forced_overwrite: bool },
-}
-
 /// Output of `promote_native_companions`: paths placed at their final
 /// destinations, plus a list of `(original, backup)` pairs the caller
 /// must restore on later failure or delete on success.
-type CompanionPromotion = (Vec<PathBuf>, Vec<(PathBuf, PathBuf)>);
+struct CompanionPromotion {
+    placed: Vec<PathBuf>,
+    backups: Vec<(PathBuf, PathBuf)>,
+}
 
 /// In-memory outcome of one [`KiroProject::install_native_companions`] call.
 ///
@@ -196,8 +206,7 @@ type CompanionPromotion = (Vec<PathBuf>, Vec<(PathBuf, PathBuf)>);
 pub struct InstalledNativeCompanionsOutcome {
     pub plugin: String,
     pub files: Vec<PathBuf>,
-    pub forced_overwrite: bool,
-    pub was_idempotent: bool,
+    pub kind: InstallOutcomeKind,
     pub source_hash: String,
     pub installed_hash: String,
 }
@@ -936,16 +945,15 @@ impl KiroProject {
         source_hash: &str,
         json_target: &Path,
         mode: crate::service::InstallMode,
-    ) -> crate::error::Result<NativeCollisionDecision> {
+    ) -> crate::error::Result<CollisionDecision<InstalledNativeAgentOutcome>> {
         match installed.agents.get(agent_name) {
             Some(existing) if existing.plugin == plugin => {
                 if existing.source_hash.as_deref() == Some(source_hash) {
-                    return Ok(NativeCollisionDecision::Idempotent(Box::new(
+                    return Ok(CollisionDecision::Idempotent(Box::new(
                         InstalledNativeAgentOutcome {
                             name: agent_name.to_owned(),
                             json_path: json_target.to_path_buf(),
-                            forced_overwrite: false,
-                            was_idempotent: true,
+                            kind: InstallOutcomeKind::Idempotent,
                             source_hash: source_hash.to_owned(),
                             installed_hash: existing.installed_hash.clone().unwrap_or_default(),
                         },
@@ -957,7 +965,7 @@ impl KiroProject {
                     }
                     .into());
                 }
-                Ok(NativeCollisionDecision::Proceed {
+                Ok(CollisionDecision::Proceed {
                     forced_overwrite: true,
                 })
             }
@@ -969,7 +977,7 @@ impl KiroProject {
                     }
                     .into());
                 }
-                Ok(NativeCollisionDecision::Proceed {
+                Ok(CollisionDecision::Proceed {
                     forced_overwrite: true,
                 })
             }
@@ -980,11 +988,11 @@ impl KiroProject {
                     }
                     .into());
                 }
-                Ok(NativeCollisionDecision::Proceed {
+                Ok(CollisionDecision::Proceed {
                     forced_overwrite: true,
                 })
             }
-            None => Ok(NativeCollisionDecision::Proceed {
+            None => Ok(CollisionDecision::Proceed {
                 forced_overwrite: false,
             }),
         }
@@ -1063,8 +1071,8 @@ impl KiroProject {
                     &json_target,
                     mode,
                 )? {
-                    NativeCollisionDecision::Idempotent(outcome) => return Ok(*outcome),
-                    NativeCollisionDecision::Proceed { forced_overwrite } => forced_overwrite,
+                    CollisionDecision::Idempotent(outcome) => return Ok(*outcome),
+                    CollisionDecision::Proceed { forced_overwrite } => forced_overwrite,
                 };
 
                 let (staging, json_rel, installed_hash) =
@@ -1142,8 +1150,11 @@ impl KiroProject {
                 Ok(InstalledNativeAgentOutcome {
                     name: agent_name,
                     json_path: json_target,
-                    forced_overwrite,
-                    was_idempotent: false,
+                    kind: if forced_overwrite {
+                        InstallOutcomeKind::ForceOverwrote
+                    } else {
+                        InstallOutcomeKind::Installed
+                    },
                     source_hash: source_hash.to_string(),
                     installed_hash,
                 })
@@ -1285,8 +1296,7 @@ impl KiroProject {
             return Ok(InstalledNativeCompanionsOutcome {
                 plugin: input.plugin.to_string(),
                 files: Vec::new(),
-                forced_overwrite: false,
-                was_idempotent: true,
+                kind: InstallOutcomeKind::Idempotent,
                 source_hash: input.source_hash.to_string(),
                 installed_hash: input.source_hash.to_string(),
             });
@@ -1319,14 +1329,14 @@ impl KiroProject {
 
         let forced_overwrite =
             match Self::classify_companion_collision(&installed, input, agents_dir)? {
-                CompanionCollisionDecision::Idempotent(outcome) => return Ok(*outcome),
-                CompanionCollisionDecision::Proceed { forced_overwrite } => forced_overwrite,
+                CollisionDecision::Idempotent(outcome) => return Ok(*outcome),
+                CollisionDecision::Proceed { forced_overwrite } => forced_overwrite,
             };
 
         let (staging, installed_hash) =
             self.stage_native_companion_files(input.plugin, input.scan_root, input.rel_paths)?;
 
-        let (placed, backups) = self.promote_native_companions(
+        let CompanionPromotion { placed, backups } = self.promote_native_companions(
             staging.path(),
             input.rel_paths,
             agents_dir,
@@ -1390,8 +1400,11 @@ impl KiroProject {
         Ok(InstalledNativeCompanionsOutcome {
             plugin: input.plugin.to_string(),
             files: placed,
-            forced_overwrite,
-            was_idempotent: false,
+            kind: if forced_overwrite {
+                InstallOutcomeKind::ForceOverwrote
+            } else {
+                InstallOutcomeKind::Installed
+            },
             source_hash: input.source_hash.to_string(),
             installed_hash,
         })
@@ -1404,18 +1417,17 @@ impl KiroProject {
         installed: &InstalledAgents,
         input: &NativeCompanionsInput<'_>,
         agents_dir: &Path,
-    ) -> crate::error::Result<CompanionCollisionDecision> {
+    ) -> crate::error::Result<CollisionDecision<InstalledNativeCompanionsOutcome>> {
         let mut forced_overwrite = false;
 
         // Same-plugin check first — idempotent or content-changed.
         if let Some(existing) = installed.native_companions.get(input.plugin) {
             if existing.source_hash == input.source_hash {
-                return Ok(CompanionCollisionDecision::Idempotent(Box::new(
+                return Ok(CollisionDecision::Idempotent(Box::new(
                     InstalledNativeCompanionsOutcome {
                         plugin: input.plugin.to_string(),
                         files: existing.files.iter().map(|p| agents_dir.join(p)).collect(),
-                        forced_overwrite: false,
-                        was_idempotent: true,
+                        kind: InstallOutcomeKind::Idempotent,
                         source_hash: input.source_hash.to_string(),
                         installed_hash: existing.installed_hash.clone(),
                     },
@@ -1463,7 +1475,7 @@ impl KiroProject {
             }
         }
 
-        Ok(CompanionCollisionDecision::Proceed { forced_overwrite })
+        Ok(CollisionDecision::Proceed { forced_overwrite })
     }
 
     /// Stage every companion file at its relative layout under a fresh
@@ -1508,11 +1520,12 @@ impl KiroProject {
 
     /// Move every staged companion file into its destination under
     /// `agents_root`, backing each existing file up to a `.kiro-bak`
-    /// sibling when `forced_overwrite` is set. Returns `(placed_paths,
-    /// backups)` so the caller can roll back on later failure.
+    /// sibling when `forced_overwrite` is set. Returns the
+    /// [`CompanionPromotion`] (placed paths plus original→backup pairs)
+    /// so the caller can roll back on later failure.
     ///
-    /// `backups` is a `Vec<(original_path, backup_path)>` — restoring
-    /// is `fs::rename(backup, original)`.
+    /// `backups` is `Vec<(original_path, backup_path)>` — restoring is
+    /// `fs::rename(backup, original)`.
     fn promote_native_companions(
         &self,
         staging: &Path,
@@ -1549,7 +1562,7 @@ impl KiroProject {
             placed.push(dest);
         }
 
-        Ok((placed, backups))
+        Ok(CompanionPromotion { placed, backups })
     }
 
     /// Compute the `.kiro-bak` sibling path for a companion file. Splices
@@ -3095,8 +3108,7 @@ mod tests {
 
         assert_eq!(outcome.name, "rev");
         assert!(outcome.json_path.ends_with("rev.json"));
-        assert!(!outcome.forced_overwrite);
-        assert!(!outcome.was_idempotent);
+        assert_eq!(outcome.kind, InstallOutcomeKind::Installed);
         assert_eq!(outcome.source_hash, source_hash);
         assert!(outcome.installed_hash.starts_with("blake3:"));
         assert!(outcome.json_path.exists());
@@ -3117,8 +3129,7 @@ mod tests {
     fn install_native_agent_idempotent_when_source_hash_matches(native_rev: NativeRev) {
         let first = install_rev(&native_rev, "m", "p", crate::service::InstallMode::New)
             .expect("first install");
-        assert!(!first.was_idempotent);
-        assert!(!first.forced_overwrite);
+        assert_eq!(first.kind, InstallOutcomeKind::Installed);
         let first_installed_at = native_rev
             .project
             .load_installed_agents()
@@ -3131,8 +3142,7 @@ mod tests {
         // Reinstall with the same source_hash — must be a verified no-op.
         let second = install_rev(&native_rev, "m", "p", crate::service::InstallMode::New)
             .expect("second install");
-        assert!(second.was_idempotent);
-        assert!(!second.forced_overwrite);
+        assert_eq!(second.kind, InstallOutcomeKind::Idempotent);
         // Idempotent path must NOT touch tracking — installed_at should
         // still reflect the first install, proving no write occurred.
         let second_installed_at = native_rev
@@ -3167,10 +3177,10 @@ mod tests {
             other => panic!("expected ContentChangedRequiresForce, got {other:?}"),
         }
 
-        // With --force: succeeds, forced_overwrite flagged, content updates.
+        // With --force: succeeds, kind is ForceOverwrote, content updates.
         let outcome = install_rev(&native_rev, "m", "p", crate::service::InstallMode::Force)
             .expect("force install");
-        assert!(outcome.forced_overwrite);
+        assert_eq!(outcome.kind, InstallOutcomeKind::ForceOverwrote);
         assert_eq!(outcome.source_hash, native_rev.source_hash);
         let installed_bytes = fs::read(&outcome.json_path).expect("read installed");
         assert_eq!(installed_bytes, br#"{"name":"rev","v":2}"#);
@@ -3211,7 +3221,7 @@ mod tests {
             crate::service::InstallMode::Force,
         )
         .expect("force transfer");
-        assert!(outcome.forced_overwrite);
+        assert_eq!(outcome.kind, InstallOutcomeKind::ForceOverwrote);
 
         let tracking = native_rev.project.load_installed_agents().expect("load");
         let entry = tracking.agents.get("rev").expect("entry");
@@ -3244,7 +3254,7 @@ mod tests {
         // With --force: orphan is overwritten and ownership recorded.
         let outcome = install_rev(&native_rev, "m", "p", crate::service::InstallMode::Force)
             .expect("force install");
-        assert!(outcome.forced_overwrite);
+        assert_eq!(outcome.kind, InstallOutcomeKind::ForceOverwrote);
 
         let tracking = native_rev.project.load_installed_agents().expect("load");
         assert!(tracking.agents.contains_key("rev"));
@@ -3324,8 +3334,7 @@ mod tests {
 
         assert_eq!(outcome.plugin, "plugin-y");
         assert_eq!(outcome.files.len(), 2);
-        assert!(!outcome.was_idempotent);
-        assert!(!outcome.forced_overwrite);
+        assert_eq!(outcome.kind, InstallOutcomeKind::Installed);
         assert_eq!(outcome.source_hash, source_hash);
         assert!(outcome.installed_hash.starts_with("blake3:"));
 
@@ -3370,7 +3379,7 @@ mod tests {
                 mode: crate::service::InstallMode::New,
             })
             .expect("empty install");
-        assert!(outcome.was_idempotent);
+        assert_eq!(outcome.kind, InstallOutcomeKind::Idempotent);
         assert!(outcome.files.is_empty());
 
         let tracking = project.load_installed_agents().expect("load");
@@ -3451,7 +3460,7 @@ mod tests {
             crate::service::InstallMode::New,
         )
         .expect("first");
-        assert!(!first.was_idempotent);
+        assert_eq!(first.kind, InstallOutcomeKind::Installed);
 
         let first_installed_at = companion_bundle
             .project
@@ -3469,7 +3478,7 @@ mod tests {
             crate::service::InstallMode::New,
         )
         .expect("second");
-        assert!(second.was_idempotent);
+        assert_eq!(second.kind, InstallOutcomeKind::Idempotent);
 
         // Idempotent path must NOT touch tracking.
         let second_installed_at = companion_bundle
@@ -3520,7 +3529,7 @@ mod tests {
             other => panic!("expected ContentChangedRequiresForce, got {other:?}"),
         }
 
-        // With --force: succeeds, content updates, forced_overwrite flagged.
+        // With --force: succeeds, content updates, kind is ForceOverwrote.
         let outcome = install_companions(
             &companion_bundle,
             "m",
@@ -3528,7 +3537,7 @@ mod tests {
             crate::service::InstallMode::Force,
         )
         .expect("force install");
-        assert!(outcome.forced_overwrite);
+        assert_eq!(outcome.kind, InstallOutcomeKind::ForceOverwrote);
         assert_eq!(outcome.source_hash, companion_bundle.source_hash);
 
         let dest_a = companion_bundle
@@ -3595,7 +3604,7 @@ mod tests {
                 mode: crate::service::InstallMode::Force,
             })
             .expect("force transfer");
-        assert!(outcome.forced_overwrite);
+        assert_eq!(outcome.kind, InstallOutcomeKind::ForceOverwrote);
 
         let tracking = companion_bundle
             .project

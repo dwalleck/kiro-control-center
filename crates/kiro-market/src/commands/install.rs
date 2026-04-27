@@ -78,18 +78,21 @@ pub fn run(
     );
     print_install_outcome(plugin_ref, &skill_result);
 
+    let install_ctx = kiro_market_core::service::AgentInstallContext {
+        mode,
+        accept_mcp,
+        marketplace: marketplace_name,
+        plugin: plugin_name,
+        version: ctx.version.as_deref(),
+    };
     let agent_result = run_agent_install(
         &svc,
         &project,
         &plugin_dir,
         &ctx.agent_scan_paths,
         skill_filter,
-        mode,
-        accept_mcp,
-        marketplace_name,
-        plugin_name,
-        ctx.version.as_deref(),
         ctx.format,
+        install_ctx,
     );
     print_agent_outcome(&agent_result);
 
@@ -167,36 +170,21 @@ fn run_skill_install(
     )
 }
 
-#[allow(clippy::too_many_arguments)] // each arg is an independent piece of upstream context
 fn run_agent_install(
     svc: &MarketplaceService,
     project: &KiroProject,
     plugin_dir: &Path,
     agent_scan_paths: &[String],
     skill_filter: Option<&str>,
-    mode: InstallMode,
-    accept_mcp: bool,
-    marketplace_name: &str,
-    plugin_name: &str,
-    version: Option<&str>,
     format: Option<kiro_market_core::plugin::PluginFormat>,
+    ctx: kiro_market_core::service::AgentInstallContext<'_>,
 ) -> InstallAgentsResult {
     // A `--skill <name>` filter narrows the install to one skill and never
     // includes agents.
     if skill_filter.is_some() {
         return InstallAgentsResult::default();
     }
-    svc.install_plugin_agents(
-        project,
-        plugin_dir,
-        agent_scan_paths,
-        mode,
-        accept_mcp,
-        marketplace_name,
-        plugin_name,
-        version,
-        format,
-    )
+    svc.install_plugin_agents(project, plugin_dir, agent_scan_paths, format, ctx)
 }
 
 /// Decide whether the command exits zero or non-zero based on the accumulated
@@ -248,7 +236,7 @@ fn print_agent_outcome(result: &InstallAgentsResult) {
     for name in &result.installed {
         let suffix = native_by_name
             .get(name.as_str())
-            .filter(|o| o.forced_overwrite)
+            .filter(|o| o.kind == kiro_market_core::project::InstallOutcomeKind::ForceOverwrote)
             .map_or("", |_| " (forced)");
         println!(
             "  {} Installed agent '{}'{}",
@@ -264,7 +252,7 @@ fn print_agent_outcome(result: &InstallAgentsResult) {
         // skip.
         let suffix = native_by_name
             .get(name.as_str())
-            .filter(|o| o.was_idempotent)
+            .filter(|o| o.kind == kiro_market_core::project::InstallOutcomeKind::Idempotent)
             .map_or("", |_| " (unchanged)");
         println!(
             "  {} Agent '{}' already installed{}",
@@ -274,12 +262,10 @@ fn print_agent_outcome(result: &InstallAgentsResult) {
         );
     }
     if let Some(companions) = &result.installed_companions {
-        let suffix = if companions.was_idempotent {
-            " (unchanged)".dimmed()
-        } else if companions.forced_overwrite {
-            " (forced)".yellow()
-        } else {
-            "".normal()
+        let suffix = match companions.kind {
+            kiro_market_core::project::InstallOutcomeKind::Idempotent => " (unchanged)".dimmed(),
+            kiro_market_core::project::InstallOutcomeKind::ForceOverwrote => " (forced)".yellow(),
+            kiro_market_core::project::InstallOutcomeKind::Installed => "".normal(),
         };
         let plural = if companions.files.len() == 1 { "" } else { "s" };
         println!(

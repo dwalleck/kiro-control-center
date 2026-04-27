@@ -16,9 +16,11 @@ use std::path::{Path, PathBuf};
 
 use kiro_market_core::agent::AgentDialect;
 use kiro_market_core::plugin::PluginFormat;
-use kiro_market_core::project::KiroProject;
+use kiro_market_core::project::{InstallOutcomeKind, KiroProject};
 use kiro_market_core::service::test_support::temp_service;
-use kiro_market_core::service::{InstallAgentsResult, InstallMode, MarketplaceService};
+use kiro_market_core::service::{
+    AgentInstallContext, InstallAgentsResult, InstallMode, MarketplaceService,
+};
 use rstest::{fixture, rstest};
 use tempfile::{TempDir, tempdir};
 
@@ -45,8 +47,7 @@ struct IntegrationHarness {
 
 impl IntegrationHarness {
     /// Install `plugin_dir` (already staged on disk) under `(marketplace,
-    /// plugin)`. Wraps the nine-arg `install_plugin_agents` call by
-    /// looking up the install context once and threading its `format`.
+    /// plugin)`. Looks up the install context once and threads its `format`.
     fn install(
         &self,
         plugin_dir: &Path,
@@ -56,16 +57,19 @@ impl IntegrationHarness {
     ) -> (Option<PluginFormat>, InstallAgentsResult) {
         let ctx = MarketplaceService::resolve_plugin_install_context_from_dir(plugin_dir)
             .expect("resolve plugin install context");
+        let install_ctx = AgentInstallContext {
+            mode,
+            accept_mcp: false, // fixtures never carry MCP servers
+            marketplace,
+            plugin,
+            version: None,
+        };
         let result = self.svc.install_plugin_agents(
             &self.project,
             plugin_dir,
             &ctx.agent_scan_paths,
-            mode,
-            false, // accept_mcp — fixtures never carry MCP servers
-            marketplace,
-            plugin,
-            None,
             ctx.format,
+            install_ctx,
         );
         (ctx.format, result)
     }
@@ -201,7 +205,7 @@ fn end_to_end_native_plugin_with_agents_and_companions(harness: IntegrationHarne
         .as_ref()
         .expect("companion outcome present");
     assert_eq!(companions.files.len(), 3);
-    assert!(!companions.was_idempotent);
+    assert_eq!(companions.kind, InstallOutcomeKind::Installed);
 
     assert_starter_kit_landed(
         harness.project_root.path(),
@@ -226,15 +230,19 @@ fn end_to_end_native_plugin_with_agents_and_companions(harness: IntegrationHarne
     );
     assert_eq!(again.skipped.len(), 3);
     assert!(
-        again.installed_native.iter().all(|o| o.was_idempotent),
+        again
+            .installed_native
+            .iter()
+            .all(|o| o.kind == InstallOutcomeKind::Idempotent),
         "every native outcome must be idempotent on reinstall"
     );
-    assert!(
+    assert_eq!(
         again
             .installed_companions
             .as_ref()
             .expect("companion outcome on reinstall")
-            .was_idempotent,
+            .kind,
+        InstallOutcomeKind::Idempotent,
         "companion bundle must be idempotent on reinstall"
     );
 }

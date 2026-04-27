@@ -356,6 +356,26 @@ pub enum FailedSkillReason {
     RequestedButNotFound { plugin: String },
 }
 
+/// Bundle of the install-context refs shared across every level of the
+/// agent-install call chain (`install_plugin_agents` ->
+/// `install_translated_agents_inner` / `install_native_kiro_cli_agents_inner`
+/// -> per-agent and per-companion helpers). All five fields flow unchanged
+/// through every layer; bundling them keeps each function under the
+/// `clippy::too_many_arguments` threshold without inventing a builder.
+///
+/// `Copy` because every field is already a cheap reference / primitive.
+#[derive(Debug, Clone, Copy)]
+pub struct AgentInstallContext<'a> {
+    pub mode: InstallMode,
+    /// Whether the user has opted in to installing agents that bring MCP
+    /// servers (subprocess / network capability). Default-deny; flip via
+    /// `--accept-mcp` or its frontend equivalent.
+    pub accept_mcp: bool,
+    pub marketplace: &'a str,
+    pub plugin: &'a str,
+    pub version: Option<&'a str>,
+}
+
 /// Outcome of installing the agents from one plugin.
 ///
 /// Mirrors [`InstallSkillsResult`]: per-agent successes and failures are
@@ -370,17 +390,16 @@ pub struct InstallAgentsResult {
     pub installed: Vec<String>,
     /// Agent names that were already installed and left untouched.
     /// Native paths populate this for idempotent reinstalls
-    /// (`was_idempotent: true`).
+    /// (`kind == InstallOutcomeKind::Idempotent`).
     pub skipped: Vec<String>,
     /// Agents whose install attempt failed (parse, validation, or fs error).
     pub failed: Vec<FailedAgent>,
     /// Non-fatal issues (unmapped tools, skipped non-agent files,
     /// MCP-gated agents).
     pub warnings: Vec<InstallWarning>,
-    /// Per-native-agent rich outcome (`forced_overwrite`, `was_idempotent`,
-    /// hashes). Empty for translated-only installs. Frontends that want
-    /// the rich detail consume this; legacy presenters keep using
-    /// `installed: Vec<String>`.
+    /// Per-native-agent rich outcome (`kind`, hashes). Empty for
+    /// translated-only installs. Frontends that want the rich detail
+    /// consume this; legacy presenters keep using `installed: Vec<String>`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub installed_native: Vec<crate::project::InstalledNativeAgentOutcome>,
     /// Per-plugin native companion bundle outcome. `None` for translated
@@ -1263,48 +1282,21 @@ impl MarketplaceService {
     ///   error. The CLI surfaces these with a non-zero exit status.
     /// - `warnings`: non-fatal issues (unmapped tools, README-like files
     ///   skipped, missing-name frontmatter).
-    #[allow(clippy::too_many_arguments)]
-    // nine non-self params, each a distinct
-    // input from upstream: project + plugin_dir + scan_paths + mode +
-    // accept_mcp + marketplace + plugin + version + format. A builder would
-    // add indirection without reducing arity at the call site.
     #[must_use = "the install result carries per-agent failures and warnings; losing it drops the user-facing summary"]
     pub fn install_plugin_agents(
         &self,
         project: &crate::project::KiroProject,
         plugin_dir: &Path,
         scan_paths: &[String],
-        mode: InstallMode,
-        accept_mcp: bool,
-        marketplace: &str,
-        plugin: &str,
-        version: Option<&str>,
         format: Option<crate::plugin::PluginFormat>,
+        ctx: AgentInstallContext<'_>,
     ) -> InstallAgentsResult {
         let _ = self;
         match format {
             Some(crate::plugin::PluginFormat::KiroCli) => {
-                Self::install_native_kiro_cli_agents_inner(
-                    project,
-                    plugin_dir,
-                    scan_paths,
-                    mode,
-                    accept_mcp,
-                    marketplace,
-                    plugin,
-                    version,
-                )
+                Self::install_native_kiro_cli_agents_inner(project, plugin_dir, scan_paths, ctx)
             }
-            None => Self::install_translated_agents_inner(
-                project,
-                plugin_dir,
-                scan_paths,
-                mode,
-                accept_mcp,
-                marketplace,
-                plugin,
-                version,
-            ),
+            None => Self::install_translated_agents_inner(project, plugin_dir, scan_paths, ctx),
         }
     }
 
@@ -1314,16 +1306,11 @@ impl MarketplaceService {
     /// failures land in `result.failed`; non-fatal issues (skipped
     /// non-agent markdown, MCP-gated agents, unmapped tools) land in
     /// `result.warnings`.
-    #[allow(clippy::too_many_arguments)] // mirrors install_plugin_agents
     fn install_translated_agents_inner(
         project: &crate::project::KiroProject,
         plugin_dir: &Path,
         scan_paths: &[String],
-        mode: InstallMode,
-        accept_mcp: bool,
-        marketplace: &str,
-        plugin: &str,
-        version: Option<&str>,
+        ctx: AgentInstallContext<'_>,
     ) -> InstallAgentsResult {
         let files = crate::agent::discover::discover_agents_in_dirs(plugin_dir, scan_paths);
         let mut result = InstallAgentsResult::default();
@@ -1367,7 +1354,7 @@ impl MarketplaceService {
             // one-time install is a long-lived foothold. Default policy:
             // skip + warn so the user sees the risk surface; re-running
             // with `--accept-mcp` flips the gate.
-            if !accept_mcp && !def.mcp_servers.is_empty() {
+            if !ctx.accept_mcp && !def.mcp_servers.is_empty() {
                 let transports: Vec<String> = def
                     .mcp_servers
                     .values()
@@ -1404,15 +1391,15 @@ impl MarketplaceService {
             }
 
             let meta = crate::project::InstalledAgentMeta {
-                marketplace: marketplace.to_string(),
-                plugin: plugin.to_string(),
-                version: version.map(String::from),
+                marketplace: ctx.marketplace.to_string(),
+                plugin: ctx.plugin.to_string(),
+                version: ctx.version.map(String::from),
                 installed_at: chrono::Utc::now(),
                 dialect: def.dialect,
                 source_hash: None,
                 installed_hash: None,
             };
-            let install_result = if mode.is_force() {
+            let install_result = if ctx.mode.is_force() {
                 project.install_agent_force(&def, &mapped, meta, Some(&path))
             } else {
                 project.install_agent(&def, &mapped, meta, Some(&path))
@@ -1456,16 +1443,11 @@ impl MarketplaceService {
     /// different `scan_paths` entries) are rejected via
     /// [`crate::error::AgentError::MultipleScanRootsNotSupported`] —
     /// v1 supports a single scan root only.
-    #[allow(clippy::too_many_arguments)] // mirrors install_plugin_agents
     fn install_native_kiro_cli_agents_inner(
         project: &crate::project::KiroProject,
         plugin_dir: &Path,
         scan_paths: &[String],
-        mode: InstallMode,
-        accept_mcp: bool,
-        marketplace: &str,
-        plugin: &str,
-        version: Option<&str>,
+        ctx: AgentInstallContext<'_>,
     ) -> InstallAgentsResult {
         let mut result = InstallAgentsResult::default();
 
@@ -1489,16 +1471,7 @@ impl MarketplaceService {
         }
 
         for f in &agent_files {
-            Self::install_one_native_agent(
-                project,
-                f,
-                mode,
-                accept_mcp,
-                marketplace,
-                plugin,
-                version,
-                &mut result,
-            );
+            Self::install_one_native_agent(project, f, ctx, &mut result);
         }
 
         if !companion_files.is_empty() {
@@ -1506,10 +1479,7 @@ impl MarketplaceService {
                 project,
                 plugin_dir,
                 &companion_files,
-                mode,
-                marketplace,
-                plugin,
-                version,
+                ctx,
                 &mut result,
             );
         }
@@ -1521,15 +1491,10 @@ impl MarketplaceService {
     /// `install_native_kiro_cli_agents_inner` stays under the line cap.
     /// Routes parse failures, MCP-gated agents, hash failures, and
     /// install failures into the right `result` bucket.
-    #[allow(clippy::too_many_arguments)] // each arg is independent upstream context
     fn install_one_native_agent(
         project: &crate::project::KiroProject,
         file: &crate::agent::DiscoveredNativeFile,
-        mode: InstallMode,
-        accept_mcp: bool,
-        marketplace: &str,
-        plugin: &str,
-        version: Option<&str>,
+        ctx: AgentInstallContext<'_>,
         result: &mut InstallAgentsResult,
     ) {
         let bundle = match crate::agent::parse_native_kiro_agent_file(&file.source, &file.scan_root)
@@ -1549,7 +1514,7 @@ impl MarketplaceService {
         // so a user installing both kinds of plugins sees one UX
         // convention. Subprocess-spawning agents always require explicit
         // --accept-mcp.
-        if !accept_mcp && !bundle.mcp_servers.is_empty() {
+        if !ctx.accept_mcp && !bundle.mcp_servers.is_empty() {
             let transports: Vec<String> = bundle
                 .mcp_servers
                 .values()
@@ -1592,14 +1557,14 @@ impl MarketplaceService {
 
         match project.install_native_agent(
             &bundle,
-            marketplace,
-            plugin,
-            version,
+            ctx.marketplace,
+            ctx.plugin,
+            ctx.version,
             &source_hash,
-            mode,
+            ctx.mode,
         ) {
             Ok(outcome) => {
-                if outcome.was_idempotent {
+                if outcome.kind == crate::project::InstallOutcomeKind::Idempotent {
                     result.skipped.push(outcome.name.clone());
                 } else {
                     result.installed.push(outcome.name.clone());
@@ -1619,15 +1584,11 @@ impl MarketplaceService {
     /// before calling this — otherwise the `rel_paths` derivation below
     /// would silently project cross-root files into the wrong
     /// `agents_root` namespace.
-    #[allow(clippy::too_many_arguments)] // each arg is independent upstream context
     fn install_native_companions_for_plugin(
         project: &crate::project::KiroProject,
         plugin_dir: &Path,
         companion_files: &[crate::agent::DiscoveredNativeFile],
-        mode: InstallMode,
-        marketplace: &str,
-        plugin: &str,
-        version: Option<&str>,
+        ctx: AgentInstallContext<'_>,
         result: &mut InstallAgentsResult,
     ) {
         let scan_root = companion_files[0].scan_root.clone();
@@ -1669,11 +1630,11 @@ impl MarketplaceService {
         match project.install_native_companions(&crate::project::NativeCompanionsInput {
             scan_root: &scan_root,
             rel_paths: &rel_paths,
-            marketplace,
-            plugin,
-            version,
+            marketplace: ctx.marketplace,
+            plugin: ctx.plugin,
+            version: ctx.version,
             source_hash: &source_hash,
-            mode,
+            mode: ctx.mode,
         }) {
             Ok(outcome) => result.installed_companions = Some(outcome),
             Err(err) => result.failed.push(FailedAgent {
@@ -1976,12 +1937,14 @@ mod tests {
             &project,
             plugin_tmp.path(),
             &["./agents/".to_string()],
-            InstallMode::New,
-            false, // accept_mcp: existing fixtures don't carry MCP servers
-            "mp",
-            "plugin-x",
             None,
-            None,
+            AgentInstallContext {
+                mode: InstallMode::New,
+                accept_mcp: false, // existing fixtures don't carry MCP servers
+                marketplace: "mp",
+                plugin: "plugin-x",
+                version: None,
+            },
         );
         let warnings = &result.warnings;
 
@@ -2053,12 +2016,14 @@ mod tests {
             &project,
             plugin_tmp.path(),
             &["./agents/".to_string()],
-            InstallMode::New,
-            false, // accept_mcp: existing fixtures don't carry MCP servers
-            "mp",
-            "p",
             None,
-            None,
+            AgentInstallContext {
+                mode: InstallMode::New,
+                accept_mcp: false,
+                marketplace: "mp",
+                plugin: "p",
+                version: None,
+            },
         );
         assert!(result.installed.is_empty());
         assert!(
@@ -2099,12 +2064,14 @@ mod tests {
             &project,
             plugin_tmp.path(),
             &["./agents/".to_string()],
-            InstallMode::New,
-            false, // accept_mcp: existing fixtures don't carry MCP servers
-            "mp",
-            "p",
             None,
-            None,
+            AgentInstallContext {
+                mode: InstallMode::New,
+                accept_mcp: false,
+                marketplace: "mp",
+                plugin: "p",
+                version: None,
+            },
         );
 
         // A succeeded, B failed, and the unmapped-tool warning for A still
@@ -2152,12 +2119,14 @@ mod tests {
             &project,
             plugin_tmp.path(),
             &["./agents/".to_string()],
-            InstallMode::New,
-            false, // accept_mcp: existing fixtures don't carry MCP servers
-            "mp",
-            "p",
             None,
-            None,
+            AgentInstallContext {
+                mode: InstallMode::New,
+                accept_mcp: false,
+                marketplace: "mp",
+                plugin: "p",
+                version: None,
+            },
         );
         assert!(result.installed.is_empty());
         assert!(result.failed.is_empty());
@@ -2199,12 +2168,14 @@ mod tests {
             &project,
             plugin_tmp.path(),
             &["./agents/".to_string()],
-            InstallMode::New,
-            false, // accept_mcp = false → gate must fire
-            "mp",
-            "p",
             None,
-            None,
+            AgentInstallContext {
+                mode: InstallMode::New,
+                accept_mcp: false, // gate must fire
+                marketplace: "mp",
+                plugin: "p",
+                version: None,
+            },
         );
 
         assert!(
@@ -2252,12 +2223,14 @@ mod tests {
             &project,
             plugin_tmp.path(),
             &["./agents/".to_string()],
-            InstallMode::New,
-            true, // accept_mcp = true → gate is bypassed
-            "mp",
-            "p",
             None,
-            None,
+            AgentInstallContext {
+                mode: InstallMode::New,
+                accept_mcp: true, // gate is bypassed
+                marketplace: "mp",
+                plugin: "p",
+                version: None,
+            },
         );
 
         assert_eq!(result.installed, vec!["terraformer".to_string()]);
@@ -2319,12 +2292,14 @@ mod tests {
             &project,
             plugin_tmp.path(),
             &["./agents/".to_string()],
-            InstallMode::New,
-            false,
-            "mp",
-            "p",
             None,
-            None,
+            AgentInstallContext {
+                mode: InstallMode::New,
+                accept_mcp: false,
+                marketplace: "mp",
+                plugin: "p",
+                version: None,
+            },
         );
         assert!(result.installed.is_empty(), "MCP agent must be skipped");
 
@@ -2373,12 +2348,14 @@ mod tests {
             &project,
             plugin_tmp.path(),
             &["./agents/".to_string()],
-            InstallMode::Force, // <-- force, but...
-            false,              // <-- accept_mcp = false should still gate
-            "mp",
-            "p",
             None,
-            None,
+            AgentInstallContext {
+                mode: InstallMode::Force, // force, but...
+                accept_mcp: false,        // accept_mcp = false should still gate
+                marketplace: "mp",
+                plugin: "p",
+                version: None,
+            },
         );
         assert!(
             result.installed.is_empty(),
@@ -2412,12 +2389,14 @@ mod tests {
             &project,
             plugin_tmp.path(),
             &["./agents/".to_string()],
-            InstallMode::New,
-            false, // accept_mcp: existing fixtures don't carry MCP servers
-            "mp",
-            "p",
             None,
-            None,
+            AgentInstallContext {
+                mode: InstallMode::New,
+                accept_mcp: false,
+                marketplace: "mp",
+                plugin: "p",
+                version: None,
+            },
         );
         assert_eq!(r1.installed, vec!["dup".to_string()]);
         assert!(r1.failed.is_empty());
@@ -2427,12 +2406,14 @@ mod tests {
             &project,
             plugin_tmp.path(),
             &["./agents/".to_string()],
-            InstallMode::New,
-            false, // accept_mcp: existing fixtures don't carry MCP servers
-            "mp",
-            "p",
             None,
-            None,
+            AgentInstallContext {
+                mode: InstallMode::New,
+                accept_mcp: false,
+                marketplace: "mp",
+                plugin: "p",
+                version: None,
+            },
         );
         assert!(r2.installed.is_empty());
         assert_eq!(r2.skipped, vec!["dup".to_string()]);
@@ -2464,12 +2445,14 @@ mod tests {
             &project,
             plugin_tmp.path(),
             &["./agents/".to_string()],
-            InstallMode::New,
-            false, // accept_mcp: existing fixtures don't carry MCP servers
-            "mp",
-            "p",
-            Some("1.0.0"),
             None,
+            AgentInstallContext {
+                mode: InstallMode::New,
+                accept_mcp: false,
+                marketplace: "mp",
+                plugin: "p",
+                version: Some("1.0.0"),
+            },
         );
         assert_eq!(r1.installed, vec!["dup".to_string()]);
 
@@ -2486,12 +2469,14 @@ mod tests {
             &project,
             plugin_tmp.path(),
             &["./agents/".to_string()],
-            InstallMode::Force,
-            false, // accept_mcp: this fixture's agents have no MCP entries
-            "mp",
-            "p",
-            Some("2.0.0"),
             None,
+            AgentInstallContext {
+                mode: InstallMode::Force,
+                accept_mcp: false,
+                marketplace: "mp",
+                plugin: "p",
+                version: Some("2.0.0"),
+            },
         );
         assert_eq!(
             r2.installed,
@@ -2550,12 +2535,14 @@ mod tests {
             &project,
             plugin_tmp.path(),
             &["./agents/".to_string()],
-            InstallMode::New,
-            false, // accept_mcp: existing fixtures don't carry MCP servers
-            "mp",
-            "p",
             None,
-            None,
+            AgentInstallContext {
+                mode: InstallMode::New,
+                accept_mcp: false,
+                marketplace: "mp",
+                plugin: "p",
+                version: None,
+            },
         );
         assert!(result.installed.is_empty());
         // Rejection happens at parse time with a typed InvalidName.
@@ -2610,12 +2597,14 @@ mod tests {
             &project,
             plugin_tmp.path(),
             &["./agents/".to_string()],
-            InstallMode::New,
-            false, // accept_mcp — fixture has no MCP servers
-            "marketplace-x",
-            "p",
-            None,
             Some(crate::plugin::PluginFormat::KiroCli),
+            AgentInstallContext {
+                mode: InstallMode::New,
+                accept_mcp: false, // fixture has no MCP servers
+                marketplace: "marketplace-x",
+                plugin: "p",
+                version: None,
+            },
         );
 
         // Native dispatch surfaces installs in BOTH `installed` (legacy
@@ -2623,8 +2612,10 @@ mod tests {
         assert_eq!(result.installed, vec!["rev".to_string()]);
         assert_eq!(result.installed_native.len(), 1);
         assert_eq!(result.installed_native[0].name, "rev");
-        assert!(!result.installed_native[0].was_idempotent);
-        assert!(!result.installed_native[0].forced_overwrite);
+        assert_eq!(
+            result.installed_native[0].kind,
+            crate::project::InstallOutcomeKind::Installed
+        );
 
         // Companion bundle landed.
         let companions = result
@@ -2675,12 +2666,14 @@ mod tests {
             &project,
             plugin_tmp.path(),
             &["./agents/".to_string()],
-            InstallMode::New,
-            false, // accept_mcp = false → gate fires
-            "m",
-            "p",
-            None,
             Some(crate::plugin::PluginFormat::KiroCli),
+            AgentInstallContext {
+                mode: InstallMode::New,
+                accept_mcp: false, // gate fires
+                marketplace: "m",
+                plugin: "p",
+                version: None,
+            },
         );
 
         assert!(
@@ -2733,12 +2726,14 @@ mod tests {
             &project,
             plugin_tmp.path(),
             &["./agents/".to_string(), "./extras/".to_string()],
-            InstallMode::New,
-            false,
-            "m",
-            "p",
-            None,
             Some(crate::plugin::PluginFormat::KiroCli),
+            AgentInstallContext {
+                mode: InstallMode::New,
+                accept_mcp: false,
+                marketplace: "m",
+                plugin: "p",
+                version: None,
+            },
         );
 
         // The bundle is rejected wholesale.
