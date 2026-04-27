@@ -1153,6 +1153,23 @@ impl KiroProject {
 
                 installed.agents.insert(def.name.clone(), meta);
 
+                // Cross-plugin force-transfer: if a prior owner of the
+                // same prompt path is some OTHER plugin, scrub the prompt
+                // from its `native_companions.files` so the entry no
+                // longer claims a file we just overwrote. Mirrors the
+                // native path's call in `install_native_companions_locked`
+                // and closes the v1 gap documented in Stage 1 Task 14.
+                //
+                // Only meaningful in force mode — non-force mode bails
+                // earlier on `AlreadyInstalled` so no transfer happens.
+                if force {
+                    Self::strip_transferred_paths_from_other_plugins(
+                        &mut installed,
+                        &plugin,
+                        std::slice::from_ref(&prompt_rel),
+                    );
+                }
+
                 let placed = [json_target.clone(), prompt_target.clone()];
 
                 if let Err(e) = Self::synthesize_companion_entry(
@@ -1184,24 +1201,28 @@ impl KiroProject {
                     return Err(e);
                 }
 
-                // Success — drop the backup files. Best-effort; an orphan
-                // .kiro-bak left here is a curiosity, not a correctness issue.
-                for (_orig, backup) in &backups {
-                    if let Err(e) = fs::remove_file(backup)
-                        && e.kind() != std::io::ErrorKind::NotFound
-                    {
-                        warn!(
-                            path = %backup.display(),
-                            error = %e,
-                            "failed to remove install backup after success"
-                        );
-                    }
-                }
-
+                Self::drop_install_backups_best_effort(&backups);
                 debug!(name = %def.name, force, "agent installed");
                 Ok(())
             },
         )
+    }
+
+    /// Best-effort removal of `.kiro-bak` backup files after a successful
+    /// install. An orphan backup is a curiosity, not a correctness issue,
+    /// so failures are logged at `warn!` and don't surface to the caller.
+    fn drop_install_backups_best_effort(backups: &[(PathBuf, PathBuf)]) {
+        for (_orig, backup) in backups {
+            if let Err(e) = fs::remove_file(backup)
+                && e.kind() != std::io::ErrorKind::NotFound
+            {
+                warn!(
+                    path = %backup.display(),
+                    error = %e,
+                    "failed to remove install backup after success"
+                );
+            }
+        }
     }
 
     /// Move staged agent files from `staging` into their final locations
@@ -3143,6 +3164,80 @@ mod tests {
                 path.display()
             );
         }
+    }
+
+    #[test]
+    fn install_agent_force_transfers_companion_ownership_across_plugins() {
+        // Regression test for the v1 limitation Stage 1 Task 14 documented:
+        // a translated agent overwritten by a different plugin via --force
+        // used to leave the prior plugin's native_companions entry still
+        // listing the prompt path. The fix mirrors the native install
+        // path's `strip_transferred_paths_from_other_plugins` call so the
+        // prior owner's tracking truthfully reflects what's on disk.
+        let (_dir, project) = temp_project();
+        let src_tmp = tempfile::tempdir().unwrap();
+
+        // Plugin A installs agent `shared`.
+        let src_a = write_agent(src_tmp.path(), "shared", "---\nname: shared\n---\nfrom A\n");
+        let (def_a, mapped_a) = parse_and_map(&src_a);
+        let mut meta_a = sample_agent_meta();
+        "plugin-a".clone_into(&mut meta_a.plugin);
+        project
+            .install_agent(&def_a, &mapped_a, meta_a, None)
+            .expect("plugin-a install");
+
+        // Plugin A owns prompts/shared.md.
+        let installed_after_a = project.load_installed_agents().unwrap();
+        assert!(
+            installed_after_a
+                .native_companions
+                .get("plugin-a")
+                .expect("plugin-a companion entry")
+                .files
+                .contains(&PathBuf::from("prompts/shared.md"))
+        );
+
+        // Plugin B force-installs an agent at the same name + prompt path.
+        let src_b = src_tmp.path().join("shared_b.md");
+        fs::write(&src_b, "---\nname: shared\n---\nfrom B\n").unwrap();
+        let (def_b, mapped_b) = parse_and_map(&src_b);
+        let mut meta_b = sample_agent_meta();
+        "plugin-b".clone_into(&mut meta_b.plugin);
+        project
+            .install_agent_force(&def_b, &mapped_b, meta_b, None)
+            .expect("plugin-b force install");
+
+        // Ownership has transferred. Plugin A's companion entry must no
+        // longer list prompts/shared.md (the file plugin B just took
+        // over); plugin B owns it now.
+        let installed_after_b = project.load_installed_agents().unwrap();
+        assert!(
+            installed_after_b
+                .native_companions
+                .get("plugin-a")
+                .is_none_or(|m| !m.files.contains(&PathBuf::from("prompts/shared.md"))),
+            "plugin-a must not still claim prompts/shared.md after transfer; native_companions: {:?}",
+            installed_after_b.native_companions
+        );
+        assert!(
+            installed_after_b
+                .native_companions
+                .get("plugin-b")
+                .expect("plugin-b companion entry")
+                .files
+                .contains(&PathBuf::from("prompts/shared.md")),
+            "plugin-b must claim prompts/shared.md"
+        );
+
+        // The agent itself reflects the new owner.
+        assert_eq!(
+            installed_after_b
+                .agents
+                .get("shared")
+                .expect("agent tracked")
+                .plugin,
+            "plugin-b"
+        );
     }
 
     #[test]
