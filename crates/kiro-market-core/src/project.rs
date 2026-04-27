@@ -130,7 +130,8 @@ pub struct InstalledAgents {
 /// row without re-reading tracking — name, the resolved destination JSON
 /// path, whether `--force` overwrote a tracked path, whether the call was
 /// a no-op idempotent reinstall, and both content hashes.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
 pub struct InstalledNativeAgentOutcome {
     pub name: String,
     pub json_path: PathBuf,
@@ -196,7 +197,8 @@ type CompanionPromotion = (Vec<PathBuf>, Vec<(PathBuf, PathBuf)>);
 /// so callers see one entry for the whole bundle rather than one per file.
 /// `files` is the absolute destination paths of every companion file
 /// installed for this plugin.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
 pub struct InstalledNativeCompanionsOutcome {
     pub plugin: String,
     pub files: Vec<PathBuf>,

@@ -89,6 +89,7 @@ pub fn run(
         marketplace_name,
         plugin_name,
         ctx.version.as_deref(),
+        ctx.format,
     );
     print_agent_outcome(&agent_result);
 
@@ -178,6 +179,7 @@ fn run_agent_install(
     marketplace_name: &str,
     plugin_name: &str,
     version: Option<&str>,
+    format: Option<kiro_market_core::plugin::PluginFormat>,
 ) -> InstallAgentsResult {
     // A `--skill <name>` filter narrows the install to one skill and never
     // includes agents.
@@ -193,6 +195,7 @@ fn run_agent_install(
         marketplace_name,
         plugin_name,
         version,
+        format,
     )
 }
 

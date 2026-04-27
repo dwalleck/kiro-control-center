@@ -365,14 +365,28 @@ pub enum FailedSkillReason {
 #[derive(Debug, Default, Serialize)]
 #[cfg_attr(feature = "specta", derive(specta::Type))]
 pub struct InstallAgentsResult {
-    /// Agent names successfully installed.
+    /// Agent names successfully installed (both translated and native paths
+    /// populate this). Native idempotent reinstalls go to `skipped`.
     pub installed: Vec<String>,
     /// Agent names that were already installed and left untouched.
+    /// Native paths populate this for idempotent reinstalls
+    /// (`was_idempotent: true`).
     pub skipped: Vec<String>,
     /// Agents whose install attempt failed (parse, validation, or fs error).
     pub failed: Vec<FailedAgent>,
-    /// Non-fatal issues (unmapped tools, skipped non-agent files).
+    /// Non-fatal issues (unmapped tools, skipped non-agent files,
+    /// MCP-gated agents).
     pub warnings: Vec<InstallWarning>,
+    /// Per-native-agent rich outcome (`forced_overwrite`, `was_idempotent`,
+    /// hashes). Empty for translated-only installs. Frontends that want
+    /// the rich detail consume this; legacy presenters keep using
+    /// `installed: Vec<String>`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub installed_native: Vec<crate::project::InstalledNativeAgentOutcome>,
+    /// Per-plugin native companion bundle outcome. `None` for translated
+    /// plugins or for native plugins with zero companion files.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub installed_companions: Option<crate::project::InstalledNativeCompanionsOutcome>,
 }
 
 /// An agent that failed to install, with the typed error.
@@ -393,6 +407,59 @@ pub struct FailedAgent {
     #[serde(serialize_with = "serialize_agent_error")]
     #[cfg_attr(feature = "specta", specta(type = String))]
     pub error: crate::error::AgentError,
+}
+
+/// Project a [`crate::agent::NativeParseFailure`] into the right
+/// [`crate::error::AgentError`] variant for [`FailedAgent`]. Exhaustive
+/// over the parse-failure enum so a new variant forces a compile-time
+/// classification decision (CLAUDE.md classifier discipline).
+///
+/// The post-Stage-1 hardening variants (`SymlinkRefused`, `FileTooLarge`,
+/// `NulByteInJsonString`) are routed through [`AgentError::InstallFailed`]
+/// rather than getting their own typed variants — they're security
+/// rejections at parse time, not user-facing collision modes.
+fn native_parse_failure_to_agent_error(
+    path: &Path,
+    failure: crate::agent::NativeParseFailure,
+) -> crate::error::AgentError {
+    use crate::agent::NativeParseFailure as F;
+    use crate::error::AgentError as A;
+    match failure {
+        F::IoError(source) => A::ManifestReadFailed {
+            path: path.to_path_buf(),
+            source,
+        },
+        F::SymlinkRefused(p) => A::InstallFailed {
+            path: p.clone(),
+            source: Box::new(crate::error::Error::Io(std::io::Error::other(format!(
+                "refusing symlinked native agent at {}",
+                p.display()
+            )))),
+        },
+        F::FileTooLarge { size, limit } => A::InstallFailed {
+            path: path.to_path_buf(),
+            source: Box::new(crate::error::Error::Io(std::io::Error::other(format!(
+                "native agent JSON exceeds size cap: {size} bytes (limit: {limit})"
+            )))),
+        },
+        F::InvalidJson(source) => A::NativeManifestParseFailed {
+            path: path.to_path_buf(),
+            source,
+        },
+        F::NulByteInJsonString { json_pointer } => A::InstallFailed {
+            path: path.to_path_buf(),
+            source: Box::new(crate::error::Error::Io(std::io::Error::other(format!(
+                "NUL byte in JSON string at `{json_pointer}`"
+            )))),
+        },
+        F::MissingName => A::NativeManifestMissingName {
+            path: path.to_path_buf(),
+        },
+        F::InvalidName(reason) => A::NativeManifestInvalidName {
+            path: path.to_path_buf(),
+            reason,
+        },
+    }
 }
 
 /// Wire-format projection of [`AgentError`] for [`FailedAgent`]. The typed
@@ -1177,12 +1244,59 @@ impl MarketplaceService {
     ///   error. The CLI surfaces these with a non-zero exit status.
     /// - `warnings`: non-fatal issues (unmapped tools, README-like files
     ///   skipped, missing-name frontmatter).
-    #[allow(clippy::too_many_arguments)] // eight non-self params, each a distinct
+    #[allow(clippy::too_many_arguments)]
+    // nine non-self params, each a distinct
     // input from upstream: project + plugin_dir + scan_paths + mode +
-    // accept_mcp + marketplace + plugin + version. A builder would add
-    // indirection without reducing arity at the call site.
+    // accept_mcp + marketplace + plugin + version + format. A builder would
+    // add indirection without reducing arity at the call site.
+    #[must_use = "the install result carries per-agent failures and warnings; losing it drops the user-facing summary"]
     pub fn install_plugin_agents(
         &self,
+        project: &crate::project::KiroProject,
+        plugin_dir: &Path,
+        scan_paths: &[String],
+        mode: InstallMode,
+        accept_mcp: bool,
+        marketplace: &str,
+        plugin: &str,
+        version: Option<&str>,
+        format: Option<crate::plugin::PluginFormat>,
+    ) -> InstallAgentsResult {
+        let _ = self;
+        match format {
+            Some(crate::plugin::PluginFormat::KiroCli) => {
+                Self::install_native_kiro_cli_agents_inner(
+                    project,
+                    plugin_dir,
+                    scan_paths,
+                    mode,
+                    accept_mcp,
+                    marketplace,
+                    plugin,
+                    version,
+                )
+            }
+            None => Self::install_translated_agents_inner(
+                project,
+                plugin_dir,
+                scan_paths,
+                mode,
+                accept_mcp,
+                marketplace,
+                plugin,
+                version,
+            ),
+        }
+    }
+
+    /// Translated install path: discovers `.md` agents under `scan_paths`,
+    /// parses each via `parse_agent_file`, applies the MCP opt-in gate,
+    /// maps tools per dialect, and installs into the project. Per-agent
+    /// failures land in `result.failed`; non-fatal issues (skipped
+    /// non-agent markdown, MCP-gated agents, unmapped tools) land in
+    /// `result.warnings`.
+    #[allow(clippy::too_many_arguments)] // mirrors install_plugin_agents
+    fn install_translated_agents_inner(
         project: &crate::project::KiroProject,
         plugin_dir: &Path,
         scan_paths: &[String],
@@ -1307,6 +1421,241 @@ impl MarketplaceService {
         }
 
         result
+    }
+
+    /// Native install path: discovers `.json` agents under `scan_paths`,
+    /// parses each via `parse_native_kiro_agent_file`, applies the MCP
+    /// opt-in gate (warning route per S2-12, parity with translated),
+    /// computes per-agent `source_hash`, and installs via
+    /// [`crate::project::KiroProject::install_native_agent`]. After all
+    /// per-agent installs, discovers companion files and installs them
+    /// as one atomic plugin-scoped bundle via
+    /// [`crate::project::KiroProject::install_native_companions`].
+    ///
+    /// Multi-scan-root native plugins (where companion files come from
+    /// different `scan_paths` entries) are rejected via
+    /// `MultipleScanRootsNotSupported` per S2-11 — v1 supports a single
+    /// scan root only.
+    #[allow(clippy::too_many_arguments)] // mirrors install_plugin_agents
+    fn install_native_kiro_cli_agents_inner(
+        project: &crate::project::KiroProject,
+        plugin_dir: &Path,
+        scan_paths: &[String],
+        mode: InstallMode,
+        accept_mcp: bool,
+        marketplace: &str,
+        plugin: &str,
+        version: Option<&str>,
+    ) -> InstallAgentsResult {
+        let mut result = InstallAgentsResult::default();
+
+        let agent_files =
+            crate::agent::discover::discover_native_kiro_agents_in_dirs(plugin_dir, scan_paths);
+        let companion_files =
+            crate::agent::discover::discover_native_companion_files(plugin_dir, scan_paths);
+
+        for f in &agent_files {
+            Self::install_one_native_agent(
+                project,
+                f,
+                mode,
+                accept_mcp,
+                marketplace,
+                plugin,
+                version,
+                &mut result,
+            );
+        }
+
+        if !companion_files.is_empty() {
+            Self::install_native_companions_for_plugin(
+                project,
+                plugin_dir,
+                &companion_files,
+                mode,
+                marketplace,
+                plugin,
+                version,
+                &mut result,
+            );
+        }
+
+        result
+    }
+
+    /// Per-agent install body extracted so
+    /// `install_native_kiro_cli_agents_inner` stays under the line cap.
+    /// Routes parse failures, MCP-gated agents, hash failures, and
+    /// install failures into the right `result` bucket.
+    #[allow(clippy::too_many_arguments)] // each arg is independent upstream context
+    fn install_one_native_agent(
+        project: &crate::project::KiroProject,
+        file: &crate::agent::DiscoveredNativeFile,
+        mode: InstallMode,
+        accept_mcp: bool,
+        marketplace: &str,
+        plugin: &str,
+        version: Option<&str>,
+        result: &mut InstallAgentsResult,
+    ) {
+        let bundle = match crate::agent::parse_native_kiro_agent_file(&file.source, &file.scan_root)
+        {
+            Ok(b) => b,
+            Err(parse_err) => {
+                result.failed.push(FailedAgent {
+                    name: None,
+                    source_path: file.source.clone(),
+                    error: native_parse_failure_to_agent_error(&file.source, parse_err),
+                });
+                return;
+            }
+        };
+
+        // MCP opt-in gate (S2-12: warning route, parity with translated).
+        if !accept_mcp && !bundle.mcp_servers.is_empty() {
+            let transports: Vec<String> = bundle
+                .mcp_servers
+                .values()
+                .map(|cfg| cfg.transport_label().to_owned())
+                .collect();
+            result
+                .warnings
+                .push(InstallWarning::McpServersRequireOptIn {
+                    agent: bundle.name.clone(),
+                    transports,
+                });
+            return;
+        }
+
+        let Some(filename) = file.source.file_name().map(std::path::PathBuf::from) else {
+            result.failed.push(FailedAgent {
+                name: Some(bundle.name.clone()),
+                source_path: file.source.clone(),
+                error: crate::error::AgentError::NativeManifestInvalidName {
+                    path: file.source.clone(),
+                    reason: "discovered file has no file-name component".to_owned(),
+                },
+            });
+            return;
+        };
+        let source_hash = match crate::hash::hash_artifact(&file.scan_root, &[filename]) {
+            Ok(h) => h,
+            Err(e) => {
+                result.failed.push(FailedAgent {
+                    name: Some(bundle.name.clone()),
+                    source_path: file.source.clone(),
+                    error: crate::error::AgentError::InstallFailed {
+                        path: file.source.clone(),
+                        source: Box::new(e.into()),
+                    },
+                });
+                return;
+            }
+        };
+
+        match project.install_native_agent(
+            &bundle,
+            marketplace,
+            plugin,
+            version,
+            &source_hash,
+            mode,
+        ) {
+            Ok(outcome) => {
+                if outcome.was_idempotent {
+                    result.skipped.push(outcome.name.clone());
+                } else {
+                    result.installed.push(outcome.name.clone());
+                }
+                result.installed_native.push(outcome);
+            }
+            Err(err) => result.failed.push(FailedAgent {
+                name: Some(bundle.name.clone()),
+                source_path: file.source.clone(),
+                error: err,
+            }),
+        }
+    }
+
+    /// Companion install body. Rejects multi-scan-root plugins per S2-11
+    /// (v1 supports a single scan root only — companion ownership tracking
+    /// would otherwise need to disambiguate which scan root each file
+    /// belongs to).
+    #[allow(clippy::too_many_arguments)] // each arg is independent upstream context
+    fn install_native_companions_for_plugin(
+        project: &crate::project::KiroProject,
+        plugin_dir: &Path,
+        companion_files: &[crate::agent::DiscoveredNativeFile],
+        mode: InstallMode,
+        marketplace: &str,
+        plugin: &str,
+        version: Option<&str>,
+        result: &mut InstallAgentsResult,
+    ) {
+        let unique_roots: std::collections::HashSet<&PathBuf> =
+            companion_files.iter().map(|f| &f.scan_root).collect();
+        if unique_roots.len() > 1 {
+            let roots: Vec<PathBuf> = unique_roots.into_iter().cloned().collect();
+            result.failed.push(FailedAgent {
+                name: None,
+                source_path: plugin_dir.to_path_buf(),
+                error: crate::error::AgentError::MultipleScanRootsNotSupported { roots },
+            });
+            return;
+        }
+
+        let scan_root = companion_files[0].scan_root.clone();
+        let mut rel_paths: Vec<PathBuf> = Vec::with_capacity(companion_files.len());
+        for f in companion_files {
+            // Discovery guarantees `f.source` is under `f.scan_root` —
+            // strip_prefix should never fail. Defensive fallback.
+            let Ok(rel) = f.source.strip_prefix(&f.scan_root) else {
+                result.failed.push(FailedAgent {
+                    name: None,
+                    source_path: f.source.clone(),
+                    error: crate::error::AgentError::InstallFailed {
+                        path: f.source.clone(),
+                        source: Box::new(crate::error::Error::Io(std::io::Error::other(
+                            "discovered companion not under its declared scan_root",
+                        ))),
+                    },
+                });
+                return;
+            };
+            rel_paths.push(rel.to_path_buf());
+        }
+
+        let source_hash = match crate::hash::hash_artifact(&scan_root, &rel_paths) {
+            Ok(h) => h,
+            Err(e) => {
+                result.failed.push(FailedAgent {
+                    name: None,
+                    source_path: scan_root,
+                    error: crate::error::AgentError::InstallFailed {
+                        path: plugin_dir.to_path_buf(),
+                        source: Box::new(e.into()),
+                    },
+                });
+                return;
+            }
+        };
+
+        match project.install_native_companions(&crate::project::NativeCompanionsInput {
+            scan_root: &scan_root,
+            rel_paths: &rel_paths,
+            marketplace,
+            plugin,
+            version,
+            source_hash: &source_hash,
+            mode,
+        }) {
+            Ok(outcome) => result.installed_companions = Some(outcome),
+            Err(err) => result.failed.push(FailedAgent {
+                name: None,
+                source_path: scan_root,
+                error: err,
+            }),
+        }
     }
 
     // -----------------------------------------------------------------------
@@ -1606,6 +1955,7 @@ mod tests {
             "mp",
             "plugin-x",
             None,
+            None,
         );
         let warnings = &result.warnings;
 
@@ -1682,6 +2032,7 @@ mod tests {
             "mp",
             "p",
             None,
+            None,
         );
         assert!(result.installed.is_empty());
         assert!(
@@ -1726,6 +2077,7 @@ mod tests {
             false, // accept_mcp: existing fixtures don't carry MCP servers
             "mp",
             "p",
+            None,
             None,
         );
 
@@ -1779,6 +2131,7 @@ mod tests {
             "mp",
             "p",
             None,
+            None,
         );
         assert!(result.installed.is_empty());
         assert!(result.failed.is_empty());
@@ -1824,6 +2177,7 @@ mod tests {
             false, // accept_mcp = false → gate must fire
             "mp",
             "p",
+            None,
             None,
         );
 
@@ -1876,6 +2230,7 @@ mod tests {
             true, // accept_mcp = true → gate is bypassed
             "mp",
             "p",
+            None,
             None,
         );
 
@@ -1943,6 +2298,7 @@ mod tests {
             "mp",
             "p",
             None,
+            None,
         );
         assert!(result.installed.is_empty(), "MCP agent must be skipped");
 
@@ -1996,6 +2352,7 @@ mod tests {
             "mp",
             "p",
             None,
+            None,
         );
         assert!(
             result.installed.is_empty(),
@@ -2034,6 +2391,7 @@ mod tests {
             "mp",
             "p",
             None,
+            None,
         );
         assert_eq!(r1.installed, vec!["dup".to_string()]);
         assert!(r1.failed.is_empty());
@@ -2047,6 +2405,7 @@ mod tests {
             false, // accept_mcp: existing fixtures don't carry MCP servers
             "mp",
             "p",
+            None,
             None,
         );
         assert!(r2.installed.is_empty());
@@ -2084,6 +2443,7 @@ mod tests {
             "mp",
             "p",
             Some("1.0.0"),
+            None,
         );
         assert_eq!(r1.installed, vec!["dup".to_string()]);
 
@@ -2105,6 +2465,7 @@ mod tests {
             "mp",
             "p",
             Some("2.0.0"),
+            None,
         );
         assert_eq!(
             r2.installed,
@@ -2168,6 +2529,7 @@ mod tests {
             "mp",
             "p",
             None,
+            None,
         );
         assert!(result.installed.is_empty());
         // Rejection happens at parse time with a typed InvalidName.
@@ -2189,6 +2551,128 @@ mod tests {
         assert!(
             !project_tmp.path().parent().unwrap().join("escape").exists(),
             "traversal must not have escaped project root"
+        );
+    }
+
+    #[test]
+    fn install_plugin_agents_dispatches_to_native_when_format_kiro_cli() {
+        // End-to-end: a plugin with format: "kiro-cli" gets routed to the
+        // native install path. Verifies the dispatcher (Task 18) wires
+        // format: Some(KiroCli) → install_native_kiro_cli_agents_inner.
+
+        // Plugin source: a single native JSON agent + a companion file.
+        let plugin_tmp = tempfile::tempdir().expect("plugin tempdir");
+        let agents = plugin_tmp.path().join("agents");
+        let prompts = agents.join("prompts");
+        std::fs::create_dir_all(&prompts).expect("create prompts");
+        std::fs::write(
+            agents.join("rev.json"),
+            br#"{"name": "rev", "prompt": "..."}"#,
+        )
+        .expect("write rev.json");
+        std::fs::write(prompts.join("rev.md"), b"prompt body").expect("write companion");
+
+        // Project root for the install destination.
+        let project_tmp = tempfile::tempdir().expect("project tempdir");
+        let project = crate::project::KiroProject::new(project_tmp.path().to_path_buf());
+
+        let (_dir, svc) = crate::service::test_support::temp_service();
+
+        let result = svc.install_plugin_agents(
+            &project,
+            plugin_tmp.path(),
+            &["./agents/".to_string()],
+            InstallMode::New,
+            false, // accept_mcp — fixture has no MCP servers
+            "marketplace-x",
+            "p",
+            None,
+            Some(crate::plugin::PluginFormat::KiroCli),
+        );
+
+        // Native dispatch surfaces installs in BOTH `installed` (legacy
+        // string list) and `installed_native` (rich outcomes).
+        assert_eq!(result.installed, vec!["rev".to_string()]);
+        assert_eq!(result.installed_native.len(), 1);
+        assert_eq!(result.installed_native[0].name, "rev");
+        assert!(!result.installed_native[0].was_idempotent);
+        assert!(!result.installed_native[0].forced_overwrite);
+
+        // Companion bundle landed.
+        let companions = result
+            .installed_companions
+            .as_ref()
+            .expect("companion outcome present");
+        assert_eq!(companions.plugin, "p");
+        assert_eq!(companions.files.len(), 1);
+
+        assert!(result.failed.is_empty(), "no failures: {:?}", result.failed);
+
+        // Tracking entry has dialect Native, proving the native install
+        // path ran (translated would write dialect Claude/Copilot).
+        let tracking = project.load_installed_agents().expect("load");
+        assert_eq!(
+            tracking.agents.get("rev").expect("rev tracked").dialect,
+            crate::agent::AgentDialect::Native
+        );
+        assert!(tracking.native_companions.contains_key("p"));
+    }
+
+    #[test]
+    fn install_plugin_agents_native_path_routes_mcp_to_warning() {
+        // S2-12: native MCP gate must use InstallWarning::McpServersRequireOptIn
+        // (parity with translated path), NOT a hard failure. Pinned because
+        // the original Stage 2 plan had it as failed.push(...) and the
+        // amendment reverted to warning-route for UX consistency.
+        let plugin_tmp = tempfile::tempdir().expect("plugin tempdir");
+        let agents = plugin_tmp.path().join("agents");
+        std::fs::create_dir_all(&agents).expect("create agents");
+        // mcpServers with stdio command — triggers the gate.
+        std::fs::write(
+            agents.join("rev.json"),
+            br#"{
+                "name": "rev",
+                "mcpServers": {
+                    "tool": { "type": "stdio", "command": "echo", "args": [] }
+                }
+            }"#,
+        )
+        .expect("write rev.json");
+
+        let project_tmp = tempfile::tempdir().expect("project tempdir");
+        let project = crate::project::KiroProject::new(project_tmp.path().to_path_buf());
+        let (_dir, svc) = crate::service::test_support::temp_service();
+
+        let result = svc.install_plugin_agents(
+            &project,
+            plugin_tmp.path(),
+            &["./agents/".to_string()],
+            InstallMode::New,
+            false, // accept_mcp = false → gate fires
+            "m",
+            "p",
+            None,
+            Some(crate::plugin::PluginFormat::KiroCli),
+        );
+
+        assert!(
+            result.installed.is_empty(),
+            "MCP-gated agent must be skipped"
+        );
+        assert!(
+            result.failed.is_empty(),
+            "MCP gate uses warning, not failed"
+        );
+        let mcp_warning = result.warnings.iter().find(|w| {
+            matches!(
+                w,
+                InstallWarning::McpServersRequireOptIn { agent, .. } if agent == "rev"
+            )
+        });
+        assert!(
+            mcp_warning.is_some(),
+            "expected McpServersRequireOptIn warning, got: {:?}",
+            result.warnings
         );
     }
 
