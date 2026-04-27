@@ -43,7 +43,6 @@ struct IntegrationHarness {
     project_root: TempDir,
     project: KiroProject,
     _svc_dir: TempDir,
-    svc: MarketplaceService,
 }
 
 impl IntegrationHarness {
@@ -65,7 +64,7 @@ impl IntegrationHarness {
             plugin,
             version: None,
         };
-        let result = self.svc.install_plugin_agents(
+        let result = MarketplaceService::install_plugin_agents(
             &self.project,
             plugin_dir,
             &ctx.agent_scan_paths,
@@ -93,7 +92,7 @@ impl IntegrationHarness {
             plugin,
             version: None,
         };
-        self.svc.install_plugin_steering(
+        MarketplaceService::install_plugin_steering(
             &self.project,
             plugin_dir,
             &ctx.steering_scan_paths,
@@ -107,13 +106,12 @@ fn harness() -> IntegrationHarness {
     let plugin_root = tempdir().expect("plugin tempdir");
     let project_root = tempdir().expect("project tempdir");
     let project = KiroProject::new(project_root.path().to_path_buf());
-    let (svc_dir, svc) = temp_service();
+    let (svc_dir, _svc) = temp_service();
     IntegrationHarness {
         plugin_root,
         project_root,
         project,
         _svc_dir: svc_dir,
-        svc,
     }
 }
 

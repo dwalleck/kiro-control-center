@@ -31,9 +31,10 @@ pub struct NativeAgentBundle {
     /// The scan root (e.g. `<plugin>/agents/`) the JSON was discovered under.
     /// Used for computing destination-relative paths and for hashing.
     pub scan_root: PathBuf,
-    /// Validated agent name (from JSON `name` field). Path-safe per
-    /// [`validation::validate_name`].
-    pub name: String,
+    /// Validated agent name (from JSON `name` field); see
+    /// [`validation::AgentName`] for the parse-time guarantee. Install
+    /// code holding a `NativeAgentBundle` does not need to re-validate.
+    pub name: validation::AgentName,
     /// MCP server entries from the JSON's `mcpServers` field. Empty if the
     /// field is absent or empty. Drives the `--accept-mcp` install gate.
     pub mcp_servers: BTreeMap<String, McpServerConfig>,
@@ -110,6 +111,11 @@ pub enum NativeParseFailure {
 /// the agent. Everything else stays in `raw_json`.
 #[derive(Deserialize)]
 struct NativeAgentProjection {
+    /// Raw `Option<String>` rather than `Option<AgentName>` so the
+    /// post-parse routing in [`parse_native_kiro_agent_file`] can split
+    /// failures across distinct [`NativeParseFailure`] variants
+    /// (`MissingName` / `InvalidName(reason)` / `InvalidJson`). See the
+    /// [`validation::AgentName`] docstring for the granularity rationale.
     name: Option<String>,
     #[serde(default, rename = "mcpServers")]
     mcp_servers: BTreeMap<String, McpServerConfig>,
@@ -192,8 +198,14 @@ pub fn parse_native_kiro_agent_file(
     let projection: NativeAgentProjection =
         serde_json::from_slice(&raw_bytes).map_err(NativeParseFailure::InvalidJson)?;
 
-    let name = projection.name.ok_or(NativeParseFailure::MissingName)?;
-    validation::validate_name(&name).map_err(|e| NativeParseFailure::InvalidName(e.to_string()))?;
+    // Two-step routing keeps MissingName / InvalidName / InvalidJson as
+    // distinct failure variants. `AgentName::new` is the same validator
+    // its `Deserialize` impl uses, so the type-level guarantee on
+    // `NativeAgentBundle.name` is identical regardless of construction
+    // route (explicit `new` here vs. `Deserialize` elsewhere).
+    let raw_name = projection.name.ok_or(NativeParseFailure::MissingName)?;
+    let name = validation::AgentName::new(raw_name)
+        .map_err(|e| NativeParseFailure::InvalidName(e.to_string()))?;
 
     Ok(NativeAgentBundle {
         agent_json_source: json_path.to_path_buf(),

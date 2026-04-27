@@ -87,7 +87,6 @@ pub fn run(
         version: ctx.version.as_deref(),
     };
     let agent_result = run_agent_install(
-        &svc,
         &project,
         &plugin_dir,
         &ctx.agent_scan_paths,
@@ -104,7 +103,6 @@ pub fn run(
         version: ctx.version.as_deref(),
     };
     let steering_result = run_steering_install(
-        &svc,
         &project,
         &plugin_dir,
         &ctx.steering_scan_paths,
@@ -194,7 +192,6 @@ fn run_skill_install(
 }
 
 fn run_agent_install(
-    svc: &MarketplaceService,
     project: &KiroProject,
     plugin_dir: &Path,
     agent_scan_paths: &[String],
@@ -207,11 +204,10 @@ fn run_agent_install(
     if skill_filter.is_some() {
         return InstallAgentsResult::default();
     }
-    svc.install_plugin_agents(project, plugin_dir, agent_scan_paths, format, ctx)
+    MarketplaceService::install_plugin_agents(project, plugin_dir, agent_scan_paths, format, ctx)
 }
 
 fn run_steering_install(
-    svc: &MarketplaceService,
     project: &KiroProject,
     plugin_dir: &Path,
     steering_scan_paths: &[String],
@@ -223,7 +219,7 @@ fn run_steering_install(
     if skill_filter.is_some() {
         return InstallSteeringResult::default();
     }
-    svc.install_plugin_steering(project, plugin_dir, steering_scan_paths, ctx)
+    MarketplaceService::install_plugin_steering(project, plugin_dir, steering_scan_paths, ctx)
 }
 
 /// Decide whether the command exits zero or non-zero based on the

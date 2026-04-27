@@ -290,13 +290,12 @@ pub enum AgentError {
     // Mirror translated-path `ParseFailed` but with structured payloads
     // matching the JSON parse pipeline (no frontmatter / YAML stages).
     // -----------------------------------------------------------------
-    /// Native agent JSON file failed to parse.
-    #[error("native agent JSON `{path}` failed to parse")]
-    NativeManifestParseFailed {
-        path: PathBuf,
-        #[source]
-        source: serde_json::Error,
-    },
+    /// Native agent JSON file failed to parse. `reason` carries the full
+    /// `serde_json` error chain materialized at the adapter boundary
+    /// (`service::native_parse_failure_to_agent_error`) — the source
+    /// type does not leak through the public API.
+    #[error("native agent JSON `{path}` failed to parse: {reason}")]
+    NativeManifestParseFailed { path: PathBuf, reason: String },
 
     /// Native agent JSON parsed but is missing the required `name` field.
     #[error("native agent at `{path}` is missing the required `name` field")]
@@ -598,6 +597,23 @@ pub fn error_full_chain(err: &(dyn std::error::Error + 'static)) -> String {
         detail.push_str(&chain);
     }
     detail
+}
+
+/// Construct an [`AgentError::NativeManifestParseFailed`] from a
+/// `serde_json::Error`, materializing the full source chain into the
+/// variant's `reason` field at the adapter boundary.
+///
+/// This is the only in-tree constructor for the variant; every call site
+/// goes through it so the documented invariant — `reason` always carries
+/// the materialized chain rather than an arbitrary string — is structural,
+/// not just prose. The enum is `#[non_exhaustive]`, so external crates
+/// cannot bypass this constructor with a struct literal.
+#[must_use]
+pub(crate) fn native_manifest_parse_failed(path: PathBuf, err: &serde_json::Error) -> AgentError {
+    AgentError::NativeManifestParseFailed {
+        path,
+        reason: error_full_chain(err),
+    }
 }
 
 #[cfg(test)]
@@ -940,15 +956,26 @@ mod tests {
     }
 
     #[test]
-    fn native_manifest_parse_failed_carries_source() {
+    fn native_manifest_parse_failed_renders_path_and_reason() {
         use std::error::Error as _;
         let parse_err = serde_json::from_str::<serde_json::Value>("{not").unwrap_err();
-        let err = AgentError::NativeManifestParseFailed {
-            path: PathBuf::from("rev.json"),
-            source: parse_err,
-        };
-        assert!(err.to_string().contains("rev.json"));
-        assert!(err.source().is_some());
+        // Exercise the only in-tree constructor — replicates exactly what
+        // `service::native_parse_failure_to_agent_error` does at the
+        // adapter boundary.
+        let err = native_manifest_parse_failed(PathBuf::from("rev.json"), &parse_err);
+        let rendered = err.to_string();
+        assert!(rendered.contains("rev.json"), "path missing: {rendered}");
+        // The serde_json line/column survives the materialization.
+        assert!(rendered.contains("line 1"), "reason missing: {rendered}");
+        // Wire-format contract: the variant exposes no `source()` chain,
+        // so downstream FFI surfaces (Tauri, CLI text) cannot accidentally
+        // re-introduce the `serde_json::Error` type by walking `.source()`.
+        // Re-introducing `#[source]` would silently break this assertion.
+        assert!(
+            err.source().is_none(),
+            "NativeManifestParseFailed must not expose a source chain — \
+             reason: String is the only carrier of the materialized serde_json detail"
+        );
     }
 
     #[test]

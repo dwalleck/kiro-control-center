@@ -35,7 +35,7 @@ fn hook_post_edit() -> Result<()> {
     }
     run_rustfmt(&file_path);
     if let Some(pkg) = derive_package(&file_path) {
-        run_clippy(pkg);
+        run_clippy(&pkg);
     }
     Ok(())
 }
@@ -153,20 +153,66 @@ To proceed:
     std::process::exit(2);
 }
 
-fn derive_package(file: &Path) -> Option<&'static str> {
-    let mut iter = file.components();
-    while let Some(c) = iter.next() {
-        if c.as_os_str() == "crates" {
-            let name = iter.next()?.as_os_str().to_str()?;
-            return match name {
-                "kiro-market-core" => Some("kiro-market-core"),
-                "kiro-market" => Some("kiro-market"),
-                "kiro-control-center" => Some("kiro-control-center"),
-                _ => None,
-            };
+/// Walk up from `file`'s parent looking for the nearest `Cargo.toml` with
+/// a `[package]` table and return its `name`. Virtual manifests (workspace
+/// roots without `[package]`) are skipped — the walk continues past them.
+/// Returns `None` when the parent chain is exhausted with no usable manifest.
+///
+/// Returning `String` (not `&'static str`) means new crates added to the
+/// workspace are picked up automatically — no per-crate code change here
+/// is needed.
+///
+/// Read and TOML errors are logged to stderr and the walk continues. A
+/// final stderr diagnostic on exhaust distinguishes "outside any workspace"
+/// from "every ancestor manifest was unreadable / malformed", so the hook
+/// produces observable signal rather than silently doing nothing.
+fn derive_package(file: &Path) -> Option<String> {
+    let start = file.parent()?;
+    for dir in start.ancestors() {
+        let manifest = dir.join("Cargo.toml");
+        if !manifest.is_file() {
+            continue;
+        }
+        let text = match std::fs::read_to_string(&manifest) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("could not read {}: {e}", manifest.display());
+                continue;
+            }
+        };
+        match parse_package_name(&text) {
+            Ok(Some(name)) => return Some(name),
+            // Virtual manifest (workspace root): keep walking.
+            Ok(None) => {}
+            Err(e) => {
+                eprintln!("could not parse {} as TOML: {e}", manifest.display());
+            }
         }
     }
+    eprintln!(
+        "derive_package: no `[package]` Cargo.toml found in ancestors of {}; skipping clippy",
+        file.display()
+    );
     None
+}
+
+/// Parse `Cargo.toml` text and return the `[package].name`, or `None` if
+/// the manifest is virtual (e.g. workspace root with no `[package]`).
+/// Pure helper extracted from [`derive_package`] so the TOML logic can
+/// be unit-tested without touching the filesystem.
+fn parse_package_name(toml_text: &str) -> Result<Option<String>, toml::de::Error> {
+    let parsed: CargoManifest = toml::from_str(toml_text)?;
+    Ok(parsed.package.map(|p| p.name))
+}
+
+#[derive(serde::Deserialize)]
+struct CargoManifest {
+    package: Option<CargoPackage>,
+}
+
+#[derive(serde::Deserialize)]
+struct CargoPackage {
+    name: String,
 }
 
 #[cfg(test)]
@@ -174,39 +220,67 @@ mod tests {
     use super::*;
 
     #[test]
-    fn derive_package_recognizes_market_core() {
-        let p = Path::new("/repo/crates/kiro-market-core/src/lib.rs");
-        assert_eq!(derive_package(p), Some("kiro-market-core"));
+    fn parse_package_name_extracts_simple_name() {
+        let toml = r#"
+[package]
+name = "my-crate"
+version = "0.1.0"
+"#;
+        assert_eq!(
+            parse_package_name(toml).unwrap().as_deref(),
+            Some("my-crate")
+        );
     }
 
     #[test]
-    fn derive_package_recognizes_control_center() {
-        let p = Path::new("/repo/crates/kiro-control-center/src-tauri/src/lib.rs");
-        assert_eq!(derive_package(p), Some("kiro-control-center"));
+    fn parse_package_name_returns_none_for_virtual_manifest() {
+        let toml = r#"
+[workspace]
+members = ["a", "b"]
+"#;
+        assert_eq!(parse_package_name(toml).unwrap(), None);
     }
 
     #[test]
-    fn derive_package_recognizes_cli() {
-        let p = Path::new("/repo/crates/kiro-market/src/main.rs");
-        assert_eq!(derive_package(p), Some("kiro-market"));
+    fn parse_package_name_surfaces_toml_errors() {
+        // Truncated table header — invalid TOML.
+        assert!(parse_package_name("[package\nname =").is_err());
     }
 
     #[test]
-    #[cfg(windows)]
-    fn derive_package_handles_windows_paths() {
-        let p = Path::new(r"C:\repo\crates\kiro-market-core\src\lib.rs");
-        assert_eq!(derive_package(p), Some("kiro-market-core"));
+    fn derive_package_walks_up_to_xtask_manifest() {
+        // The xtask crate's own source files must resolve to `xtask`.
+        // Anchored on CARGO_MANIFEST_DIR so the test works regardless of
+        // where `cargo test` was invoked from.
+        let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let this_file = manifest_dir.join("src").join("main.rs");
+        assert_eq!(derive_package(&this_file).as_deref(), Some("xtask"));
     }
 
     #[test]
-    fn derive_package_returns_none_for_unrelated_paths() {
-        assert_eq!(derive_package(Path::new("/tmp/random/file.rs")), None);
+    fn derive_package_walks_up_through_workspace_to_member_crate() {
+        // A file inside `crates/kiro-market-core/src/` must resolve to
+        // `kiro-market-core` (the member's `[package].name`), skipping
+        // the workspace's virtual root manifest.
+        let workspace_root = Path::new(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .expect("xtask is a workspace member, parent is workspace root");
+        let core_lib = workspace_root
+            .join("crates")
+            .join("kiro-market-core")
+            .join("src")
+            .join("lib.rs");
+        assert_eq!(
+            derive_package(&core_lib).as_deref(),
+            Some("kiro-market-core")
+        );
     }
 
     #[test]
-    fn derive_package_returns_none_for_unknown_crate() {
-        let p = Path::new("/repo/crates/some-other-crate/src/lib.rs");
-        assert_eq!(derive_package(p), None);
+    fn derive_package_returns_none_outside_any_workspace() {
+        // A path with no `Cargo.toml` anywhere up its parent chain.
+        let nowhere = Path::new("/tmp/definitely-not-a-cargo-project/file.rs");
+        assert_eq!(derive_package(nowhere), None);
     }
 
     #[test]

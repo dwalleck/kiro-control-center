@@ -487,10 +487,9 @@ fn native_parse_failure_to_agent_error(
                 "native agent JSON exceeds size cap: {size} bytes (limit: {limit})"
             )))),
         },
-        F::InvalidJson(source) => A::NativeManifestParseFailed {
-            path: path.to_path_buf(),
-            source,
-        },
+        F::InvalidJson(source) => {
+            crate::error::native_manifest_parse_failed(path.to_path_buf(), &source)
+        }
         F::NulByteInJsonString { json_pointer } => A::InstallFailed {
             path: path.to_path_buf(),
             source: Box::new(crate::error::Error::Io(std::io::Error::other(format!(
@@ -1291,14 +1290,12 @@ impl MarketplaceService {
     ///   skipped, missing-name frontmatter).
     #[must_use = "the install result carries per-agent failures and warnings; losing it drops the user-facing summary"]
     pub fn install_plugin_agents(
-        &self,
         project: &crate::project::KiroProject,
         plugin_dir: &Path,
         scan_paths: &[String],
         format: Option<crate::plugin::PluginFormat>,
         ctx: AgentInstallContext<'_>,
     ) -> InstallAgentsResult {
-        let _ = self;
         match format {
             Some(crate::plugin::PluginFormat::KiroCli) => {
                 Self::install_native_kiro_cli_agents_inner(project, plugin_dir, scan_paths, ctx)
@@ -1324,13 +1321,11 @@ impl MarketplaceService {
     /// ambiguous.
     #[must_use = "the install result carries per-file failures and warnings; losing it drops the user-facing summary"]
     pub fn install_plugin_steering(
-        &self,
         project: &crate::project::KiroProject,
         plugin_dir: &Path,
         scan_paths: &[String],
         ctx: crate::steering::SteeringInstallContext<'_>,
     ) -> crate::steering::InstallSteeringResult {
-        let _ = self;
         let mut result = crate::steering::InstallSteeringResult::default();
 
         let (files, warnings) =
@@ -1603,7 +1598,7 @@ impl MarketplaceService {
             result
                 .warnings
                 .push(InstallWarning::McpServersRequireOptIn {
-                    agent: bundle.name.clone(),
+                    agent: bundle.name.to_string(),
                     transports,
                 });
             return;
@@ -1611,7 +1606,7 @@ impl MarketplaceService {
 
         let Some(filename) = file.source.file_name().map(std::path::PathBuf::from) else {
             result.failed.push(FailedAgent {
-                name: Some(bundle.name.clone()),
+                name: Some(bundle.name.to_string()),
                 source_path: file.source.clone(),
                 error: crate::error::AgentError::NativeManifestInvalidName {
                     path: file.source.clone(),
@@ -1624,7 +1619,7 @@ impl MarketplaceService {
             Ok(h) => h,
             Err(e) => {
                 result.failed.push(FailedAgent {
-                    name: Some(bundle.name.clone()),
+                    name: Some(bundle.name.to_string()),
                     source_path: file.source.clone(),
                     error: crate::error::AgentError::InstallFailed {
                         path: file.source.clone(),
@@ -1652,7 +1647,7 @@ impl MarketplaceService {
                 result.installed_native.push(outcome);
             }
             Err(err) => result.failed.push(FailedAgent {
-                name: Some(bundle.name.clone()),
+                name: Some(bundle.name.to_string()),
                 source_path: file.source.clone(),
                 error: err,
             }),
@@ -1991,7 +1986,7 @@ mod tests {
         use crate::agent::tools::UnmappedReason;
         use crate::project::KiroProject;
 
-        let (_dir, svc) = temp_service();
+        let (_dir, _svc) = temp_service();
         let plugin_tmp = tempfile::tempdir().unwrap();
         let agents_dir = plugin_tmp.path().join("agents");
         fs::create_dir_all(&agents_dir).unwrap();
@@ -2013,7 +2008,7 @@ mod tests {
         let project_tmp = tempfile::tempdir().unwrap();
         let project = KiroProject::new(project_tmp.path().to_path_buf());
 
-        let result = svc.install_plugin_agents(
+        let result = MarketplaceService::install_plugin_agents(
             &project,
             plugin_tmp.path(),
             &["./agents/".to_string()],
@@ -2078,7 +2073,7 @@ mod tests {
     fn install_plugin_agents_surfaces_parse_failures_other_than_missing_fence() {
         use crate::project::KiroProject;
 
-        let (_dir, svc) = temp_service();
+        let (_dir, _svc) = temp_service();
         let plugin_tmp = tempfile::tempdir().unwrap();
         let agents_dir = plugin_tmp.path().join("agents");
         fs::create_dir_all(&agents_dir).unwrap();
@@ -2092,7 +2087,7 @@ mod tests {
         let project_tmp = tempfile::tempdir().unwrap();
         let project = KiroProject::new(project_tmp.path().to_path_buf());
 
-        let result = svc.install_plugin_agents(
+        let result = MarketplaceService::install_plugin_agents(
             &project,
             plugin_tmp.path(),
             &["./agents/".to_string()],
@@ -2120,7 +2115,7 @@ mod tests {
     fn install_plugin_agents_partial_success_preserves_warnings_and_failures() {
         use crate::project::KiroProject;
 
-        let (_dir, svc) = temp_service();
+        let (_dir, _svc) = temp_service();
         let plugin_tmp = tempfile::tempdir().unwrap();
         let agents_dir = plugin_tmp.path().join("agents");
         fs::create_dir_all(&agents_dir).unwrap();
@@ -2140,7 +2135,7 @@ mod tests {
         fs::create_dir_all(&agents_out).unwrap();
         fs::write(agents_out.join("bbb.json"), b"{}").unwrap();
 
-        let result = svc.install_plugin_agents(
+        let result = MarketplaceService::install_plugin_agents(
             &project,
             plugin_tmp.path(),
             &["./agents/".to_string()],
@@ -2181,7 +2176,7 @@ mod tests {
         // was tested, which short-circuited this path.
         use crate::project::KiroProject;
 
-        let (_dir, svc) = temp_service();
+        let (_dir, _svc) = temp_service();
         let plugin_tmp = tempfile::tempdir().unwrap();
         let agents_dir = plugin_tmp.path().join("agents");
         fs::create_dir_all(&agents_dir).unwrap();
@@ -2195,7 +2190,7 @@ mod tests {
         let project_tmp = tempfile::tempdir().unwrap();
         let project = KiroProject::new(project_tmp.path().to_path_buf());
 
-        let result = svc.install_plugin_agents(
+        let result = MarketplaceService::install_plugin_agents(
             &project,
             plugin_tmp.path(),
             &["./agents/".to_string()],
@@ -2229,7 +2224,7 @@ mod tests {
         // see what got skipped and how to opt in.
         use crate::project::KiroProject;
 
-        let (_dir, svc) = temp_service();
+        let (_dir, _svc) = temp_service();
         let plugin_tmp = tempfile::tempdir().unwrap();
         let agents_dir = plugin_tmp.path().join("agents");
         fs::create_dir_all(&agents_dir).unwrap();
@@ -2244,7 +2239,7 @@ mod tests {
         let project_tmp = tempfile::tempdir().unwrap();
         let project = KiroProject::new(project_tmp.path().to_path_buf());
 
-        let result = svc.install_plugin_agents(
+        let result = MarketplaceService::install_plugin_agents(
             &project,
             plugin_tmp.path(),
             &["./agents/".to_string()],
@@ -2286,7 +2281,7 @@ mod tests {
         // mcpServers block in the emitted JSON.
         use crate::project::KiroProject;
 
-        let (_dir, svc) = temp_service();
+        let (_dir, _svc) = temp_service();
         let plugin_tmp = tempfile::tempdir().unwrap();
         let agents_dir = plugin_tmp.path().join("agents");
         fs::create_dir_all(&agents_dir).unwrap();
@@ -2299,7 +2294,7 @@ mod tests {
         let project_tmp = tempfile::tempdir().unwrap();
         let project = KiroProject::new(project_tmp.path().to_path_buf());
 
-        let result = svc.install_plugin_agents(
+        let result = MarketplaceService::install_plugin_agents(
             &project,
             plugin_tmp.path(),
             &["./agents/".to_string()],
@@ -2341,7 +2336,7 @@ mod tests {
         // the risk surface.
         use crate::project::KiroProject;
 
-        let (_dir, svc) = temp_service();
+        let (_dir, _svc) = temp_service();
         let plugin_tmp = tempfile::tempdir().unwrap();
         let agents_dir = plugin_tmp.path().join("agents");
         fs::create_dir_all(&agents_dir).unwrap();
@@ -2368,7 +2363,7 @@ mod tests {
         let project_tmp = tempfile::tempdir().unwrap();
         let project = KiroProject::new(project_tmp.path().to_path_buf());
 
-        let result = svc.install_plugin_agents(
+        let result = MarketplaceService::install_plugin_agents(
             &project,
             plugin_tmp.path(),
             &["./agents/".to_string()],
@@ -2411,7 +2406,7 @@ mod tests {
         // --force; --accept-mcp is the only opt-in.
         use crate::project::KiroProject;
 
-        let (_dir, svc) = temp_service();
+        let (_dir, _svc) = temp_service();
         let plugin_tmp = tempfile::tempdir().unwrap();
         let agents_dir = plugin_tmp.path().join("agents");
         fs::create_dir_all(&agents_dir).unwrap();
@@ -2424,7 +2419,7 @@ mod tests {
         let project_tmp = tempfile::tempdir().unwrap();
         let project = KiroProject::new(project_tmp.path().to_path_buf());
 
-        let result = svc.install_plugin_agents(
+        let result = MarketplaceService::install_plugin_agents(
             &project,
             plugin_tmp.path(),
             &["./agents/".to_string()],
@@ -2455,7 +2450,7 @@ mod tests {
     fn install_plugin_agents_already_installed_goes_to_skipped() {
         use crate::project::KiroProject;
 
-        let (_dir, svc) = temp_service();
+        let (_dir, _svc) = temp_service();
         let plugin_tmp = tempfile::tempdir().unwrap();
         let agents_dir = plugin_tmp.path().join("agents");
         fs::create_dir_all(&agents_dir).unwrap();
@@ -2465,7 +2460,7 @@ mod tests {
         let project = KiroProject::new(project_tmp.path().to_path_buf());
 
         // First install: should succeed.
-        let r1 = svc.install_plugin_agents(
+        let r1 = MarketplaceService::install_plugin_agents(
             &project,
             plugin_tmp.path(),
             &["./agents/".to_string()],
@@ -2482,7 +2477,7 @@ mod tests {
         assert!(r1.failed.is_empty());
 
         // Second install: should be reported as skipped, not failed.
-        let r2 = svc.install_plugin_agents(
+        let r2 = MarketplaceService::install_plugin_agents(
             &project,
             plugin_tmp.path(),
             &["./agents/".to_string()],
@@ -2508,7 +2503,7 @@ mod tests {
         // must now put them back into `installed`.
         use crate::project::KiroProject;
 
-        let (_dir, svc) = temp_service();
+        let (_dir, _svc) = temp_service();
         let plugin_tmp = tempfile::tempdir().unwrap();
         let agents_dir = plugin_tmp.path().join("agents");
         fs::create_dir_all(&agents_dir).unwrap();
@@ -2521,7 +2516,7 @@ mod tests {
         let project_tmp = tempfile::tempdir().unwrap();
         let project = KiroProject::new(project_tmp.path().to_path_buf());
 
-        let r1 = svc.install_plugin_agents(
+        let r1 = MarketplaceService::install_plugin_agents(
             &project,
             plugin_tmp.path(),
             &["./agents/".to_string()],
@@ -2545,7 +2540,7 @@ mod tests {
         )
         .unwrap();
 
-        let r2 = svc.install_plugin_agents(
+        let r2 = MarketplaceService::install_plugin_agents(
             &project,
             plugin_tmp.path(),
             &["./agents/".to_string()],
@@ -2597,7 +2592,7 @@ mod tests {
         use crate::agent::ParseFailure;
         use crate::project::KiroProject;
 
-        let (_dir, svc) = temp_service();
+        let (_dir, _svc) = temp_service();
         let plugin_tmp = tempfile::tempdir().unwrap();
         let agents_dir = plugin_tmp.path().join("agents");
         fs::create_dir_all(&agents_dir).unwrap();
@@ -2611,7 +2606,7 @@ mod tests {
         let project_tmp = tempfile::tempdir().unwrap();
         let project = KiroProject::new(project_tmp.path().to_path_buf());
 
-        let result = svc.install_plugin_agents(
+        let result = MarketplaceService::install_plugin_agents(
             &project,
             plugin_tmp.path(),
             &["./agents/".to_string()],
@@ -2671,9 +2666,9 @@ mod tests {
         let project_tmp = tempfile::tempdir().expect("project tempdir");
         let project = crate::project::KiroProject::new(project_tmp.path().to_path_buf());
 
-        let (_dir, svc) = crate::service::test_support::temp_service();
+        let (_dir, _svc) = crate::service::test_support::temp_service();
 
-        let result = svc.install_plugin_agents(
+        let result = MarketplaceService::install_plugin_agents(
             &project,
             plugin_tmp.path(),
             &["./agents/".to_string()],
@@ -2740,9 +2735,9 @@ mod tests {
 
         let project_tmp = tempfile::tempdir().expect("project tempdir");
         let project = crate::project::KiroProject::new(project_tmp.path().to_path_buf());
-        let (_dir, svc) = crate::service::test_support::temp_service();
+        let (_dir, _svc) = crate::service::test_support::temp_service();
 
-        let result = svc.install_plugin_agents(
+        let result = MarketplaceService::install_plugin_agents(
             &project,
             plugin_tmp.path(),
             &["./agents/".to_string()],
@@ -2800,9 +2795,9 @@ mod tests {
 
         let project_tmp = tempfile::tempdir().expect("project tempdir");
         let project = crate::project::KiroProject::new(project_tmp.path().to_path_buf());
-        let (_dir, svc) = crate::service::test_support::temp_service();
+        let (_dir, _svc) = crate::service::test_support::temp_service();
 
-        let result = svc.install_plugin_agents(
+        let result = MarketplaceService::install_plugin_agents(
             &project,
             plugin_tmp.path(),
             &["./agents/".to_string(), "./extras/".to_string()],
@@ -2943,7 +2938,7 @@ mod tests {
         std::fs::write(steering.join("alpha.md"), b"alpha").unwrap();
         std::fs::write(steering.join("beta.md"), b"beta").unwrap();
 
-        let (_dir, svc) = crate::service::test_support::temp_service();
+        let (_dir, _svc) = crate::service::test_support::temp_service();
         let project_tmp = tempfile::tempdir().expect("project tempdir");
         let project = crate::project::KiroProject::new(project_tmp.path().to_path_buf());
 
@@ -2955,7 +2950,12 @@ mod tests {
             version: None,
         };
 
-        let result = svc.install_plugin_steering(&project, plugin_tmp.path(), &scan_paths, ctx);
+        let result = MarketplaceService::install_plugin_steering(
+            &project,
+            plugin_tmp.path(),
+            &scan_paths,
+            ctx,
+        );
 
         assert_eq!(result.installed.len(), 2);
         assert!(
@@ -2967,7 +2967,12 @@ mod tests {
         assert!(project_tmp.path().join(".kiro/steering/beta.md").exists());
 
         // Idempotent reinstall.
-        let again = svc.install_plugin_steering(&project, plugin_tmp.path(), &scan_paths, ctx);
+        let again = MarketplaceService::install_plugin_steering(
+            &project,
+            plugin_tmp.path(),
+            &scan_paths,
+            ctx,
+        );
         assert!(
             again
                 .installed
@@ -2990,7 +2995,7 @@ mod tests {
         std::fs::create_dir_all(&steering).expect("create steering dir");
         std::fs::write(steering.join("ok.md"), b"ok").unwrap();
 
-        let (_dir, svc) = crate::service::test_support::temp_service();
+        let (_dir, _svc) = crate::service::test_support::temp_service();
         let project_tmp = tempfile::tempdir().expect("project tempdir");
         let project = crate::project::KiroProject::new(project_tmp.path().to_path_buf());
 
@@ -3005,7 +3010,12 @@ mod tests {
             version: None,
         };
 
-        let result = svc.install_plugin_steering(&project, plugin_tmp.path(), &scan_paths, ctx);
+        let result = MarketplaceService::install_plugin_steering(
+            &project,
+            plugin_tmp.path(),
+            &scan_paths,
+            ctx,
+        );
 
         assert_eq!(result.installed.len(), 1, "legitimate file still installs");
         assert!(result.failed.is_empty(), "no failures expected");
@@ -3058,7 +3068,7 @@ mod tests {
         std::fs::write(plugin_tmp.path().join("a/alpha.md"), b"alpha").unwrap();
         std::fs::write(plugin_tmp.path().join("b/beta.md"), b"beta").unwrap();
 
-        let (_dir, svc) = crate::service::test_support::temp_service();
+        let (_dir, _svc) = crate::service::test_support::temp_service();
         let project_tmp = tempfile::tempdir().expect("project tempdir");
         let project = crate::project::KiroProject::new(project_tmp.path().to_path_buf());
 
@@ -3070,7 +3080,12 @@ mod tests {
             version: None,
         };
 
-        let result = svc.install_plugin_steering(&project, plugin_tmp.path(), &scan_paths, ctx);
+        let result = MarketplaceService::install_plugin_steering(
+            &project,
+            plugin_tmp.path(),
+            &scan_paths,
+            ctx,
+        );
 
         assert_eq!(result.installed.len(), 2);
         assert!(result.failed.is_empty(), "no failures expected");

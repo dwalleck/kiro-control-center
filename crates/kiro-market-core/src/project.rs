@@ -1717,7 +1717,7 @@ impl KiroProject {
         mode: crate::service::InstallMode,
     ) -> Result<InstalledNativeAgentOutcome, AgentError> {
         let json_target = self.agents_dir().join(format!("{}.json", &bundle.name));
-        let agent_name = bundle.name.clone();
+        let agent_name = bundle.name.to_string();
         let json_target_for_err = json_target.clone();
 
         let result: crate::error::Result<InstalledNativeAgentOutcome> =
@@ -1998,7 +1998,7 @@ impl KiroProject {
         let (staging, installed_hash) =
             self.stage_native_companion_files(input.plugin, input.scan_root, input.rel_paths)?;
 
-        let CompanionPromotion { placed, backups } = self.promote_native_companions(
+        let CompanionPromotion { placed, backups } = Self::promote_native_companions(
             staging.path(),
             input.rel_paths,
             agents_dir,
@@ -2240,13 +2240,11 @@ impl KiroProject {
     /// `backups` is `Vec<(original_path, backup_path)>` — restoring is
     /// `fs::rename(backup, original)`.
     fn promote_native_companions(
-        &self,
         staging: &Path,
         rel_paths: &[PathBuf],
         agents_dir: &Path,
         forced_overwrite: bool,
     ) -> crate::error::Result<CompanionPromotion> {
-        let _ = self;
         let mut placed: Vec<PathBuf> = Vec::with_capacity(rel_paths.len());
         let mut backups: Vec<(PathBuf, PathBuf)> = Vec::new();
 
