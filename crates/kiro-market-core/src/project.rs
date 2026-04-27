@@ -146,6 +146,15 @@ pub struct InstalledNativeAgentOutcome {
     pub installed_hash: String,
 }
 
+/// Output of [`KiroProject::classify_native_collision`]: either return
+/// the idempotent outcome immediately (boxed to keep enum size small),
+/// or proceed with install and apply `forced_overwrite` to staging /
+/// promote.
+enum NativeCollisionDecision {
+    Idempotent(Box<InstalledNativeAgentOutcome>),
+    Proceed { forced_overwrite: bool },
+}
+
 /// In-memory outcome of one [`KiroProject::install_native_companions`] call.
 ///
 /// Plugin-scoped (companion bundles are owned per-plugin, not per-agent),
@@ -902,6 +911,342 @@ impl KiroProject {
         companion_entry.source_hash = companion_hash.clone();
         companion_entry.installed_hash = companion_hash;
         Ok(())
+    }
+
+    /// Decide what `install_native_agent` should do given the existing
+    /// tracking state and on-disk state. Returns either an early-exit
+    /// idempotent outcome or a `forced_overwrite` flag for the caller
+    /// to thread through staging + promote.
+    ///
+    /// The classifier is exhaustive over the four possible states:
+    /// (a) tracked + same plugin + same hash → idempotent no-op,
+    /// (b) tracked + same plugin + different hash → `ContentChanged`,
+    /// (c) tracked + different plugin → `NameClash`,
+    /// (d) untracked + file on disk → `Orphan`,
+    /// (e) untracked + clean destination → clean install.
+    /// Each (b)/(c)/(d) is a hard error under [`InstallMode::New`] and a
+    /// `forced_overwrite: true` proceed under [`InstallMode::Force`].
+    fn classify_native_collision(
+        installed: &InstalledAgents,
+        agent_name: &str,
+        plugin: &str,
+        source_hash: &str,
+        json_target: &Path,
+        mode: crate::service::InstallMode,
+    ) -> crate::error::Result<NativeCollisionDecision> {
+        match installed.agents.get(agent_name) {
+            Some(existing) if existing.plugin == plugin => {
+                if existing.source_hash.as_deref() == Some(source_hash) {
+                    return Ok(NativeCollisionDecision::Idempotent(Box::new(
+                        InstalledNativeAgentOutcome {
+                            name: agent_name.to_owned(),
+                            json_path: json_target.to_path_buf(),
+                            forced_overwrite: false,
+                            was_idempotent: true,
+                            source_hash: source_hash.to_owned(),
+                            installed_hash: existing.installed_hash.clone().unwrap_or_default(),
+                        },
+                    )));
+                }
+                if !mode.is_force() {
+                    return Err(AgentError::ContentChangedRequiresForce {
+                        name: agent_name.to_owned(),
+                    }
+                    .into());
+                }
+                Ok(NativeCollisionDecision::Proceed {
+                    forced_overwrite: true,
+                })
+            }
+            Some(existing) => {
+                if !mode.is_force() {
+                    return Err(AgentError::NameClashWithOtherPlugin {
+                        name: agent_name.to_owned(),
+                        owner: existing.plugin.clone(),
+                    }
+                    .into());
+                }
+                Ok(NativeCollisionDecision::Proceed {
+                    forced_overwrite: true,
+                })
+            }
+            None if json_target.exists() => {
+                if !mode.is_force() {
+                    return Err(AgentError::OrphanFileAtDestination {
+                        path: json_target.to_path_buf(),
+                    }
+                    .into());
+                }
+                Ok(NativeCollisionDecision::Proceed {
+                    forced_overwrite: true,
+                })
+            }
+            None => Ok(NativeCollisionDecision::Proceed {
+                forced_overwrite: false,
+            }),
+        }
+    }
+
+    /// Install one native Kiro agent JSON.
+    ///
+    /// Writes [`NativeAgentBundle::raw_bytes`] verbatim to
+    /// `.kiro/agents/<name>.json` and records the installation in
+    /// `installed-agents.json` with [`AgentDialect::Native`].
+    ///
+    /// # Collision semantics
+    ///
+    /// The behavior on a name collision depends on `mode` and on what's
+    /// already tracked at this name:
+    ///
+    /// - **Idempotent reinstall**: same plugin, same `source_hash`. The
+    ///   call is a verified no-op and returns the prior `installed_hash`.
+    /// - **Same plugin, different `source_hash`**: returns
+    ///   [`AgentError::ContentChangedRequiresForce`] under
+    ///   [`InstallMode::New`]; under [`InstallMode::Force`] the existing
+    ///   file is backed up, replaced, and the backup deleted on success
+    ///   (P-6).
+    /// - **Different plugin**: returns
+    ///   [`AgentError::NameClashWithOtherPlugin`] under
+    ///   [`InstallMode::New`]; under [`InstallMode::Force`] ownership
+    ///   transfers and the previous owner's tracking entry is overwritten.
+    /// - **No tracking entry but file exists on disk**: returns
+    ///   [`AgentError::OrphanFileAtDestination`] under
+    ///   [`InstallMode::New`]; under [`InstallMode::Force`] the orphan
+    ///   is overwritten and ownership recorded.
+    ///
+    /// # Atomicity
+    ///
+    /// Adopts the staging-before-rename + backup-then-swap pattern:
+    /// `installed_hash` is computed against the staged copy *before* any
+    /// destructive op on `.kiro/agents/`. In force mode, the existing
+    /// destination is renamed to `<name>.json.kiro-bak` before the
+    /// staging-rename; on tracking-write failure the backup is restored
+    /// and the new file removed. This closes the data-loss window where
+    /// a hash or tracking failure mid-install would otherwise leave the
+    /// user with no install on disk.
+    ///
+    /// # Errors
+    ///
+    /// - [`AgentError::ContentChangedRequiresForce`] /
+    ///   [`AgentError::NameClashWithOtherPlugin`] /
+    ///   [`AgentError::OrphanFileAtDestination`] per the collision matrix.
+    /// - [`AgentError::InstallFailed`] for any I/O / hash / tracking
+    ///   failure during stage / promote / write.
+    ///
+    /// [`InstallMode::New`]: crate::service::InstallMode::New
+    /// [`InstallMode::Force`]: crate::service::InstallMode::Force
+    pub fn install_native_agent(
+        &self,
+        bundle: &crate::agent::NativeAgentBundle,
+        marketplace: &str,
+        plugin: &str,
+        version: Option<&str>,
+        source_hash: &str,
+        mode: crate::service::InstallMode,
+    ) -> Result<InstalledNativeAgentOutcome, AgentError> {
+        let json_target = self.agents_dir().join(format!("{}.json", &bundle.name));
+        let agent_name = bundle.name.clone();
+        let json_target_for_err = json_target.clone();
+
+        let result: crate::error::Result<InstalledNativeAgentOutcome> =
+            crate::file_lock::with_file_lock(&self.agent_tracking_path(), || {
+                let mut installed = self.load_installed_agents()?;
+
+                // Sweep stale staging dirs for this name from prior crashed runs.
+                if let Err(e) = self.cleanup_leftover_agent_staging(&agent_name) {
+                    warn!(
+                        name = %agent_name,
+                        error = %e,
+                        "leftover-staging cleanup failed; proceeding with install anyway"
+                    );
+                }
+
+                // Collision matrix — return early or set `forced_overwrite`.
+                let forced_overwrite = match Self::classify_native_collision(
+                    &installed,
+                    &agent_name,
+                    plugin,
+                    source_hash,
+                    &json_target,
+                    mode,
+                )? {
+                    NativeCollisionDecision::Idempotent(outcome) => return Ok(*outcome),
+                    NativeCollisionDecision::Proceed { forced_overwrite } => forced_overwrite,
+                };
+
+                let (staging, json_rel, installed_hash) =
+                    self.stage_native_agent_file(&agent_name, &bundle.raw_bytes)?;
+
+                let had_backup =
+                    self.promote_native_agent(&staging, &json_rel, &json_target, forced_overwrite)?;
+
+                installed.agents.insert(
+                    agent_name.clone(),
+                    InstalledAgentMeta {
+                        marketplace: marketplace.to_string(),
+                        plugin: plugin.to_string(),
+                        version: version.map(String::from),
+                        installed_at: chrono::Utc::now(),
+                        dialect: AgentDialect::Native,
+                        source_hash: Some(source_hash.to_string()),
+                        installed_hash: Some(installed_hash.clone()),
+                    },
+                );
+
+                if let Err(e) = self.write_agent_tracking(&installed) {
+                    warn!(
+                        name = %agent_name,
+                        error = %e,
+                        "agent tracking update failed; rolling back files"
+                    );
+                    if let Err(rb_err) = fs::remove_file(&json_target)
+                        && rb_err.kind() != std::io::ErrorKind::NotFound
+                    {
+                        warn!(
+                            path = %json_target.display(),
+                            error = %rb_err,
+                            "failed to remove placed agent JSON during rollback"
+                        );
+                    }
+                    if had_backup {
+                        let backup = json_target.with_extension("json.kiro-bak");
+                        if let Err(restore_err) = fs::rename(&backup, &json_target) {
+                            warn!(
+                                backup = %backup.display(),
+                                target = %json_target.display(),
+                                error = %restore_err,
+                                "failed to restore backup after tracking write failure — \
+                                 user may need to rename .kiro-bak file manually"
+                            );
+                        }
+                    }
+                    return Err(e);
+                }
+
+                // Success — drop the backup file. Best-effort; an orphan
+                // .kiro-bak left here is a curiosity, not a correctness issue.
+                if had_backup {
+                    let backup = json_target.with_extension("json.kiro-bak");
+                    if let Err(e) = fs::remove_file(&backup)
+                        && e.kind() != std::io::ErrorKind::NotFound
+                    {
+                        warn!(
+                            path = %backup.display(),
+                            error = %e,
+                            "failed to remove install backup after success"
+                        );
+                    }
+                }
+
+                debug!(name = %agent_name, force = mode.is_force(), "native agent installed");
+
+                Ok(InstalledNativeAgentOutcome {
+                    name: agent_name,
+                    json_path: json_target,
+                    forced_overwrite,
+                    was_idempotent: false,
+                    source_hash: source_hash.to_string(),
+                    installed_hash,
+                })
+            });
+
+        result.map_err(|e| match e {
+            crate::error::Error::Agent(agent_err) => agent_err,
+            other => AgentError::InstallFailed {
+                path: json_target_for_err,
+                source: Box::new(other),
+            },
+        })
+    }
+
+    /// Stage a native agent's `raw_bytes` into a fresh staging directory
+    /// using the final filename `<name>.json` so hashing the staged copy
+    /// produces the same value as hashing after promotion. Computes
+    /// `installed_hash` against staging BEFORE any destructive op on
+    /// `agents_root` — a hash failure leaves `agents_root` untouched.
+    ///
+    /// Returns `(staging_dir, json_rel, installed_hash)` on success.
+    fn stage_native_agent_file(
+        &self,
+        name: &str,
+        raw_bytes: &[u8],
+    ) -> crate::error::Result<(PathBuf, PathBuf, String)> {
+        let staging = self.fresh_agent_staging_dir(name);
+        let json_rel = PathBuf::from(format!("{name}.json"));
+        let staging_json = staging.join(&json_rel);
+
+        fs::create_dir_all(&staging)?;
+        if let Err(e) = fs::write(&staging_json, raw_bytes) {
+            remove_staging_dir(&staging);
+            return Err(e.into());
+        }
+
+        let installed_hash =
+            match crate::hash::hash_artifact(&staging, std::slice::from_ref(&json_rel)) {
+                Ok(h) => h,
+                Err(e) => {
+                    warn!(
+                        name,
+                        error = %e,
+                        "installed_hash computation failed on staging; removing staging dir"
+                    );
+                    remove_staging_dir(&staging);
+                    return Err(e.into());
+                }
+            };
+
+        Ok((staging, json_rel, installed_hash))
+    }
+
+    /// Move a staged native agent JSON into its final destination using
+    /// the backup-then-swap pattern (P-6) when `forced_overwrite` is set.
+    /// Returns `had_backup` so the caller can restore on tracking failure
+    /// or drop the backup on success.
+    ///
+    /// Pre-conditions: caller has already done the collision check; under
+    /// `forced_overwrite == false` the destination is guaranteed to not
+    /// exist (no tracking entry, no orphan on disk).
+    fn promote_native_agent(
+        &self,
+        staging: &Path,
+        json_rel: &Path,
+        json_target: &Path,
+        forced_overwrite: bool,
+    ) -> crate::error::Result<bool> {
+        let staging_json = staging.join(json_rel);
+
+        if let Err(e) = fs::create_dir_all(self.agents_dir()) {
+            remove_staging_dir(staging);
+            return Err(e.into());
+        }
+
+        // Backup phase — only when overwriting an existing file.
+        let backup_target = json_target.with_extension("json.kiro-bak");
+        let mut had_backup = false;
+        if forced_overwrite && json_target.exists() {
+            if let Err(e) = fs::rename(json_target, &backup_target) {
+                remove_staging_dir(staging);
+                return Err(e.into());
+            }
+            had_backup = true;
+        }
+
+        // Promote phase.
+        if let Err(e) = fs::rename(&staging_json, json_target) {
+            // Restore backup if we made one.
+            if had_backup && let Err(restore_err) = fs::rename(&backup_target, json_target) {
+                warn!(
+                    backup = %backup_target.display(),
+                    target = %json_target.display(),
+                    error = %restore_err,
+                    "failed to restore backup after rename failure"
+                );
+            }
+            remove_staging_dir(staging);
+            return Err(e.into());
+        }
+        remove_staging_dir(staging);
+        Ok(had_backup)
     }
 
     /// Remove any `_installing-agent-<name>-*` staging directories left over
@@ -2435,5 +2780,104 @@ mod tests {
                 .files
                 .contains(&std::path::PathBuf::from("prompts/beta.md"))
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // install_native_agent
+    // -----------------------------------------------------------------------
+
+    /// Stage a source agent JSON in `<tmp>/source-agents/` and parse it
+    /// into a `NativeAgentBundle` ready for install.
+    fn stage_native_source(
+        scratch: &Path,
+        name: &str,
+        body: &[u8],
+    ) -> (
+        crate::agent::NativeAgentBundle,
+        std::path::PathBuf,
+        std::path::PathBuf,
+    ) {
+        let src_dir = scratch.join("source-agents");
+        fs::create_dir_all(&src_dir).expect("create source-agents");
+        let src_json = src_dir.join(format!("{name}.json"));
+        fs::write(&src_json, body).expect("write source");
+        let bundle = crate::agent::parse_native_kiro_agent_file(&src_json, &src_dir)
+            .expect("parse native agent");
+        (bundle, src_dir, src_json)
+    }
+
+    #[test]
+    fn install_native_agent_writes_json_with_dialect_native_and_hashes() {
+        let (dir, project) = temp_project();
+        let scratch = dir.path();
+        let (bundle, src_dir, _src_json) = stage_native_source(
+            scratch,
+            "rev",
+            br#"{"name": "rev", "prompt": "You are a reviewer."}"#,
+        );
+        let source_hash =
+            crate::hash::hash_artifact(&src_dir, &[std::path::PathBuf::from("rev.json")])
+                .expect("source hash");
+
+        let outcome = project
+            .install_native_agent(
+                &bundle,
+                "marketplace-x",
+                "plugin-y",
+                Some("0.1.0"),
+                &source_hash,
+                crate::service::InstallMode::New,
+            )
+            .expect("install_native_agent must succeed");
+
+        assert_eq!(outcome.name, "rev");
+        assert!(outcome.json_path.ends_with("rev.json"));
+        assert!(!outcome.forced_overwrite);
+        assert!(!outcome.was_idempotent);
+        assert_eq!(outcome.source_hash, source_hash);
+        assert!(outcome.installed_hash.starts_with("blake3:"));
+
+        // The file landed.
+        assert!(outcome.json_path.exists());
+
+        // Tracking entry exists with dialect Native.
+        let tracking = project.load_installed_agents().expect("load tracking");
+        let entry = tracking.agents.get("rev").expect("entry persisted");
+        assert_eq!(entry.dialect, crate::agent::AgentDialect::Native);
+        assert_eq!(entry.plugin, "plugin-y");
+        assert_eq!(entry.marketplace, "marketplace-x");
+        assert_eq!(entry.source_hash.as_deref(), Some(source_hash.as_str()));
+        assert_eq!(
+            entry.installed_hash.as_deref(),
+            Some(outcome.installed_hash.as_str())
+        );
+    }
+
+    #[test]
+    fn install_native_agent_writes_raw_bytes_verbatim() {
+        // Source contains non-canonical whitespace + field ordering.
+        // The installed file must be byte-for-byte identical to the source
+        // (per the design doc's "v1 preserves verbatim" promise).
+        let (dir, project) = temp_project();
+        let scratch = dir.path();
+        let body = b"{\n  \"name\":   \"rev\",\n     \"prompt\":\"x\"\n}\n";
+        let (bundle, src_dir, _src_json) = stage_native_source(scratch, "rev", body);
+        let source_hash =
+            crate::hash::hash_artifact(&src_dir, &[std::path::PathBuf::from("rev.json")])
+                .expect("source hash");
+
+        let outcome = project
+            .install_native_agent(
+                &bundle,
+                "m",
+                "p",
+                None,
+                &source_hash,
+                crate::service::InstallMode::New,
+            )
+            .expect("install");
+
+        let installed_bytes = fs::read(&outcome.json_path).expect("read installed");
+        assert_eq!(installed_bytes.as_slice(), body.as_slice());
     }
 }
