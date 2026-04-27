@@ -2786,6 +2786,40 @@ mod tests {
     // install_native_agent
     // -----------------------------------------------------------------------
 
+    use rstest::{fixture, rstest};
+
+    /// Source bytes for a minimal valid native agent named `rev`. Reused
+    /// across collision tests where the specific JSON content doesn't
+    /// matter — only its hash and identity do.
+    const REV_BODY: &[u8] = br#"{"name":"rev"}"#;
+
+    /// Fully-baked test fixture: a tempdir, a project rooted at it, a
+    /// staged-and-parsed `NativeAgentBundle` for `rev`, and the
+    /// pre-computed `source_hash` over the staging dir. Owns the tempdir
+    /// (kept alive for the test's lifetime).
+    struct NativeRev {
+        _dir: tempfile::TempDir,
+        project: KiroProject,
+        bundle: crate::agent::NativeAgentBundle,
+        src_dir: std::path::PathBuf,
+        src_json: std::path::PathBuf,
+        source_hash: String,
+    }
+
+    impl NativeRev {
+        /// Re-stage and re-parse the source JSON after the body changes.
+        /// Used by the content-changed test (T12) to bump from v1 to v2
+        /// without re-creating the tempdir or project.
+        fn rewrite_source(&mut self, new_body: &[u8]) {
+            fs::write(&self.src_json, new_body).expect("rewrite source");
+            self.bundle = crate::agent::parse_native_kiro_agent_file(&self.src_json, &self.src_dir)
+                .expect("re-parse bundle");
+            self.source_hash =
+                crate::hash::hash_artifact(&self.src_dir, &[std::path::PathBuf::from("rev.json")])
+                    .expect("re-hash");
+        }
+    }
+
     /// Stage a source agent JSON in `<tmp>/source-agents/` and parse it
     /// into a `NativeAgentBundle` ready for install.
     fn stage_native_source(
@@ -2806,8 +2840,42 @@ mod tests {
         (bundle, src_dir, src_json)
     }
 
+    #[fixture]
+    fn native_rev() -> NativeRev {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let project = KiroProject::new(dir.path().to_path_buf());
+        let (bundle, src_dir, src_json) = stage_native_source(dir.path(), "rev", REV_BODY);
+        let source_hash =
+            crate::hash::hash_artifact(&src_dir, &[std::path::PathBuf::from("rev.json")])
+                .expect("source hash");
+        NativeRev {
+            _dir: dir,
+            project,
+            bundle,
+            src_dir,
+            src_json,
+            source_hash,
+        }
+    }
+
+    /// Convenience: install `rev` from the fixture under `(marketplace,
+    /// plugin)`. Wraps the same `install_native_agent` call every test
+    /// makes, parameterised only by mode and identity.
+    fn install_rev(
+        f: &NativeRev,
+        marketplace: &str,
+        plugin: &str,
+        mode: crate::service::InstallMode,
+    ) -> Result<InstalledNativeAgentOutcome, AgentError> {
+        f.project
+            .install_native_agent(&f.bundle, marketplace, plugin, None, &f.source_hash, mode)
+    }
+
     #[test]
     fn install_native_agent_writes_json_with_dialect_native_and_hashes() {
+        // Happy-path test uses a richer body than the fixture's REV_BODY
+        // so the assertions exercise version, marketplace, and plugin
+        // fields together.
         let (dir, project) = temp_project();
         let scratch = dir.path();
         let (bundle, src_dir, _src_json) = stage_native_source(
@@ -2836,11 +2904,8 @@ mod tests {
         assert!(!outcome.was_idempotent);
         assert_eq!(outcome.source_hash, source_hash);
         assert!(outcome.installed_hash.starts_with("blake3:"));
-
-        // The file landed.
         assert!(outcome.json_path.exists());
 
-        // Tracking entry exists with dialect Native.
         let tracking = project.load_installed_agents().expect("load tracking");
         let entry = tracking.agents.get("rev").expect("entry persisted");
         assert_eq!(entry.dialect, crate::agent::AgentDialect::Native);
@@ -2851,6 +2916,145 @@ mod tests {
             entry.installed_hash.as_deref(),
             Some(outcome.installed_hash.as_str())
         );
+    }
+
+    #[rstest]
+    fn install_native_agent_idempotent_when_source_hash_matches(native_rev: NativeRev) {
+        let first = install_rev(&native_rev, "m", "p", crate::service::InstallMode::New)
+            .expect("first install");
+        assert!(!first.was_idempotent);
+        assert!(!first.forced_overwrite);
+        let first_installed_at = native_rev
+            .project
+            .load_installed_agents()
+            .expect("load")
+            .agents
+            .get("rev")
+            .expect("entry")
+            .installed_at;
+
+        // Reinstall with the same source_hash — must be a verified no-op.
+        let second = install_rev(&native_rev, "m", "p", crate::service::InstallMode::New)
+            .expect("second install");
+        assert!(second.was_idempotent);
+        assert!(!second.forced_overwrite);
+        // Idempotent path must NOT touch tracking — installed_at should
+        // still reflect the first install, proving no write occurred.
+        let second_installed_at = native_rev
+            .project
+            .load_installed_agents()
+            .expect("load")
+            .agents
+            .get("rev")
+            .expect("entry")
+            .installed_at;
+        assert_eq!(first_installed_at, second_installed_at);
+    }
+
+    #[rstest]
+    fn install_native_agent_content_changed_requires_force(mut native_rev: NativeRev) {
+        // v1 install seeds tracking.
+        let h_v1 = native_rev.source_hash.clone();
+        install_rev(&native_rev, "m", "p", crate::service::InstallMode::New)
+            .expect("first install");
+
+        // Bump source content. Fixture handles re-parse + re-hash.
+        native_rev.rewrite_source(br#"{"name":"rev","v":2}"#);
+        assert_ne!(h_v1, native_rev.source_hash);
+
+        // Without --force: must fail with ContentChangedRequiresForce.
+        let err = install_rev(&native_rev, "m", "p", crate::service::InstallMode::New)
+            .expect_err("must refuse");
+        match err {
+            AgentError::ContentChangedRequiresForce { name } => {
+                assert_eq!(name, "rev");
+            }
+            other => panic!("expected ContentChangedRequiresForce, got {other:?}"),
+        }
+
+        // With --force: succeeds, forced_overwrite flagged, content updates.
+        let outcome = install_rev(&native_rev, "m", "p", crate::service::InstallMode::Force)
+            .expect("force install");
+        assert!(outcome.forced_overwrite);
+        assert_eq!(outcome.source_hash, native_rev.source_hash);
+        let installed_bytes = fs::read(&outcome.json_path).expect("read installed");
+        assert_eq!(installed_bytes, br#"{"name":"rev","v":2}"#);
+    }
+
+    #[rstest]
+    fn install_native_agent_cross_plugin_name_clash_fails_loudly(native_rev: NativeRev) {
+        // plugin-a installs first.
+        install_rev(
+            &native_rev,
+            "m",
+            "plugin-a",
+            crate::service::InstallMode::New,
+        )
+        .expect("plugin-a install");
+
+        // plugin-b tries to install the same agent name — must fail.
+        let err = install_rev(
+            &native_rev,
+            "m",
+            "plugin-b",
+            crate::service::InstallMode::New,
+        )
+        .expect_err("must refuse");
+        match err {
+            AgentError::NameClashWithOtherPlugin { name, owner } => {
+                assert_eq!(name, "rev");
+                assert_eq!(owner, "plugin-a");
+            }
+            other => panic!("expected NameClashWithOtherPlugin, got {other:?}"),
+        }
+
+        // With --force: ownership transfers to plugin-b.
+        let outcome = install_rev(
+            &native_rev,
+            "m",
+            "plugin-b",
+            crate::service::InstallMode::Force,
+        )
+        .expect("force transfer");
+        assert!(outcome.forced_overwrite);
+
+        let tracking = native_rev.project.load_installed_agents().expect("load");
+        let entry = tracking.agents.get("rev").expect("entry");
+        assert_eq!(entry.plugin, "plugin-b", "ownership must transfer");
+    }
+
+    #[rstest]
+    fn install_native_agent_orphan_at_destination_fails_loudly(native_rev: NativeRev) {
+        // Pre-create the destination with no tracking (orphan from a manual
+        // copy or a prior crashed install).
+        fs::create_dir_all(native_rev.project.kiro_dir().join("agents"))
+            .expect("create agents dir");
+        let orphan_path = native_rev
+            .project
+            .kiro_dir()
+            .join("agents")
+            .join("rev.json");
+        fs::write(&orphan_path, b"orphan content").expect("write orphan");
+
+        // Without --force: must fail with OrphanFileAtDestination.
+        let err = install_rev(&native_rev, "m", "p", crate::service::InstallMode::New)
+            .expect_err("must refuse");
+        match err {
+            AgentError::OrphanFileAtDestination { path } => {
+                assert_eq!(path, orphan_path);
+            }
+            other => panic!("expected OrphanFileAtDestination, got {other:?}"),
+        }
+
+        // With --force: orphan is overwritten and ownership recorded.
+        let outcome = install_rev(&native_rev, "m", "p", crate::service::InstallMode::Force)
+            .expect("force install");
+        assert!(outcome.forced_overwrite);
+
+        let tracking = native_rev.project.load_installed_agents().expect("load");
+        assert!(tracking.agents.contains_key("rev"));
+        let installed_bytes = fs::read(&orphan_path).expect("read installed");
+        assert_eq!(installed_bytes, REV_BODY);
     }
 
     #[test]
