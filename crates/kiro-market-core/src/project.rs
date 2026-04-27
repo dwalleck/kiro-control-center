@@ -4653,10 +4653,18 @@ mod tests {
         let v1_bytes = fs::read(&dest).unwrap();
         assert_eq!(v1_bytes.as_slice(), body_v1.as_slice());
 
-        // Poison tracking so write fails: replace with a directory.
-        let tracking_path = project.root.join(".kiro/installed-agents.json");
-        fs::remove_file(&tracking_path).unwrap();
-        fs::create_dir_all(&tracking_path).unwrap();
+        // Poison the atomic_write tmp path (NOT the tracking path itself).
+        // `cache::atomic_write` opens `<path>.with_extension("tmp")` first,
+        // syncs, then renames into place. Pre-creating that tmp path as a
+        // directory blocks the OpenOptions::create+truncate+open call but
+        // leaves the real tracking file readable — so `load_installed_agents`
+        // succeeds, the install proceeds through promote (acquiring backups),
+        // and `write_agent_tracking` fails AFTER promotion. That's the
+        // sequence the rollback path is designed to handle. (Replacing the
+        // tracking file itself with a directory makes `load_installed_agents`
+        // fail BEFORE promotion, never reaching the rollback code.)
+        let tmp_blocker = project.root.join(".kiro/installed-agents.tmp");
+        fs::create_dir_all(&tmp_blocker).unwrap();
 
         // Force-install v2 (stage_native_source overwrites the source).
         let body_v2 = br#"{"name":"rev","prompt":"v2"}"#;
@@ -4718,10 +4726,12 @@ mod tests {
         let dest = project.root.join(".kiro/steering/guide.md");
         assert_eq!(fs::read(&dest).unwrap(), b"v1");
 
-        // Poison the steering tracking path.
-        let tracking_path = project.root.join(".kiro/installed-steering.json");
-        fs::remove_file(&tracking_path).unwrap();
-        fs::create_dir_all(&tracking_path).unwrap();
+        // Poison the atomic_write tmp path so write_steering_tracking
+        // fails AFTER promote without breaking load_installed_steering.
+        // See install_native_agent_rollback_restores_when_tracking_write_fails
+        // for the full rationale.
+        let tmp_blocker = project.root.join(".kiro/installed-steering.tmp");
+        fs::create_dir_all(&tmp_blocker).unwrap();
 
         // Force-install v2.
         fs::write(scan_root.join("guide.md"), b"v2").unwrap();
@@ -4938,11 +4948,14 @@ mod tests {
         let dest_b = project.root.join(".kiro/agents/prompts/b.md");
         assert!(dest_a.exists() && dest_b.exists());
 
-        // Poison tracking so write_agent_tracking fails: replace the
-        // tracking file with a directory of the same name.
-        let tracking_path = project.root.join(".kiro/installed-agents.json");
-        fs::remove_file(&tracking_path).unwrap();
-        fs::create_dir_all(&tracking_path).unwrap();
+        // Poison the atomic_write tmp path so write_agent_tracking
+        // fails AFTER promote + diff-capture, exercising the
+        // post-tracking-write rollback. Replacing the tracking file
+        // itself with a directory would make load_installed_agents
+        // fail BEFORE promote and never reach the diff/removal logic
+        // this test is designed to exercise.
+        let tmp_blocker = project.root.join(".kiro/installed-agents.tmp");
+        fs::create_dir_all(&tmp_blocker).unwrap();
 
         // Bump a.md content + drop b.md from the new bundle. This is
         // the shrink case: prior tracking owned [a.md, b.md], new
