@@ -2196,13 +2196,9 @@ impl KiroProject {
                     source: Box::new(crate::error::Error::Io(e)),
                 })?;
                 if md.is_file() && md.nlink() > 1 {
-                    return Err(AgentError::InstallFailed {
+                    return Err(AgentError::SourceHardlinked {
                         path: src.clone(),
-                        source: Box::new(crate::error::Error::Io(std::io::Error::other(format!(
-                            "refusing hardlinked native companion at {} (nlink={})",
-                            src.display(),
-                            md.nlink()
-                        )))),
+                        nlink: md.nlink(),
                     }
                     .into());
                 }
@@ -5110,11 +5106,13 @@ mod tests {
                 mode: crate::service::InstallMode::New,
             })
             .expect_err("hardlinked source must be refused");
-        let msg = err.to_string();
-        assert!(
-            msg.contains("hardlinked"),
-            "expected hardlinked-rejection error, got: {msg}"
-        );
+        match err {
+            AgentError::SourceHardlinked { path, nlink } => {
+                assert_eq!(path, linked);
+                assert!(nlink >= 2, "nlink must reflect the hardlink share");
+            }
+            other => panic!("expected AgentError::SourceHardlinked, got {other:?}"),
+        }
 
         // Destination must remain untouched.
         assert!(

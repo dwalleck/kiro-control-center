@@ -358,6 +358,16 @@ pub enum AgentError {
     #[error("native plugin spans multiple agent scan roots; v1 supports a single scan root only")]
     MultipleScanRootsNotSupported { roots: Vec<PathBuf> },
 
+    /// A native companion source file is a hardlink (Unix `nlink > 1`).
+    /// The other path(s) sharing the inode could be sensitive host
+    /// files; the install refuses rather than `fs::copy` inode contents
+    /// into `.kiro/agents/`. Mirrors
+    /// [`crate::agent::parse_native::NativeParseFailure::HardlinkRefused`]
+    /// (the canonical statement of the threat model) and
+    /// `SteeringError::SourceHardlinked`.
+    #[error("refusing hardlinked native companion at `{path}` (nlink={nlink})")]
+    SourceHardlinked { path: PathBuf, nlink: u64 },
+
     // -----------------------------------------------------------------
     // Catch-all for non-AgentError infrastructure failures that surface
     // through the install pipeline.
