@@ -61,11 +61,46 @@ WHERE s.kind = 'struct_field'
        OR s.signature LIKE '%toml::%')
 ORDER BY f.path, s.line";
 
-const ALL_GATES: &[Gate] = &[Gate {
-    name: "gate-4-external-error-boundary",
-    description: "external crate error type behind #[source] on a pub variant field",
-    sql: GATE_4_SQL,
-}];
+/// CLAUDE.md "Zero-tolerance in production code (tests are exempt): no
+/// `.unwrap()`, no `.expect()`". This query finds calls to those methods
+/// in production code, where "production" means:
+///
+/// - The containing symbol is a function or method (skips uses in
+///   constants, type expressions, etc. that aren't runtime panic points).
+/// - The containing symbol is not itself marked as a test (`#[test]`,
+///   `#[tokio::test]`, `#[rstest]`, ...).
+/// - The file is not under a `tests/` or `benches/` directory (Cargo's
+///   conventional locations for integration tests / benchmarks) and is
+///   not a `test_support` / `test_utils` module.
+///
+/// `signature` carries the call name (`unwrap` or `expect`) so the same
+/// `Finding` shape works for this gate and Gate 4.
+const NO_UNWRAP_SQL: &str = "\
+SELECT f.path, r.line, s.qualified_name, r.reference_name
+FROM refs r
+JOIN symbols s ON s.id = r.in_symbol_id
+JOIN files f ON f.id = r.file_id
+WHERE r.reference_name IN ('unwrap', 'expect')
+  AND s.kind IN ('function', 'method')
+  AND s.is_test = 0
+  AND f.path NOT LIKE '%/tests/%'
+  AND f.path NOT LIKE '%/benches/%'
+  AND f.path NOT LIKE '%test_support%'
+  AND f.path NOT LIKE '%test_utils%'
+ORDER BY f.path, r.line";
+
+const ALL_GATES: &[Gate] = &[
+    Gate {
+        name: "gate-4-external-error-boundary",
+        description: "external crate error type behind #[source] on a pub variant field",
+        sql: GATE_4_SQL,
+    },
+    Gate {
+        name: "no-unwrap-in-production",
+        description: ".unwrap() or .expect() in non-test production code",
+        sql: NO_UNWRAP_SQL,
+    },
+];
 
 impl Gate {
     fn run(&self, conn: &Connection) -> Result<Vec<Finding>> {
@@ -269,6 +304,18 @@ mod tests {
             parent_symbol_id INTEGER,
             is_test INTEGER NOT NULL DEFAULT 0
         );
+        CREATE TABLE refs (
+            id INTEGER PRIMARY KEY,
+            symbol_id INTEGER,
+            file_id INTEGER NOT NULL,
+            kind TEXT NOT NULL DEFAULT 'call',
+            line INTEGER NOT NULL,
+            column INTEGER NOT NULL DEFAULT 0,
+            end_line INTEGER,
+            end_column INTEGER,
+            in_symbol_id INTEGER,
+            reference_name TEXT
+        );
         CREATE TABLE attributes (
             id INTEGER PRIMARY KEY,
             symbol_id INTEGER NOT NULL,
@@ -438,5 +485,169 @@ mod tests {
         // src/agent.rs sorts before src/error.rs alphabetically.
         assert_eq!(findings[0].path, "src/agent.rs");
         assert_eq!(findings[1].path, "src/error.rs");
+    }
+
+    // ─── no-unwrap-in-production ────────────────────────────────────────
+
+    fn no_unwrap() -> &'static Gate {
+        ALL_GATES
+            .iter()
+            .find(|g| g.name == "no-unwrap-in-production")
+            .expect("no-unwrap gate should be registered")
+    }
+
+    /// Seeds a `files` row plus a containing function symbol and returns
+    /// the symbol id so callers can attach unwrap refs to it.
+    fn seed_function(
+        conn: &Connection,
+        file_id: i64,
+        path: &str,
+        sym_id: i64,
+        qualified: &str,
+        is_test: bool,
+    ) {
+        conn.execute(
+            "INSERT OR IGNORE INTO files (id, path, language) VALUES (?1, ?2, 'rust')",
+            rusqlite::params![file_id, path],
+        )
+        .expect("file insert");
+        conn.execute(
+            "INSERT INTO symbols (id, file_id, name, qualified_name, kind, line, signature, is_test)
+             VALUES (?1, ?2, ?3, ?4, 'function', 1, 'fn x()', ?5)",
+            rusqlite::params![sym_id, file_id, qualified, qualified, i64::from(is_test)],
+        )
+        .expect("symbol insert");
+    }
+
+    fn insert_panic_ref(
+        conn: &Connection,
+        file_id: i64,
+        in_symbol_id: i64,
+        line: u32,
+        which: &str,
+    ) {
+        conn.execute(
+            "INSERT INTO refs (symbol_id, file_id, in_symbol_id, line, reference_name)
+             VALUES (NULL, ?1, ?2, ?3, ?4)",
+            rusqlite::params![file_id, in_symbol_id, line, which],
+        )
+        .expect("ref insert");
+    }
+
+    #[test]
+    fn no_unwrap_flags_unwrap_in_production_function() {
+        let conn = fresh_db();
+        seed_function(&conn, 2, "crates/core/src/git.rs", 10, "run_git", false);
+        insert_panic_ref(&conn, 2, 10, 42, "unwrap");
+
+        let findings = no_unwrap().run(&conn).expect("query should succeed");
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].path, "crates/core/src/git.rs");
+        assert_eq!(findings[0].line, 42);
+        assert_eq!(findings[0].qualified_name, "run_git");
+        assert_eq!(findings[0].signature.as_deref(), Some("unwrap"));
+    }
+
+    #[test]
+    fn no_unwrap_flags_expect_too() {
+        let conn = fresh_db();
+        seed_function(&conn, 2, "crates/core/src/git.rs", 10, "run_git", false);
+        insert_panic_ref(&conn, 2, 10, 42, "expect");
+
+        let findings = no_unwrap().run(&conn).expect("query should succeed");
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].signature.as_deref(), Some("expect"));
+    }
+
+    #[test]
+    fn no_unwrap_skips_unwrap_or_and_unwrap_or_else() {
+        let conn = fresh_db();
+        seed_function(&conn, 2, "crates/core/src/git.rs", 10, "run_git", false);
+        // These call shapes are safe (provide defaults). They must not be
+        // flagged — IN ('unwrap', 'expect') is exact-match only.
+        insert_panic_ref(&conn, 2, 10, 5, "unwrap_or");
+        insert_panic_ref(&conn, 2, 10, 6, "unwrap_or_else");
+        insert_panic_ref(&conn, 2, 10, 7, "unwrap_or_default");
+
+        let findings = no_unwrap().run(&conn).expect("query should succeed");
+        assert!(
+            findings.is_empty(),
+            "default-providing variants are not panic points; got {findings:?}"
+        );
+    }
+
+    #[test]
+    fn no_unwrap_skips_test_marked_functions() {
+        // A function with `is_test = 1` (because tethys saw `#[test]` etc.)
+        // is exempt — CLAUDE.md zero-tolerance applies to production only.
+        let conn = fresh_db();
+        seed_function(&conn, 2, "crates/core/src/lib.rs", 10, "test_thing", true);
+        insert_panic_ref(&conn, 2, 10, 42, "unwrap");
+
+        let findings = no_unwrap().run(&conn).expect("query should succeed");
+        assert!(
+            findings.is_empty(),
+            "test-marked fn exempt; got {findings:?}"
+        );
+    }
+
+    #[test]
+    fn no_unwrap_skips_files_under_tests_dir() {
+        // Cargo's integration-tests convention: anything under `tests/` is
+        // test code by virtue of where it lives, even if the function
+        // itself isn't `#[test]`-marked (helpers in tests/common/, etc.).
+        let conn = fresh_db();
+        seed_function(
+            &conn,
+            2,
+            "crates/core/tests/common/fixtures.rs",
+            10,
+            "make_fixture",
+            false,
+        );
+        insert_panic_ref(&conn, 2, 10, 42, "unwrap");
+
+        let findings = no_unwrap().run(&conn).expect("query should succeed");
+        assert!(
+            findings.is_empty(),
+            "files under tests/ are exempt; got {findings:?}"
+        );
+    }
+
+    #[test]
+    fn no_unwrap_skips_test_support_modules() {
+        let conn = fresh_db();
+        seed_function(
+            &conn,
+            2,
+            "crates/core/src/service/test_support.rs",
+            10,
+            "MarketplaceService::stub",
+            false,
+        );
+        insert_panic_ref(&conn, 2, 10, 42, "expect");
+
+        let findings = no_unwrap().run(&conn).expect("query should succeed");
+        assert!(
+            findings.is_empty(),
+            "test_support modules exempt; got {findings:?}"
+        );
+    }
+
+    #[test]
+    fn no_unwrap_does_not_flag_calls_outside_a_function() {
+        // A ref with NULL in_symbol_id (e.g. unwrap inside a `const fn` body
+        // that tethys can't yet attribute) shouldn't fail the JOIN-based
+        // query — INNER JOIN excludes it naturally.
+        let conn = fresh_db();
+        conn.execute(
+            "INSERT INTO refs (symbol_id, file_id, in_symbol_id, line, reference_name)
+             VALUES (NULL, 1, NULL, 5, 'unwrap')",
+            [],
+        )
+        .expect("ref insert");
+
+        let findings = no_unwrap().run(&conn).expect("query should succeed");
+        assert!(findings.is_empty());
     }
 }
