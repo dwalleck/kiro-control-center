@@ -76,8 +76,8 @@ pub fn discover_agents_in_dirs(plugin_dir: &Path, scan_paths: &[String]) -> Vec<
             // Use symlink_metadata (does NOT follow symlinks) so a malicious
             // plugin cannot smuggle in an agent path that reads arbitrary
             // files via parse_agent_file. Matches project::copy_dir_recursive.
-            let file_type = match fs::symlink_metadata(&path) {
-                Ok(m) => m.file_type(),
+            let metadata = match fs::symlink_metadata(&path) {
+                Ok(m) => m,
                 Err(e) => {
                     warn!(
                         path = %path.display(),
@@ -87,14 +87,14 @@ pub fn discover_agents_in_dirs(plugin_dir: &Path, scan_paths: &[String]) -> Vec<
                     continue;
                 }
             };
-            if file_type.is_symlink() {
+            if crate::platform::is_reparse_or_symlink(&metadata) {
                 debug!(
                     path = %path.display(),
-                    "skipping symlink in agent scan directory"
+                    "skipping symlink or reparse point in agent scan directory"
                 );
                 continue;
             }
-            if !file_type.is_file() {
+            if !metadata.file_type().is_file() {
                 continue;
             }
             let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
@@ -173,8 +173,8 @@ pub fn discover_native_kiro_agents_in_dirs(
                 }
             };
             let path = entry.path();
-            let file_type = match fs::symlink_metadata(&path) {
-                Ok(m) => m.file_type(),
+            let metadata = match fs::symlink_metadata(&path) {
+                Ok(m) => m,
                 Err(e) => {
                     warn!(
                         path = %path.display(),
@@ -184,14 +184,14 @@ pub fn discover_native_kiro_agents_in_dirs(
                     continue;
                 }
             };
-            if file_type.is_symlink() {
+            if crate::platform::is_reparse_or_symlink(&metadata) {
                 debug!(
                     path = %path.display(),
-                    "skipping symlink in native agent scan directory"
+                    "skipping symlink or reparse point in native agent scan directory"
                 );
                 continue;
             }
-            if !file_type.is_file() {
+            if !metadata.file_type().is_file() {
                 continue;
             }
             let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
@@ -287,7 +287,7 @@ pub fn discover_native_companion_files(
                     continue;
                 }
             };
-            if md.file_type().is_symlink() || !md.file_type().is_dir() {
+            if crate::platform::is_reparse_or_symlink(&md) || !md.file_type().is_dir() {
                 continue;
             }
             collect_companion_subdir_files(&subdir, &scan_root, &mut out);
@@ -339,10 +339,10 @@ fn collect_companion_subdir_files(
                 continue;
             }
         };
-        if inner_md.file_type().is_symlink() {
+        if crate::platform::is_reparse_or_symlink(&inner_md) {
             debug!(
                 path = %inner_path.display(),
-                "skipping symlink in companion subdir"
+                "skipping symlink or reparse point in companion subdir"
             );
             continue;
         }
@@ -624,6 +624,44 @@ mod tests {
             .map(|f| f.source.file_name().unwrap().to_string_lossy().into_owned())
             .collect();
         assert_eq!(names, vec!["real.json"]);
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn companion_discovery_skips_directory_junctions() {
+        // Path::is_symlink() returns false for Windows directory junctions
+        // (they're IO_REPARSE_TAG_MOUNT_POINT, not IO_REPARSE_TAG_SYMLINK),
+        // so the broader is_reparse_or_symlink() check has to catch them.
+        // A junction at agents/escape pointing outside the plugin tree
+        // would otherwise let collect_companion_subdir_files walk into
+        // arbitrary host directories and surface their files as
+        // companion candidates.
+        let tmp = tempdir().unwrap();
+        let agents = tmp.path().join("agents");
+        fs::create_dir_all(&agents).unwrap();
+        // Create a real companion subdir with a real file.
+        let real_subdir = agents.join("prompts");
+        fs::create_dir_all(&real_subdir).unwrap();
+        fs::write(real_subdir.join("a.md"), b"real").unwrap();
+
+        // Junction target lives outside `agents/` and contains a file
+        // the attacker wants surfaced as a companion.
+        let outside = tmp.path().join("outside");
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("smuggled.md"), b"smuggled").unwrap();
+        let junction_path = agents.join("escape");
+        junction::create(&outside, &junction_path).expect("create junction");
+
+        let found = discover_native_companion_files(tmp.path(), &["./agents/".to_string()]);
+
+        let names: Vec<_> = found
+            .iter()
+            .map(|f| f.source.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        // Only the real prompt should appear. The junction must be
+        // refused at the outer subdir loop, so its `smuggled.md` never
+        // even reaches collect_companion_subdir_files.
+        assert_eq!(names, vec!["a.md"]);
     }
 
     #[test]

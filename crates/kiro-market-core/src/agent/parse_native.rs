@@ -119,7 +119,7 @@ pub fn parse_native_kiro_agent_file(
     scan_root: &Path,
 ) -> Result<NativeAgentBundle, NativeParseFailure> {
     let md = std::fs::symlink_metadata(json_path).map_err(NativeParseFailure::IoError)?;
-    if md.file_type().is_symlink() {
+    if crate::platform::is_reparse_or_symlink(&md) {
         return Err(NativeParseFailure::SymlinkRefused(json_path.to_path_buf()));
     }
     if md.len() > MAX_NATIVE_AGENT_BYTES {
