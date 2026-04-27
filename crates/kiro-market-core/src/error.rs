@@ -533,6 +533,9 @@ pub enum Error {
     Agent(#[from] AgentError),
 
     #[error(transparent)]
+    Steering(#[from] crate::steering::SteeringError),
+
+    #[error(transparent)]
     Git(#[from] GitError),
 
     #[error(transparent)]

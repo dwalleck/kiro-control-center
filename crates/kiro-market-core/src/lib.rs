@@ -17,6 +17,7 @@ pub mod project;
 pub(crate) mod raii;
 pub mod service;
 pub mod skill;
+pub mod steering;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_utils;
 pub mod validation;
