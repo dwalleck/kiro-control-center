@@ -1125,6 +1125,33 @@ impl KiroProject {
         self.install_agent_inner(def, mapped_tools, meta, true, source_path)
     }
 
+    /// Hash a translated-agent source file against its parent
+    /// directory + filename. Returns `Ok(None)` for `None` input
+    /// (test fixtures sometimes synthesize an `AgentDefinition` from
+    /// thin air); otherwise the blake3-prefixed hash. Lifted out of
+    /// `install_agent_inner` to keep that function under the line cap.
+    fn hash_translated_source(source_path: Option<&Path>) -> crate::error::Result<Option<String>> {
+        let Some(p) = source_path else {
+            return Ok(None);
+        };
+        let parent = p.parent().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("source path `{}` has no parent dir", p.display()),
+            )
+        })?;
+        let filename = p.file_name().ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("source path `{}` has no file name", p.display()),
+            )
+        })?;
+        Ok(Some(crate::hash::hash_artifact(
+            parent,
+            &[std::path::PathBuf::from(filename)],
+        )?))
+    }
+
     fn install_agent_inner(
         &self,
         def: &AgentDefinition,
@@ -1141,26 +1168,7 @@ impl KiroProject {
 
         // Compute source_hash outside the lock — it's a read-only I/O
         // operation on the source file and need not block other installers.
-        let source_hash: Option<String> = source_path
-            .map(|p| -> crate::error::Result<String> {
-                let parent = p.parent().ok_or_else(|| {
-                    std::io::Error::new(
-                        std::io::ErrorKind::InvalidInput,
-                        format!("source path `{}` has no parent dir", p.display()),
-                    )
-                })?;
-                let filename = p.file_name().ok_or_else(|| {
-                    std::io::Error::new(
-                        std::io::ErrorKind::InvalidInput,
-                        format!("source path `{}` has no file name", p.display()),
-                    )
-                })?;
-                Ok(crate::hash::hash_artifact(
-                    parent,
-                    &[std::path::PathBuf::from(filename)],
-                )?)
-            })
-            .transpose()?;
+        let source_hash = Self::hash_translated_source(source_path)?;
 
         crate::file_lock::with_file_lock(
             &self.agent_tracking_path(),
@@ -1212,15 +1220,24 @@ impl KiroProject {
                 //
                 // Only meaningful in force mode — non-force mode bails
                 // earlier on `AlreadyInstalled` so no transfer happens.
-                if force {
-                    Self::strip_transferred_paths_from_other_plugins(
+                let placed = [json_target.clone(), prompt_target.clone()];
+
+                if force
+                    && let Err(e) = Self::strip_transferred_paths_from_other_plugins(
                         &mut installed,
                         &plugin,
                         std::slice::from_ref(&prompt_rel),
+                        &agents_root,
+                    )
+                {
+                    warn!(
+                        name = %def.name,
+                        error = %e,
+                        "cross-plugin transfer hash recompute failed; restoring backups"
                     );
+                    Self::rollback_companion_promotion(&placed, &backups);
+                    return Err(e);
                 }
-
-                let placed = [json_target.clone(), prompt_target.clone()];
 
                 if let Err(e) = Self::synthesize_companion_entry(
                     &mut installed,
@@ -1892,12 +1909,21 @@ impl KiroProject {
         // staging is a TempDir; drops at scope exit and cleans up the
         // now-empty (or partially-promoted-out-of) staging directory.
 
-        if forced_overwrite {
-            Self::strip_transferred_paths_from_other_plugins(
+        if forced_overwrite
+            && let Err(e) = Self::strip_transferred_paths_from_other_plugins(
                 &mut installed,
                 input.plugin,
                 input.rel_paths,
+                agents_dir,
+            )
+        {
+            warn!(
+                plugin = %input.plugin,
+                error = %e,
+                "cross-plugin transfer hash recompute failed; restoring backups"
             );
+            Self::rollback_companion_promotion(&placed, &backups);
+            return Err(e);
         }
 
         // Capture the prior file set BEFORE replacing the tracking entry
@@ -2186,13 +2212,33 @@ impl KiroProject {
     }
 
     /// In force mode: drop transferred `rel_paths` from any other plugin's
-    /// tracking entry, and remove emptied entries entirely. Caller has
-    /// just promoted the files, so the previous owner has lost ownership.
+    /// tracking entry, recompute that plugin's `source_hash` /
+    /// `installed_hash` over the surviving file set, and remove emptied
+    /// entries entirely. Caller has just promoted the files, so the
+    /// previous owner has lost ownership.
+    ///
+    /// # Why recompute hashes
+    ///
+    /// Closes silent-failure-hunter #1: dropping files from
+    /// `meta.files` without recomputing leaves the prior plugin's hash
+    /// claiming the OLD file set. A future drift-check command would
+    /// then report a phantom mismatch on every cross-plugin force
+    /// transfer. Both `source_hash` and `installed_hash` are set to
+    /// the hash of the surviving files at `agents_dir` — post-transfer
+    /// the destination IS the canonical truth for what this plugin
+    /// owns, since the original source bundle is no longer accessible.
+    ///
+    /// # Errors
+    ///
+    /// Returns the hash error if recomputing any modified plugin's
+    /// hash fails. Caller is responsible for rolling back the file
+    /// promotion since this happens AFTER promote.
     fn strip_transferred_paths_from_other_plugins(
         installed: &mut InstalledAgents,
         plugin: &str,
         rel_paths: &[PathBuf],
-    ) {
+        agents_dir: &Path,
+    ) -> crate::error::Result<()> {
         let new_set: std::collections::HashSet<&PathBuf> = rel_paths.iter().collect();
         let other_plugins: Vec<String> = installed
             .native_companions
@@ -2200,14 +2246,33 @@ impl KiroProject {
             .filter(|p| p.as_str() != plugin)
             .cloned()
             .collect();
+        let mut modified: Vec<String> = Vec::new();
         for p in other_plugins {
             if let Some(meta) = installed.native_companions.get_mut(&p) {
+                let len_before = meta.files.len();
                 meta.files.retain(|f| !new_set.contains(f));
+                if meta.files.len() != len_before {
+                    modified.push(p);
+                }
+            }
+        }
+        // Recompute hashes BEFORE pruning empties — pruning consumes
+        // the entry, and we'd need to special-case "empty entries
+        // don't need a hash recompute". Cleaner to recompute first,
+        // then prune.
+        for p in &modified {
+            if let Some(meta) = installed.native_companions.get_mut(p)
+                && !meta.files.is_empty()
+            {
+                let new_hash = crate::hash::hash_artifact(agents_dir, &meta.files)?;
+                new_hash.clone_into(&mut meta.source_hash);
+                meta.installed_hash = new_hash;
             }
         }
         installed
             .native_companions
             .retain(|_, meta| !meta.files.is_empty());
+        Ok(())
     }
 
     /// Compute the prior tracked companion files for `plugin` that are
@@ -3393,6 +3458,115 @@ mod tests {
                 .expect("agent tracked")
                 .plugin,
             "plugin-b"
+        );
+    }
+
+    #[test]
+    fn install_native_companions_force_transfer_partial_overlap_recomputes_prior_hash() {
+        // Closes silent-failure-hunter #1 + pr-test-analyzer C2.
+        //
+        // Scenario: plugin-a owns [keep.md, transfer.md]; plugin-b
+        // force-installs at transfer.md only. Plugin-a's entry must
+        // SURVIVE with [keep.md] + a recomputed hash that matches the
+        // current bytes of keep.md, NOT the stale hash over the
+        // original [keep.md, transfer.md] pair.
+        let (_dir, project) = temp_project();
+
+        // Plugin-a stages 2 files.
+        let scratch_a = tempfile::tempdir().unwrap();
+        let scan_a = scratch_a.path().join("src");
+        fs::create_dir_all(scan_a.join("prompts")).unwrap();
+        fs::write(scan_a.join("prompts/keep.md"), b"keep body").unwrap();
+        fs::write(scan_a.join("prompts/transfer.md"), b"a-transfer").unwrap();
+        let rel_paths_a = vec![
+            PathBuf::from("prompts/keep.md"),
+            PathBuf::from("prompts/transfer.md"),
+        ];
+        let h_a = crate::hash::hash_artifact(&scan_a, &rel_paths_a).unwrap();
+        project
+            .install_native_companions(&NativeCompanionsInput {
+                scan_root: &scan_a,
+                rel_paths: &rel_paths_a,
+                marketplace: "m",
+                plugin: "plugin-a",
+                version: None,
+                source_hash: &h_a,
+                mode: crate::service::InstallMode::New,
+            })
+            .expect("plugin-a install");
+
+        let stale_a_hash = project
+            .load_installed_agents()
+            .unwrap()
+            .native_companions
+            .get("plugin-a")
+            .unwrap()
+            .installed_hash
+            .clone();
+
+        // Plugin-b takes only transfer.md with different bytes.
+        let scratch_b = tempfile::tempdir().unwrap();
+        let scan_b = scratch_b.path().join("src");
+        fs::create_dir_all(scan_b.join("prompts")).unwrap();
+        fs::write(scan_b.join("prompts/transfer.md"), b"b-transfer").unwrap();
+        let rel_paths_b = vec![PathBuf::from("prompts/transfer.md")];
+        let h_b = crate::hash::hash_artifact(&scan_b, &rel_paths_b).unwrap();
+        project
+            .install_native_companions(&NativeCompanionsInput {
+                scan_root: &scan_b,
+                rel_paths: &rel_paths_b,
+                marketplace: "m",
+                plugin: "plugin-b",
+                version: None,
+                source_hash: &h_b,
+                mode: crate::service::InstallMode::Force,
+            })
+            .expect("plugin-b force install");
+
+        let after = project.load_installed_agents().unwrap();
+
+        // Plugin-a's entry survived with keep.md only.
+        let a_entry = after
+            .native_companions
+            .get("plugin-a")
+            .expect("plugin-a entry must survive");
+        assert_eq!(a_entry.files, vec![PathBuf::from("prompts/keep.md")]);
+
+        // Hashes must reflect the surviving file set, NOT the original
+        // pair. The new hash is hash_artifact(agents_dir, [keep.md]).
+        let agents_dir = project.root.join(".kiro/agents");
+        let expected_a_hash =
+            crate::hash::hash_artifact(&agents_dir, &[PathBuf::from("prompts/keep.md")]).unwrap();
+        assert_eq!(
+            a_entry.installed_hash, expected_a_hash,
+            "installed_hash must be recomputed over surviving files"
+        );
+        assert_eq!(
+            a_entry.source_hash, expected_a_hash,
+            "source_hash must equal installed_hash post-transfer (canonical truth = current bytes on disk)"
+        );
+        assert_ne!(
+            a_entry.installed_hash, stale_a_hash,
+            "post-transfer hash must DIFFER from the original [keep.md, transfer.md] hash"
+        );
+
+        // Plugin-b owns transfer.md.
+        let b_entry = after
+            .native_companions
+            .get("plugin-b")
+            .expect("plugin-b entry exists");
+        assert_eq!(b_entry.files, vec![PathBuf::from("prompts/transfer.md")]);
+
+        // Files on disk reflect the new ownership.
+        assert_eq!(
+            fs::read(agents_dir.join("prompts/keep.md")).unwrap(),
+            b"keep body",
+            "plugin-a's keep.md untouched"
+        );
+        assert_eq!(
+            fs::read(agents_dir.join("prompts/transfer.md")).unwrap(),
+            b"b-transfer",
+            "plugin-b's bytes won the transfer"
         );
     }
 
