@@ -14,12 +14,13 @@ fn main() {
     // which applies to every artifact: bin, integration tests, and the
     // lib unit-test exe. The content matches what tauri_build would
     // have shipped (just the v6 dependency declaration).
-    let mut attributes = tauri_build::Attributes::new();
+    // Shadowing keeps `attributes` immutable on non-Windows targets, where
+    // the cfg block below is removed and `mut` would warn. Linux CI runs
+    // clippy with `-D warnings` so the original `let mut` shape failed there.
+    let attributes = tauri_build::Attributes::new();
     #[cfg(target_os = "windows")]
-    {
-        attributes = attributes
-            .windows_attributes(tauri_build::WindowsAttributes::new_without_app_manifest());
-    }
+    let attributes =
+        attributes.windows_attributes(tauri_build::WindowsAttributes::new_without_app_manifest());
     if let Err(e) = tauri_build::try_build(attributes) {
         eprintln!("tauri-build failed: {e:#}");
         std::process::exit(1);
