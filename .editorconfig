@@ -5,3 +5,8 @@ root = true
 [*]
 end_of_line = lf
 insert_final_newline = true
+
+# Windows shells require CRLF — keep editors aligned with .gitattributes
+# so editor saves don't fight git's normalization on stage.
+[*.{bat,ps1}]
+end_of_line = crlf
