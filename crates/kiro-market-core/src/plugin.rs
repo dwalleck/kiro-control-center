@@ -26,6 +26,12 @@ pub struct PluginManifest {
     /// Authoring format for this plugin. See [`PluginFormat`].
     #[serde(default)]
     pub format: Option<PluginFormat>,
+
+    /// Optional list of directories (relative to the plugin root) to scan
+    /// for steering markdown files. Empty means "use the default scan
+    /// paths" ([`crate::DEFAULT_STEERING_PATHS`]).
+    #[serde(default)]
+    pub steering: Vec<String>,
 }
 
 /// The plugin's native authoring format. Drives dispatch in
@@ -442,6 +448,20 @@ mod tests {
         let json = br#"{ "name": "p" }"#;
         let m = PluginManifest::from_json(json).expect("should parse");
         assert!(m.agents.is_empty());
+    }
+
+    #[test]
+    fn manifest_parses_steering_paths() {
+        let json = br#"{"name": "p", "steering": ["./guidance/", "./extras/"]}"#;
+        let manifest = PluginManifest::from_json(json).expect("should parse");
+        assert_eq!(manifest.steering, vec!["./guidance/", "./extras/"]);
+    }
+
+    #[test]
+    fn manifest_steering_absent_is_empty_vec() {
+        let json = br#"{"name": "p"}"#;
+        let manifest = PluginManifest::from_json(json).expect("should parse");
+        assert!(manifest.steering.is_empty());
     }
 
     #[test]
