@@ -10,6 +10,7 @@ use kiro_market_core::project::KiroProject;
 use kiro_market_core::service::{
     InstallAgentsResult, InstallFilter, InstallMode, InstallSkillsResult, MarketplaceService,
 };
+use kiro_market_core::steering::InstallSteeringResult;
 use tracing::{debug, warn};
 
 use crate::cli;
@@ -96,7 +97,29 @@ pub fn run(
     );
     print_agent_outcome(&agent_result);
 
-    summarize_outcome(plugin_ref, skill_filter, &skill_result, &agent_result)
+    let steering_ctx = kiro_market_core::steering::SteeringInstallContext {
+        mode,
+        marketplace: marketplace_name,
+        plugin: plugin_name,
+        version: ctx.version.as_deref(),
+    };
+    let steering_result = run_steering_install(
+        &svc,
+        &project,
+        &plugin_dir,
+        &ctx.steering_scan_paths,
+        skill_filter,
+        steering_ctx,
+    );
+    print_steering_outcome(&steering_result, &project);
+
+    summarize_outcome(
+        plugin_ref,
+        skill_filter,
+        &skill_result,
+        &agent_result,
+        &steering_result,
+    )
 }
 
 /// Look up the stored git protocol preference for a marketplace, falling back
@@ -187,29 +210,55 @@ fn run_agent_install(
     svc.install_plugin_agents(project, plugin_dir, agent_scan_paths, format, ctx)
 }
 
-/// Decide whether the command exits zero or non-zero based on the accumulated
-/// skill + agent results. Any per-item failure becomes a non-zero exit so CI
-/// catches partial-success regressions.
+fn run_steering_install(
+    svc: &MarketplaceService,
+    project: &KiroProject,
+    plugin_dir: &Path,
+    steering_scan_paths: &[String],
+    skill_filter: Option<&str>,
+    ctx: kiro_market_core::steering::SteeringInstallContext<'_>,
+) -> InstallSteeringResult {
+    // A `--skill <name>` filter narrows the install to one skill and never
+    // touches steering files.
+    if skill_filter.is_some() {
+        return InstallSteeringResult::default();
+    }
+    svc.install_plugin_steering(project, plugin_dir, steering_scan_paths, ctx)
+}
+
+/// Decide whether the command exits zero or non-zero based on the
+/// accumulated skill + agent + steering results. Any per-item failure
+/// becomes a non-zero exit so CI catches partial-success regressions.
 fn summarize_outcome(
     plugin_ref: &str,
     skill_filter: Option<&str>,
     skill_result: &InstallSkillsResult,
     agent_result: &InstallAgentsResult,
+    steering_result: &InstallSteeringResult,
 ) -> Result<()> {
     let nothing_installed = skill_result.installed.is_empty()
         && skill_result.skipped.is_empty()
         && agent_result.installed.is_empty()
-        && agent_result.skipped.is_empty();
-    if nothing_installed && agent_result.failed.is_empty() && skill_result.failed.is_empty() {
+        && agent_result.skipped.is_empty()
+        && steering_result.installed.is_empty();
+    if nothing_installed
+        && agent_result.failed.is_empty()
+        && skill_result.failed.is_empty()
+        && steering_result.failed.is_empty()
+    {
         let kind = if skill_filter.is_some() {
             "skills"
         } else {
-            "skills or agents"
+            "skills, agents, or steering files"
         };
         bail!("no {kind} were installed from '{plugin_ref}'");
     }
-    if !agent_result.failed.is_empty() || !skill_result.failed.is_empty() {
-        let fail_count = agent_result.failed.len() + skill_result.failed.len();
+    if !agent_result.failed.is_empty()
+        || !skill_result.failed.is_empty()
+        || !steering_result.failed.is_empty()
+    {
+        let fail_count =
+            agent_result.failed.len() + skill_result.failed.len() + steering_result.failed.len();
         bail!(
             "{fail_count} item{s} failed during install from '{plugin_ref}'",
             s = if fail_count == 1 { "" } else { "s" }
@@ -286,6 +335,47 @@ fn print_agent_outcome(result: &InstallAgentsResult) {
             "  {} Failed to install agent '{}': {rendered}",
             "✗".red().bold(),
             label
+        );
+    }
+    for w in &result.warnings {
+        eprintln!("  {} {w}", "!".yellow().bold());
+    }
+}
+
+/// Render the steering install summary plus per-file failures and
+/// warnings. Failures use [`error_full_chain`](kiro_market_core::error::error_full_chain)
+/// per S3-13 so the underlying `io::Error` reason (e.g. which file
+/// couldn't be read, what OS error fired) reaches the user — a bare
+/// `to_string()` would drop the `#[source]` chain and produce
+/// "tracking I/O failed" with no actionable detail.
+fn print_steering_outcome(result: &InstallSteeringResult, project: &KiroProject) {
+    let steering_root = project.steering_dir();
+    for outcome in &result.installed {
+        // S3-8: 3-variant exhaustive match over the workspace-shared
+        // InstallOutcomeKind. Identical in shape to print_agent_outcome's
+        // companion-suffix match.
+        let suffix = match outcome.kind {
+            kiro_market_core::project::InstallOutcomeKind::Idempotent => " (unchanged)".dimmed(),
+            kiro_market_core::project::InstallOutcomeKind::ForceOverwrote => " (forced)".yellow(),
+            kiro_market_core::project::InstallOutcomeKind::Installed => "".normal(),
+        };
+        let rel = outcome
+            .destination
+            .strip_prefix(&steering_root)
+            .unwrap_or(&outcome.destination);
+        println!(
+            "  {} Installed steering '{}'{}",
+            "✓".green().bold(),
+            rel.display(),
+            suffix
+        );
+    }
+    for failed in &result.failed {
+        let rendered = kiro_market_core::error::error_full_chain(&failed.error);
+        eprintln!(
+            "  {} Failed to install steering '{}': {rendered}",
+            "✗".red().bold(),
+            failed.source.display()
         );
     }
     for w in &result.warnings {
