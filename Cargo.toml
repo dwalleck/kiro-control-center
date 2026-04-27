@@ -4,6 +4,7 @@ members = [
     "crates/kiro-market-core",
     "crates/kiro-market",
     "crates/kiro-control-center/src-tauri",
+    "xtask",
 ]
 
 [workspace.package]
