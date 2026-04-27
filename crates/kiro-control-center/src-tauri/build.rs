@@ -37,9 +37,18 @@ fn main() {
   </dependency>
 </assembly>
 "#;
-        let out_dir = std::env::var("OUT_DIR").expect("OUT_DIR not set");
+        let out_dir = std::env::var("OUT_DIR").unwrap_or_else(|e| {
+            eprintln!("OUT_DIR not set in build script env: {e}");
+            std::process::exit(1);
+        });
         let manifest_path = std::path::Path::new(&out_dir).join("kcc.manifest");
-        std::fs::write(&manifest_path, MANIFEST).expect("write manifest");
+        std::fs::write(&manifest_path, MANIFEST).unwrap_or_else(|e| {
+            eprintln!(
+                "failed to write manifest at {}: {e}",
+                manifest_path.display()
+            );
+            std::process::exit(1);
+        });
         println!("cargo:rustc-link-arg=/MANIFEST:EMBED");
         println!(
             "cargo:rustc-link-arg=/MANIFESTINPUT:{}",

@@ -242,11 +242,24 @@ fn summarize_outcome(
         && skill_result.failed.is_empty()
         && steering_result.failed.is_empty()
     {
+        // Warnings already printed to stderr by `print_*_outcome`. When
+        // they explain the empty result (e.g. all steering scan paths
+        // were rejected as path-traversal), point the user there rather
+        // than implying the plugin is empty. `InstallSkillsResult` has no
+        // analogous `warnings` field today; if one is added later, extend
+        // this guard.
+        let any_warnings =
+            !agent_result.warnings.is_empty() || !steering_result.warnings.is_empty();
         let kind = if skill_filter.is_some() {
             "skills"
         } else {
             "skills, agents, or steering files"
         };
+        if any_warnings {
+            bail!(
+                "no {kind} were installed from '{plugin_ref}' — see warnings above for the cause"
+            );
+        }
         bail!("no {kind} were installed from '{plugin_ref}'");
     }
     if !agent_result.failed.is_empty()

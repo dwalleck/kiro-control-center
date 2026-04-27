@@ -192,10 +192,28 @@ pub struct InstalledNativeAgentOutcome {
 /// `classify_companion_collision` (with
 /// [`InstalledNativeCompanionsOutcome`]), and
 /// `classify_steering_collision` (with
-/// [`crate::steering::InstalledSteeringOutcome`]).
+/// [`SteeringIdempotentEcho`] — *not* the full
+/// `InstalledSteeringOutcome`; see that struct's docs for why).
 enum CollisionDecision<T> {
     Idempotent(Box<T>),
     Proceed { forced_overwrite: bool },
+}
+
+/// Returned in [`CollisionDecision::Idempotent`] from
+/// [`KiroProject::classify_steering_collision`]. Carries only the prior
+/// `installed_hash` because the classifier doesn't see the original
+/// source path — the caller (`install_steering_file_locked`) holds
+/// `source.source` and constructs the full
+/// [`crate::steering::InstalledSteeringOutcome`] there.
+///
+/// Splitting the construction prevents the bug where the classifier
+/// would otherwise have to fall back to setting `source = dest` (the
+/// classifier never receives the source path), which would leak the
+/// destination path into the wire-format `source` field on idempotent
+/// reinstalls — visible to Tauri callers via the
+/// `#[derive(specta::Type)]` on `InstalledSteeringOutcome`.
+struct SteeringIdempotentEcho {
+    prior_installed_hash: String,
 }
 
 /// Input bundle for [`KiroProject::install_native_companions`]. Groups the
@@ -908,20 +926,13 @@ impl KiroProject {
         source_hash: &str,
         dest: &Path,
         mode: crate::service::InstallMode,
-    ) -> Result<
-        CollisionDecision<crate::steering::InstalledSteeringOutcome>,
-        crate::steering::SteeringError,
-    > {
+    ) -> Result<CollisionDecision<SteeringIdempotentEcho>, crate::steering::SteeringError> {
         match installed.files.get(rel_path) {
             Some(existing) if existing.plugin == plugin => {
                 if existing.source_hash == source_hash {
                     return Ok(CollisionDecision::Idempotent(Box::new(
-                        crate::steering::InstalledSteeringOutcome {
-                            source: dest.to_path_buf(),
-                            destination: dest.to_path_buf(),
-                            kind: InstallOutcomeKind::Idempotent,
-                            source_hash: source_hash.to_owned(),
-                            installed_hash: existing.installed_hash.clone(),
+                        SteeringIdempotentEcho {
+                            prior_installed_hash: existing.installed_hash.clone(),
                         },
                     )));
                 }
@@ -1090,7 +1101,19 @@ impl KiroProject {
             dest,
             ctx.mode,
         )? {
-            CollisionDecision::Idempotent(outcome) => return Ok(*outcome),
+            // Idempotent: assemble the full outcome here where `source.source`
+            // is in scope. The classifier returned only the prior installed_hash
+            // so it couldn't accidentally substitute `dest` for the missing
+            // source path.
+            CollisionDecision::Idempotent(echo) => {
+                return Ok(crate::steering::InstalledSteeringOutcome {
+                    source: source.source.clone(),
+                    destination: dest.to_path_buf(),
+                    kind: InstallOutcomeKind::Idempotent,
+                    source_hash: source_hash.to_owned(),
+                    installed_hash: echo.prior_installed_hash,
+                });
+            }
             CollisionDecision::Proceed { forced_overwrite } => forced_overwrite,
         };
 
@@ -2914,6 +2937,21 @@ mod tests {
         assert_eq!(
             second.installed_hash, first.installed_hash,
             "idempotent reinstall must report the prior installed_hash"
+        );
+        // Wire-format regression guard: the idempotent path must report the
+        // ORIGINAL source path, not the destination. The classifier doesn't
+        // see the source, so before SteeringIdempotentEcho landed it would
+        // fall back to setting `source = dest`, which then leaks the
+        // `.kiro/steering/...` path through the specta-derived TS binding
+        // for `InstalledSteeringOutcome`.
+        assert_eq!(
+            second.source,
+            steering_file.source_path(),
+            "idempotent outcome.source must be the original source path, not the destination"
+        );
+        assert_ne!(
+            second.source, second.destination,
+            "outcome.source must not equal outcome.destination on idempotent reinstall"
         );
     }
 
@@ -5229,6 +5267,66 @@ mod tests {
         );
         // a.md must contain v1 content (rollback restored from backup).
         assert_eq!(fs::read(&dest_a).unwrap(), b"a v1");
+    }
+
+    #[test]
+    fn install_native_companions_clean_install_rolls_back_placed_files_on_tracking_write_failure() {
+        // Mirrors `install_native_agent_rollback_restores_when_tracking_write_fails`
+        // for the companion path's clean-install branch (no backups, only
+        // newly-placed files). The shrink test above covers `forced_overwrite
+        // = true` with non-empty backups; this test covers `forced_overwrite
+        // = false` with empty backups but non-empty `placed`.
+        //
+        // Pre-fix: if `rollback_companion_promotion(&placed, &backups)` ever
+        // shipped a regression that skipped the placed-file removal when
+        // `backups` was empty, a clean first-install with a tracking-write
+        // failure would leave orphan files at the destination — the user
+        // would then hit `OrphanFileAtDestination` on every subsequent
+        // install attempt with no obvious recovery path.
+        let (_dir, project) = temp_project();
+
+        let scratch = tempfile::tempdir().unwrap();
+        let scan_root = scratch.path().join("src");
+        fs::create_dir_all(scan_root.join("prompts")).unwrap();
+        fs::write(scan_root.join("prompts/a.md"), b"a v1").unwrap();
+        fs::write(scan_root.join("prompts/b.md"), b"b v1").unwrap();
+        let rel_paths = vec![PathBuf::from("prompts/a.md"), PathBuf::from("prompts/b.md")];
+        let source_hash = crate::hash::hash_artifact(&scan_root, &rel_paths).unwrap();
+
+        // Poison the atomic_write tmp path BEFORE the install so
+        // write_agent_tracking fails on the very first attempt — the
+        // companion promote already happened, but the tracking write is
+        // about to fail. Replacing the tracking file itself with a directory
+        // would make load_installed_agents fail before promote and never
+        // reach the rollback path.
+        let tmp_blocker = project.root.join(".kiro/installed-agents.tmp");
+        fs::create_dir_all(&tmp_blocker).unwrap();
+
+        let err = project
+            .install_native_companions(&NativeCompanionsInput {
+                scan_root: &scan_root,
+                rel_paths: &rel_paths,
+                marketplace: "m",
+                plugin: "p",
+                version: None,
+                source_hash: &source_hash,
+                mode: crate::service::InstallMode::New,
+            })
+            .expect_err("tracking write must fail with .tmp dir blocker in place");
+        assert!(matches!(err, AgentError::InstallFailed { .. }));
+
+        // Rollback contract: placed files must be removed so the user is
+        // not left with orphan files blocking future install attempts.
+        let dest_a = project.root.join(".kiro/agents/prompts/a.md");
+        let dest_b = project.root.join(".kiro/agents/prompts/b.md");
+        assert!(
+            !dest_a.exists(),
+            "clean-install rollback must remove placed file a.md after tracking-write failure"
+        );
+        assert!(
+            !dest_b.exists(),
+            "clean-install rollback must remove placed file b.md after tracking-write failure"
+        );
     }
 
     /// Fixture: a tempdir, a project, a single-file companion bundle

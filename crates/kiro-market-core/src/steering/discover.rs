@@ -91,19 +91,24 @@ pub fn discover_steering_files_in_dirs(
             let entry = match entry {
                 Ok(e) => e,
                 Err(e) => {
-                    warn!(
+                    // Demoted from `warn!` to `debug!`: the structured
+                    // warning below is the user-facing channel; a flaky FS
+                    // or intermittent EIO on a single entry doesn't need
+                    // to be in two places. Symlink/reparse skips below
+                    // also use `debug!` for the same reason.
+                    debug!(
                         dir = %dir.display(),
                         error = %e,
                         "failed to read directory entry; skipping"
                     );
-                    // Surface as a structured warning too — a flaky FS or
-                    // intermittent EIO on a single entry shouldn't vanish
-                    // into tracing-only output. Using ScanDirUnreadable
-                    // because the failure points at the dir we were
-                    // iterating; the entry itself never resolved.
+                    // Phrase the reason at the entry level — the directory
+                    // itself is readable (we got `entries` above); only one
+                    // entry failed. Saying "could not read steering scan
+                    // directory <dir>: entry read failed: ..." misled users
+                    // into checking the directory rather than the entry.
                     warnings.push(SteeringWarning::ScanDirUnreadable {
                         path: dir.clone(),
-                        reason: format!("entry read failed: {e}"),
+                        reason: format!("failed to read an entry in this directory: {e}"),
                     });
                     continue;
                 }
@@ -112,13 +117,14 @@ pub fn discover_steering_files_in_dirs(
             let metadata = match fs::symlink_metadata(&path) {
                 Ok(m) => m,
                 Err(e) => {
-                    warn!(
+                    debug!(
                         path = %path.display(),
                         error = %e,
                         "failed to stat steering candidate; skipping"
                     );
                     // Per-candidate stat failure is system-level and
-                    // user-actionable (perm, broken FS); surface it.
+                    // user-actionable (perm, broken FS); the structured
+                    // warning is the user-facing channel.
                     warnings.push(SteeringWarning::ScanDirUnreadable {
                         path: path.clone(),
                         reason: format!("stat failed: {e}"),
