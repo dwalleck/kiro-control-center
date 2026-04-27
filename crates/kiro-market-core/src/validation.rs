@@ -93,6 +93,105 @@ impl<'de> Deserialize<'de> for RelativePath {
     }
 }
 
+/// A string that has been validated as a safe agent / skill / plugin name.
+///
+/// Construction goes through [`AgentName::new`], which applies
+/// [`validate_name`] — so holding an `AgentName` is a static guarantee
+/// that the inner string passed name validation (non-empty, no path
+/// separators, no `..`, no NUL, no Windows reserved names, etc.).
+///
+/// The newtype replaces a plain `String` for the validated `name` field
+/// of [`crate::agent::parse_native::NativeAgentBundle`] so downstream
+/// install code never needs to re-validate. `Deserialize` calls `new`
+/// internally, so any future serializable type that embeds an
+/// `AgentName` rejects bad names at parse time.
+///
+/// The native-agent projection (`NativeAgentProjection`) deliberately
+/// keeps a raw `Option<String>` for the wire-format `name` field so the
+/// post-parse conversion can route into distinct
+/// [`crate::agent::parse_native::NativeParseFailure`] variants
+/// (`MissingName` vs `InvalidName(reason)` vs `InvalidJson`) — this
+/// granularity is part of the contract surfaced via
+/// `service::native_parse_failure_to_agent_error`.
+#[derive(Clone, Debug, Eq, Hash, PartialEq, Serialize)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
+#[serde(transparent)]
+pub struct AgentName(String);
+
+impl AgentName {
+    /// Construct an `AgentName` from any string-like value, validating it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ValidationError::InvalidName`] if the input fails
+    /// [`validate_name`].
+    pub fn new(value: impl Into<String>) -> Result<Self, ValidationError> {
+        let value = value.into();
+        validate_name(&value)?;
+        Ok(Self(value))
+    }
+
+    /// View the validated name as a `&str`.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Consume the newtype and return the inner `String`.
+    #[must_use]
+    pub fn into_inner(self) -> String {
+        self.0
+    }
+}
+
+impl TryFrom<&str> for AgentName {
+    type Error = ValidationError;
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+
+impl TryFrom<String> for AgentName {
+    type Error = ValidationError;
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+
+impl AsRef<str> for AgentName {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for AgentName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl PartialEq<str> for AgentName {
+    fn eq(&self, other: &str) -> bool {
+        self.0 == other
+    }
+}
+
+impl PartialEq<&str> for AgentName {
+    fn eq(&self, other: &&str) -> bool {
+        self.0 == *other
+    }
+}
+
+impl<'de> Deserialize<'de> for AgentName {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let s = String::deserialize(deserializer)?;
+        Self::new(s).map_err(serde::de::Error::custom)
+    }
+}
+
 /// Names reserved by Windows for legacy device handles. Trying to create
 /// a file or directory with one of these names (with or without extension)
 /// fails on Windows in interesting ways: the OS short-circuits the path to
@@ -567,5 +666,92 @@ mod tests {
         let err = serde_json::from_str::<Wrapper>(r#"{"path":""}"#)
             .expect_err("should reject empty path");
         assert!(err.to_string().contains("empty"), "got: {err}");
+    }
+
+    // -- AgentName -----------------------------------------------------
+
+    #[test]
+    fn agent_name_new_accepts_valid() {
+        let n = AgentName::new("rev").expect("valid name");
+        assert_eq!(n.as_str(), "rev");
+    }
+
+    #[test]
+    fn agent_name_new_rejects_traversal() {
+        let err = AgentName::new("../evil").expect_err("must reject");
+        assert!(err.to_string().contains(".."), "got: {err}");
+    }
+
+    #[test]
+    fn agent_name_new_rejects_empty() {
+        AgentName::new("").expect_err("must reject empty");
+    }
+
+    #[test]
+    fn agent_name_accessors_round_trip() {
+        let n = AgentName::new("rev").expect("valid name");
+        assert_eq!(n.as_str(), "rev");
+        assert_eq!(<AgentName as AsRef<str>>::as_ref(&n), "rev");
+        assert_eq!(format!("{n}"), "rev");
+        assert_eq!(n.clone().into_inner(), String::from("rev"));
+    }
+
+    #[test]
+    fn agent_name_partial_eq_against_str_and_ref_str() {
+        let n = AgentName::new("rev").expect("valid name");
+        // Both impls compile and evaluate — locks the ergonomic surface
+        // that downstream `assert_eq!(bundle.name, "rev")` relies on.
+        assert!(n == *"rev");
+        assert!(n == "rev");
+    }
+
+    #[derive(Debug, serde::Deserialize)]
+    struct AgentNameWrapper {
+        name: AgentName,
+    }
+
+    #[test]
+    fn deserialize_agent_name_accepts_valid() {
+        let w: AgentNameWrapper = serde_json::from_str(r#"{"name":"rev"}"#).expect("parse");
+        assert_eq!(w.name, "rev");
+    }
+
+    #[test]
+    fn deserialize_agent_name_rejects_traversal() {
+        let err = serde_json::from_str::<AgentNameWrapper>(r#"{"name":"../evil"}"#)
+            .expect_err("must reject");
+        assert!(
+            err.to_string().contains("..") || err.to_string().contains("name"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn deserialize_agent_name_rejects_empty() {
+        serde_json::from_str::<AgentNameWrapper>(r#"{"name":""}"#).expect_err("must reject empty");
+    }
+
+    #[test]
+    fn deserialize_agent_name_rejects_path_separator() {
+        serde_json::from_str::<AgentNameWrapper>(r#"{"name":"sub/dir"}"#)
+            .expect_err("must reject path separator");
+    }
+
+    #[test]
+    fn serialize_agent_name_is_transparent_string() {
+        // Locks the `#[serde(transparent)]` choice — without it the wire
+        // format becomes `{"0":"rev"}` and any future `AgentName`-bearing
+        // wire-format type silently shifts shape. Removing
+        // `#[serde(transparent)]` would break this assertion.
+        let n = AgentName::new("rev").expect("valid name");
+        assert_eq!(serde_json::to_string(&n).expect("ser"), r#""rev""#);
+    }
+
+    #[test]
+    fn agent_name_round_trips_through_serde_json() {
+        let original = AgentName::new("rev").expect("valid name");
+        let wire = serde_json::to_string(&original).expect("ser");
+        let parsed: AgentName = serde_json::from_str(&wire).expect("de");
+        assert_eq!(parsed, original);
     }
 }

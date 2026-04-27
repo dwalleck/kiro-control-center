@@ -379,6 +379,17 @@ pub struct PluginInstallContext {
     /// declares no agents. Consumed by
     /// [`MarketplaceService::install_plugin_agents`].
     pub agent_scan_paths: Vec<String>,
+    /// Directories to scan for steering `.md` files inside the plugin.
+    /// Derived from `plugin.json`'s `steering` field, or
+    /// [`crate::DEFAULT_STEERING_PATHS`] when the manifest is absent or
+    /// declares no steering paths. Consumed by
+    /// [`MarketplaceService::install_plugin_steering`].
+    pub steering_scan_paths: Vec<String>,
+    /// Authoring format declared by the plugin manifest. Drives dispatch
+    /// in [`MarketplaceService::install_plugin_agents`]: `Some(KiroCli)`
+    /// validates-and-copies native JSON; `None` (legacy) parses-and-translates
+    /// markdown agents.
+    pub format: Option<crate::plugin::PluginFormat>,
 }
 
 // ---------------------------------------------------------------------------
@@ -728,10 +739,14 @@ impl MarketplaceService {
         let version = manifest.as_ref().and_then(|m| m.version.clone());
         let skill_dirs = discover_skills_for_plugin(plugin_dir, manifest.as_ref());
         let agent_scan_paths = agent_scan_paths_for_plugin(manifest.as_ref());
+        let steering_scan_paths = steering_scan_paths_for_plugin(manifest.as_ref());
+        let format = manifest.as_ref().and_then(|m| m.format);
         Ok(PluginInstallContext {
             version,
             skill_dirs,
             agent_scan_paths,
+            steering_scan_paths,
+            format,
         })
     }
 }
@@ -869,6 +884,21 @@ fn agent_scan_paths_for_plugin(manifest: Option<&PluginManifest>) -> Vec<String>
         m.agents.clone()
     } else {
         crate::DEFAULT_AGENT_PATHS
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect()
+    }
+}
+
+/// Resolve the list of steering-scan paths a plugin declares, falling
+/// back to [`crate::DEFAULT_STEERING_PATHS`] when the manifest is absent
+/// or its `steering` list is empty. Mirrors
+/// [`agent_scan_paths_for_plugin`].
+fn steering_scan_paths_for_plugin(manifest: Option<&PluginManifest>) -> Vec<String> {
+    if let Some(m) = manifest.filter(|m| !m.steering.is_empty()) {
+        m.steering.clone()
+    } else {
+        crate::DEFAULT_STEERING_PATHS
             .iter()
             .map(|s| (*s).to_string())
             .collect()
@@ -2865,5 +2895,70 @@ mod tests {
             "manifest declares no skills and no skills/ tree exists, got: {:?}",
             ctx.skill_dirs
         );
+    }
+
+    #[test]
+    fn resolve_plugin_install_context_uses_default_steering_when_absent() {
+        let (dir, _svc) = temp_service();
+        let plugin_dir = dir.path().join("plugin");
+        fs::create_dir_all(&plugin_dir).expect("create plugin dir");
+
+        let ctx = MarketplaceService::resolve_plugin_install_context_from_dir(&plugin_dir)
+            .expect("absent manifest must yield default steering paths");
+        assert_eq!(
+            ctx.steering_scan_paths,
+            crate::DEFAULT_STEERING_PATHS
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect::<Vec<_>>(),
+            "absent manifest must fall back to DEFAULT_STEERING_PATHS"
+        );
+    }
+
+    #[test]
+    fn resolve_plugin_install_context_uses_manifest_steering_when_declared() {
+        let (dir, _svc) = temp_service();
+        let plugin_dir = dir.path().join("plugin");
+        fs::create_dir_all(&plugin_dir).expect("create plugin dir");
+        fs::write(
+            plugin_dir.join("plugin.json"),
+            br#"{"name": "p", "steering": ["./guide/", "./extras/"]}"#,
+        )
+        .expect("write plugin.json");
+
+        let ctx = MarketplaceService::resolve_plugin_install_context_from_dir(&plugin_dir)
+            .expect("happy path");
+        assert_eq!(
+            ctx.steering_scan_paths,
+            vec!["./guide/".to_string(), "./extras/".to_string()]
+        );
+    }
+
+    #[test]
+    fn resolve_plugin_install_context_reads_format_kiro_cli() {
+        let (dir, _svc) = temp_service();
+        let plugin_dir = dir.path().join("plugin");
+        fs::create_dir_all(&plugin_dir).expect("create plugin dir");
+        fs::write(
+            plugin_dir.join("plugin.json"),
+            br#"{"name": "p", "format": "kiro-cli"}"#,
+        )
+        .expect("write plugin.json");
+
+        let ctx = MarketplaceService::resolve_plugin_install_context_from_dir(&plugin_dir)
+            .expect("happy path");
+        assert_eq!(ctx.format, Some(crate::plugin::PluginFormat::KiroCli));
+    }
+
+    #[test]
+    fn resolve_plugin_install_context_format_absent_is_none() {
+        let (dir, _svc) = temp_service();
+        let plugin_dir = dir.path().join("plugin");
+        fs::create_dir_all(&plugin_dir).expect("create plugin dir");
+        fs::write(plugin_dir.join("plugin.json"), br#"{"name": "p"}"#).expect("write plugin.json");
+
+        let ctx = MarketplaceService::resolve_plugin_install_context_from_dir(&plugin_dir)
+            .expect("happy path");
+        assert!(ctx.format.is_none());
     }
 }

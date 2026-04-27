@@ -3300,6 +3300,7 @@ dependencies = [
  "gix",
  "hex",
  "junction",
+ "kiro-market-core",
  "rstest",
  "serde",
  "serde_json",
@@ -7158,6 +7159,16 @@ dependencies = [
  "libc",
  "once_cell",
  "pkg-config",
+]
+
+[[package]]
+name = "xtask"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "serde",
+ "serde_json",
+ "toml 0.8.2",
 ]
 
 [[package]]

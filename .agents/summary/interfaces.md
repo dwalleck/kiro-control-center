@@ -1,236 +1,176 @@
 # Interfaces
 
-## CLI Interface
+## Tauri IPC Commands
 
-The CLI (`kiro-market`) exposes commands via clap derive:
+All commands are registered in `src-tauri/src/lib.rs` via `tauri-specta`. TypeScript bindings are auto-generated in `src/lib/bindings.ts`.
+
+### Browse Commands
+
+| Command | Parameters | Returns | Purpose |
+|---------|-----------|---------|---------|
+| `list_marketplaces` | — | `MarketplaceInfo[]` | List registered marketplaces with metadata |
+| `list_plugins` | `marketplace: string` | `PluginInfo[]` | List plugins in a marketplace |
+| `list_available_skills` | `marketplace: string, plugin: string` | `PluginSkillsResult` | List skills for a specific plugin |
+| `list_all_skills_for_marketplace` | `marketplace: string` | `BulkSkillsResult` | List all skills across all plugins in a marketplace |
+| `install_skills` | `marketplace, plugin, skills?, force?, accept_mcp?` | `InstallResult` | Install skills/agents from a plugin |
+| `get_project_info` | — | `ProjectInfo` | Get active project path and status |
+
+### Installed Commands
+
+| Command | Parameters | Returns | Purpose |
+|---------|-----------|---------|---------|
+| `list_installed_skills` | — | `InstalledSkillInfo[]` | List skills installed in active project |
+| `remove_skill` | `name: string` | — | Remove an installed skill |
+
+### Marketplace Commands
+
+| Command | Parameters | Returns | Purpose |
+|---------|-----------|---------|---------|
+| `add_marketplace` | `source: string` | `MarketplaceAddResult` | Register a new marketplace |
+| `remove_marketplace` | `name: string` | — | Unregister a marketplace |
+| `update_marketplace` | `name?: string` | `UpdateResult` | Pull latest from remote |
+
+### Settings Commands
+
+| Command | Parameters | Returns | Purpose |
+|---------|-----------|---------|---------|
+| `get_settings` | — | `Settings` | Load app settings |
+| `save_scan_roots` | `roots: string[]` | — | Save project scan root paths |
+| `discover_projects` | — | `DiscoveredProject[]` | Scan for Kiro projects |
+| `set_active_project` | `path: string` | — | Set the active project |
+
+### Kiro Settings Commands
+
+| Command | Parameters | Returns | Purpose |
+|---------|-----------|---------|---------|
+| `get_kiro_settings` | — | `ResolvedSettings` | Load `.kiro/settings.json` with defaults |
+| `set_kiro_setting` | `key: string, value: JsonValue` | — | Set a setting value |
+| `reset_kiro_setting` | `key: string` | — | Remove a setting (revert to default) |
+
+---
+
+## CLI Interface (kiro-market)
 
 ```
 kiro-market [OPTIONS] <COMMAND>
 
 Commands:
-  marketplace   Manage marketplace sources (add, list, update, remove)
-  search        Search plugins across all registered marketplaces
-  install       Install a plugin (or a specific skill from a plugin)
-  list          List all installed skills in the current project
-  update        Update installed plugins (or a specific one)
-  remove        Remove an installed skill from the current project
-  info          Show detailed information about a plugin
-  cache         Inspect or clean up the on-disk cache
+  marketplace   Manage marketplace sources
+    add <source> [--protocol https|ssh] [--allow-insecure-http]
+    list
+    update [name]
+    remove <name>
+  search [query]
+  install <plugin@marketplace> [--skill <name>] [--force] [--accept-mcp]
+  list
+  update [plugin_ref]
+  remove <skill-name>
+  info <plugin@marketplace>
+  cache
+    prune [--dry-run]
 
 Options:
-  -v, --verbose   Increase verbosity (-v, -vv, -vvv)
+  -v, -vv, -vvv    Increase verbosity
+  --version        Show version
+  --help           Show help
 ```
 
-### Plugin Reference Format
+**Plugin reference format:** `plugin@marketplace` (split on first `@`)
 
-`plugin@marketplace` — e.g., `dotnet@dotnet-agent-skills`
-
-Parsed by `parse_plugin_ref()` which splits on the first `@`.
-
-## Tauri IPC Interface
-
-The desktop app exposes Rust functions to the frontend via `tauri-specta`. TypeScript bindings are auto-generated at `src/lib/bindings.ts`.
-
-### Browse Commands
-
-```typescript
-listMarketplaces(): Promise<MarketplaceInfo[]>
-listPlugins(marketplace: string): Promise<PluginInfo[]>
-listAvailableSkills(marketplace: string, plugin: string): Promise<SkillInfo[]>
-listAllSkillsForMarketplace(marketplace: string): Promise<BulkSkillsResult>
-installSkills(marketplace: string, plugin: string, skills: string[], force: boolean): Promise<InstallResult>
-getProjectInfo(): Promise<ProjectInfo>
-```
-
-### Installed Commands
-
-```typescript
-listInstalledSkills(): Promise<InstalledSkillInfo[]>
-removeSkill(name: string): Promise<void>
-```
-
-### Marketplace Commands
-
-```typescript
-addMarketplace(source: string): Promise<MarketplaceInfo>
-removeMarketplace(name: string): Promise<void>
-updateMarketplace(name: string): Promise<void>
-```
-
-### Settings Commands
-
-```typescript
-getSettings(): Promise<Settings>
-saveScanRoots(roots: string[]): Promise<void>
-discoverProjects(): Promise<DiscoveredProject[]>
-setActiveProject(path: string): Promise<ProjectInfo>
-getKiroSettings(): Promise<SettingEntry[]>
-setKiroSetting(key: string, value: JsonValue): Promise<SettingEntry>
-resetKiroSetting(key: string): Promise<SettingEntry>
-```
+---
 
 ## Core Library Public API
 
-### MarketplaceService
+### MarketplaceService<G: GitBackend>
 
 ```rust
-impl MarketplaceService {
-    pub fn new(cache: CacheDir, git: impl GitBackend) -> Self;
-    pub fn add(source: &str, options: MarketplaceAddOptions) -> Result<MarketplaceAddResult>;
-    pub fn remove(name: &str) -> Result<()>;
-    pub fn update(name: Option<&str>) -> Result<UpdateResult>;
-    pub fn list() -> Result<Vec<KnownMarketplace>>;
-    pub fn marketplace_path(name: &str) -> PathBuf;
-    pub fn list_plugin_entries(marketplace: &str) -> Result<Vec<PluginEntry>>;
-    pub fn install_skills(project: &KiroProject, ...) -> Result<InstallSkillsResult>;
-    pub fn install_plugin_agents(project: &KiroProject, ...) -> Result<InstallAgentsResult>;
-}
+// Marketplace lifecycle
+fn add(opts: MarketplaceAddOptions) -> Result<MarketplaceAddResult>
+fn remove(name: &str) -> Result<()>
+fn update(name: Option<&str>) -> Result<UpdateResult>
+fn list() -> Result<Vec<KnownMarketplace>>
+
+// Plugin operations
+fn list_plugin_entries(marketplace: &str) -> Result<Vec<PluginEntry>>
+fn marketplace_path(name: &str) -> PathBuf
+
+// Skill browsing
+fn list_skills_for_plugin(marketplace, plugin, installed) -> Result<PluginSkillsResult>
+fn list_all_skills(marketplace, installed) -> BulkSkillsResult
+fn count_skills_for_plugin(marketplace, plugin) -> SkillCount
+
+// Installation
+fn install_skills(context, project, filter, mode) -> InstallSkillsResult
+fn install_plugin_agents(context, project, accept_mcp, mode) -> InstallAgentsResult
+fn install_plugin_steering(context, project, mode) -> InstallSteeringResult
 ```
 
 ### KiroProject
 
 ```rust
-impl KiroProject {
-    pub fn new(root: &Path) -> Self;
-    pub fn install_skill_from_dir(name: &str, source: &Path) -> Result<()>;
-    pub fn install_skill_from_dir_force(name: &str, source: &Path) -> Result<()>;
-    pub fn remove_skill(name: &str) -> Result<()>;
-    pub fn load_installed() -> Result<InstalledSkills>;
-    pub fn install_agent(def: &AgentDefinition, meta: InstalledAgentMeta) -> Result<()>;
-    pub fn install_agent_force(def: &AgentDefinition, meta: InstalledAgentMeta) -> Result<()>;
-    pub fn load_installed_agents() -> Result<InstalledAgents>;
-}
+fn new(kiro_dir: PathBuf) -> Self
+fn install_skill_from_dir(name, source_dir, version?, marketplace?, plugin?) -> Result<()>
+fn install_skill_from_dir_force(name, source_dir, ...) -> Result<()>
+fn remove_skill(name: &str) -> Result<()>
+fn load_installed() -> Result<InstalledSkills>
+fn install_agent(definition, marketplace, plugin, mode) -> Result<()>
+fn install_native_agent(source, name, marketplace, plugin, mode) -> Result<InstalledNativeAgentOutcome>
+fn install_steering_file(source, name, marketplace, plugin, mode) -> Result<()>
+```
+
+### CacheDir
+
+```rust
+fn default_location() -> PathBuf  // ~/.cache/kiro-market/
+fn detect(source: &str) -> MarketplaceSource
+fn add_known_marketplace(name, source, protocol?) -> Result<()>
+fn remove_known_marketplace(name: &str) -> Result<()>
+fn load_known_marketplaces() -> Result<Vec<KnownMarketplace>>
+fn prune_orphans(mode: PruneMode) -> Result<PruneReport>
 ```
 
 ### GitBackend Trait
 
 ```rust
-pub trait GitBackend {
-    fn clone_repo(url: &str, dest: &Path, options: &CloneOptions) -> Result<()>;
-    fn pull_repo(path: &Path) -> Result<()>;
+trait GitBackend {
+    fn clone_repo(url: &str, dest: &Path, options: &CloneOptions) -> Result<String>;
+    fn pull_repo(path: &Path) -> Result<String>;
     fn verify_sha(path: &Path, expected: &str) -> Result<()>;
 }
 ```
 
-## File System Interfaces
+---
 
-### Marketplace Manifest
+## File Format Interfaces
 
-Located at `.claude-plugin/marketplace.json` within a marketplace repo:
+### marketplace.json (in marketplace repos)
 
 ```json
 {
-  "name": "marketplace-name",
-  "description": "Optional description",
   "plugins": [
     {
       "name": "plugin-name",
-      "description": "Optional",
-      "source": "relative/path"
+      "description": "Optional description",
+      "path": "./relative/path",
+      "source": { "github": "owner/repo" }  // or git_url, or relative path
     }
   ]
 }
 ```
 
-### Plugin Manifest
-
-Located at `plugin.json` within a plugin directory:
+### plugin.json (in plugin directories)
 
 ```json
 {
   "name": "plugin-name",
   "description": "Optional",
   "skills": ["./skills/"],
-  "agents": ["./agents/"]
+  "agents": ["./agents/"],
+  "steering": ["./steering/"],
+  "format": "kiro-cli"  // optional, triggers native agent handling
 }
 ```
 
-### Skill File
+### .kiro/settings.json
 
-Located at `SKILL.md` with YAML frontmatter:
-
-```markdown
----
-name: skill-name
-description: What this skill does
-invocable: true
----
-
-Skill content in markdown...
-```
-
-### Agent File (Claude Format)
-
-```markdown
----
-name: agent-name
-description: Optional
-model: optional-model
-tools:
-  - Read
-  - Edit
----
-
-Agent prompt content...
-```
-
-### Agent File (Copilot Format)
-
-`*.agent.md` with YAML frontmatter including `tools` list and optional `mcpServers` configuration.
-
-### Installed Skills Tracking
-
-`.kiro/installed-skills.json`:
-
-```json
-{
-  "skills": {
-    "skill-name": {
-      "marketplace": "marketplace-name",
-      "plugin": "plugin-name",
-      "installed_at": "2024-01-01T00:00:00Z"
-    }
-  }
-}
-```
-
-### Installed Agents Tracking
-
-`.kiro/installed-agents.json`:
-
-```json
-{
-  "agents": {
-    "agent-name": {
-      "marketplace": "marketplace-name",
-      "plugin": "plugin-name",
-      "dialect": "claude",
-      "installed_at": "2024-01-01T00:00:00Z"
-    }
-  }
-}
-```
-
-### Cache Structure
-
-```
-~/.cache/kiro-market/
-├── known_marketplaces.json
-├── marketplaces/
-│   └── <name>/              # Cloned/linked marketplace repos
-├── plugins/
-│   └── <marketplace>/<plugin>/  # Resolved plugin directories
-└── registries/
-    └── <marketplace>.json   # Persisted plugin registry
-```
-
-### Desktop App Settings
-
-`~/.config/kiro-control-center/settings.json`:
-
-```json
-{
-  "scan_roots": ["/path/to/projects"],
-  "last_project": "/path/to/last/project"
-}
-```
+Typed key-value store with dotted paths (e.g., `"editor.tabSize"`). Schema defined in `kiro_settings.rs` registry.

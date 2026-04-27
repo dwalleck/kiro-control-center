@@ -12,7 +12,7 @@ workspace = true
 default = []
 cli = ["clap"]
 specta = ["dep:specta"]
-test-support = ["dep:tempfile"]
+test-support = []
 
 [dependencies]
 serde = { workspace = true }
@@ -38,7 +38,10 @@ specta = { version = "2.0.0-rc.24", optional = true, features = ["derive", "serd
 # the resolved feature list contains `ssl` so this regression cannot
 # return unnoticed.
 curl = { workspace = true }
-tempfile = { workspace = true, optional = true }
+# Runtime dep: production install paths use tempfile::TempDir for staging
+# directories so the OS-cleanup-on-Drop semantic replaces hand-rolled
+# unique-name generation + leftover-orphan sweeping.
+tempfile = { workspace = true }
 
 [target.'cfg(windows)'.dependencies]
 junction = { workspace = true }
@@ -46,3 +49,11 @@ junction = { workspace = true }
 [dev-dependencies]
 rstest = { workspace = true }
 tempfile = { workspace = true }
+# Self-cycle dev-dep activates the `test-support` feature for unit AND
+# integration tests in this crate. Cargo handles the self-reference for
+# dev-deps (no transitive recursion). Without this, integration tests in
+# `tests/` cannot reach the `service::test_support` module (it's gated on
+# `cfg(any(test, feature = "test-support"))`, and external test compilation
+# units don't get `cfg(test)` for their dependencies). Pattern documented
+# at https://github.com/rust-lang/cargo/issues/2911.
+kiro-market-core = { path = ".", features = ["test-support"] }

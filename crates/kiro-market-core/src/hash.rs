@@ -66,12 +66,18 @@ pub fn hash_artifact(base: &Path, relative_paths: &[PathBuf]) -> Result<String, 
             path: abs.clone(),
             source: e,
         })?;
-        if md.file_type().is_symlink() {
+        // Use is_reparse_or_symlink (not is_symlink) so Windows directory
+        // junctions and other reparse-point flavors are also caught — a
+        // junction substituted between walk and read would otherwise slip
+        // past `is_symlink()` (which returns false for
+        // IO_REPARSE_TAG_MOUNT_POINT) and let the read traverse outside
+        // the install boundary.
+        if crate::platform::is_reparse_or_symlink(&md) {
             return Err(HashError::ReadFailed {
                 path: abs.clone(),
                 source: std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
-                    "symlink appeared between walk and read",
+                    "symlink or reparse point appeared between walk and read",
                 ),
             });
         }
@@ -131,10 +137,13 @@ fn walk_collect(root: &Path, current: &Path, out: &mut Vec<PathBuf>) -> Result<(
             path: path.clone(),
             source: e,
         })?;
-        let ft = md.file_type();
-        if ft.is_symlink() {
+        // is_reparse_or_symlink catches Windows directory junctions
+        // (which is_symlink misses) — a junction inside the source
+        // tree would otherwise let the walker traverse outside `root`.
+        if crate::platform::is_reparse_or_symlink(&md) {
             continue;
         }
+        let ft = md.file_type();
         if ft.is_dir() {
             walk_collect(root, &path, out)?;
         } else if ft.is_file() {

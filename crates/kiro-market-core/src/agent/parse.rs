@@ -43,6 +43,12 @@ pub fn parse_agent_file(path: &Path) -> Result<AgentDefinition, AgentError> {
     let result = match dialect {
         AgentDialect::Claude => parse_claude_agent(&content),
         AgentDialect::Copilot => parse_copilot_agent(&content),
+        // Defensive sanity check: the service routes Native dialect to
+        // `install_native_kiro_cli_agents_inner`, never here. If we reach
+        // this arm, the upstream dispatch is buggy. Use the dedicated
+        // variant rather than the IoError sentinel so callers branching
+        // on "transient I/O — retry?" don't misclassify the routing bug.
+        AgentDialect::Native => Err(ParseFailure::UnsupportedDialect),
     };
     result.map_err(|failure| AgentError::ParseFailed {
         path: path.to_path_buf(),

@@ -7,12 +7,18 @@ mod frontmatter;
 mod parse;
 mod parse_claude;
 mod parse_copilot;
+pub mod parse_native;
 pub mod tools;
 pub mod types;
 
+pub use discover::{
+    DiscoveredNativeFile, discover_agents_in_dirs, discover_native_companion_files,
+    discover_native_kiro_agents_in_dirs,
+};
 pub use parse::{detect_dialect, parse_agent_file};
 pub use parse_claude::parse_claude_agent;
 pub use parse_copilot::parse_copilot_agent;
+pub use parse_native::{NativeAgentBundle, NativeParseFailure, parse_native_kiro_agent_file};
 pub use types::{AgentDefinition, AgentDialect, ParseFailure};
 
 #[cfg(test)]

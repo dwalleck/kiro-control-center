@@ -6,8 +6,8 @@
         "hooks": [
           {
             "type": "command",
-            "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/block-cargo-lock.sh",
-            "timeout": 5
+            "command": "cd \"$CLAUDE_PROJECT_DIR\" && cargo xtask hook-block-cargo-lock",
+            "timeout": 30
           }
         ]
       }
@@ -18,12 +18,7 @@
         "hooks": [
           {
             "type": "command",
-            "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/rustfmt.sh",
-            "timeout": 15
-          },
-          {
-            "type": "command",
-            "command": "\"$CLAUDE_PROJECT_DIR\"/.claude/hooks/clippy.sh",
+            "command": "cd \"$CLAUDE_PROJECT_DIR\" && cargo xtask hook-post-edit",
             "timeout": 60
           }
         ]

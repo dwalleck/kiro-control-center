@@ -29,7 +29,7 @@ jobs:
         run: |
           git fetch origin ${{ github.base_ref }}
           COMMITS=$(git log --format="%s" origin/${{ github.base_ref }}..HEAD)
-          PATTERN="^(feat|fix|docs|style|refactor|perf|test|build|ci|chore)(\([a-z][a-z0-9-]*\))?!?: .{3,}"
+          PATTERN="^(feat|fix|docs|style|refactor|perf|test|build|ci|chore|review)(\([a-z][a-z0-9-]*\))?!?: .{3,}"
           FAILED=0
           while IFS= read -r msg; do
             if [[ -z "$msg" ]]; then continue; fi
@@ -43,7 +43,7 @@ jobs:
           if [[ $FAILED -eq 1 ]]; then
             echo ""
             echo "Expected format: <type>[optional scope]: <description>"
-            echo "Valid types: feat, fix, docs, style, refactor, perf, test, build, ci, chore"
+            echo "Valid types: feat, fix, docs, style, refactor, perf, test, build, ci, chore, review"
             exit 1
           fi
 

@@ -1,131 +1,110 @@
 # Architecture
 
-## System Overview
+## Design Philosophy
 
-Kiro Control Center follows a layered architecture with a shared core library consumed by two frontends (CLI and desktop GUI).
+**Shared core, thin frontends.** All business logic lives in `kiro-market-core`. The CLI (`kiro-market`) and desktop app (`kiro-control-center`) are presentation-only wrappers that delegate to the core library. This ensures behavior parity between interfaces and keeps the test surface concentrated.
+
+## System Layers
 
 ```mermaid
 graph TB
     subgraph Frontends
-        CLI[kiro-market CLI]
-        GUI[kcc Desktop App]
+        CLI["kiro-market (CLI)"]
+        Desktop["kcc (Tauri Desktop)"]
     end
 
-    subgraph "kiro-market-core (shared library)"
-        SVC[MarketplaceService]
-        PRJ[KiroProject]
-        CACHE[CacheDir]
-        GIT[Git Operations]
-        PLUGIN[Plugin Discovery]
-        SKILL[Skill Parsing]
-        AGENT[Agent Parsing/Emit]
-        LOCK[File Locking]
-        VALID[Validation]
-        SETTINGS[Kiro Settings]
+    subgraph Core["kiro-market-core"]
+        Service["MarketplaceService<br/>orchestrator"]
+        Project["KiroProject<br/>disk operations"]
+        Cache["CacheDir<br/>marketplace storage"]
+        Git["Git Backend<br/>gix + CLI"]
+        Agent["Agent Module<br/>parse/emit/discover"]
     end
 
-    subgraph "External"
-        FS[File System]
-        REPO[Git Repositories]
-        KIRO[.kiro/ Project Dir]
+    subgraph Storage["On-Disk State"]
+        CacheFS["~/.cache/kiro-market/"]
+        ProjectFS[".kiro/ directory"]
     end
 
-    CLI --> SVC
-    GUI --> SVC
-    GUI --> PRJ
-    GUI --> SETTINGS
-    SVC --> CACHE
-    SVC --> GIT
-    SVC --> PLUGIN
-    SVC --> SKILL
-    SVC --> AGENT
-    SVC --> LOCK
-    SVC --> VALID
-    PRJ --> FS
-    PRJ --> KIRO
-    GIT --> REPO
-    CACHE --> FS
+    CLI --> Service
+    Desktop -->|"IPC (tauri-specta)"| Service
+    Service --> Project
+    Service --> Cache
+    Service --> Git
+    Service --> Agent
+    Cache --> CacheFS
+    Project --> ProjectFS
 ```
 
-## Architectural Patterns
+## Key Architectural Decisions
 
-### Shared Core, Thin Frontends
+### 1. Generic Git Backend
 
-The `kiro-market-core` crate contains all business logic. Both the CLI (`kiro-market`) and the desktop app (`kiro-control-center`) are thin presentation layers that call into the core. This ensures consistent behavior regardless of interface.
+`MarketplaceService` is generic over a `GitBackend` trait. Production uses `GixCliBackend` (tries gix first, falls back to git CLI). Tests inject mock backends for deterministic behavior without network access.
 
-### Service Layer Pattern
+### 2. File-Based State (No Database)
 
-`MarketplaceService` is the primary orchestrator. It coordinates:
-- Marketplace registration (clone/link/copy)
-- Plugin discovery and registry management
-- Skill/agent installation into projects
-
-The service accepts a `GitBackend` trait for testability — production uses real git, tests inject mocks.
-
-### File-Based State with Locking
-
-All persistent state is stored as JSON files on disk:
+All persistence is JSON on disk:
 - `~/.cache/kiro-market/` — marketplace clones, plugin registries
-- `.kiro/installed-skills.json` — per-project skill tracking
-- `.kiro/installed-agents.json` — per-project agent tracking
+- `.kiro/installed-skills.json` — installed skill tracking
+- `.kiro/installed-agents.json` — installed agent tracking
+- `.kiro/settings.json` — project-level Kiro settings
 
-Concurrent access is serialized via `fs4` file locks (`file_lock.rs`).
+Concurrent access is serialized via `fs4` file locks.
 
-### RAII Cleanup Guards
+### 3. RAII Cleanup Guards
 
-`DirCleanupGuard` ensures temporary/staging directories are removed on failure. The guard can be `defuse()`d on success or `retarget()`ed to a different path. This prevents orphaned temp dirs from interrupted operations.
+`DirCleanupGuard` auto-removes staging directories on failure (Drop). Call `.defuse()` on success to keep the directory. This prevents orphaned temp dirs from interrupted operations.
 
-### Dual Git Backend
+### 4. Typed IPC via tauri-specta
 
-Git operations use `gix` (pure Rust) as the primary backend with a CLI fallback (`git` subprocess). If `gix` fails (e.g., auth issues), the system tries the CLI backend. Both errors are combined for diagnostics.
+Tauri commands are defined in Rust with `specta::Type` derives. The `generate_types` test produces `bindings.ts` with full TypeScript types for all commands and their return types. The frontend never uses untyped `invoke()`.
 
-### Typed IPC (Tauri + Specta)
+### 5. Dual Git Backend Strategy
 
-The desktop app uses `tauri-specta` to generate TypeScript bindings from Rust command signatures. This provides compile-time type safety across the IPC boundary. Bindings are regenerated via a test:
+```mermaid
+flowchart LR
+    Clone["clone_repo()"] --> Gix["Try gix"]
+    Gix -->|success| Done["Return OK"]
+    Gix -->|failure| CLI["Try git CLI"]
+    CLI -->|success| Done
+    CLI -->|failure| Combined["Combine both errors"]
 ```
-cargo test -p kiro-control-center --lib -- --ignored generate_types
-```
 
-### Feature Flags
+`gix` provides pure-Rust git without subprocess overhead. The CLI fallback handles edge cases (auth helpers, unusual SSH configs). Both errors are combined for diagnostics.
 
-The core library uses Cargo features for optional functionality:
-- `cli` — enables `clap` derive on types (used by CLI crate)
-- `specta` — enables specta derive for TypeScript binding generation (used by Tauri crate)
-- `test-support` — exposes test utilities
+### 6. Platform Abstraction
+
+Local marketplaces use OS-native linking:
+- **Unix**: symlinks
+- **Windows**: NTFS junctions (preferred), recursive copy (fallback)
+
+`MarketplaceStorage` enum tracks which method was used so the UI can warn about copy-mode limitations.
 
 ## Security Architecture
 
-### Path Traversal Prevention
+```mermaid
+flowchart TD
+    Input["User Input"] --> Validate["validate_name()<br/>validate_relative_path()"]
+    Validate -->|pass| Process["Process Request"]
+    Validate -->|fail| Reject["Return ValidationError"]
+    
+    Process --> PathCheck["RelativePath newtype<br/>enforces at construction"]
+    Process --> MCPCheck["MCP opt-in gate<br/>--accept-mcp required"]
+    Process --> TLSCheck["TLS enforcement<br/>reject http:// by default"]
+    Process --> LinkCheck["Symlink rejection<br/>in copy_dir_recursive"]
+```
 
-All user-supplied names and paths are validated through `validation.rs`:
-- `validate_name()` — rejects `/`, `\`, `..`, Windows reserved names, control chars
-- `validate_relative_path()` — rejects absolute paths, parent traversal, backslashes, NUL bytes
-- `RelativePath` newtype — validated at construction, cannot be created with unsafe content
+**Invariants:**
+1. All user-supplied names pass `validate_name()` (rejects traversal, reserved names, control chars)
+2. All paths use `RelativePath` newtype (rejects absolute paths, `..`, backslash)
+3. MCP agents require explicit `--accept-mcp` opt-in
+4. `http://` sources rejected unless `--allow-insecure-http` passed
+5. `copy_dir_recursive` skips symlinks and hardlinks in source trees
+6. Workspace-level `unsafe_code = "forbid"`
 
-### MCP Agent Gating
+## Error Handling Strategy
 
-Agents with MCP server configurations (which can execute arbitrary processes) require explicit `--accept-mcp` opt-in. Without it, MCP-bearing agents are skipped with a warning.
+Errors are organized into domain-specific enums (`MarketplaceError`, `PluginError`, `SkillError`, `AgentError`, `GitError`) unified by a top-level `Error` enum with `From` conversions. Each variant carries enough context for actionable error messages (paths, names, source chains).
 
-### TLS Enforcement
-
-HTTP marketplace sources are rejected by default. The `--allow-insecure-http` flag must be explicitly passed. CI asserts that `curl-sys` is built with the `ssl` feature to prevent silent plaintext fallback.
-
-### Symlink/Hardlink Rejection
-
-`copy_dir_recursive` skips symlinks and hardlinks in source trees to prevent escape-to-arbitrary-path attacks during skill installation.
-
-## Error Handling
-
-The crate uses a structured error hierarchy (`error.rs`):
-- `Error` — top-level enum with variants for each subsystem
-- `MarketplaceError`, `PluginError`, `SkillError`, `AgentError`, `GitError`, `ValidationError`
-- `error_full_chain()` / `error_source_chain()` — utilities for formatting nested error chains
-
-The Tauri layer maps core errors to `CommandError` with typed `ErrorType` variants for frontend consumption.
-
-## Platform Handling
-
-`platform.rs` abstracts OS-specific behavior:
-- **Unix**: symlinks for local marketplace linking
-- **Windows**: NTFS junctions (preferred), with recursive copy as fallback
-- Detection via `is_local_link()`, creation via `create_local_link()`, removal via `remove_local_link()`
+The Tauri layer wraps core errors into `CommandError` with an `ErrorType` discriminant for frontend-friendly categorization.

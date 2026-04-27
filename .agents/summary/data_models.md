@@ -1,235 +1,161 @@
 # Data Models
 
+## On-Disk State Files
+
+### ~/.cache/kiro-market/known-marketplaces.json
+
+```json
+[
+  {
+    "name": "dotnet-agent-skills",
+    "source": "https://github.com/microsoft/dotnet-agent-skills.git"
+  }
+]
+```
+
+### ~/.cache/kiro-market/registries/{marketplace}.json
+
+Plugin registry persisted after marketplace add/update:
+
+```json
+[
+  {
+    "name": "dotnet",
+    "description": "EF Core and .NET skills",
+    "path": "./dotnet",
+    "source": null
+  }
+]
+```
+
+### .kiro/installed-skills.json
+
+```json
+{
+  "skills": {
+    "efcore": {
+      "marketplace": "dotnet-agent-skills",
+      "plugin": "dotnet",
+      "version": "abc1234",
+      "installed_at": "2025-01-15T10:30:00Z",
+      "source_hash": "blake3:abcdef...",
+      "installed_hash": "blake3:123456..."
+    }
+  }
+}
+```
+
+### .kiro/installed-agents.json
+
+```json
+{
+  "agents": {
+    "my-agent": {
+      "marketplace": "dotnet-agent-skills",
+      "plugin": "dotnet",
+      "dialect": "claude",
+      "installed_at": "2025-01-15T10:30:00Z",
+      "source_hash": "blake3:abcdef...",
+      "installed_hash": "blake3:123456...",
+      "native_companions": {}
+    }
+  }
+}
+```
+
+### .kiro/installed-steering.json
+
+```json
+{
+  "files": {
+    "review-process.md": {
+      "marketplace": "dotnet-agent-skills",
+      "plugin": "dotnet",
+      "installed_at": "2025-01-15T10:30:00Z",
+      "source_hash": "blake3:abcdef...",
+      "installed_hash": "blake3:123456..."
+    }
+  }
+}
+```
+
+---
+
 ## Core Domain Types
 
-### Marketplace Layer
+### MarketplaceSource (enum)
+
+Detected from user input string:
 
 ```mermaid
-classDiagram
-    class Marketplace {
-        +String name
-        +Option~String~ description
-        +Vec~PluginEntry~ plugins
-        +from_json(value) Result~Marketplace~
-    }
-
-    class PluginEntry {
-        +String name
-        +Option~String~ description
-        +PluginSource source
-    }
-
-    class PluginSource {
-        <<enum>>
-        RelativePath(String)
-        Structured(StructuredSource)
-    }
-
-    class StructuredSource {
-        +String url
-        +Option~String~ subdir
-        +Option~String~ git_ref
-        +Option~String~ sha
-    }
-
-    Marketplace --> PluginEntry
-    PluginEntry --> PluginSource
-    PluginSource --> StructuredSource
+flowchart LR
+    Input["source string"] --> Detect["CacheDir::detect()"]
+    Detect --> GH["GitHubShorthand<br/>owner/repo"]
+    Detect --> URL["GitUrl<br/>https:// or git@"]
+    Detect --> HTTP["HttpUrl<br/>http://"]
+    Detect --> File["FileUrl<br/>file://"]
+    Detect --> Local["LocalPath<br/>./path or /abs"]
 ```
 
-### Cache Layer
+### AgentDefinition
 
-```mermaid
-classDiagram
-    class CacheDir {
-        +PathBuf root
-        +default_location() PathBuf
-        +with_root(path) Self
-        +marketplace_path(name) PathBuf
-        +plugin_path(marketplace, plugin) PathBuf
-        +ensure_dirs() Result
-        +prune_orphans(mode) Result~PruneReport~
-    }
+Unified representation after parsing any dialect:
 
-    class KnownMarketplace {
-        +String name
-        +MarketplaceSource source
-        +GitProtocol protocol
-    }
+| Field | Type | Description |
+|-------|------|-------------|
+| `name` | `String` | Agent identifier |
+| `description` | `Option<String>` | Human-readable description |
+| `model` | `Option<String>` | LLM model preference |
+| `dialect` | `AgentDialect` | Source format (Claude, Copilot, Native) |
+| `body` | `String` | Prompt/system message content |
+| `source_tools` | `Vec<String>` | Original tool names from source |
+| `mcp_servers` | `Vec<McpServerConfig>` | MCP server declarations |
 
-    class MarketplaceSource {
-        <<enum>>
-        GitUrl(String)
-        LocalPath(PathBuf)
-    }
+### AgentDialect (enum)
 
-    class PruneReport {
-        +Vec~PathBuf~ removed
-        +Vec~PruneFailure~ failed
-    }
+- `Claude` — parsed from `.md` with YAML frontmatter
+- `Copilot` — parsed from `.agent.md` with YAML frontmatter
+- `Native` — parsed from Kiro JSON format
 
-    class PruneMode {
-        <<enum>>
-        DryRun
-        Execute
-    }
+### McpServerConfig
 
-    CacheDir --> KnownMarketplace
-    KnownMarketplace --> MarketplaceSource
-    CacheDir --> PruneReport
-```
+| Field | Type | Description |
+|-------|------|-------------|
+| `name` | `String` | Server identifier |
+| `transport` | `Transport` | `Stdio { command, args, env }` or `Http { url }` |
 
-### Project Layer
+### SkillFrontmatter
 
-```mermaid
-classDiagram
-    class KiroProject {
-        +PathBuf root
-        +new(root) Self
-        +kiro_dir() PathBuf
-        +skills_dir() PathBuf
-        +agents_dir() PathBuf
-    }
+| Field | Type | Description |
+|-------|------|-------------|
+| `name` | `String` | Skill identifier (validated) |
+| `description` | `Option<String>` | Human-readable description |
+| `invocable` | `Option<bool>` | Whether skill can be invoked directly |
 
-    class InstalledSkills {
-        +HashMap~String, InstalledSkillMeta~ skills
-    }
+### PluginManifest (from plugin.json)
 
-    class InstalledSkillMeta {
-        +String marketplace
-        +String plugin
-        +DateTime installed_at
-    }
+| Field | Type | Description |
+|-------|------|-------------|
+| `name` | `String` | Plugin identifier |
+| `description` | `Option<String>` | Description |
+| `skills` | `Vec<String>` | Skill scan paths |
+| `agents` | `Vec<String>` | Agent scan paths |
+| `steering` | `Vec<String>` | Steering file scan paths |
+| `format` | `Option<PluginFormat>` | `KiroCli` for native agents |
 
-    class InstalledAgents {
-        +HashMap~String, InstalledAgentMeta~ agents
-    }
+### InstallMode (enum)
 
-    class InstalledAgentMeta {
-        +String marketplace
-        +String plugin
-        +AgentDialect dialect
-        +DateTime installed_at
-    }
+- `Normal` — skip if already installed
+- `Force` — overwrite existing installations
 
-    KiroProject --> InstalledSkills
-    KiroProject --> InstalledAgents
-    InstalledSkills --> InstalledSkillMeta
-    InstalledAgents --> InstalledAgentMeta
-```
+### InsecureHttpPolicy (enum)
 
-### Plugin & Skill Layer
+- `Reject` — refuse `http://` URLs (default)
+- `Allow` — permit insecure sources (requires explicit opt-in)
 
-```mermaid
-classDiagram
-    class PluginManifest {
-        +String name
-        +Option~String~ description
-        +Vec~String~ skills
-        +Vec~String~ agents
-        +from_json(value) Result
-    }
+---
 
-    class DiscoveredPlugin {
-        +String name
-        +PathBuf path
-        +Option~PluginManifest~ manifest
-        +relative_path() String
-    }
-
-    class SkillFrontmatter {
-        +String name
-        +Option~String~ description
-        +Option~bool~ invocable
-        +parse_frontmatter(content) Result
-    }
-
-    DiscoveredPlugin --> PluginManifest
-```
-
-### Agent Layer
-
-```mermaid
-classDiagram
-    class AgentDefinition {
-        +String name
-        +Option~String~ description
-        +Option~String~ model
-        +AgentDialect dialect
-        +Vec~MappedTool~ tools
-        +Vec~UnmappedTool~ unmapped_tools
-        +Vec~McpServerConfig~ mcp_servers
-        +String body
-    }
-
-    class AgentDialect {
-        <<enum>>
-        Claude
-        Copilot
-    }
-
-    class McpServerConfig {
-        +String name
-        +McpTransport transport
-        +is_stdio() bool
-    }
-
-    class MappedTool {
-        +String source_name
-        +String kiro_name
-    }
-
-    class UnmappedTool {
-        +String name
-        +UnmappedReason reason
-    }
-
-    AgentDefinition --> AgentDialect
-    AgentDefinition --> McpServerConfig
-    AgentDefinition --> MappedTool
-    AgentDefinition --> UnmappedTool
-```
-
-### Service Result Types
-
-```mermaid
-classDiagram
-    class MarketplaceAddResult {
-        +String name
-        +Vec~PluginBasicInfo~ plugins
-        +MarketplaceStorage storage
-    }
-
-    class MarketplaceStorage {
-        <<enum>>
-        Cloned
-        Linked
-        Copied
-    }
-
-    class InstallSkillsResult {
-        +Vec~String~ installed
-        +Vec~String~ skipped
-        +Vec~FailedSkill~ failed
-    }
-
-    class InstallAgentsResult {
-        +Vec~String~ installed
-        +Vec~String~ skipped
-        +Vec~FailedAgent~ failed
-        +Vec~InstallWarning~ warnings
-    }
-
-    class UpdateResult {
-        +Vec~String~ updated
-        +Vec~FailedUpdate~ failed
-        +Vec~String~ skipped
-    }
-
-    MarketplaceAddResult --> MarketplaceStorage
-```
-
-### Error Types
+## Error Hierarchy
 
 ```mermaid
 classDiagram
@@ -245,8 +171,25 @@ classDiagram
         Json(serde_json::Error)
     }
 
+    class MarketplaceError {
+        NotFound
+        AlreadyRegistered
+        InvalidManifest
+        NoPluginsFound
+        InsecureSource
+    }
+
+    class PluginError {
+        NotFound
+        InvalidManifest
+        ManifestNotFound
+        NoSkills
+        ManifestReadFailed
+        DirectoryMissing
+        RemoteSourceNotLocal
+    }
+
     class GitError {
-        <<enum>>
         CloneFailed
         PullFailed
         OpenFailed
@@ -255,67 +198,24 @@ classDiagram
         CommandFailed
     }
 
-    class ValidationError {
-        +String message
-    }
-
+    Error --> MarketplaceError
+    Error --> PluginError
     Error --> GitError
-    Error --> ValidationError
 ```
 
-### Settings Types
-
-```mermaid
-classDiagram
-    class SettingDef {
-        +String key
-        +SettingCategory category
-        +SettingType value_type
-        +SettingValue default
-        +String description
-    }
-
-    class SettingCategory {
-        <<enum>>
-        General
-        Security
-        Display
-    }
-
-    class SettingType {
-        <<enum>>
-        Bool
-        String
-        Number
-    }
-
-    class SettingEntry {
-        +String key
-        +String category
-        +String category_label
-        +SettingType value_type
-        +SettingValue value
-        +SettingValue default
-        +String description
-    }
-
-    SettingDef --> SettingCategory
-    SettingDef --> SettingType
-```
+---
 
 ## Tauri Frontend Types
 
-### TypeScript Interfaces (auto-generated via specta)
+The desktop app adds presentation-layer types:
 
-Key types exposed to the frontend:
-
-- `MarketplaceInfo` — marketplace name, source type, plugin count
-- `PluginInfo` — plugin name, description, source type
-- `SkillInfo` — skill name, description, installed status
-- `InstalledSkillInfo` — name, marketplace, plugin, version, install date
-- `ProjectInfo` — project path, installed skill/agent counts
-- `Settings` — scan roots, last project
-- `DiscoveredProject` — path, has `.kiro/` directory
-- `SettingEntry` — key, category, type, value, default, description
-- `CommandError` — error type enum + message string
-- `SourceType` — `github` | `git_url` | `local_path` | `git_subdir`
+| Type | Purpose |
+|------|---------|
+| `MarketplaceInfo` | Marketplace with source type and plugin count |
+| `PluginInfo` | Plugin with skill count and source type |
+| `SourceType` | `github`, `git_url`, `local_path`, `git_subdir` |
+| `ProjectInfo` | Active project path and validation status |
+| `InstalledSkillInfo` | Installed skill with display metadata |
+| `Settings` | App-level settings (scan roots, active project) |
+| `DiscoveredProject` | Found project path from scan |
+| `CommandError` | Typed error with `ErrorType` discriminant |

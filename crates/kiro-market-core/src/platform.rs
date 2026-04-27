@@ -59,6 +59,23 @@ pub fn remove_local_link(path: &Path) -> io::Result<()> {
     sys::remove_local_link(path)
 }
 
+/// True if `metadata` describes any kind of reparse point or symlink.
+///
+/// On Unix, this is exactly `metadata.file_type().is_symlink()` —
+/// reparse points are a Windows concept. On Windows, the `is_symlink()`
+/// check only catches `IO_REPARSE_TAG_SYMLINK`, missing directory
+/// junctions (`IO_REPARSE_TAG_MOUNT_POINT`) and other reparse-point
+/// flavors. Discovery callers want to refuse all of them — a junction
+/// at `agents/evil` could leak files outside the plugin root just like
+/// a symlink — so we mask `FILE_ATTRIBUTE_REPARSE_POINT` on Windows.
+///
+/// Takes [`fs::Metadata`] (not a path) so callers that already have it
+/// from `symlink_metadata` don't pay for a second stat.
+#[must_use]
+pub fn is_reparse_or_symlink(metadata: &std::fs::Metadata) -> bool {
+    sys::is_reparse_or_symlink(metadata)
+}
+
 #[cfg(unix)]
 mod sys {
     use std::io;
@@ -77,6 +94,12 @@ mod sys {
 
     pub fn remove_local_link(path: &Path) -> io::Result<()> {
         std::fs::remove_file(path)
+    }
+
+    pub fn is_reparse_or_symlink(metadata: &std::fs::Metadata) -> bool {
+        // Reparse points are a Windows-NTFS concept. On Unix the only
+        // "this entry redirects somewhere else" check is the symlink bit.
+        metadata.file_type().is_symlink()
     }
 }
 
@@ -173,6 +196,15 @@ mod sys {
         } else {
             std::fs::remove_file(path)
         }
+    }
+
+    pub fn is_reparse_or_symlink(metadata: &std::fs::Metadata) -> bool {
+        // FILE_ATTRIBUTE_REPARSE_POINT covers symlinks AND directory
+        // junctions AND mount points AND any other reparse-point flavor
+        // a future Windows version might define. Path::is_symlink() only
+        // checks IO_REPARSE_TAG_SYMLINK, so a junction at `agents/evil`
+        // would slip past it. Mask the raw attribute bit for breadth.
+        metadata.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0
     }
 
     // The local `StagingGuard` was extracted into the shared

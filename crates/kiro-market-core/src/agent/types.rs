@@ -88,6 +88,22 @@ impl McpServerConfig {
 pub enum AgentDialect {
     Claude,
     Copilot,
+    /// Plugin authored in Kiro's native JSON format. Installed via
+    /// validate-and-copy (no parse-and-translate).
+    Native,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn agent_dialect_native_serializes_to_native() {
+        let json = serde_json::to_string(&AgentDialect::Native).expect("serialize");
+        assert_eq!(json, "\"native\"");
+        let round: AgentDialect = serde_json::from_str("\"native\"").expect("deserialize");
+        assert_eq!(round, AgentDialect::Native);
+    }
 }
 
 /// Agent definition normalized across Claude and Copilot source formats.
@@ -147,6 +163,18 @@ pub enum ParseFailure {
     /// File read failed (permission denied, not found during racy delete,
     /// etc.). Carries the rendered I/O error message.
     IoError(String),
+    /// The translated parser (`parse_agent_file`) was called with a file
+    /// whose detected dialect belongs on a different install code path.
+    /// Currently fires only for [`AgentDialect::Native`]: native agents are
+    /// installed via validate-and-copy through `parse_native_kiro_agent_file`,
+    /// not through `parse_agent_file`. The service routes by dialect
+    /// upstream, so this branch is a defensive sanity check rather than a
+    /// normal failure mode.
+    ///
+    /// Distinct from [`ParseFailure::IoError`] so callers branching on
+    /// "should I retry the I/O?" don't misclassify a routing bug as a
+    /// transient I/O failure.
+    UnsupportedDialect,
 }
 
 impl std::fmt::Display for ParseFailure {
@@ -162,6 +190,10 @@ impl std::fmt::Display for ParseFailure {
             ParseFailure::MissingName => f.write_str("missing required `name` field"),
             ParseFailure::InvalidName(reason) => write!(f, "invalid `name` value: {reason}"),
             ParseFailure::IoError(msg) => write!(f, "read failed: {msg}"),
+            ParseFailure::UnsupportedDialect => f.write_str(
+                "translated parser called for a dialect that uses the validate-and-copy path \
+                 (native agents go through `parse_native_kiro_agent_file`)",
+            ),
         }
     }
 }

@@ -8,9 +8,9 @@ use kiro_market_core::cache::CacheDir;
 use kiro_market_core::git::{GitProtocol, GixCliBackend};
 use kiro_market_core::project::KiroProject;
 use kiro_market_core::service::{
-    FailedAgent, InstallAgentsResult, InstallFilter, InstallMode, InstallSkillsResult,
-    MarketplaceService,
+    InstallAgentsResult, InstallFilter, InstallMode, InstallSkillsResult, MarketplaceService,
 };
+use kiro_market_core::steering::InstallSteeringResult;
 use tracing::{debug, warn};
 
 use crate::cli;
@@ -79,21 +79,45 @@ pub fn run(
     );
     print_install_outcome(plugin_ref, &skill_result);
 
+    let install_ctx = kiro_market_core::service::AgentInstallContext {
+        mode,
+        accept_mcp,
+        marketplace: marketplace_name,
+        plugin: plugin_name,
+        version: ctx.version.as_deref(),
+    };
     let agent_result = run_agent_install(
-        &svc,
         &project,
         &plugin_dir,
         &ctx.agent_scan_paths,
         skill_filter,
-        mode,
-        accept_mcp,
-        marketplace_name,
-        plugin_name,
-        ctx.version.as_deref(),
+        ctx.format,
+        install_ctx,
     );
     print_agent_outcome(&agent_result);
 
-    summarize_outcome(plugin_ref, skill_filter, &skill_result, &agent_result)
+    let steering_ctx = kiro_market_core::steering::SteeringInstallContext {
+        mode,
+        marketplace: marketplace_name,
+        plugin: plugin_name,
+        version: ctx.version.as_deref(),
+    };
+    let steering_result = run_steering_install(
+        &project,
+        &plugin_dir,
+        &ctx.steering_scan_paths,
+        skill_filter,
+        steering_ctx,
+    );
+    print_steering_outcome(&steering_result, &project);
+
+    summarize_outcome(
+        plugin_ref,
+        skill_filter,
+        &skill_result,
+        &agent_result,
+        &steering_result,
+    )
 }
 
 /// Look up the stored git protocol preference for a marketplace, falling back
@@ -167,59 +191,83 @@ fn run_skill_install(
     )
 }
 
-#[allow(clippy::too_many_arguments)] // each arg is an independent piece of upstream context
 fn run_agent_install(
-    svc: &MarketplaceService,
     project: &KiroProject,
     plugin_dir: &Path,
     agent_scan_paths: &[String],
     skill_filter: Option<&str>,
-    mode: InstallMode,
-    accept_mcp: bool,
-    marketplace_name: &str,
-    plugin_name: &str,
-    version: Option<&str>,
+    format: Option<kiro_market_core::plugin::PluginFormat>,
+    ctx: kiro_market_core::service::AgentInstallContext<'_>,
 ) -> InstallAgentsResult {
     // A `--skill <name>` filter narrows the install to one skill and never
     // includes agents.
     if skill_filter.is_some() {
         return InstallAgentsResult::default();
     }
-    svc.install_plugin_agents(
-        project,
-        plugin_dir,
-        agent_scan_paths,
-        mode,
-        accept_mcp,
-        marketplace_name,
-        plugin_name,
-        version,
-    )
+    MarketplaceService::install_plugin_agents(project, plugin_dir, agent_scan_paths, format, ctx)
 }
 
-/// Decide whether the command exits zero or non-zero based on the accumulated
-/// skill + agent results. Any per-item failure becomes a non-zero exit so CI
-/// catches partial-success regressions.
+fn run_steering_install(
+    project: &KiroProject,
+    plugin_dir: &Path,
+    steering_scan_paths: &[String],
+    skill_filter: Option<&str>,
+    ctx: kiro_market_core::steering::SteeringInstallContext<'_>,
+) -> InstallSteeringResult {
+    // A `--skill <name>` filter narrows the install to one skill and never
+    // touches steering files.
+    if skill_filter.is_some() {
+        return InstallSteeringResult::default();
+    }
+    MarketplaceService::install_plugin_steering(project, plugin_dir, steering_scan_paths, ctx)
+}
+
+/// Decide whether the command exits zero or non-zero based on the
+/// accumulated skill + agent + steering results. Any per-item failure
+/// becomes a non-zero exit so CI catches partial-success regressions.
 fn summarize_outcome(
     plugin_ref: &str,
     skill_filter: Option<&str>,
     skill_result: &InstallSkillsResult,
     agent_result: &InstallAgentsResult,
+    steering_result: &InstallSteeringResult,
 ) -> Result<()> {
     let nothing_installed = skill_result.installed.is_empty()
         && skill_result.skipped.is_empty()
         && agent_result.installed.is_empty()
-        && agent_result.skipped.is_empty();
-    if nothing_installed && agent_result.failed.is_empty() && skill_result.failed.is_empty() {
+        && agent_result.skipped.is_empty()
+        && steering_result.installed.is_empty();
+    if nothing_installed
+        && agent_result.failed.is_empty()
+        && skill_result.failed.is_empty()
+        && steering_result.failed.is_empty()
+    {
+        // Warnings already printed to stderr by `print_*_outcome`. When
+        // they explain the empty result (e.g. all steering scan paths
+        // were rejected as path-traversal), point the user there rather
+        // than implying the plugin is empty. `InstallSkillsResult` has no
+        // analogous `warnings` field today; if one is added later, extend
+        // this guard.
+        let any_warnings =
+            !agent_result.warnings.is_empty() || !steering_result.warnings.is_empty();
         let kind = if skill_filter.is_some() {
             "skills"
         } else {
-            "skills or agents"
+            "skills, agents, or steering files"
         };
+        if any_warnings {
+            bail!(
+                "no {kind} were installed from '{plugin_ref}' — see warnings above for the cause"
+            );
+        }
         bail!("no {kind} were installed from '{plugin_ref}'");
     }
-    if !agent_result.failed.is_empty() || !skill_result.failed.is_empty() {
-        let fail_count = agent_result.failed.len() + skill_result.failed.len();
+    if !agent_result.failed.is_empty()
+        || !skill_result.failed.is_empty()
+        || !steering_result.failed.is_empty()
+    {
+        let fail_count =
+            agent_result.failed.len() + skill_result.failed.len() + steering_result.failed.len();
         bail!(
             "{fail_count} item{s} failed during install from '{plugin_ref}'",
             s = if fail_count == 1 { "" } else { "s" }
@@ -232,21 +280,130 @@ fn summarize_outcome(
 /// failures. Warnings and failures go to stderr so they don't pollute
 /// stdout piping, matching the skill flow.
 fn print_agent_outcome(result: &InstallAgentsResult) {
+    // Build a lookup from agent name to its rich native outcome so the
+    // legacy `installed: Vec<String>` rendering can append a `(forced)`
+    // suffix where the native install path overwrote a tracked path.
+    // Translated installs leave installed_native empty, so the lookup is
+    // a no-op for that path.
+    let native_by_name: std::collections::HashMap<&str, &_> = result
+        .installed_native
+        .iter()
+        .map(|o| (o.name.as_str(), o))
+        .collect();
+
     for name in &result.installed {
-        println!("  {} Installed agent '{}'", "✓".green().bold(), name.bold());
-    }
-    for name in &result.skipped {
+        let suffix = native_by_name
+            .get(name.as_str())
+            .filter(|o| o.kind == kiro_market_core::project::InstallOutcomeKind::ForceOverwrote)
+            .map_or("", |_| " (forced)");
         println!(
-            "  {} Agent '{}' already installed",
-            "·".yellow().bold(),
-            name.bold()
+            "  {} Installed agent '{}'{}",
+            "✓".green().bold(),
+            name.bold(),
+            suffix.yellow()
         );
     }
-    for FailedAgent { name, error } in &result.failed {
+    for name in &result.skipped {
+        // Native idempotent reinstalls land here with a typed outcome
+        // already in installed_native — render "(unchanged)" so the
+        // user can tell the difference from a translated already-installed
+        // skip.
+        let suffix = native_by_name
+            .get(name.as_str())
+            .filter(|o| o.kind == kiro_market_core::project::InstallOutcomeKind::Idempotent)
+            .map_or("", |_| " (unchanged)");
+        println!(
+            "  {} Agent '{}' already installed{}",
+            "·".yellow().bold(),
+            name.bold(),
+            suffix.dimmed()
+        );
+    }
+    if let Some(companions) = &result.installed_companions {
+        // Wildcard arm required by `InstallOutcomeKind`'s `#[non_exhaustive]`
+        // (cross-crate matches must accept future variants). New variants
+        // land with neutral rendering until the CLI explicitly handles them.
+        let suffix = match companions.kind {
+            kiro_market_core::project::InstallOutcomeKind::Idempotent => " (unchanged)".dimmed(),
+            kiro_market_core::project::InstallOutcomeKind::ForceOverwrote => " (forced)".yellow(),
+            other => {
+                // Surface unhandled future variants at debug! so RUST_LOG=debug
+                // operators see the gap before users.
+                debug!(
+                    plugin = %companions.plugin,
+                    kind = ?other,
+                    "unhandled InstallOutcomeKind in companion render; falling back to neutral suffix"
+                );
+                "".normal()
+            }
+        };
+        let plural = if companions.files.len() == 1 { "" } else { "s" };
+        println!(
+            "  {} Installed {} companion file{plural} for '{}'{}",
+            "✓".green().bold(),
+            companions.files.len(),
+            companions.plugin.bold(),
+            suffix
+        );
+    }
+    for failed in &result.failed {
+        let label = failed
+            .name
+            .as_deref()
+            .map_or_else(|| failed.source_path.display().to_string(), str::to_owned);
+        let rendered = kiro_market_core::error::error_full_chain(&failed.error);
         eprintln!(
-            "  {} Failed to install agent '{}': {error}",
+            "  {} Failed to install agent '{}': {rendered}",
             "✗".red().bold(),
-            name
+            label
+        );
+    }
+    for w in &result.warnings {
+        eprintln!("  {} {w}", "!".yellow().bold());
+    }
+}
+
+/// Render the steering install summary plus per-file failures and
+/// warnings. Failures use [`error_full_chain`](kiro_market_core::error::error_full_chain)
+/// per S3-13 so the underlying `io::Error` reason (e.g. which file
+/// couldn't be read, what OS error fired) reaches the user — a bare
+/// `to_string()` would drop the `#[source]` chain and produce
+/// "tracking I/O failed" with no actionable detail.
+fn print_steering_outcome(result: &InstallSteeringResult, project: &KiroProject) {
+    let steering_root = project.steering_dir();
+    for outcome in &result.installed {
+        // Match the workspace-shared `InstallOutcomeKind` (3 variants
+        // today). Wildcard arm required by `#[non_exhaustive]` —
+        // future variants render neutrally until explicitly handled.
+        let suffix = match outcome.kind {
+            kiro_market_core::project::InstallOutcomeKind::Idempotent => " (unchanged)".dimmed(),
+            kiro_market_core::project::InstallOutcomeKind::ForceOverwrote => " (forced)".yellow(),
+            other => {
+                debug!(
+                    destination = %outcome.destination.display(),
+                    kind = ?other,
+                    "unhandled InstallOutcomeKind in steering render; falling back to neutral suffix"
+                );
+                "".normal()
+            }
+        };
+        let rel = outcome
+            .destination
+            .strip_prefix(&steering_root)
+            .unwrap_or(&outcome.destination);
+        println!(
+            "  {} Installed steering '{}'{}",
+            "✓".green().bold(),
+            rel.display(),
+            suffix
+        );
+    }
+    for failed in &result.failed {
+        let rendered = kiro_market_core::error::error_full_chain(&failed.error);
+        eprintln!(
+            "  {} Failed to install steering '{}': {rendered}",
+            "✗".red().bold(),
+            failed.source.display()
         );
     }
     for w in &result.warnings {

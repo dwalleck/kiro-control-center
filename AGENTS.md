@@ -23,16 +23,19 @@
 crates/
 ├── kiro-market-core/src/       # Shared library — ALL business logic lives here
 │   ├── service.rs              # MarketplaceService: primary orchestrator (add/remove/update/install)
+│   ├── service/browse.rs       # Skill enumeration, plugin install context resolution
 │   ├── cache.rs                # CacheDir: ~/.cache/kiro-market/ management, source detection
-│   ├── project.rs              # KiroProject: .kiro/ directory operations (install/remove skills+agents)
+│   ├── project.rs              # KiroProject: .kiro/ directory operations (install/remove skills+agents+steering)
 │   ├── git.rs                  # Dual-backend git (gix primary, CLI fallback)
-│   ├── agent/                  # Agent parsing (Claude + Copilot dialects), tool mapping, Kiro emission
+│   ├── agent/                  # Agent parsing (Claude + Copilot + Native dialects), tool mapping, Kiro emission
+│   ├── steering/               # Steering file discovery and installation
 │   ├── plugin.rs               # Plugin discovery (scan dirs for plugin.json)
 │   ├── skill.rs                # SKILL.md frontmatter parsing
 │   ├── validation.rs           # Path/name validation (security-critical)
 │   ├── kiro_settings.rs        # .kiro/settings.json typed registry
 │   ├── platform.rs             # OS abstraction (symlinks vs junctions vs copy)
 │   ├── file_lock.rs            # Cross-process file locking (fs4)
+│   ├── hash.rs                 # BLAKE3 content hashing for change detection
 │   ├── raii.rs                 # DirCleanupGuard (RAII temp dir removal)
 │   └── error.rs                # Structured error hierarchy
 ├── kiro-market/src/            # CLI binary — thin clap wrapper over core
@@ -86,7 +89,7 @@ cargo test -p kiro-control-center --lib -- --ignored generate_types
 
 - **curl dependency is a shim**: `kiro-market-core` depends on `curl = { workspace = true }` solely to activate the `ssl` feature on `curl-sys` (pulled transitively by `gix-transport`). It's not used for HTTP requests. Removing it breaks TLS on static-libcurl builds.
 
-- **Cargo.lock edits are blocked**: A Claude hook (`block-cargo-lock.sh`) prevents direct edits. Use `cargo update -p <crate>` instead. Override with `KIRO_ALLOW_LOCKFILE_EDIT=1`.
+- **Cargo.lock edits are blocked**: A Claude hook (`hook-block-cargo-lock` in xtask) prevents direct edits. Use `cargo update -p <crate>` instead. Override with `KIRO_ALLOW_LOCKFILE_EDIT=1`.
 
 - **`bindings.ts` is generated**: Never edit `src/lib/bindings.ts` manually. It's overwritten by the `generate_types` test.
 
@@ -94,11 +97,15 @@ cargo test -p kiro-control-center --lib -- --ignored generate_types
 
 - **Plugin reference format**: Always `plugin@marketplace` (split on first `@`).
 
-- **Default scan paths**: When a plugin has no `plugin.json`, skills are discovered from `./skills/` and agents from `./agents/`.
+- **Default scan paths**: When a plugin has no `plugin.json`, skills are discovered from `./skills/`, agents from `./agents/`, and steering from `./steering/`.
 
 - **Dual git backend**: `gix` is tried first, then `git` CLI. Both errors are combined. Auth failures get user-friendly messages.
 
 - **Platform linking**: Local marketplaces use symlinks (Unix) or NTFS junctions (Windows). If junctions fail, falls back to recursive copy. `MarketplaceStorage` enum tracks which method was used.
+
+- **Self-cycle dev-dep**: `kiro-market-core` has itself as a dev-dependency with `features = ["test-support"]` to activate test utilities in integration tests (Cargo handles this without recursion).
+
+- **BLAKE3 hash tracking**: Both source and installed content hashes are stored. Idempotent reinstalls are skipped when hashes match; content changes require `--force`.
 
 ---
 
@@ -119,11 +126,11 @@ cargo test -p kiro-control-center --lib -- --ignored generate_types
 - `coverage` — `cargo-llvm-cov` → Codecov
 
 **Claude hooks** (`.claude/settings.json`):
-- **PreToolUse** (Write/Edit): blocks Cargo.lock edits
-- **PostToolUse** (Write/Edit): runs `rustfmt` then `clippy` on the edited file's package
+- **PreToolUse** (Write/Edit/MultiEdit): runs `cargo xtask hook-block-cargo-lock` — blocks Cargo.lock edits
+- **PostToolUse** (Write/Edit): runs `cargo xtask hook-post-edit` — runs `rustfmt` then `clippy` on the edited file's package
 
 **Workspace lints**:
-- `unsafe_code = "deny"`
+- `unsafe_code = "forbid"`
 - `clippy::all = "warn"`, `clippy::pedantic = "warn"`
 
 ---
@@ -142,7 +149,7 @@ These MUST be maintained in all changes:
 
 4. **Symlink/hardlink rejection**: `copy_dir_recursive` skips symlinks and hardlinks in source trees.
 
-5. **No unsafe code**: Workspace-level `unsafe_code = "deny"`.
+5. **No unsafe code**: Workspace-level `unsafe_code = "forbid"`.
 
 ---
 
@@ -150,3 +157,4 @@ These MUST be maintained in all changes:
 <!-- This section is for human and agent-maintained operational knowledge.
      Add repo-specific conventions, gotchas, and workflow rules here.
      This section is preserved exactly as-is when re-running codebase-summary. -->
+

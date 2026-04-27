@@ -284,6 +284,103 @@ pub enum AgentError {
         path: PathBuf,
         failure: ParseFailure,
     },
+
+    // -----------------------------------------------------------------
+    // Native-import parsing failures.
+    // Mirror translated-path `ParseFailed` but with structured payloads
+    // matching the JSON parse pipeline (no frontmatter / YAML stages).
+    // -----------------------------------------------------------------
+    /// Native agent JSON file failed to parse. `reason` carries the full
+    /// `serde_json` error chain materialized at the adapter boundary
+    /// (`service::native_parse_failure_to_agent_error`) — the source
+    /// type does not leak through the public API.
+    #[error("native agent JSON `{path}` failed to parse: {reason}")]
+    NativeManifestParseFailed { path: PathBuf, reason: String },
+
+    /// Native agent JSON parsed but is missing the required `name` field.
+    #[error("native agent at `{path}` is missing the required `name` field")]
+    NativeManifestMissingName { path: PathBuf },
+
+    /// Native agent JSON has a `name` that failed validation
+    /// (path-unsafe characters, empty, etc.).
+    #[error("native agent at `{path}` has an invalid `name`: {reason}")]
+    NativeManifestInvalidName { path: PathBuf, reason: String },
+
+    /// Native agent JSON manifest read failed (permission denied,
+    /// transient I/O, etc.). Parallels [`PluginError::ManifestReadFailed`].
+    #[error("could not read native agent manifest at {path}")]
+    ManifestReadFailed {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+
+    // -----------------------------------------------------------------
+    // Cross-plugin / collision errors.
+    // -----------------------------------------------------------------
+    /// Native agent install would clobber an agent owned by another plugin.
+    /// Without `--force`, ownership is preserved by the existing owner.
+    #[error(
+        "native agent name `{name}` would clobber an agent owned by plugin \
+         `{owner}`; pass --force to transfer ownership"
+    )]
+    NameClashWithOtherPlugin { name: String, owner: String },
+
+    /// Companion file path is owned by another plugin's bundle.
+    /// Without `--force`, the existing owner keeps the path.
+    #[error("path `{path}` is owned by plugin `{owner}`; pass --force to transfer")]
+    PathOwnedByOtherPlugin { path: PathBuf, owner: String },
+
+    /// File exists at the destination but no plugin has tracking for it
+    /// (orphan from a manual install or a previous uninstall that left
+    /// stray files). Without `--force`, refused to avoid silent overwrite.
+    #[error(
+        "file exists at `{path}` but has no tracking entry; \
+         remove it manually or pass --force"
+    )]
+    OrphanFileAtDestination { path: PathBuf },
+
+    /// Same plugin reinstalled the same agent / companion bundle, but the
+    /// source content has changed since the last install. Without
+    /// `--force`, the install is refused so the user explicitly opts in
+    /// to overwriting prior content.
+    #[error(
+        "agent `{name}` content has changed since last install; \
+         pass --force to overwrite"
+    )]
+    ContentChangedRequiresForce { name: String },
+
+    /// A native plugin declares multiple agent scan roots. v1 supports a
+    /// single scan root only — companion ownership tracking would otherwise
+    /// have to disambiguate which scan root each companion belongs to,
+    /// expanding the tracking schema. Out of scope for v1.
+    #[error("native plugin spans multiple agent scan roots; v1 supports a single scan root only")]
+    MultipleScanRootsNotSupported { roots: Vec<PathBuf> },
+
+    /// A native companion source file is a hardlink (Unix `nlink > 1`).
+    /// The other path(s) sharing the inode could be sensitive host
+    /// files; the install refuses rather than `fs::copy` inode contents
+    /// into `.kiro/agents/`. Mirrors
+    /// [`crate::agent::parse_native::NativeParseFailure::HardlinkRefused`]
+    /// (the canonical statement of the threat model) and
+    /// `SteeringError::SourceHardlinked`.
+    #[error("refusing hardlinked native companion at `{path}` (nlink={nlink})")]
+    SourceHardlinked { path: PathBuf, nlink: u64 },
+
+    // -----------------------------------------------------------------
+    // Catch-all for non-AgentError infrastructure failures that surface
+    // through the install pipeline.
+    // -----------------------------------------------------------------
+    /// An infrastructure error (I/O, hash, JSON) bubbled up through an
+    /// install attempt. Used at the boundary where a top-level [`Error`]
+    /// must be wrapped into a per-agent failure entry without losing the
+    /// underlying source chain.
+    #[error("install failed at `{path}`")]
+    InstallFailed {
+        path: PathBuf,
+        #[source]
+        source: Box<crate::error::Error>,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -445,6 +542,9 @@ pub enum Error {
     Agent(#[from] AgentError),
 
     #[error(transparent)]
+    Steering(#[from] crate::steering::SteeringError),
+
+    #[error(transparent)]
     Git(#[from] GitError),
 
     #[error(transparent)]
@@ -497,6 +597,23 @@ pub fn error_full_chain(err: &(dyn std::error::Error + 'static)) -> String {
         detail.push_str(&chain);
     }
     detail
+}
+
+/// Construct an [`AgentError::NativeManifestParseFailed`] from a
+/// `serde_json::Error`, materializing the full source chain into the
+/// variant's `reason` field at the adapter boundary.
+///
+/// This is the only in-tree constructor for the variant; every call site
+/// goes through it so the documented invariant — `reason` always carries
+/// the materialized chain rather than an arbitrary string — is structural,
+/// not just prose. The enum is `#[non_exhaustive]`, so external crates
+/// cannot bypass this constructor with a struct literal.
+#[must_use]
+pub(crate) fn native_manifest_parse_failed(path: PathBuf, err: &serde_json::Error) -> AgentError {
+    AgentError::NativeManifestParseFailed {
+        path,
+        reason: error_full_chain(err),
+    }
 }
 
 #[cfg(test)]
@@ -772,6 +889,104 @@ mod tests {
     )]
     fn agent_error_display(#[case] err: AgentError, #[case] expected: &str) {
         assert_eq!(err.to_string(), expected);
+    }
+
+    #[test]
+    fn name_clash_with_other_plugin_renders_useful_message() {
+        let err = AgentError::NameClashWithOtherPlugin {
+            name: "code-reviewer".into(),
+            owner: "other-plugin".into(),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("code-reviewer"));
+        assert!(msg.contains("other-plugin"));
+        assert!(msg.contains("--force"));
+    }
+
+    #[test]
+    fn content_changed_requires_force_renders_useful_message() {
+        let err = AgentError::ContentChangedRequiresForce { name: "x".into() };
+        let msg = err.to_string();
+        assert!(msg.contains('x'));
+        assert!(msg.contains("--force"));
+    }
+
+    #[test]
+    fn path_owned_by_other_plugin_renders_useful_message() {
+        let err = AgentError::PathOwnedByOtherPlugin {
+            path: PathBuf::from("prompts/shared.md"),
+            owner: "plugin-a".into(),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains("prompts/shared.md"));
+        assert!(msg.contains("plugin-a"));
+        assert!(msg.contains("--force"));
+    }
+
+    #[test]
+    fn orphan_file_at_destination_mentions_force() {
+        let err = AgentError::OrphanFileAtDestination {
+            path: PathBuf::from(".kiro/agents/rev.json"),
+        };
+        let msg = err.to_string();
+        assert!(msg.contains(".kiro/agents/rev.json"));
+        assert!(msg.contains("--force"));
+    }
+
+    #[test]
+    fn install_failed_carries_source_chain() {
+        use std::error::Error as _;
+        let inner = io::Error::from(io::ErrorKind::PermissionDenied);
+        let err = AgentError::InstallFailed {
+            path: PathBuf::from(".kiro/agents/x.json"),
+            source: Box::new(crate::error::Error::Io(inner)),
+        };
+        let display = err.to_string();
+        assert!(display.contains(".kiro/agents/x.json"));
+        let source = err.source().expect("source chain populated");
+        assert!(source.to_string().to_lowercase().contains("permission"));
+    }
+
+    #[test]
+    fn multiple_scan_roots_not_supported_renders() {
+        let err = AgentError::MultipleScanRootsNotSupported {
+            roots: vec![PathBuf::from("./agents/"), PathBuf::from("./extra/")],
+        };
+        assert!(err.to_string().contains("multiple agent scan roots"));
+    }
+
+    #[test]
+    fn native_manifest_parse_failed_renders_path_and_reason() {
+        use std::error::Error as _;
+        let parse_err = serde_json::from_str::<serde_json::Value>("{not").unwrap_err();
+        // Exercise the only in-tree constructor — replicates exactly what
+        // `service::native_parse_failure_to_agent_error` does at the
+        // adapter boundary.
+        let err = native_manifest_parse_failed(PathBuf::from("rev.json"), &parse_err);
+        let rendered = err.to_string();
+        assert!(rendered.contains("rev.json"), "path missing: {rendered}");
+        // The serde_json line/column survives the materialization.
+        assert!(rendered.contains("line 1"), "reason missing: {rendered}");
+        // Wire-format contract: the variant exposes no `source()` chain,
+        // so downstream FFI surfaces (Tauri, CLI text) cannot accidentally
+        // re-introduce the `serde_json::Error` type by walking `.source()`.
+        // Re-introducing `#[source]` would silently break this assertion.
+        assert!(
+            err.source().is_none(),
+            "NativeManifestParseFailed must not expose a source chain — \
+             reason: String is the only carrier of the materialized serde_json detail"
+        );
+    }
+
+    #[test]
+    fn manifest_read_failed_carries_io_source() {
+        use std::error::Error as _;
+        let err = AgentError::ManifestReadFailed {
+            path: PathBuf::from("rev.json"),
+            source: io::Error::from(io::ErrorKind::PermissionDenied),
+        };
+        assert!(err.to_string().contains("rev.json"));
+        assert!(err.source().is_some());
     }
 
     #[test]
