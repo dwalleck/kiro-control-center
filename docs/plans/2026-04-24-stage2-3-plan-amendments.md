@@ -1265,7 +1265,13 @@ The `#[non_exhaustive]` is mandatory per the codebase convention for every publi
 
 ---
 
-### S3-3: `uuid_or_pid()` undefined helper
+### S3-3: `uuid_or_pid()` undefined helper *(SUPERSEDED by S3-9)*
+
+> **STATUS:** Superseded after Stage 2 Tier 1.4 cleanup retired the
+> `STAGING_COUNTER` + manual `cleanup_leftover_*` pattern in favour of
+> `tempfile::TempDir`. **Do not implement this amendment as written.**
+> Apply [S3-9](#s3-9-staging-uses-tempfiletempdir-no-staging_counter-no-leftover-sweep)
+> instead. The original text below is preserved for historical context.
 
 **Severity:** BLOCKING
 
@@ -1281,48 +1287,7 @@ let staging = self
 
 With note: "if the project doesn't already have such a helper, use `std::process::id().to_string()` or similar".
 
-**What's actually true:** No `uuid_or_pid` helper exists anywhere in the codebase. The codebase doesn't depend on the `uuid` crate. The closest existing pattern is `fresh_agent_staging_dir` (`crates/kiro-market-core/src/project.rs:468`) which uses `std::process::id()` + a process-local atomic counter (`STAGING_COUNTER`):
-
-```rust
-fn fresh_agent_staging_dir(&self, name: &str) -> PathBuf {
-    use std::sync::atomic::Ordering;
-    let pid = std::process::id();
-    let seq = STAGING_COUNTER.fetch_add(1, Ordering::Relaxed);
-    self.kiro_dir()
-        .join(format!("_installing-agent-{name}-{pid}-{seq}"))
-}
-```
-
-**Required revision:** Mirror the existing pattern. Add a helper on `KiroProject`:
-
-```rust
-/// Generate a per-attempt staging file path for a steering install.
-///
-/// Encodes pid + a process-local atomic sequence so concurrent installers
-/// (or two threads in the same process) get distinct staging paths even
-/// without holding the steering tracking lock.
-fn fresh_steering_staging(&self, name: &str) -> PathBuf {
-    use std::sync::atomic::Ordering;
-    let pid = std::process::id();
-    let seq = STAGING_COUNTER.fetch_add(1, Ordering::Relaxed);
-    self.steering_dir()
-        .join(format!(".steering-staging-{name}-{pid}-{seq}"))
-}
-```
-
-Reuse the existing `STAGING_COUNTER` (it's a single shared sequence; collisions across the agent and steering install paths are still impossible because the prefix differs).
-
-In Task 7 step 3, replace `uuid_or_pid()` call:
-
-```rust
-let staging = self.fresh_steering_staging(rel_path.file_stem().and_then(|s| s.to_str()).unwrap_or("anon"));
-```
-
-(The `name` arg is purely for human-readable staging names; it doesn't affect uniqueness, which comes from `pid + seq`.)
-
-Also add a `cleanup_leftover_steering_staging(&self, name: &str)` mirroring `cleanup_leftover_agent_staging` (`crates/kiro-market-core/src/project.rs:669+`) to sweep `.steering-staging-*` files from prior crashed processes — call it inside the file-lock at the top of `install_steering_file`.
-
-**Reasoning:** Reusing the existing pid+counter helper pattern keeps the codebase consistent and avoids adding a uuid dependency. The leftover-sweep keeps `kiro/steering/` from accumulating crash residue.
+**What was true at amendment-write time (Stage 1):** No `uuid_or_pid` helper existed. The codebase used `STAGING_COUNTER` (atomic) + `pid` for unique staging names, swept by `cleanup_leftover_agent_staging`. Stage 2 commit `47bee9a` replaced the whole pattern with `tempfile::TempDir`, so this amendment's "use `STAGING_COUNTER`" instruction is now stale. See S3-9 for the current pattern.
 
 ---
 
@@ -1459,30 +1424,382 @@ Mirrors `install_plugin_agents`'s positional shape. CLI callsite passes `mode: c
 
 ---
 
-### S3-7: Out-of-scope items deliberately deferred from Stage 3
+### S3-8: `InstalledSteeringOutcome` uses `kind: InstallOutcomeKind`, not the bool pair
+
+**Severity:** BLOCKING
+
+**Affected plan section:** Task 2 step 1 (`InstalledSteeringOutcome` struct definition, lines 188–198), Task 7 step 1 (test assertions on `outcome.was_idempotent`, line 868), Task 7 step 3 (struct-literal construction sites, lines 936–941 and 1010–1017), Task 8 (every collision-test assertion that branches on `was_idempotent` / `forced_overwrite`), Task 9 (`assert!(again.installed.iter().all(|o| o.was_idempotent))`, line 1257), Task 10 step 3 (CLI presenter at lines 1391–1397), Task 11 (line 1545).
+
+**What the plan says:**
+
+```rust
+pub struct InstalledSteeringOutcome {
+    pub source: PathBuf,
+    pub destination: PathBuf,
+    /// True if `--force` overwrote a tracked path (orphan or other plugin).
+    pub forced_overwrite: bool,
+    /// True if the install was a no-op because tracking matched
+    /// `source_hash` exactly (idempotent reinstall).
+    pub was_idempotent: bool,
+    pub source_hash: String,
+    pub installed_hash: String,
+}
+```
+
+**What's actually true (commit `e65e314`, Issue #59):** The `(was_idempotent: bool, forced_overwrite: bool)` pair was retired across `InstalledNativeAgentOutcome` and `InstalledNativeCompanionsOutcome` in favour of a 3-state enum. The `(true, true)` state was unrepresentable — encoding it as a single enum makes that explicit and forces presenters to match exhaustively. The shared enum is already `pub` in `crate::project`:
+
+```rust
+// crates/kiro-market-core/src/project.rs:128
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
+#[serde(rename_all = "snake_case")]
+pub enum InstallOutcomeKind {
+    /// Verified no-op — `source_hash` matched the existing tracking
+    /// entry's `source_hash`. No bytes were written.
+    Idempotent,
+    /// Clean first install — no prior tracking entry, no orphan on disk.
+    Installed,
+    /// Force-mode overwrote a tracked path (same plugin's prior content,
+    /// another plugin's content via ownership transfer, or an orphan
+    /// without tracking).
+    ForceOverwrote,
+}
+```
+
+**Required revision:** Replace the bool pair with `kind: InstallOutcomeKind` on `InstalledSteeringOutcome`. **Do not** introduce a parallel `SteeringOutcomeKind` — reuse the existing enum.
+
+```rust
+// In steering/types.rs:
+use crate::project::InstallOutcomeKind;
+
+#[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
+pub struct InstalledSteeringOutcome {
+    pub source: PathBuf,
+    pub destination: PathBuf,
+    pub kind: InstallOutcomeKind,
+    pub source_hash: String,
+    pub installed_hash: String,
+}
+```
+
+Mechanical follow-throughs:
+
+- **Task 7 step 3 idempotent branch:** `kind: InstallOutcomeKind::Idempotent` (replaces `forced_overwrite: false, was_idempotent: true`).
+- **Task 7 step 3 success branch:** `kind: if forced_overwrite { InstallOutcomeKind::ForceOverwrote } else { InstallOutcomeKind::Installed }` (replaces `forced_overwrite, was_idempotent: false`). The `forced_overwrite: bool` local stays as the internal control variable threaded through staging — only the *outcome* shape changes.
+- **Task 7 step 1 test:** `assert_eq!(outcome.kind, InstallOutcomeKind::Installed);` instead of `assert!(!outcome.was_idempotent);`. Add `use kiro_market_core::project::InstallOutcomeKind;`.
+- **Task 8 collision tests:** every `assert!(outcome.forced_overwrite)` becomes `assert_eq!(outcome.kind, InstallOutcomeKind::ForceOverwrote)`; every `assert!(outcome.was_idempotent)` becomes `assert_eq!(outcome.kind, InstallOutcomeKind::Idempotent)`.
+- **Task 9 step 1 test:** `assert!(again.installed.iter().all(|o| o.kind == InstallOutcomeKind::Idempotent))`.
+- **Task 10 step 3 CLI presenter:** match-based suffix instead of two `if`s, exhaustive over the 3-variant enum (the 3-variant exhaustive match is the *point* of the refactor — don't preserve the cascading `if/else if` shape):
+
+  ```rust
+  let suffix = match outcome.kind {
+      InstallOutcomeKind::Idempotent => " (unchanged)".dimmed(),
+      InstallOutcomeKind::ForceOverwrote => " (forced)".yellow(),
+      InstallOutcomeKind::Installed => "".normal(),
+  };
+  ```
+
+- **Task 11 end-to-end test:** `assert!(steering_again.installed.iter().all(|o| o.kind == InstallOutcomeKind::Idempotent))`.
+
+**Reasoning:** Without this, Stage 3 ships a fresh instance of the exact bug pattern Issue #59 just retired. The enum is already public and already used by both other native install outcomes; reusing it keeps the wire format consistent (Specta export will produce one `InstallOutcomeKind` TS type, not three).
+
+---
+
+### S3-9: Staging uses `tempfile::TempDir`, no `STAGING_COUNTER`, no leftover sweep
+
+**Severity:** BLOCKING
+
+**Affected plan section:** Task 7 step 3 (`install_steering_file` body, lines 972–984), supersedes [S3-3](#s3-3-uuid_or_pid-undefined-helper-superseded-by-s3-9).
+
+**What the plan says:**
+
+```rust
+std::fs::create_dir_all(self.steering_dir())?;
+let staging = self
+    .steering_dir()
+    .join(format!(".staging-{}", uuid_or_pid()));
+std::fs::write(&staging, std::fs::read(&source.source)?)?;
+if dest.exists() {
+    std::fs::remove_file(&dest)?;
+}
+if let Some(parent) = dest.parent() {
+    std::fs::create_dir_all(parent)?;
+}
+std::fs::rename(&staging, &dest)?;
+```
+
+**What's actually true (commit `47bee9a`, Stage 2 Tier 1.4):** The `STAGING_COUNTER` + `cleanup_leftover_*_staging` pattern was retired in Stage 2 in favour of `tempfile::TempDir`. RAII `Drop` cleans up even when the install panics or returns early — no leftover-sweep needed, no atomic counter, no pid encoding. Both `stage_native_agent_file` and `stage_native_companion_files` now follow this pattern:
+
+```rust
+// crates/kiro-market-core/src/project.rs:1182 (stage_native_agent_file)
+let staging = tempfile::Builder::new()
+    .prefix(&format!("_installing-agent-{name}-"))
+    .tempdir_in(self.kiro_dir())?;
+let json_rel = PathBuf::from(format!("{name}.json"));
+let staging_json = staging.path().join(&json_rel);
+fs::write(&staging_json, raw_bytes)?;
+
+let installed_hash =
+    crate::hash::hash_artifact(staging.path(), std::slice::from_ref(&json_rel))?;
+// staging is a TempDir; drops at scope exit and cleans up the staging dir.
+```
+
+`tempfile` is already a workspace dep with both runtime (`[dependencies]`) and dev usage in `kiro-market-core` (Stage 2 promoted it from dev-only to runtime).
+
+**Required revision:** Drop S3-3 entirely. Refactor `install_steering_file` to stage into a `tempfile::TempDir` rooted under `self.kiro_dir()` (NOT under `self.steering_dir()` — staging directories must not live inside the destination directory the install is writing to, because a subsequent `fs::create_dir_all(self.steering_dir())` race could cause it to nest). Hash the staging copy BEFORE the destructive promote (P-1, see S3-4), then `fs::rename` the single staged file into place. Let `staging` drop at end-of-scope.
+
+Sketch — combine with S3-4's backup-then-swap:
+
+```rust
+// Inside the file-lock closure, AFTER the collision check decided we proceed:
+
+// Stage. Create staging dir under .kiro/ (NOT inside steering_dir/).
+fs::create_dir_all(self.kiro_dir())
+    .map_err(|source| SteeringError::DestinationDirFailed {
+        path: self.kiro_dir(),
+        source,
+    })?;
+let staging = tempfile::Builder::new()
+    .prefix(&format!("_installing-steering-{}-", file_stem(&rel_path)))
+    .tempdir_in(self.kiro_dir())
+    .map_err(|source| SteeringError::StagingWriteFailed {
+        path: self.kiro_dir(),
+        source,
+    })?;
+
+// Read source + write to staging at the FINAL filename so hashing the
+// staged copy gives the same value as hashing after promotion.
+let staged_file = staging.path().join(rel_path.file_name().unwrap_or_default());
+let source_bytes = fs::read(&source.source)
+    .map_err(|src| SteeringError::SourceReadFailed {
+        path: source.source.clone(),
+        source: src,
+    })?;
+fs::write(&staged_file, &source_bytes)
+    .map_err(|src| SteeringError::StagingWriteFailed {
+        path: staged_file.clone(),
+        source: src,
+    })?;
+
+// Compute installed_hash on staging BEFORE the destructive promote (P-1).
+let staged_rel = std::path::PathBuf::from(rel_path.file_name().unwrap_or_default());
+let installed_hash = crate::hash::hash_artifact(staging.path(), std::slice::from_ref(&staged_rel))
+    .map_err(|src| SteeringError::HashFailed {
+        path: staged_file.clone(),
+        source: src,
+    })?;
+
+// Backup-then-swap promote (P-6). See S3-4 for the rollback semantics.
+// ...
+fs::rename(&staged_file, &dest).map_err(|src| ...)?;
+// staging (TempDir) drops here and cleans up the now-empty staging dir.
+```
+
+The `cleanup_leftover_steering_staging` helper from S3-3 is **not needed**. Do not add it. (TempDir's Drop sweeps on the happy path; on an OS-level kill, future installs cannot race on the same staging path because each gets its own random suffix from `tempfile::Builder`.)
+
+**Reasoning:** S3-3 was correct against the Stage 1 codebase but went stale within a few commits. Adopting the now-canonical `TempDir` pattern keeps the three native-install staging paths consistent and removes one nontrivial chunk of crash-recovery code from the steering module before it ships.
+
+---
+
+### S3-10: Reuse generic `CollisionDecision<T>`; extract a `classify_steering_collision` helper
+
+**Severity:** COSMETIC (recommended; not strictly blocking)
+
+**Affected plan section:** Task 7 step 3 (the inline `let mut forced_overwrite = false; if let Some(existing) = ...` ladder at lines 929–970).
+
+**What the plan says:** A 40-line inline collision ladder threaded through the file-lock body, with three error branches and one `forced_overwrite = true` proceed signal, all fused with the staging + promote + tracking code in a single function.
+
+**What's actually true (commit `e65e314`, Issue #60):** Stage 2 extracted both `classify_native_collision` and `classify_companion_collision` into private associated functions that return a generic `CollisionDecision<T>`. The classifiers stay short and exhaustive over the same-plugin / cross-plugin / orphan-on-disk / clean-install matrix; the install body becomes a `match` over the decision plus a linear staging-promote-track sequence. The shared enum lives in `crates/kiro-market-core/src/project.rs:163`:
+
+```rust
+enum CollisionDecision<T> {
+    Idempotent(Box<T>),
+    Proceed { forced_overwrite: bool },
+}
+```
+
+(Private to `project.rs`. Steering code lives in the same crate, so the visibility is fine — but it's currently `pub(crate)`-by-default with no `pub` modifier, so verify the `enum` line is reachable from steering's caller before reusing. If reuse requires bumping it to `pub(crate)`, do that in the same commit.)
+
+**Required revision:** Refactor Task 7 step 3 to:
+
+```rust
+fn classify_steering_collision(
+    installed: &InstalledSteering,
+    rel_path: &Path,
+    plugin: &str,
+    source_hash: &str,
+    dest: &Path,
+    mode: crate::service::InstallMode,
+) -> Result<CollisionDecision<InstalledSteeringOutcome>, SteeringError> { ... }
+```
+
+Then `install_steering_file`'s body shrinks to:
+
+```rust
+let forced_overwrite = match Self::classify_steering_collision(
+    &installed, &rel_path, plugin, source_hash, &dest, mode,
+)? {
+    CollisionDecision::Idempotent(outcome) => return Ok(*outcome),
+    CollisionDecision::Proceed { forced_overwrite } => forced_overwrite,
+};
+// stage + hash + promote + tracking
+```
+
+The classifier must be exhaustive (no `_ => default` — see the CLAUDE.md "classifiers enumerate every variant" rule). Steering's collision matrix has exactly four states:
+1. Tracked + same plugin + same hash → `Idempotent`
+2. Tracked + same plugin + different hash → `ContentChangedRequiresForce` or `Proceed { forced_overwrite: true }`
+3. Tracked + different plugin → `PathOwnedByOtherPlugin` or `Proceed { forced_overwrite: true }`
+4. Untracked + on-disk → `OrphanFileAtDestination` or `Proceed { forced_overwrite: true }`
+5. Untracked + clean → `Proceed { forced_overwrite: false }`
+
+**Reasoning:** Marked COSMETIC rather than BLOCKING because the inline ladder is correct as-written. But every previously-shipped install path in this crate now follows the classifier-decision shape; landing steering with the older inline shape diverges the codebase right as it grows a third install target. If pressed for time, ship inline and follow up — but the refactor takes ~30 lines of net change and lifts the whole install-body comprehension cost.
+
+---
+
+### S3-11: Multi-scan-root steering is allowed (unlike companion bundles)
+
+**Severity:** COSMETIC (documentation amendment + one explicit test)
+
+**Affected plan section:** Task 3 (`discover_steering_files_in_dirs` semantics), Task 9 (`install_plugin_steering` body), and Task 11 (end-to-end test scenarios).
+
+**What the plan says:** The plan does not address what happens when `manifest.steering` declares multiple paths (e.g. `["./guidance/", "./extras/"]`). Since steering files have no shared identity (the per-file relative path under `.kiro/steering/` is the tracking key), there's no analogue to the companion bundle's "single-scan-root" invariant.
+
+**What's actually true (commit `085b48b`):** Stage 2 added `multiple_companion_scan_roots` rejection BEFORE installing any agents, because companion `rel_paths` derivation is ambiguous when files come from two different scan roots — the same `prompts/foo.md` from `./agents/` vs `./extras/` would silently overwrite. Steering does not have this problem: each file's `rel` is computed against its own `scan_root` independently, and the destination key is purely the filename. Two files named `process.md` in two different scan roots WOULD collide at `.kiro/steering/process.md`, but that collision surfaces naturally through `PathOwnedByOtherPlugin` / `ContentChangedRequiresForce` / `OrphanFileAtDestination` — exactly the same way it surfaces for a single-scan-root duplicate.
+
+**Required revision:** Add an explicit note in Task 9's body and a test in Task 11 (or Task 8) that exercises a multi-scan-root steering manifest. The note in Task 9:
+
+```
+// Multi-scan-root is supported — each file's rel under its own scan_root
+// is the tracking key. Same-name files from different scan roots
+// surface as a normal cross-rel collision via the standard collision
+// matrix, no upstream rejection needed.
+```
+
+The test:
+
+```rust
+#[test]
+fn install_plugin_steering_handles_multi_scan_root_without_special_case() {
+    // plugin manifest declares ["./a/", "./b/"] with distinct .md files
+    // in each. Both install. No upstream rejection.
+}
+```
+
+**Reasoning:** The asymmetry with `MultipleScanRootsNotSupported` is intentional and load-bearing — the Stage 2 reviewer asked about it, and the answer "steering doesn't need the same rejection because the rel-key derivation is unambiguous" should be documented in the plan and pinned by a test rather than living only in this amendments doc.
+
+---
+
+### S3-12: Use `rstest` `#[fixture]` for collision-test setup
+
+**Severity:** COSMETIC
+
+**Affected plan section:** Task 8 (collision tests for `install_steering_file`).
+
+**What's actually true (Stage 2):** The Stage 2 `install_native_agent` and `install_native_companions` collision tests use `rstest` `#[fixture]` (`NativeRev`, `CompanionBundle`) to share multi-step setup across 3+ tests. The pattern is documented in MEMORY.md (`feedback_test_fixtures.md`): "when 3+ tests share multi-step setup, extract a `#[fixture]` returning a resource-owning struct."
+
+**Required revision:** Task 8 will have ≥4 collision tests (idempotent / content-changed / cross-plugin / orphan). Stage 3 should pre-declare a `SteeringFile` fixture mirroring `CompanionBundle`'s shape:
+
+```rust
+struct SteeringFile {
+    scratch: tempfile::TempDir,
+    project: KiroProject,
+    scan_root: PathBuf,
+    rel_path: PathBuf,
+    source_hash: String,
+}
+
+impl SteeringFile {
+    fn rewrite_source(&mut self, body: &[u8]) { /* re-stage + re-hash */ }
+}
+
+#[fixture]
+fn steering_file() -> SteeringFile { /* tempdir + project + stage one .md */ }
+
+fn install_steering(
+    f: &SteeringFile,
+    plugin: &str,
+    mode: InstallMode,
+) -> Result<InstalledSteeringOutcome, SteeringError> { /* convenience wrapper */ }
+```
+
+Same shape as `crates/kiro-market-core/src/project.rs:3399` (`CompanionBundle`).
+
+**Reasoning:** The fixture pattern is already on disk; following it makes the diff smaller and trains the next reader to look for fixtures rather than copy-paste setup.
+
+---
+
+### S3-13: CLI errors render via `error_full_chain`, not `to_string()`
+
+**Severity:** BLOCKING
+
+**Affected plan section:** Task 10 (CLI integration of `install_plugin_steering` results, lines 1370–1409).
+
+**What's actually true (CLAUDE.md):** > At Tauri/log boundaries, AND in any wire-format `reason`/`error: String` field that crosses the FFI, use `error_full_chain(&err)` — not `err.to_string()`, which drops the source chain.
+
+The Stage 2 CLI presenter (`crates/kiro-market/src/commands/install.rs:298`) already follows this:
+
+```rust
+let rendered = kiro_market_core::error::error_full_chain(&failed.error);
+eprintln!(...);
+```
+
+**Required revision:** When Task 10 renders `result.failed` entries, use `error_full_chain(&entry.error)`. Do not use `entry.error.to_string()` or `format!("{}", entry.error)` — either drops `#[source]` chain context (e.g. the underlying `io::Error` reason for a `SourceReadFailed`).
+
+```rust
+for failed in &steering_result.failed {
+    let rendered = kiro_market_core::error::error_full_chain(&failed.error);
+    eprintln!(
+        "  {} steering {}: {}",
+        "✗".red().bold(),
+        failed.source.display(),
+        rendered
+    );
+}
+```
+
+**Reasoning:** Stage 1 set this rule explicitly because a previous `to_string()` call dropped the inner `io::Error` reason and produced "tracking I/O failed" without saying which file or which OS error code. Stage 2's CLI follows it; Stage 3's must too.
+
+---
+
+### S3-7: Per-task amendment recap (appears last because it cross-references all other S3 amendments)
+
+> **Reading order note:** S3-7 was authored in pass 1 as a per-task recap; pass 2 inserted S3-8 through S3-13 *before* it on the page so the new amendments group with the others numerically. As a result the on-page section order is `S3-1 … S3-6, S3-8 … S3-13, S3-7`. S3-7 still works as a recap because its bullets reference the new S3-N amendments by number.
 
 - **Tasks 1, 3, 4, 5, 6** — `PluginManifest` extension, `discover_steering_files_in_dirs`, `PluginInstallContext.steering_scan_paths`, `InstalledSteering` / `InstalledSteeringMeta`, load/save helpers. Execute as planned. Note Task 5 should add `#[serde(default, skip_serializing_if = "HashMap::is_empty")]` to `InstalledSteering.files` per P-4 (the original plan only has `#[serde(default)]`).
-- **Task 8** — collision tests for `install_steering_file`. Update `force: bool` → `mode: InstallMode` per S3-6; otherwise execute as planned.
-- **Task 10** — CLI integration. Drop `SteeringInstallOptions { force }` argument; pass `mode: cli_force_flag.into()`.
-- **Tasks 11, 12** — End-to-end test + final verification. Update fixture call per S3-5; otherwise execute as planned.
+- **Task 7** — happy path. Apply S3-4 (P-1 + P-6 atomicity), S3-8 (`InstallOutcomeKind`), S3-9 (`tempfile::TempDir` staging), and S3-10 (extract classifier).
+- **Task 8** — collision tests. Apply S3-6 (`force: bool` → `mode: InstallMode`), S3-8 (`kind: InstallOutcomeKind` assertions), and S3-12 (rstest `#[fixture]`).
+- **Task 9** — `install_plugin_steering`. Apply S3-2 (`SteeringWarning`), S3-5 (`temp_service`), S3-6 (`mode: InstallMode`), S3-8 (`InstallOutcomeKind`), and S3-11 (multi-scan-root note + test).
+- **Task 10** — CLI integration. Apply S3-6 (drop `SteeringInstallOptions`), S3-8 (3-variant match in presenter), and S3-13 (`error_full_chain`).
+- **Tasks 11, 12** — End-to-end test + final verification. Apply S3-5 (fixture call), S3-8 (idempotent assertion shape), and S3-11 (consider extending the multi-scan-root scenario into the integration test).
 
 ---
 
 ## Cross-stage notes
 
-- **PluginInstallContext propagation** — Stage 2 Task 7 adds `format: Option<PluginFormat>`; Stage 3 Task 4 adds `steering_scan_paths`. Both should land in the SAME plan-revision pass (extending the same struct in two adjacent commits). The CLI call sites that build the context need to consume both new fields together.
+- **PluginInstallContext propagation** — Stage 2 Task 7 adds `format: Option<PluginFormat>`; Stage 3 Task 4 adds `steering_scan_paths`. Both should land in the SAME plan-revision pass (extending the same struct in two adjacent commits). The CLI call sites that build the context need to consume both new fields together. *(Stage 2 has shipped; Stage 3 is the only remaining edit to `PluginInstallContext`.)*
 
-- **`PluginInstallContext` as parameter struct vs positional** — Multiple S2 amendments above keep the codebase's positional-arg convention rather than introducing the planned `(ctx: &PluginInstallContext, opts: ...)` shape. This is a deliberate choice to minimize blast radius. If a future PR wants to refactor to the context-shape, do it for ALL three install entrypoints (`install_skills`, `install_plugin_agents`, `install_plugin_steering`) in one focused refactor PR, AFTER Stage 2 and Stage 3 both land.
+- **`PluginInstallContext` as parameter struct vs positional** — Multiple S2 amendments above kept the codebase's positional-arg convention through Stage 2. After Stage 2 landed, Issue #61 (commit `e65e314`) introduced `AgentInstallContext<'a>` as a Copy-able bundle for the agent-install chain's shared `(mode, accept_mcp, marketplace, plugin, version)`. Stage 3's `install_plugin_steering` is currently planned as 4 positional args (`project, marketplace, ctx, opts`), which stays under the `clippy::too_many_arguments` threshold — leaving it positional is fine. If you want consistency with `AgentInstallContext`, introduce a sibling `SteeringInstallContext { mode, marketplace, plugin, version }` (no `accept_mcp` — steering has no MCP gate); it adds ~5 lines and a Copy derive. Either choice is defensible; flagged here so the executor doesn't reach for the now-unconventional bundle shape used in Stage 1.
 
-- **Stage 1's residual companion-hash gap** — The Stage 1 `synthesize_companion_entry` (translated path) leaves a force-mode data-loss window for the per-plugin companion hash. P-6 backup-then-swap should be retroactively applied to that helper too, in a focused commit either alongside Stage 2 (since Stage 2's `install_native_companions` adopts P-6 from the start) or as a Stage 1.5 cleanup PR. Out of scope for this amendments doc; flag for the executor.
+- **Stage 1's residual companion-hash gap** — The Stage 1 `synthesize_companion_entry` (translated path) leaves a force-mode data-loss window for the per-plugin companion hash. P-6 backup-then-swap should be retroactively applied to that helper too, in a focused commit either alongside Stage 2 (since Stage 2's `install_native_companions` adopts P-6 from the start) or as a Stage 1.5 cleanup PR. Out of scope for this amendments doc; flag for the executor. *(Status check before starting Stage 3: verify whether commit `f203a1b` "extract synthesize_companion_entry helper" carried the P-6 fix or only extracted the helper. If still P-1-only, treat as a parallel cleanup before Stage 3 ships.)*
 
-- **Test count expectations** — After Stage 2 lands, `cargo test -p kiro-market-core` count rises by approximately 35-50 tests (varies with how many collision-edge-case tests Tasks 11-14, 16 each contribute). Stage 3 adds approximately 15-25 more. Final workspace test count target: ~620-650 in the `kiro-market-core` lib bucket.
+- **Stage 2 patterns now established as canonical** — Issue #59 (`InstallOutcomeKind`), Issue #60 (`CollisionDecision<T>` + `CompanionPromotion` struct), Issue #61 (`AgentInstallContext` bundle), and the `tempfile::TempDir` migration (commit `47bee9a`) all landed AFTER the original Stage 3 plan was written. The new amendments S3-8 through S3-13 cover the steering-side fall-through; Issue #60's `CollisionDecision<T>` is the most reusable artifact (S3-10). Per-issue tracking lives at GitHub issues #59/#60/#61, all closed by `e65e314`.
+
+- **`tempfile` is now a runtime dep** — Stage 2 promoted `tempfile` from `[dev-dependencies]` to `[dependencies]` in `crates/kiro-market-core/Cargo.toml`. Stage 3's S3-9 staging refactor relies on this — no Cargo.toml edit needed.
+
+- **Self-cycle dev-dep activates `test-support` for integration tests** — Stage 2 added a self-referential `kiro-market-core = { path = ".", features = ["test-support"] }` line under `[dev-dependencies]` so integration tests in `tests/` can reach `service::test_support::temp_service`. Stage 3's Task 11 inherits this — extending `tests/integration_native_install.rs` Just Works. If Stage 3 instead creates a new `tests/integration_steering.rs`, the same feature activation applies (it's per-crate, not per-test-file).
+
+- **Test count expectations (revised)** — Pre-Stage-3 baseline: `cargo test -p kiro-market-core` reports **587 lib tests + 2 integration tests + 2 doc tests** as of commit `e65e314`. Stage 3 should add ~15–25 lib tests (Tasks 1, 3, 4, 5, 6, 7, 8) plus 1–2 integration tests (Task 11). Target total after Stage 3: **~605–615 lib tests**. (The earlier "620–650" target in this doc's previous revision assumed Stage 2 would add 35–50 tests; the actual Stage 2 increment was smaller because several planned tests collapsed into shared `rstest` fixtures.)
 
 ---
 
 ## Self-review note
 
-This amendments doc was synthesized by reading: the Stage 2 + Stage 3 + design + review-findings + Stage 1 plan files in full; the actual landed code in `crates/kiro-market-core/src/{error,project,service/mod,service/test_support,hash}.rs`; and the Stage 1 PR commit history (`56de6d4`, `495755d`, `db6535b`, `a8cd6b2`, `19e97c3`, `f203a1b`, `925990f`). Snippets are quoted verbatim from the live code at those file paths and from the original plan files. If a snippet here disagrees with what `git show <sha> -- <path>` produces, trust the live code over this doc.
+This amendments doc was synthesized in two passes:
+
+**Pass 1 (2026-04-24, S3-1 through S3-7):** synthesized by reading the Stage 2 + Stage 3 + design + review-findings + Stage 1 plan files in full; the Stage-1-era landed code in `crates/kiro-market-core/src/{error,project,service/mod,service/test_support,hash}.rs`; and the Stage 1 PR commit history (`56de6d4`, `495755d`, `db6535b`, `a8cd6b2`, `19e97c3`, `f203a1b`, `925990f`).
+
+**Pass 2 (2026-04-26, S3-8 through S3-13 + cross-stage revisions):** added after Stage 2 shipped (PR #48 merged via `617a16a`) and the post-merge cleanup work (issues #59/#60/#61) closed via commit `e65e314` on `feat/native-kiro-plugin-import`. The new amendments are grounded against `crates/kiro-market-core/src/{project,service/mod,steering — N/A yet}.rs` AND `crates/kiro-market/src/commands/install.rs` at HEAD-of-branch as of that commit. S3-3 was retained (with a SUPERSEDED banner) rather than deleted so the audit trail of "why doesn't Stage 3 use STAGING_COUNTER" stays in the doc. Snippets are quoted verbatim from the live code; if a snippet disagrees with `git show <sha> -- <path>`, trust the live code.
 
 Items intentionally NOT amended that the original review-findings doc flagged as "documentation only" or "already noted":
 - #13 (Hash failure surfacing) — Stage 1 wired `Error::Hash(#[from])`, callers using `?` propagation are unaffected; documented in Stage 1 Task 15 already.
