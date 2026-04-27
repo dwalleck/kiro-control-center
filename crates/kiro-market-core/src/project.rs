@@ -148,13 +148,14 @@ pub struct InstalledSteering {
     pub files: HashMap<PathBuf, InstalledSteeringMeta>,
 }
 
-/// What happened during one native install call. The three reachable
-/// states are encoded as distinct variants so the previous
-/// `(was_idempotent, forced_overwrite)` bool pair's unrepresentable
-/// `(true, true)` state cannot be constructed.
+/// What happened during one native install call. Three states are
+/// distinct variants rather than a `(was_idempotent: bool,
+/// forced_overwrite: bool)` pair so that the contradictory
+/// `(true, true)` state is unrepresentable by construction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[cfg_attr(feature = "specta", derive(specta::Type))]
 #[serde(rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum InstallOutcomeKind {
     /// Verified no-op — `source_hash` matched the existing tracking
     /// entry's `source_hash`. No bytes were written.
@@ -185,10 +186,13 @@ pub struct InstalledNativeAgentOutcome {
 /// Output of any classifier that decides between "early-return idempotent
 /// outcome" and "proceed with install, possibly with `forced_overwrite`".
 /// The idempotent variant boxes its payload to keep the enum size small
-/// when the outcome type is large. Used by both
+/// when the outcome type is large. Used by three classifiers:
 /// [`KiroProject::classify_native_collision`] (with
-/// [`InstalledNativeAgentOutcome`]) and `classify_companion_collision`
-/// (with [`InstalledNativeCompanionsOutcome`]).
+/// [`InstalledNativeAgentOutcome`]),
+/// `classify_companion_collision` (with
+/// [`InstalledNativeCompanionsOutcome`]), and
+/// `classify_steering_collision` (with
+/// [`crate::steering::InstalledSteeringOutcome`]).
 enum CollisionDecision<T> {
     Idempotent(Box<T>),
     Proceed { forced_overwrite: bool },
@@ -915,9 +919,19 @@ impl KiroProject {
 
         result.map_err(|e| match e {
             crate::error::Error::Steering(steering_err) => steering_err,
+            crate::error::Error::Json(json_err) => {
+                crate::steering::SteeringError::TrackingMalformed {
+                    path: tracking_path,
+                    source: json_err,
+                }
+            }
             other => crate::steering::SteeringError::TrackingIoFailed {
                 path: tracking_path,
-                source: std::io::Error::other(other.to_string()),
+                // error_full_chain walks #[source] so the underlying
+                // io::Error or hash failure reaches the user (CLAUDE.md
+                // FFI rule). `to_string()` would drop everything below
+                // Error's top-level Display.
+                source: std::io::Error::other(crate::error::error_full_chain(&other)),
             },
         })
     }
@@ -933,11 +947,21 @@ impl KiroProject {
         source_hash: &str,
         ctx: crate::steering::SteeringInstallContext<'_>,
     ) -> crate::error::Result<crate::steering::InstalledSteeringOutcome> {
-        let mut installed = self.load_installed_steering().map_err(|e| {
-            crate::steering::SteeringError::TrackingIoFailed {
-                path: self.steering_tracking_path(),
-                source: std::io::Error::other(e.to_string()),
+        let tracking_path = self.steering_tracking_path();
+        let mut installed = self.load_installed_steering().map_err(|e| match e {
+            // A malformed installed-steering.json is a distinct condition
+            // from "couldn't read the file at all" — give it the typed
+            // variant the steering error surface declares.
+            crate::error::Error::Json(json_err) => {
+                crate::steering::SteeringError::TrackingMalformed {
+                    path: tracking_path.clone(),
+                    source: json_err,
+                }
             }
+            other => crate::steering::SteeringError::TrackingIoFailed {
+                path: tracking_path.clone(),
+                source: std::io::Error::other(crate::error::error_full_chain(&other)),
+            },
         })?;
 
         let forced_overwrite = match Self::classify_steering_collision(
@@ -989,8 +1013,8 @@ impl KiroProject {
             );
             Self::rollback_companion_promotion(&placed, &backups);
             return Err(crate::steering::SteeringError::TrackingIoFailed {
-                path: self.steering_tracking_path(),
-                source: std::io::Error::other(e.to_string()),
+                path: tracking_path,
+                source: std::io::Error::other(crate::error::error_full_chain(&e)),
             }
             .into());
         }
@@ -2062,9 +2086,11 @@ impl KiroProject {
         Ok(CompanionPromotion { placed, backups })
     }
 
-    /// Compute the `.kiro-bak` sibling path for a companion file. Splices
-    /// the suffix between the file stem and extension so a `.md` file
-    /// becomes `.md.kiro-bak` rather than just `.kiro-bak`.
+    /// Compute the `.kiro-bak` sibling path for a companion file.
+    /// Appends `.kiro-bak` to the full path (preserving any existing
+    /// extension) so a `foo.md` companion becomes `foo.md.kiro-bak`
+    /// and the original extension survives in the backup name —
+    /// useful for recovery if the user spots leftover backups on disk.
     fn companion_backup_path(dest: &Path) -> PathBuf {
         let mut bak = dest.as_os_str().to_owned();
         bak.push(".kiro-bak");
@@ -2165,9 +2191,12 @@ impl KiroProject {
     /// two concurrent installs of the same skill name cannot both pass the
     /// existence check and clobber each other's staging directory.
     ///
-    /// Per-attempt staging directory naming (`_installing-<name>-<pid>-<seq>`)
-    /// provides defense-in-depth against impossible races and ensures two
-    /// threads in the same process always have distinct staging paths.
+    /// Per-attempt staging is a `tempfile::TempDir` rooted under
+    /// `self.skills_dir()` with prefix `_installing-skill-<name>-`;
+    /// `tempfile::Builder` appends a random suffix so two threads in
+    /// the same process always have distinct staging paths, and the
+    /// `TempDir` RAII Drop sweeps the directory on `?`-propagation,
+    /// panic-unwind, or scope exit.
     fn write_skill_dir(
         &self,
         name: &str,

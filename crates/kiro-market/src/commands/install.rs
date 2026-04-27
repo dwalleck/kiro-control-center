@@ -311,10 +311,16 @@ fn print_agent_outcome(result: &InstallAgentsResult) {
         );
     }
     if let Some(companions) = &result.installed_companions {
+        // Wildcard arm required by `InstallOutcomeKind`'s `#[non_exhaustive]`
+        // (cross-crate matches must accept future variants). New variants
+        // land with neutral rendering until the CLI explicitly handles them.
         let suffix = match companions.kind {
             kiro_market_core::project::InstallOutcomeKind::Idempotent => " (unchanged)".dimmed(),
             kiro_market_core::project::InstallOutcomeKind::ForceOverwrote => " (forced)".yellow(),
-            kiro_market_core::project::InstallOutcomeKind::Installed => "".normal(),
+            // Installed today + any future variant render neutrally
+            // until explicitly handled. Wildcard required by
+            // InstallOutcomeKind's #[non_exhaustive].
+            _ => "".normal(),
         };
         let plural = if companions.files.len() == 1 { "" } else { "s" };
         println!(
@@ -351,13 +357,16 @@ fn print_agent_outcome(result: &InstallAgentsResult) {
 fn print_steering_outcome(result: &InstallSteeringResult, project: &KiroProject) {
     let steering_root = project.steering_dir();
     for outcome in &result.installed {
-        // S3-8: 3-variant exhaustive match over the workspace-shared
-        // InstallOutcomeKind. Identical in shape to print_agent_outcome's
-        // companion-suffix match.
+        // Match the workspace-shared `InstallOutcomeKind` (3 variants
+        // today). Wildcard arm required by `#[non_exhaustive]` —
+        // future variants render neutrally until explicitly handled.
         let suffix = match outcome.kind {
             kiro_market_core::project::InstallOutcomeKind::Idempotent => " (unchanged)".dimmed(),
             kiro_market_core::project::InstallOutcomeKind::ForceOverwrote => " (forced)".yellow(),
-            kiro_market_core::project::InstallOutcomeKind::Installed => "".normal(),
+            // Installed today + any future variant render neutrally
+            // until explicitly handled. Wildcard required by
+            // InstallOutcomeKind's #[non_exhaustive].
+            _ => "".normal(),
         };
         let rel = outcome
             .destination
