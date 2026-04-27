@@ -8,6 +8,7 @@
 pub mod discover;
 pub mod types;
 
+pub use discover::discover_steering_files_in_dirs;
 pub use types::{
     FailedSteeringFile, InstallSteeringResult, InstalledSteeringOutcome, SteeringError,
     SteeringWarning,
