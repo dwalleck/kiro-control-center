@@ -68,12 +68,12 @@ pub fn find_plugin_entry(
         )
     })?;
     if let Some(dp) = discovered.into_iter().find(|dp| dp.name() == plugin_name) {
-        let rel = kiro_market_core::validation::RelativePath::new(dp.as_relative_path_string())
-            .expect("discovered plugin paths are always valid relative paths");
         return Ok(PluginEntry {
             name: dp.name().to_owned(),
             description: dp.description().map(String::from),
-            source: kiro_market_core::marketplace::PluginSource::RelativePath(rel),
+            source: kiro_market_core::marketplace::PluginSource::RelativePath(
+                dp.as_relative_path(),
+            ),
         });
     }
 

@@ -7,6 +7,14 @@ use tracing::warn;
 /// Machine-readable error classification for frontend conditional logic.
 ///
 /// Serialized as snake_case strings and exported to TypeScript via specta.
+///
+/// `Internal` is reserved for invariant violations the backend believes
+/// are unreachable (post-condition failures, registry/file-state desync,
+/// etc.). It is *not* the dustbin variant for unmapped errors — that role
+/// stays with `Unknown`, whose `From<CoreError>` arm logs a warning to
+/// signal "we forgot to map this." The frontend can grow special UX for
+/// `Internal` ("please file an issue") without it being noisy from
+/// unmapped-but-mundane errors.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, specta::Type)]
 #[serde(rename_all = "snake_case")]
 pub enum ErrorType {
@@ -16,6 +24,7 @@ pub enum ErrorType {
     GitError,
     IoError,
     ParseError,
+    Internal,
     Unknown,
 }
 
@@ -290,5 +299,22 @@ mod tests {
         let err = CommandError::new("boom", ErrorType::Validation);
         assert_eq!(err.message, "boom");
         assert_eq!(err.error_type, ErrorType::Validation);
+    }
+
+    /// Pin the wire format for `ErrorType::Internal`. The frontend relies
+    /// on the snake-case discriminator (`"internal"`) being distinct from
+    /// `"unknown"` so it can render "please file an issue" UX without
+    /// triggering on every unmapped-CoreError variant.
+    #[test]
+    fn error_type_internal_serializes_as_snake_case_distinct_from_unknown() {
+        assert_eq!(
+            serde_json::to_string(&ErrorType::Internal).expect("ser"),
+            r#""internal""#
+        );
+        assert_eq!(
+            serde_json::to_string(&ErrorType::Unknown).expect("ser"),
+            r#""unknown""#
+        );
+        assert_ne!(ErrorType::Internal, ErrorType::Unknown);
     }
 }

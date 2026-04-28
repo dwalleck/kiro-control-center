@@ -1909,17 +1909,13 @@ fn storage_from_source_and_link(ms: &MarketplaceSource, link: LinkResult) -> Mar
 fn plugin_entry_from_discovered(
     dp: &crate::plugin::DiscoveredPlugin,
 ) -> crate::marketplace::PluginEntry {
-    // `as_relative_path_string` always returns `./<unix-path>` and the
-    // components originate from our own filesystem scan, so validation
-    // cannot legitimately fail here. `expect` documents the invariant:
-    // if it ever panics, discovery has admitted an unsafe name that it
-    // should have rejected upstream.
-    let rel = crate::validation::RelativePath::new(dp.as_relative_path_string())
-        .expect("discovered plugin paths are always valid relative paths");
+    // `DiscoveredPlugin::as_relative_path` consumes a validated-by-discovery
+    // path via `RelativePath::from_internal_unchecked`, avoiding the
+    // `.expect("discovery paths are valid")` that the no-unwrap gate flags.
     crate::marketplace::PluginEntry {
         name: dp.name().to_owned(),
         description: dp.description().map(String::from),
-        source: crate::marketplace::PluginSource::RelativePath(rel),
+        source: crate::marketplace::PluginSource::RelativePath(dp.as_relative_path()),
     }
 }
 

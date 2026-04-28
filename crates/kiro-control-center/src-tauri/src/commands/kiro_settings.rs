@@ -6,8 +6,8 @@ use std::sync::Mutex;
 use kiro_market_core::file_lock::with_file_lock;
 use kiro_market_core::kiro_settings::{
     apply_registered_setting, default_kiro_dir, kiro_settings_path, load_kiro_settings_from,
-    registry, remove_nested, resolve_settings, save_kiro_settings_to, LoadSettingsError,
-    SettingEntry, SettingValue,
+    registry, remove_nested, resolve_setting_for_key, resolve_settings, save_kiro_settings_to,
+    LoadSettingsError, SettingEntry, SettingValue,
 };
 use serde_json::Value as JsonValue;
 
@@ -140,10 +140,26 @@ pub async fn set_kiro_setting(
     })?;
 
     let json = load_settings(&dir)?;
-    let entry = resolve_settings(&json)
-        .into_iter()
-        .find(|e| e.key == key)
-        .expect("key was validated against registry inside apply_registered_setting");
+    // `apply_registered_setting` already validated `key` against the
+    // registry, so `resolve_setting_for_key` returns Some by construction.
+    // Surface the impossible case as a typed `Internal` error rather than
+    // `.expect()`-panicking — `Internal` is distinct from `Unknown` (the
+    // unmapped-error dustbin) so the frontend can grow specific UX for
+    // backend-invariant violations. The `tracing::error!` is the diagnostic
+    // signal a panic backtrace would have provided; without it the
+    // post-condition failure is invisible to operators.
+    let Some(entry) = resolve_setting_for_key(&json, &key) else {
+        tracing::error!(
+            key = %key,
+            "set_kiro_setting: key validated by apply_registered_setting but absent on reload — registry/file invariant violated"
+        );
+        return Err(CommandError::new(
+            format!(
+                "internal error: settings update for `{key}` succeeded but the follow-up read could not find it; reload and retry"
+            ),
+            ErrorType::Internal,
+        ));
+    };
 
     Ok(entry)
 }
