@@ -41,13 +41,27 @@ struct Finding {
 }
 
 /// External crate paths that must not appear behind `#[source]` on any
-/// `pub` enum variant in `kiro-market-core`. CLAUDE.md says these errors
-/// should be mapped at the adapter boundary into typed `ErrorKind`
-/// variants with `reason: String` payloads, never leaked through the
-/// public API.
+/// field of a public enum or struct. CLAUDE.md says these errors should
+/// be mapped at the adapter boundary into typed `ErrorKind` variants
+/// with `reason: String` payloads, never leaked through the public API.
 ///
 /// `io::` is intentionally absent — it's std and CLAUDE.md explicitly
 /// allows it.
+///
+/// Visibility check is on the *parent type*, not the field itself: Rust
+/// syntax doesn't allow `pub` on enum variant fields (`pub enum E { V {
+/// pub x: T } }` is a compile error), so they always extract as
+/// `Visibility::Private`. A `WHERE s.visibility = 'public'` predicate
+/// would therefore skip every legitimate Gate 4 violation — the
+/// canonical PR #64 case `NativeParseFailure::InvalidJson(#[source]
+/// serde_json::Error)` has a private field syntactically. What matters
+/// is whether the *enclosing enum or struct* is public — `pub(crate)`
+/// or fully private parents don't leak through `kiro-market-core`'s
+/// public API.
+///
+/// The `EXISTS` clause uses `qualified_name`'s `Parent::*` prefix to
+/// walk up to the parent symbol, since `parent_symbol_id` is NULL on
+/// the current tethys schema (a known gap — see the reference memory).
 const GATE_4_SQL: &str = "\
 SELECT f.path, s.line, s.qualified_name, s.signature
 FROM symbols s
@@ -59,6 +73,13 @@ WHERE s.kind = 'struct_field'
        OR s.signature LIKE '%gix::%'
        OR s.signature LIKE '%reqwest::%'
        OR s.signature LIKE '%toml::%')
+  AND EXISTS (
+      SELECT 1 FROM symbols parent
+      WHERE parent.kind IN ('enum', 'struct')
+        AND parent.visibility = 'public'
+        AND parent.file_id = s.file_id
+        AND s.qualified_name LIKE parent.name || '::%'
+  )
 ORDER BY f.path, s.line";
 
 /// CLAUDE.md "Zero-tolerance in production code (tests are exempt): no
@@ -92,7 +113,7 @@ ORDER BY f.path, r.line";
 const ALL_GATES: &[Gate] = &[
     Gate {
         name: "gate-4-external-error-boundary",
-        description: "external crate error type behind #[source] on a pub variant field",
+        description: "external crate error type behind #[source] on a field of a public enum/struct",
         sql: GATE_4_SQL,
     },
     Gate {
@@ -337,6 +358,30 @@ mod tests {
         conn
     }
 
+    /// Seed a parent enum row for Gate-4 fixtures with a caller-managed
+    /// id. Both kind values ('enum' and 'struct') satisfy the gate's
+    /// EXISTS clause; we pick 'enum' because that's the canonical Gate-4
+    /// shape (variants with `#[source]` fields).
+    fn seed_parent_enum(
+        conn: &Connection,
+        sym_id: i64,
+        file_id: i64,
+        name: &str,
+        visibility: &str,
+    ) {
+        conn.execute(
+            "INSERT INTO symbols (id, file_id, name, qualified_name, kind, line, visibility)
+             VALUES (?1, ?2, ?3, ?3, 'enum', 1, ?4)",
+            rusqlite::params![sym_id, file_id, name, visibility],
+        )
+        .expect("parent enum insert");
+    }
+
+    /// Seed a `struct_field` row plus a public parent enum derived from
+    /// the qualified name's first `::`-segment. Convenience wrapper for
+    /// the common Gate-4 fixture shape; use
+    /// [`insert_field_under_parent`] when the test needs a non-public
+    /// parent.
     fn insert_field(
         conn: &Connection,
         id: i64,
@@ -345,6 +390,52 @@ mod tests {
         line: u32,
         with_source_attr: bool,
     ) {
+        insert_field_under_parent(
+            conn,
+            id,
+            qualified,
+            signature,
+            line,
+            with_source_attr,
+            "public",
+        );
+    }
+
+    /// Seed a `struct_field` row plus its parent enum at the requested
+    /// visibility. Parent ids occupy the 1000+ range so they cannot
+    /// collide with the lower field ids that existing tests use; calling
+    /// this twice with the same parent name is fine — only the first
+    /// call seeds the parent (the second's INSERT silently succeeds via
+    /// a different `parent_id`, which is harmless because the EXISTS
+    /// clause matches by name+file, not by id).
+    fn insert_field_under_parent(
+        conn: &Connection,
+        id: i64,
+        qualified: &str,
+        signature: &str,
+        line: u32,
+        with_source_attr: bool,
+        parent_visibility: &str,
+    ) {
+        let parent_name = qualified
+            .split("::")
+            .next()
+            .expect("qualified name has at least one segment");
+        // Allocate a non-conflicting parent id derived from the field id.
+        let parent_id: i64 = 1000 + id;
+        // Skip if this parent_id is already taken (e.g. multiple fields
+        // under one parent within the same test): the EXISTS clause
+        // matches by (file_id, name) so any pre-existing row works.
+        let already_seeded: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM symbols WHERE file_id = 1 AND name = ?1 AND kind = 'enum'",
+                [parent_name],
+                |r| r.get(0),
+            )
+            .expect("count query");
+        if already_seeded == 0 {
+            seed_parent_enum(conn, parent_id, 1, parent_name, parent_visibility);
+        }
         conn.execute(
             "INSERT INTO symbols (id, file_id, name, qualified_name, kind, line, signature)
              VALUES (?1, 1, '0', ?2, 'struct_field', ?3, ?4)",
@@ -450,41 +541,88 @@ mod tests {
     #[test]
     fn gate_4_findings_ordered_by_path_then_line() {
         let conn = fresh_db();
-        // Second file so we can verify ordering across files.
+        // Second file so we can verify ordering across files. file_id=1 is
+        // 'src/error.rs' (set up by fresh_db); file_id=2 is 'src/agent.rs'.
         conn.execute(
             "INSERT INTO files (id, path, language) VALUES (2, 'src/agent.rs', 'rust')",
             [],
         )
         .expect("second file insert");
-        // Insert in reverse path order to detect that ORDER BY actually fires.
+        // Parent enum 'A' lives in file 1; parent enum 'B' lives in file 2.
+        // Both public so Gate 4 fires.
+        conn.execute(
+            "INSERT INTO symbols (file_id, name, qualified_name, kind, line, visibility)
+             VALUES (1, 'A', 'A', 'enum', 1, 'public'),
+                    (2, 'B', 'B', 'enum', 1, 'public')",
+            [],
+        )
+        .expect("parent enums");
+        // Insert fields in reverse path order to detect that ORDER BY fires.
         conn.execute(
             "INSERT INTO symbols (id, file_id, name, qualified_name, kind, line, signature)
-             VALUES (10, 1, '0', 'A::0', 'struct_field', 99, 'serde_json::Error')",
+             VALUES (10, 1, '0', 'A::0', 'struct_field', 99, 'serde_json::Error'),
+                    (11, 2, '0', 'B::0', 'struct_field', 1, 'gix::Error')",
             [],
         )
-        .expect("late insert");
+        .expect("fields");
         conn.execute(
-            "INSERT INTO attributes (symbol_id, name, args, line) VALUES (10, 'source', NULL, 99)",
+            "INSERT INTO attributes (symbol_id, name, args, line)
+             VALUES (10, 'source', NULL, 99), (11, 'source', NULL, 1)",
             [],
         )
-        .expect("attr");
-        conn.execute(
-            "INSERT INTO symbols (id, file_id, name, qualified_name, kind, line, signature)
-             VALUES (11, 2, '0', 'B::0', 'struct_field', 1, 'gix::Error')",
-            [],
-        )
-        .expect("early insert");
-        conn.execute(
-            "INSERT INTO attributes (symbol_id, name, args, line) VALUES (11, 'source', NULL, 1)",
-            [],
-        )
-        .expect("attr");
+        .expect("attrs");
 
         let findings = gate_4().run(&conn).expect("gate query should succeed");
         assert_eq!(findings.len(), 2);
         // src/agent.rs sorts before src/error.rs alphabetically.
         assert_eq!(findings[0].path, "src/agent.rs");
         assert_eq!(findings[1].path, "src/error.rs");
+    }
+
+    #[test]
+    fn gate_4_skips_field_when_parent_is_private() {
+        // The exact pattern PR #72's review flagged: an internal type
+        // with #[source] serde_json::Error. CLAUDE.md scopes the rule to
+        // the *public API*; a private parent doesn't violate it.
+        let conn = fresh_db();
+        insert_field_under_parent(
+            &conn,
+            1,
+            "InternalIndexError::Bad::0",
+            "serde_json::Error",
+            10,
+            true,
+            "private",
+        );
+
+        let findings = gate_4().run(&conn).expect("gate query should succeed");
+        assert!(
+            findings.is_empty(),
+            "private parent enum is not public API; got {findings:?}",
+        );
+    }
+
+    #[test]
+    fn gate_4_skips_field_when_parent_is_pub_crate() {
+        // pub(crate) is reachable within the crate but not part of the
+        // *external* public API of `kiro-market-core`. CLAUDE.md scopes
+        // the rule to the public API.
+        let conn = fresh_db();
+        insert_field_under_parent(
+            &conn,
+            1,
+            "InternalIndexError::Bad::0",
+            "serde_json::Error",
+            10,
+            true,
+            "crate",
+        );
+
+        let findings = gate_4().run(&conn).expect("gate query should succeed");
+        assert!(
+            findings.is_empty(),
+            "pub(crate) parent enum is not public API; got {findings:?}",
+        );
     }
 
     // ─── no-unwrap-in-production ────────────────────────────────────────
