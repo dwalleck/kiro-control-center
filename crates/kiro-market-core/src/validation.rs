@@ -40,24 +40,24 @@ impl RelativePath {
         Ok(Self(value))
     }
 
-    /// Construct a `RelativePath` from a value the *caller* guarantees has
-    /// already been validated upstream — used internally when the input
-    /// originates from a trusted in-tree source (filesystem discovery,
-    /// previously-validated manifest data, etc.) and re-running
-    /// [`validate_relative_path`] would only ever succeed.
+    /// Construct a `RelativePath` from a value the caller has already
+    /// validated upstream. `pub(crate)` so external callers cannot bypass
+    /// `validate_relative_path`.
     ///
-    /// `pub(crate)` so callers outside `kiro-market-core` cannot bypass
-    /// validation. Inside the crate, exposing this constructor avoids the
-    /// `.expect("validation will succeed")` pattern at internal call sites
-    /// — those `.expect()` calls are otherwise caught by
-    /// `cargo xtask plan-lint --gate no-unwrap-in-production`.
-    ///
-    /// **Caller contract:** if `value` would fail
-    /// [`validate_relative_path`], this constructs a malformed
-    /// `RelativePath` that downstream code may not handle correctly. Use
-    /// only when the upstream discovery / parse step has already
-    /// established validity.
+    /// **Caller contract:** `value` must already satisfy
+    /// `validate_relative_path` — non-empty, no leading `/` or `\`, no
+    /// embedded `\` or NUL, no `..` component. The current caller —
+    /// [`crate::plugin::DiscoveredPlugin::as_relative_path`] — is sound
+    /// only because [`crate::plugin::try_read_plugin`] runs
+    /// `validate_relative_path` against the assembled path before
+    /// constructing the `DiscoveredPlugin`. Adding a new internal caller
+    /// requires re-establishing this argument; the `debug_assert!` below
+    /// catches a contract violation in tests.
     pub(crate) fn from_internal_unchecked(value: String) -> Self {
+        debug_assert!(
+            validate_relative_path(&value).is_ok(),
+            "from_internal_unchecked called with invalid path: {value:?}"
+        );
         Self(value)
     }
 
