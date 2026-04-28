@@ -148,10 +148,36 @@ pub struct InstalledSteeringOutcome {
 }
 
 /// Per-file failure entry in a steering install batch.
-#[derive(Debug)]
+///
+/// In-process consumers see `error` as a typed [`SteeringError`] and can
+/// match on its variants. **Across the Tauri FFI** (and in the generated
+/// `bindings.ts`) `error` is a pre-rendered string carrying the full
+/// chain produced by [`crate::error::error_full_chain`] — TypeScript
+/// consumers should treat it as opaque diagnostic text, not as a
+/// structured value. Mirrors the precedent set by
+/// [`crate::service::FailedAgent`] / `serialize_agent_error`:
+/// [`SteeringError`] carries `io::Error` / `HashError` payloads that
+/// don't implement `Serialize`, and the serialized chain stays stable
+/// across variant additions.
+#[derive(Debug, Serialize)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
 pub struct FailedSteeringFile {
     pub source: PathBuf,
+    #[serde(serialize_with = "serialize_steering_error")]
+    #[cfg_attr(feature = "specta", specta(type = String))]
     pub error: SteeringError,
+}
+
+/// Serialize a [`SteeringError`] as the rendered chain produced by
+/// [`crate::error::error_full_chain`]. Mirrors
+/// [`crate::service::serialize_agent_error`] — the typed variants carry
+/// `io::Error` / `HashError` payloads that don't implement `Serialize`,
+/// so the wire format projects through the chain string instead.
+fn serialize_steering_error<S: serde::Serializer>(
+    err: &SteeringError,
+    serializer: S,
+) -> std::result::Result<S::Ok, S::Error> {
+    serializer.serialize_str(&crate::error::error_full_chain(err))
 }
 
 /// Non-fatal issues raised during steering discovery. Surface
@@ -171,6 +197,7 @@ pub struct FailedSteeringFile {
 /// <https://github.com/dwalleck/kiro-control-center/issues/66>.
 #[derive(Clone, Debug, Serialize)]
 #[cfg_attr(feature = "specta", derive(specta::Type))]
+#[serde(tag = "kind", rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum SteeringWarning {
     /// A steering scan path declared in the manifest failed validation
@@ -229,7 +256,8 @@ impl std::fmt::Display for SteeringWarning {
 }
 
 /// Aggregate result of `MarketplaceService::install_plugin_steering`.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Serialize)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
 pub struct InstallSteeringResult {
     pub installed: Vec<InstalledSteeringOutcome>,
     pub failed: Vec<FailedSteeringFile>,
@@ -257,12 +285,91 @@ mod tests {
         // re-introduce the `serde_json::Error` type by walking `.source()`.
         // Re-introducing `#[source]` would silently break this assertion.
         // Mirrors the same lock at
-        // `crate::error::tests::native_manifest_parse_failed_exposes_no_source_chain`
-        // and `crate::agent::parse_native::tests::invalid_json_materializes_chain_into_reason_and_hides_source`.
+        // `crate::error::tests::native_manifest_parse_failed_exposes_no_source_chain`.
         assert!(
             err.source().is_none(),
             "TrackingMalformed must not expose a source chain — \
              reason: String is the only carrier of the materialized serde_json detail"
+        );
+    }
+
+    use rstest::rstest;
+
+    #[rstest]
+    #[case::scan_path_invalid(
+        SteeringWarning::ScanPathInvalid {
+            path: PathBuf::from("../escape"),
+            reason: "path traversal".into(),
+        },
+        serde_json::json!({
+            "kind": "scan_path_invalid",
+            "path": "../escape",
+            "reason": "path traversal",
+        }),
+    )]
+    #[case::scan_dir_unreadable(
+        SteeringWarning::ScanDirUnreadable {
+            path: PathBuf::from("/tmp/plugins/x/steering"),
+            reason: "permission denied".into(),
+        },
+        serde_json::json!({
+            "kind": "scan_dir_unreadable",
+            "path": "/tmp/plugins/x/steering",
+            "reason": "permission denied",
+        }),
+    )]
+    fn steering_warning_variants_json_shape(
+        #[case] warning: SteeringWarning,
+        #[case] expected: serde_json::Value,
+    ) {
+        let json = serde_json::to_value(&warning).expect("serialize");
+        assert_eq!(
+            json, expected,
+            "wire format must use internally-tagged `kind` + snake_case to match \
+             SkippedReason / FailedSkillReason / InstallOutcomeKind. Frontend code \
+             writes `if (warning.kind === \"scan_path_invalid\")` — reverting this \
+             attribute would silently break that pattern."
+        );
+    }
+
+    /// `serialize_steering_error` projects through `error_full_chain`, which
+    /// walks `Error::source()`. The end-to-end test in
+    /// `commands::steering::tests` only exercises
+    /// `ContentChangedRequiresForce` (no `#[source]` field), so a regression
+    /// that stopped walking the source chain would survive that test —
+    /// every source-bearing variant (`SourceReadFailed`, `TrackingIoFailed`,
+    /// `HashFailed`, `StagingWriteFailed`, `DestinationDirFailed`) would
+    /// silently lose its inner detail. Lock the chain walk here using
+    /// `SourceReadFailed` as the canary.
+    #[test]
+    fn serialize_steering_error_renders_source_chain_for_source_bearing_variant() {
+        let io_err = io::Error::new(io::ErrorKind::PermissionDenied, "denied for test");
+        let failed = FailedSteeringFile {
+            source: PathBuf::from("plugin/steering/locked.md"),
+            error: SteeringError::SourceReadFailed {
+                path: PathBuf::from("/abs/plugin/steering/locked.md"),
+                source: io_err,
+            },
+        };
+
+        let json = serde_json::to_value(&failed).expect("FailedSteeringFile serializes");
+        let rendered = json
+            .pointer("/error")
+            .and_then(|e| e.as_str())
+            .expect("error must serialize as string per FFI contract");
+
+        assert!(
+            rendered.contains("locked.md"),
+            "rendered chain must include the path component, got: {rendered}"
+        );
+        // The decisive assertion: a regression that stops walking
+        // `Error::source()` in `error_full_chain` drops the inner
+        // io::Error message, leaving operators with a generic top-level
+        // string and no actionable detail.
+        assert!(
+            rendered.contains("denied for test"),
+            "rendered chain must include the io::Error source message; \
+             got: {rendered}"
         );
     }
 }

@@ -2,31 +2,11 @@
 //!
 //! Thin wrappers around [`kiro_market_core::service::MarketplaceService`].
 
-use kiro_market_core::cache::CacheDir;
-use kiro_market_core::git::{GitProtocol, GixCliBackend};
-use kiro_market_core::service::{MarketplaceAddResult, MarketplaceService, UpdateResult};
+use kiro_market_core::git::GitProtocol;
+use kiro_market_core::service::{MarketplaceAddResult, UpdateResult};
 
-use crate::error::{CommandError, ErrorType};
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-/// Obtain the `CacheDir`, returning a `CommandError` if the data directory
-/// cannot be determined.
-fn get_cache() -> Result<CacheDir, CommandError> {
-    CacheDir::default_location().ok_or_else(|| {
-        CommandError::new(
-            "could not determine data directory; is $HOME set?",
-            ErrorType::IoError,
-        )
-    })
-}
-
-fn service() -> Result<MarketplaceService, CommandError> {
-    let cache = get_cache()?;
-    Ok(MarketplaceService::new(cache, GixCliBackend::default()))
-}
+use crate::commands::make_service;
+use crate::error::CommandError;
 
 // ---------------------------------------------------------------------------
 // Commands
@@ -39,7 +19,7 @@ pub async fn add_marketplace(
     source: String,
     protocol: Option<GitProtocol>,
 ) -> Result<MarketplaceAddResult, CommandError> {
-    let svc = service()?;
+    let svc = make_service()?;
     let protocol = protocol.unwrap_or_default();
     svc.add(&source, protocol).map_err(CommandError::from)
 }
@@ -48,7 +28,7 @@ pub async fn add_marketplace(
 #[tauri::command]
 #[specta::specta]
 pub async fn remove_marketplace(name: String) -> Result<(), CommandError> {
-    let svc = service()?;
+    let svc = make_service()?;
     svc.remove(&name).map_err(CommandError::from)
 }
 
@@ -56,6 +36,6 @@ pub async fn remove_marketplace(name: String) -> Result<(), CommandError> {
 #[tauri::command]
 #[specta::specta]
 pub async fn update_marketplace(name: Option<String>) -> Result<UpdateResult, CommandError> {
-    let svc = service()?;
+    let svc = make_service()?;
     svc.update(name.as_deref()).map_err(CommandError::from)
 }

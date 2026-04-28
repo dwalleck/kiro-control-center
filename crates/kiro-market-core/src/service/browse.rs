@@ -85,10 +85,8 @@ impl SkippedPlugin {
     ///
     /// This is the ONLY way to build a [`SkippedPlugin`] outside the
     /// service module (fields are `pub(crate)`), so `reason` and `kind`
-    /// cannot drift from the underlying error. Subsumes the previous
-    /// free helper `plugin_skip_reason(&Error) -> Option<SkippedReason>`
-    /// — callers that only need the kind still have
-    /// [`SkippedReason::from_plugin_error`].
+    /// cannot drift from the underlying error. Callers that only need
+    /// the kind have [`SkippedReason::from_plugin_error`].
     #[must_use]
     pub(crate) fn from_plugin_error(name: String, err: &Error) -> Option<Self> {
         let Error::Plugin(pe) = err else { return None };
@@ -364,13 +362,24 @@ pub enum SkillCount {
 /// (registry-driven) or
 /// [`MarketplaceService::resolve_plugin_install_context_from_dir`]
 /// (directory-driven, for fetch-aware CLI callers).
+///
 /// Rust-internal only — never crosses the FFI boundary, so no `Serialize`
-/// or `specta::Type` derive. The type is `pub` so frontend handlers can
-/// hold onto the resolved inputs between the context-resolution call and
-/// the install call without pulling the preamble logic back into each
-/// handler.
+/// or `specta::Type` derive. **Do not add `Serialize`** — `plugin_dir`
+/// and `skill_dirs` are absolute host paths whose disclosure to the
+/// frontend would leak filesystem layout. The type is `pub` so frontend
+/// handlers can hold onto the resolved inputs between the
+/// context-resolution call and the install call without pulling the
+/// preamble logic back into each handler.
 #[derive(Clone, Debug)]
 pub struct PluginInstallContext {
+    /// Resolved plugin root directory. Required by install paths that
+    /// scan the plugin tree directly (agents, steering) rather than
+    /// consuming pre-resolved subdirectory lists like
+    /// [`Self::skill_dirs`]. Always set by the resolver — callers can
+    /// pass `&ctx.plugin_dir` directly to
+    /// [`MarketplaceService::install_plugin_steering`] /
+    /// [`MarketplaceService::install_plugin_agents`].
+    pub plugin_dir: PathBuf,
     pub version: Option<String>,
     pub skill_dirs: Vec<PathBuf>,
     /// Directories to scan for agent `.md` files inside the plugin.
@@ -391,6 +400,38 @@ pub struct PluginInstallContext {
     /// markdown agents.
     pub format: Option<crate::plugin::PluginFormat>,
 }
+
+// Compile-time lock for the "Do not add `Serialize`" invariant on
+// `PluginInstallContext`. `plugin_dir` and `skill_dirs` are absolute
+// host paths; serializing them would leak filesystem layout to the
+// frontend. The doc comment on the struct documents the rule, but a
+// future contributor typing `#[derive(Serialize)]` would break the
+// invariant silently — this block turns it into a compile error.
+//
+// Implementation note: uses the standard "two overlapping blanket
+// impls" trick from `static_assertions::assert_not_impl_any!`. The
+// generic parameter on `AmbiguousIfSerialize` is inferable when only
+// the unconditional impl applies (`T: !Serialize`); when `T: Serialize`
+// both impls match and inference becomes ambiguous, producing E0283.
+// Diagnostic is cryptic — read this comment when it fires.
+const _: fn() = || {
+    trait AmbiguousIfSerialize<A> {
+        fn check() {}
+    }
+    impl<T: ?Sized> AmbiguousIfSerialize<()> for T {}
+    impl<T: ?Sized + serde::Serialize> AmbiguousIfSerialize<u8> for T {}
+    <PluginInstallContext as AmbiguousIfSerialize<_>>::check();
+};
+
+#[cfg(feature = "specta")]
+const _: fn() = || {
+    trait AmbiguousIfSpectaType<A> {
+        fn check() {}
+    }
+    impl<T: ?Sized> AmbiguousIfSpectaType<()> for T {}
+    impl<T: ?Sized + specta::Type> AmbiguousIfSpectaType<u8> for T {}
+    <PluginInstallContext as AmbiguousIfSpectaType<_>>::check();
+};
 
 // ---------------------------------------------------------------------------
 // Service methods
@@ -742,6 +783,7 @@ impl MarketplaceService {
         let steering_scan_paths = steering_scan_paths_for_plugin(manifest.as_ref());
         let format = manifest.as_ref().and_then(|m| m.format);
         Ok(PluginInstallContext {
+            plugin_dir: plugin_dir.to_path_buf(),
             version,
             skill_dirs,
             agent_scan_paths,
@@ -2585,6 +2627,14 @@ mod tests {
         let ctx = svc
             .resolve_plugin_install_context("mp1", "myplugin")
             .expect("happy path");
+        assert_eq!(
+            ctx.plugin_dir,
+            marketplace_path.join("plugins").join("myplugin"),
+            "plugin_dir must point at the resolved plugin root so callers \
+             of install_plugin_steering / install_plugin_agents don't have \
+             to re-resolve. A regression to e.g. `plugin_dir.parent()` would \
+             pass every other assertion in this test."
+        );
         assert_eq!(ctx.version.as_deref(), Some("1.2.3"));
         let mut names: Vec<String> = ctx
             .skill_dirs
@@ -2861,6 +2911,11 @@ mod tests {
 
         let ctx = MarketplaceService::resolve_plugin_install_context_from_dir(&plugin_dir)
             .expect("missing manifest must yield default agent paths, not error");
+        assert_eq!(
+            ctx.plugin_dir, plugin_dir,
+            "plugin_dir must echo the input path so install_plugin_steering / \
+             install_plugin_agents callers can use it without re-resolving"
+        );
         assert_eq!(
             ctx.agent_scan_paths,
             crate::DEFAULT_AGENT_PATHS

@@ -84,6 +84,17 @@ export const commands = {
 	setKiroSetting: (key: string, value: SettingValue) => typedError<SettingEntry, CommandError>(__TAURI_INVOKE("set_kiro_setting", { key, value })),
 	// Remove a single Kiro CLI setting by key, reverting it to its default.
 	resetKiroSetting: (key: string) => typedError<null, CommandError>(__TAURI_INVOKE("reset_kiro_setting", { key })),
+	/**
+	 *  Install every steering file declared by a plugin into the active
+	 *  project's `.kiro/steering/` directory.
+	 * 
+	 *  The wrapper exists only to construct a [`MarketplaceService`] from
+	 *  process globals and translate the FFI `force: bool` into an
+	 *  [`InstallMode`]; the install itself runs in
+	 *  [`install_plugin_steering_impl`] so it can be tested without a Tauri
+	 *  runtime.
+	 */
+	installPluginSteering: (marketplace: string, plugin: string, force: boolean, projectPath: string) => typedError<InstallSteeringResult_Serialize, CommandError>(__TAURI_INVOKE("install_plugin_steering", { marketplace, plugin, force, projectPath })),
 };
 
 /* Types */
@@ -190,6 +201,60 @@ export type FailedSkillReason =
  */
 { kind: "requested_but_not_found"; plugin: string };
 
+/**
+ *  Per-file failure entry in a steering install batch.
+ * 
+ *  In-process consumers see `error` as a typed [`SteeringError`] and can
+ *  match on its variants. **Across the Tauri FFI** (and in the generated
+ *  `bindings.ts`) `error` is a pre-rendered string carrying the full
+ *  chain produced by [`crate::error::error_full_chain`] — TypeScript
+ *  consumers should treat it as opaque diagnostic text, not as a
+ *  structured value. Mirrors the precedent set by
+ *  [`crate::service::FailedAgent`] / `serialize_agent_error`:
+ *  [`SteeringError`] carries `io::Error` / `HashError` payloads that
+ *  don't implement `Serialize`, and the serialized chain stays stable
+ *  across variant additions.
+ */
+export type FailedSteeringFile = FailedSteeringFile_Serialize | FailedSteeringFile_Deserialize;
+
+/**
+ *  Per-file failure entry in a steering install batch.
+ * 
+ *  In-process consumers see `error` as a typed [`SteeringError`] and can
+ *  match on its variants. **Across the Tauri FFI** (and in the generated
+ *  `bindings.ts`) `error` is a pre-rendered string carrying the full
+ *  chain produced by [`crate::error::error_full_chain`] — TypeScript
+ *  consumers should treat it as opaque diagnostic text, not as a
+ *  structured value. Mirrors the precedent set by
+ *  [`crate::service::FailedAgent`] / `serialize_agent_error`:
+ *  [`SteeringError`] carries `io::Error` / `HashError` payloads that
+ *  don't implement `Serialize`, and the serialized chain stays stable
+ *  across variant additions.
+ */
+export type FailedSteeringFile_Deserialize = {
+	source: string,
+	error: string,
+};
+
+/**
+ *  Per-file failure entry in a steering install batch.
+ * 
+ *  In-process consumers see `error` as a typed [`SteeringError`] and can
+ *  match on its variants. **Across the Tauri FFI** (and in the generated
+ *  `bindings.ts`) `error` is a pre-rendered string carrying the full
+ *  chain produced by [`crate::error::error_full_chain`] — TypeScript
+ *  consumers should treat it as opaque diagnostic text, not as a
+ *  structured value. Mirrors the precedent set by
+ *  [`crate::service::FailedAgent`] / `serialize_agent_error`:
+ *  [`SteeringError`] carries `io::Error` / `HashError` payloads that
+ *  don't implement `Serialize`, and the serialized chain stays stable
+ *  across variant additions.
+ */
+export type FailedSteeringFile_Serialize = {
+	source: string,
+	error: string,
+};
+
 // A marketplace that failed to update, with the reason.
 export type FailedUpdate = {
 	name: string,
@@ -205,6 +270,27 @@ export type GitProtocol =
 "https" | 
 // Clone via SSH (uses SSH agent / keys).
 "ssh";
+
+/**
+ *  What happened during one native install call. Three states are
+ *  distinct variants rather than a `(was_idempotent: bool,
+ *  forced_overwrite: bool)` pair so that the contradictory
+ *  `(true, true)` state is unrepresentable by construction.
+ */
+export type InstallOutcomeKind = 
+/**
+ *  Verified no-op — `source_hash` matched the existing tracking
+ *  entry's `source_hash`. No bytes were written.
+ */
+"idempotent" | 
+// Clean first install — no prior tracking entry, no orphan on disk.
+"installed" | 
+/**
+ *  Force-mode overwrote a tracked path (same plugin's prior content,
+ *  another plugin's content via ownership transfer, or an orphan
+ *  without tracking).
+ */
+"force_overwrote";
 
 // Outcome of installing a list of skill directories from one plugin.
 export type InstallSkillsResult = {
@@ -228,6 +314,23 @@ export type InstallSkillsResult = {
 	skipped_skills: SkippedSkill[],
 };
 
+// Aggregate result of `MarketplaceService::install_plugin_steering`.
+export type InstallSteeringResult = InstallSteeringResult_Serialize | InstallSteeringResult_Deserialize;
+
+// Aggregate result of `MarketplaceService::install_plugin_steering`.
+export type InstallSteeringResult_Deserialize = {
+	installed: InstalledSteeringOutcome[],
+	failed: FailedSteeringFile_Deserialize[],
+	warnings: SteeringWarning[],
+};
+
+// Aggregate result of `MarketplaceService::install_plugin_steering`.
+export type InstallSteeringResult_Serialize = {
+	installed: InstalledSteeringOutcome[],
+	failed: FailedSteeringFile_Serialize[],
+	warnings: SteeringWarning[],
+};
+
 // Information about a single installed skill.
 export type InstalledSkillInfo = {
 	name: string,
@@ -236,6 +339,21 @@ export type InstalledSkillInfo = {
 	version: string | null,
 	// ISO 8601 timestamp of when the skill was installed.
 	installed_at: string,
+};
+
+/**
+ *  Per-call outcome of `KiroProject::install_steering_file`.
+ * 
+ *  The `kind` field uses the workspace-shared [`InstallOutcomeKind`] so
+ *  presenters can match exhaustively over the same 3-variant enum used
+ *  by `InstalledNativeAgentOutcome` and `InstalledNativeCompanionsOutcome`.
+ */
+export type InstalledSteeringOutcome = {
+	source: string,
+	destination: string,
+	kind: InstallOutcomeKind,
+	source_hash: string,
+	installed_hash: string,
 };
 
 // Result of adding a new marketplace.
@@ -561,6 +679,41 @@ export type SkippedSkillReason =
  *  type like `"github" | "git" | "local" | "relative" | "git_subdir"`.
  */
 export type SourceType = "github" | "git" | "local" | "relative" | "git-subdir";
+
+/**
+ *  Non-fatal issues raised during steering discovery. Surface
+ *  actionable signals only — by-design exclusions (README-style files,
+ *  symlinks refused for security) stay as `tracing::debug!` so the
+ *  CLI doesn't spam users with normal product behaviour.
+ * 
+ *  Per the original S3-2 amendment this enum was scoped wider; the
+ *  `Skipped` variant was retired during PR-64 review when it became
+ *  clear surfacing every README would teach users to ignore warnings,
+ *  and that symlink/junction refusals are by-design security behaviour
+ *  rather than actionable feedback for plugin authors.
+ * 
+ *  The `reason: String` payloads on both variants are pre-rendered;
+ *  upgrading them to typed payloads (`ValidationError` / `io::Error`)
+ *  is tracked at
+ *  <https://github.com/dwalleck/kiro-control-center/issues/66>.
+ */
+export type SteeringWarning = 
+/**
+ *  A steering scan path declared in the manifest failed validation
+ *  (path-traversal, absolute, embedded NUL, non-utf-8 component).
+ *  `path` carries the raw manifest value — almost always a typo
+ *  worth surfacing to the plugin author. The validation rejection
+ *  is also logged at `tracing::warn!` for operators.
+ */
+{ kind: "scan_path_invalid"; path: string; reason: string } | 
+/**
+ *  A steering scan directory exists but couldn't be read
+ *  (permission denied, I/O error). Distinct from `NotFound` —
+ *  missing directories are a silent no-op since plugins commonly
+ *  declare `./steering/` without authoring any files. This variant
+ *  fires only for system-level failures the user can act on.
+ */
+{ kind: "scan_dir_unreadable"; path: string; reason: string };
 
 /**
  *  Provider-specific structured source descriptor, internally tagged on `"source"`.
