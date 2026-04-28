@@ -870,8 +870,43 @@ mod tests {
         },
         "failed to parse agent at readme.md: missing opening `---` frontmatter fence"
     )]
+    #[case::native_manifest_parse_failed(
+        AgentError::NativeManifestParseFailed {
+            path: PathBuf::from("rev.json"),
+            reason: "expected `,` or `}` at line 3 column 1".into(),
+        },
+        "native agent JSON `rev.json` failed to parse: expected `,` or `}` at line 3 column 1"
+    )]
     fn agent_error_display(#[case] err: AgentError, #[case] expected: &str) {
         assert_eq!(err.to_string(), expected);
+    }
+
+    /// Locks the wire-format contract that
+    /// [`AgentError::NativeManifestParseFailed`] does not expose a
+    /// `source()` chain. The `reason: String` field is the only carrier
+    /// of materialized `serde_json` detail; re-introducing
+    /// `#[source] serde_json::Error` would silently break this assertion
+    /// AND would be caught at lint time by
+    /// `cargo xtask plan-lint --gate gate-4-external-error-boundary`.
+    ///
+    /// Replaces the deleted `native_manifest_parse_failed_renders_path_and_reason`
+    /// test that exercised the now-removed
+    /// `error::native_manifest_parse_failed` constructor — the contract
+    /// still applies even though the constructor is gone, since
+    /// `service::native_parse_failure_to_agent_error` now produces this
+    /// variant directly from `NativeParseFailure::InvalidJson { reason }`.
+    #[test]
+    fn native_manifest_parse_failed_exposes_no_source_chain() {
+        use std::error::Error as _;
+        let err = AgentError::NativeManifestParseFailed {
+            path: PathBuf::from("rev.json"),
+            reason: "stub".into(),
+        };
+        assert!(
+            err.source().is_none(),
+            "NativeManifestParseFailed must not expose a source chain — \
+             reason: String is the only carrier of materialized serde_json detail"
+        );
     }
 
     #[test]
