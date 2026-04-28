@@ -220,8 +220,27 @@ EXIT CODES:
     );
 }
 
+/// Reject an unknown `--gate <name>` value with a list of registered
+/// gates. Without this check, a typo like `--gate gate4-external-...`
+/// (missing hyphen) would skip every gate, return `Ok(())`, and exit 0
+/// — the exact silent-pass failure mode the broken plan-review-checklist
+/// grep had. Validating up front means a CI typo fails loud.
+fn validate_gate_filter(filter: Option<&str>, gates: &[Gate]) -> Result<()> {
+    let Some(name) = filter else {
+        return Ok(());
+    };
+    if gates.iter().any(|g| g.name == name) {
+        return Ok(());
+    }
+    let known: Vec<&str> = gates.iter().map(|g| g.name).collect();
+    bail!("unknown gate `{name}`; known gates: {}", known.join(", "));
+}
+
 pub fn run(args: impl Iterator<Item = String>) -> Result<()> {
     let opts = Options::parse(args)?;
+
+    // Validate `--gate <name>` before the expensive index step.
+    validate_gate_filter(opts.gate_filter.as_deref(), ALL_GATES)?;
 
     if !opts.skip_reindex {
         ensure_tethys_index(&opts.workspace).context("re-indexing with tethys failed")?;
@@ -812,5 +831,49 @@ mod tests {
 
         let findings = no_unwrap().run(&conn).expect("query should succeed");
         assert!(findings.is_empty());
+    }
+
+    // ─── --gate <name> validation ───────────────────────────────────────
+
+    #[test]
+    fn gate_filter_none_passes() {
+        // Default invocation runs every gate.
+        validate_gate_filter(None, ALL_GATES).expect("None should pass");
+    }
+
+    #[test]
+    fn gate_filter_with_known_name_passes() {
+        validate_gate_filter(Some("gate-4-external-error-boundary"), ALL_GATES)
+            .expect("registered gate name should pass");
+        validate_gate_filter(Some("no-unwrap-in-production"), ALL_GATES)
+            .expect("registered gate name should pass");
+    }
+
+    #[test]
+    fn gate_filter_with_unknown_name_fails_loud() {
+        // The exact failure mode the broken plan-review-checklist grep had:
+        // a typo silently skips everything. Must produce an error naming
+        // the unknown gate AND the valid alternatives.
+        let err =
+            validate_gate_filter(Some("gate4-external-error-boundary"), ALL_GATES).unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("gate4-external-error-boundary"),
+            "error should echo the typo, got: {msg}"
+        );
+        assert!(
+            msg.contains("gate-4-external-error-boundary"),
+            "error should list valid gate names so the user can find the typo, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn gate_filter_empty_string_fails_loud() {
+        // `--gate ""` is also a typo, not a "match all" wildcard.
+        let err = validate_gate_filter(Some(""), ALL_GATES).unwrap_err();
+        assert!(
+            err.to_string().contains("unknown gate"),
+            "empty string should be treated as unknown, got: {err}"
+        );
     }
 }
