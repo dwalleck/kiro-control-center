@@ -792,6 +792,40 @@ fn remove_nested_impl(value: &mut JsonValue, segments: &[&str]) -> bool {
     obj.is_empty()
 }
 
+/// Resolve a single registry setting by key against a loaded JSON config,
+/// returning `None` if the key is not registered.
+///
+/// Equivalent to `resolve_settings(json).into_iter().find(|e| e.key == key)`
+/// but avoids materializing the full entry list. Use this from callers that
+/// have a key in hand (e.g. the Tauri `set_kiro_setting` handler that needs
+/// to return the just-updated entry); use [`resolve_settings`] from callers
+/// that need every entry.
+#[must_use]
+pub fn resolve_setting_for_key(json: &JsonValue, key: &str) -> Option<SettingEntry> {
+    let def = registry().iter().find(|d| d.key == key)?;
+    let current_value = get_nested(json, def.key).cloned();
+    let value_type = match &def.value_type {
+        SettingType::Bool => SettingValueInfo::Bool,
+        SettingType::String => SettingValueInfo::String,
+        SettingType::Number => SettingValueInfo::Number,
+        SettingType::Char => SettingValueInfo::Char,
+        SettingType::StringArray => SettingValueInfo::StringArray,
+        SettingType::Enum(opts) => SettingValueInfo::Enum {
+            options: opts.iter().map(|&s| s.to_owned()).collect(),
+        },
+    };
+    Some(SettingEntry {
+        key: def.key.to_owned(),
+        label: def.label.to_owned(),
+        description: def.description.to_owned(),
+        category: def.category,
+        category_label: def.category.label().to_owned(),
+        value_type,
+        default_value: def.default.clone(),
+        current_value,
+    })
+}
+
 /// Resolve all registry settings against a loaded JSON config, returning a
 /// [`SettingEntry`] for each definition.
 ///
