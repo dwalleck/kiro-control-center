@@ -196,10 +196,13 @@ export type FailedSkillReason =
 /**
  *  Per-file failure entry in a steering install batch.
  * 
- *  `error` stays typed in-process so consumers can match on
- *  [`SteeringError`] variants. The wire format projects it to a string
- *  via [`error_full_chain`], mirroring the precedent set by
- *  [`crate::service::FailedAgent`] / `serialize_agent_error` —
+ *  In-process consumers see `error` as a typed [`SteeringError`] and can
+ *  match on its variants. **Across the Tauri FFI** (and in the generated
+ *  `bindings.ts`) `error` is a pre-rendered string carrying the full
+ *  chain produced by [`crate::error::error_full_chain`] — TypeScript
+ *  consumers should treat it as opaque diagnostic text, not as a
+ *  structured value. Mirrors the precedent set by
+ *  [`crate::service::FailedAgent`] / `serialize_agent_error`:
  *  [`SteeringError`] carries `io::Error` / `HashError` payloads that
  *  don't implement `Serialize`, and the serialized chain stays stable
  *  across variant additions.
@@ -209,10 +212,13 @@ export type FailedSteeringFile = FailedSteeringFile_Serialize | FailedSteeringFi
 /**
  *  Per-file failure entry in a steering install batch.
  * 
- *  `error` stays typed in-process so consumers can match on
- *  [`SteeringError`] variants. The wire format projects it to a string
- *  via [`error_full_chain`], mirroring the precedent set by
- *  [`crate::service::FailedAgent`] / `serialize_agent_error` —
+ *  In-process consumers see `error` as a typed [`SteeringError`] and can
+ *  match on its variants. **Across the Tauri FFI** (and in the generated
+ *  `bindings.ts`) `error` is a pre-rendered string carrying the full
+ *  chain produced by [`crate::error::error_full_chain`] — TypeScript
+ *  consumers should treat it as opaque diagnostic text, not as a
+ *  structured value. Mirrors the precedent set by
+ *  [`crate::service::FailedAgent`] / `serialize_agent_error`:
  *  [`SteeringError`] carries `io::Error` / `HashError` payloads that
  *  don't implement `Serialize`, and the serialized chain stays stable
  *  across variant additions.
@@ -225,10 +231,13 @@ export type FailedSteeringFile_Deserialize = {
 /**
  *  Per-file failure entry in a steering install batch.
  * 
- *  `error` stays typed in-process so consumers can match on
- *  [`SteeringError`] variants. The wire format projects it to a string
- *  via [`error_full_chain`], mirroring the precedent set by
- *  [`crate::service::FailedAgent`] / `serialize_agent_error` —
+ *  In-process consumers see `error` as a typed [`SteeringError`] and can
+ *  match on its variants. **Across the Tauri FFI** (and in the generated
+ *  `bindings.ts`) `error` is a pre-rendered string carrying the full
+ *  chain produced by [`crate::error::error_full_chain`] — TypeScript
+ *  consumers should treat it as opaque diagnostic text, not as a
+ *  structured value. Mirrors the precedent set by
+ *  [`crate::service::FailedAgent`] / `serialize_agent_error`:
  *  [`SteeringError`] carries `io::Error` / `HashError` payloads that
  *  don't implement `Serialize`, and the serialized chain stays stable
  *  across variant additions.
@@ -688,10 +697,7 @@ export type SteeringWarning =
  *  worth surfacing to the plugin author. The validation rejection
  *  is also logged at `tracing::warn!` for operators.
  */
-({ ScanPathInvalid: {
-	path: string,
-	reason: string,
-} }) & { ScanDirUnreadable?: never } | 
+{ kind: "scan_path_invalid"; path: string; reason: string } | 
 /**
  *  A steering scan directory exists but couldn't be read
  *  (permission denied, I/O error). Distinct from `NotFound` —
@@ -699,10 +705,7 @@ export type SteeringWarning =
  *  declare `./steering/` without authoring any files. This variant
  *  fires only for system-level failures the user can act on.
  */
-({ ScanDirUnreadable: {
-	path: string,
-	reason: string,
-} }) & { ScanPathInvalid?: never };
+{ kind: "scan_dir_unreadable"; path: string; reason: string };
 
 /**
  *  Provider-specific structured source descriptor, internally tagged on `"source"`.

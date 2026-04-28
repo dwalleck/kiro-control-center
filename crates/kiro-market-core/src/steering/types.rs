@@ -149,10 +149,13 @@ pub struct InstalledSteeringOutcome {
 
 /// Per-file failure entry in a steering install batch.
 ///
-/// `error` stays typed in-process so consumers can match on
-/// [`SteeringError`] variants. The wire format projects it to a string
-/// via [`error_full_chain`], mirroring the precedent set by
-/// [`crate::service::FailedAgent`] / `serialize_agent_error` —
+/// In-process consumers see `error` as a typed [`SteeringError`] and can
+/// match on its variants. **Across the Tauri FFI** (and in the generated
+/// `bindings.ts`) `error` is a pre-rendered string carrying the full
+/// chain produced by [`crate::error::error_full_chain`] — TypeScript
+/// consumers should treat it as opaque diagnostic text, not as a
+/// structured value. Mirrors the precedent set by
+/// [`crate::service::FailedAgent`] / `serialize_agent_error`:
 /// [`SteeringError`] carries `io::Error` / `HashError` payloads that
 /// don't implement `Serialize`, and the serialized chain stays stable
 /// across variant additions.
@@ -194,6 +197,7 @@ fn serialize_steering_error<S: serde::Serializer>(
 /// <https://github.com/dwalleck/kiro-control-center/issues/66>.
 #[derive(Clone, Debug, Serialize)]
 #[cfg_attr(feature = "specta", derive(specta::Type))]
+#[serde(tag = "kind", rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum SteeringWarning {
     /// A steering scan path declared in the manifest failed validation
@@ -286,6 +290,45 @@ mod tests {
             err.source().is_none(),
             "TrackingMalformed must not expose a source chain — \
              reason: String is the only carrier of the materialized serde_json detail"
+        );
+    }
+
+    use rstest::rstest;
+
+    #[rstest]
+    #[case::scan_path_invalid(
+        SteeringWarning::ScanPathInvalid {
+            path: PathBuf::from("../escape"),
+            reason: "path traversal".into(),
+        },
+        serde_json::json!({
+            "kind": "scan_path_invalid",
+            "path": "../escape",
+            "reason": "path traversal",
+        }),
+    )]
+    #[case::scan_dir_unreadable(
+        SteeringWarning::ScanDirUnreadable {
+            path: PathBuf::from("/tmp/plugins/x/steering"),
+            reason: "permission denied".into(),
+        },
+        serde_json::json!({
+            "kind": "scan_dir_unreadable",
+            "path": "/tmp/plugins/x/steering",
+            "reason": "permission denied",
+        }),
+    )]
+    fn steering_warning_variants_json_shape(
+        #[case] warning: SteeringWarning,
+        #[case] expected: serde_json::Value,
+    ) {
+        let json = serde_json::to_value(&warning).expect("serialize");
+        assert_eq!(
+            json, expected,
+            "wire format must use internally-tagged `kind` + snake_case to match \
+             SkippedReason / FailedSkillReason / InstallOutcomeKind. Frontend code \
+             writes `if (warning.kind === \"scan_path_invalid\")` — reverting this \
+             attribute would silently break that pattern."
         );
     }
 }

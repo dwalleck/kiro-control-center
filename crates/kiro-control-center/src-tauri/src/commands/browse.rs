@@ -5,9 +5,8 @@ use std::path::PathBuf;
 use serde::Serialize;
 use tracing::warn;
 
-use kiro_market_core::cache::{CacheDir, MarketplaceSource};
+use kiro_market_core::cache::MarketplaceSource;
 use kiro_market_core::error::error_full_chain;
-use kiro_market_core::git::GixCliBackend;
 use kiro_market_core::marketplace::{PluginSource, StructuredSource};
 use kiro_market_core::project::{InstalledSkills, KiroProject};
 use kiro_market_core::service::{
@@ -15,6 +14,7 @@ use kiro_market_core::service::{
     PluginSkillsResult, SkillCount,
 };
 
+use crate::commands::make_service;
 use crate::error::{CommandError, ErrorType};
 
 // ---------------------------------------------------------------------------
@@ -70,20 +70,6 @@ pub struct ProjectInfo {
 // ---------------------------------------------------------------------------
 // Commands
 // ---------------------------------------------------------------------------
-
-/// Construct a `MarketplaceService` for read-side handlers.
-///
-/// All Tauri commands here are read-only or install-only; the [`GitBackend`]
-/// is unused on every code path, so the default `GixCliBackend` is fine.
-fn make_service() -> Result<MarketplaceService, CommandError> {
-    let cache = CacheDir::default_location().ok_or_else(|| {
-        CommandError::new(
-            "could not determine data directory; is $HOME set?",
-            ErrorType::IoError,
-        )
-    })?;
-    Ok(MarketplaceService::new(cache, GixCliBackend::default()))
-}
 
 /// List all registered marketplaces with plugin counts.
 #[tauri::command]
