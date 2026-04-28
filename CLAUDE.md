@@ -33,7 +33,7 @@ Run all three before committing — CI enforces each:
 - `cargo xtask hook-block-cargo-lock` — blocks direct `Cargo.lock` edits. Override for one session via `KIRO_ALLOW_LOCKFILE_EDIT=1`.
 
 ## Planning
-Before writing or reviewing a plan, apply the 5 gates in `docs/plan-review-checklist.md` (Grounding / Threat Model / Wire Format / External Type Boundary / Type Design). Originated from the PR #64 retrospective — the gates codify the categories of issues that cost a follow-up commit each on PR #64. Complement to (not replacement for) the upstream `superpowers:writing-plans` skill: invoke that skill first, then run the gates as a self-review pass before declaring the plan implementation-ready.
+After writing a plan and before starting implementation, apply the 5 gates in `docs/plan-review-checklist.md` (Grounding / Threat Model / Wire Format / External Type Boundary / Type Design). The gates also fire as code-review questions on any change touching the public API of `kiro-market-core`. Originated from the PR #64 retrospective — the gates codify the categories of issues that cost a follow-up commit each on PR #64. Complement to (not replacement for) the upstream `superpowers:writing-plans` skill: invoke that skill first, then run the gates as a self-review pass before declaring the plan implementation-ready.
 
 ## Project Structure
 - `crates/kiro-market-core/` — library crate (types, parsing, git, cache, project state)

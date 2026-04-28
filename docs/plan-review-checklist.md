@@ -136,11 +136,17 @@ site. PR #64 ended up doing this with `SteeringIdempotentEcho`.
 **What to check.** No field of any `pub` type in `kiro-market-core`
 carries an external crate's error type via `#[source]`. CLAUDE.md's
 "map external errors at the adapter boundary" rule is tested by a
-`grep` at plan-review time, not by waiting for a reviewer agent to
+SQL gate at plan-review time, not by waiting for a reviewer agent to
 flag it.
 
 **Where to look.**
-- `grep -rn '#\[source\]\s*\n\s*source: \(serde_json\|gix\|reqwest\|toml\)::' crates/kiro-market-core/src/`
+- `cargo xtask plan-lint --gate gate-4-external-error-boundary` —
+  this queries the tethys index for any `pub` enum variant carrying
+  an external crate's error type (`serde_json`, `gix`, `reqwest`,
+  `toml`) via `#[source]`. The earlier shape of this gate was a
+  `grep` against source files, but standard `grep` doesn't match
+  multi-line patterns and silently produced zero matches even when
+  violations existed; the SQL gate is the supported form.
 - Any planned variant matching this pattern needs the
   `#[non_exhaustive]` enum + `reason: String` field +
   `pub(crate) fn` constructor recipe (CLAUDE.md "Map external errors
@@ -155,7 +161,8 @@ flag it.
 `SteeringError::TrackingMalformed { #[source] source: serde_json::Error
 }`. Both leaked `serde_json` through the public API. Both shipped
 that way and were fixed in follow-up commits with the
-constructor-pattern recipe. A plan-review grep would have caught both.
+constructor-pattern recipe. A plan-lint Gate 4 run would have caught
+both at plan-review time.
 
 ---
 
@@ -167,7 +174,20 @@ constructor-pattern recipe. A plan-review grep would have caught both.
    field in a manifest. A plan that says "validate the name field"
    is a fail; the correct shape is a newtype with a fallible `new` and
    a `Deserialize` routing through `new`. Templates: `RelativePath`,
-   `GitRef`, `AgentName`.
+   `GitRef`, `AgentName` — note `GitRef` is a parse-don't-validate
+   template only and lacks the specta derive; for the specta cfg-attr
+   in item 2, follow `RelativePath` instead.
+
+   *Exception:* a transient projection struct may keep a raw
+   `Option<String>` field when post-parse routing needs to split
+   failures across distinct error variants — e.g.
+   `NativeAgentProjection.name: Option<String>` so `MissingName` /
+   `InvalidName(reason)` / `InvalidJson` route to three distinct
+   `AgentError` variants instead of collapsing into
+   `InvalidJson(serde_json::Error)`. The type-level guarantee must
+   still land at the *bundle* boundary
+   (`NativeAgentBundle.name: AgentName`). See the parse-don't-validate
+   exception in CLAUDE.md.
 2. **Specta cfg-attr on validation newtypes** — every newtype that
    *could* end up in a Tauri-reachable type needs
    `#[cfg_attr(feature = "specta", derive(specta::Type))]` from day
@@ -177,7 +197,21 @@ constructor-pattern recipe. A plan-review grep would have caught both.
    error enum matches every variant explicitly (no `_ => default`).
    When the plan adds a new variant, it must list which classifiers
    need a new arm.
-4. **`InstallOutcomeKind`-style enum vs. boolean pair** — when the
+4. **Classifier idempotent-payload rule** — when a classifier returns
+   `CollisionDecision::Idempotent(Box<T>)`, every field of `T` must be
+   data the classifier *actually receives as input*, not data the
+   caller has but didn't pass in. If a field can't be filled from the
+   classifier's inputs, split the type: return a minimal echo from the
+   classifier (e.g. `SteeringIdempotentEcho { prior_installed_hash:
+   String }`) and have the caller assemble the full outcome where the
+   missing data is in scope. PR #64's steering classifier shipped with
+   `T = InstalledSteeringOutcome` and substituted `dest` for the
+   missing `source` path, leaking the destination into the wire-format
+   `source` field on idempotent reinstalls — this rule is named in
+   CLAUDE.md ("Classifier idempotent-payload rule") because the bug
+   shape is repeatable. Cross-references Gate 3 (wire-format payload
+   correctness) but lives here because the fix is type-design.
+5. **`InstallOutcomeKind`-style enum vs. boolean pair** — when the
    plan introduces multiple boolean flags that describe the same axis
    (e.g. `was_idempotent` + `forced_overwrite`), check whether the
    `(true, true)` state is meaningful. If not, replace with a 3- or
@@ -189,6 +223,11 @@ constructor-pattern recipe. A plan-review grep would have caught both.
   constructor?
 - For every planned error enum variant: which existing classifier
   functions need an arm?
+- For every planned `classify_*_collision` returning
+  `Idempotent(Box<T>)`: do a who-constructs-this inventory and confirm
+  every field of `T` is data the classifier actually receives as
+  input. If two construction sites of `T` have different inputs in
+  scope, split the type.
 - For every planned outcome / status struct: are there ≥2 boolean
   fields that could collapse into an enum?
 
@@ -197,6 +236,12 @@ constructor-pattern recipe. A plan-review grep would have caught both.
 - `NativeAgentBundle.name: String` validated post-parse via free
   `validate_name` — fixed in review by introducing the `AgentName`
   newtype.
+- `classify_steering_collision` returning
+  `Idempotent(Box<InstalledSteeringOutcome>)` and substituting `dest`
+  for the missing `source` path — leaked the destination into the
+  wire-format `source` field on idempotent reinstalls, fixed in
+  follow-up by splitting the type into `SteeringIdempotentEcho` (echo
+  from the classifier) plus full assembly at the data-rich caller.
 - `InstalledSteeringOutcome { was_idempotent: bool, forced_overwrite:
   bool }` with a meaningless `(true, true)` state — fixed mid-plan
   (Issue #59) with `InstallOutcomeKind` 3-variant enum.
