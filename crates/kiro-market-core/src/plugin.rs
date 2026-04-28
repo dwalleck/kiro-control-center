@@ -100,6 +100,21 @@ impl DiscoveredPlugin {
         format!("./{unix_path}")
     }
 
+    /// The relative path as a validated [`RelativePath`].
+    ///
+    /// Discovery has already established the path's validity (it lives
+    /// under `repo_root` and originates from a filesystem walk, not user
+    /// input), so this uses [`RelativePath::from_internal_unchecked`] to
+    /// avoid an unnecessary re-validation that would only ever succeed.
+    /// Callers that have a `DiscoveredPlugin` should prefer this over
+    /// `RelativePath::new(dp.as_relative_path_string())`, which previously
+    /// required an `.expect("paths from discovery are valid")` call site
+    /// flagged by the `no-unwrap-in-production` plan-lint gate.
+    #[must_use]
+    pub fn as_relative_path(&self) -> crate::validation::RelativePath {
+        crate::validation::RelativePath::from_internal_unchecked(self.as_relative_path_string())
+    }
+
     /// The relative path with forward slashes, suitable for cross-platform
     /// comparison against manifest paths.
     #[must_use]

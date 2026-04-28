@@ -40,6 +40,27 @@ impl RelativePath {
         Ok(Self(value))
     }
 
+    /// Construct a `RelativePath` from a value the *caller* guarantees has
+    /// already been validated upstream — used internally when the input
+    /// originates from a trusted in-tree source (filesystem discovery,
+    /// previously-validated manifest data, etc.) and re-running
+    /// [`validate_relative_path`] would only ever succeed.
+    ///
+    /// `pub(crate)` so callers outside `kiro-market-core` cannot bypass
+    /// validation. Inside the crate, exposing this constructor avoids the
+    /// `.expect("validation will succeed")` pattern at internal call sites
+    /// — those `.expect()` calls are otherwise caught by
+    /// `cargo xtask plan-lint --gate no-unwrap-in-production`.
+    ///
+    /// **Caller contract:** if `value` would fail
+    /// [`validate_relative_path`], this constructs a malformed
+    /// `RelativePath` that downstream code may not handle correctly. Use
+    /// only when the upstream discovery / parse step has already
+    /// established validity.
+    pub(crate) fn from_internal_unchecked(value: String) -> Self {
+        Self(value)
+    }
+
     /// View the validated path as a `&str`.
     #[must_use]
     pub fn as_str(&self) -> &str {
