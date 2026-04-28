@@ -614,8 +614,11 @@ pub fn get_nested<'a>(value: &'a JsonValue, path: &str) -> Option<&'a JsonValue>
 /// user with `{"chat": "broken"}` calling `set_nested("chat.model", v)`
 /// loses the `"broken"` string, and the warning gives them a trail.
 ///
-/// A path of `""` is treated as a single empty segment ("" is what
-/// `"".split('.').collect::<Vec<_>>()` produces).
+/// Empty paths and paths with empty segments (`""`, `"."`, `".key"`,
+/// `"key."`, `"a..b"`, `".."`) are rejected at the top of the function
+/// with a `tracing::error!` and the JSON value is left unchanged. Use
+/// [`is_well_formed_dotted_path`] to pre-validate if you need a
+/// boolean check rather than the side-effecting skip.
 ///
 /// # Trust contract
 ///
@@ -1025,6 +1028,29 @@ mod tests {
         let mut seen = HashSet::new();
         for def in reg {
             assert!(seen.insert(def.key), "duplicate registry key: {}", def.key);
+        }
+    }
+
+    /// `apply_registered_setting` calls `set_nested(json, key, val)` and
+    /// unconditionally returns `Ok(())` afterward. `set_nested` silently
+    /// skips writes for malformed dotted paths (with `tracing::error!`).
+    /// If a future registry maintainer ships a malformed key (e.g.
+    /// `chat..defaultModel`, `KIRO_LOG_NO_COLOR.`), the user would see
+    /// "save succeeded" but no value would persist — the kind of silent
+    /// failure the no-unwrap gate exists to prevent.
+    ///
+    /// This test pins the implicit contract: every registered key must
+    /// be a well-formed dotted path that `set_nested` will actually act
+    /// on.
+    #[test]
+    fn every_registry_key_is_well_formed_dotted_path() {
+        for def in registry() {
+            assert!(
+                is_well_formed_dotted_path(def.key),
+                "registry key {:?} is not a well-formed dotted path; \
+                 apply_registered_setting would silently skip writes for it",
+                def.key,
+            );
         }
     }
 
