@@ -37,6 +37,9 @@ Run all three before committing — CI enforces each:
 
   Requires the `tethys` binary on PATH (or `TETHYS_BIN` env var); pass `--no-reindex` to query the existing `.rivets/index/tethys.db` without re-indexing first; pass `--gate <NAME>` to run a single gate. Exits 1 on findings (CI gate fails).
 
+## Planning
+After writing a plan and before starting implementation, apply the 5 gates in `docs/plan-review-checklist.md` (Grounding / Threat Model / Wire Format / External Type Boundary / Type Design). The gates also fire as code-review questions on any change touching the public API of `kiro-market-core`. Originated from the PR #64 retrospective — the gates codify the categories of issues that cost a follow-up commit each on PR #64. Complement to (not replacement for) the upstream `superpowers:writing-plans` skill: invoke that skill first, then run the gates as a self-review pass before declaring the plan implementation-ready.
+
 ## Project Structure
 - `crates/kiro-market-core/` — library crate (types, parsing, git, cache, project state)
 - `crates/kiro-market/` — binary crate (CLI commands)
