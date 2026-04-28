@@ -115,6 +115,31 @@ WHERE r.reference_name IN ('unwrap', 'expect')
   AND f.path NOT LIKE '%test_utils%'
 ORDER BY f.path, r.line";
 
+/// Catches `panic!`, `todo!`, and `unimplemented!` macro invocations in
+/// non-test production code. Same JOIN shape as `no-unwrap-in-production`,
+/// just a different `reference_name` list — these macros are not method
+/// calls but tree-sitter-rust extracts `macro_invocation` references the
+/// same way it extracts method calls, so the query is identical in shape.
+///
+/// `unreachable!()` is *not* in the list — it's the canonical replacement
+/// when restructuring code to satisfy zero-tolerance, and treating it as
+/// a violation would defeat its purpose. If `unreachable!()` ever shows
+/// up at a runtime-reachable site, that's a code-review concern, not a
+/// gate concern.
+const NO_PANIC_SQL: &str = "\
+SELECT f.path, r.line, s.qualified_name, r.reference_name
+FROM refs r
+JOIN symbols s ON s.id = r.in_symbol_id
+JOIN files f ON f.id = r.file_id
+WHERE r.reference_name IN ('panic', 'todo', 'unimplemented')
+  AND s.kind IN ('function', 'method')
+  AND s.is_test = 0
+  AND '/' || f.path NOT LIKE '%/tests/%'
+  AND '/' || f.path NOT LIKE '%/benches/%'
+  AND f.path NOT LIKE '%test_support%'
+  AND f.path NOT LIKE '%test_utils%'
+ORDER BY f.path, r.line";
+
 const ALL_GATES: &[Gate] = &[
     Gate {
         name: "gate-4-external-error-boundary",
@@ -125,6 +150,11 @@ const ALL_GATES: &[Gate] = &[
         name: "no-unwrap-in-production",
         description: ".unwrap() or .expect() in non-test production code",
         sql: NO_UNWRAP_SQL,
+    },
+    Gate {
+        name: "no-panic-in-production",
+        description: "panic!, todo!, or unimplemented! in non-test production code",
+        sql: NO_PANIC_SQL,
     },
 ];
 
@@ -1181,5 +1211,62 @@ mod tests {
             stale.is_empty(),
             "no entries should be stale when every index matched"
         );
+    }
+
+    // ─── no-panic-in-production ─────────────────────────────────────────
+
+    fn no_panic() -> &'static Gate {
+        ALL_GATES
+            .iter()
+            .find(|g| g.name == "no-panic-in-production")
+            .expect("no-panic gate registered")
+    }
+
+    #[test]
+    fn no_panic_flags_panic_macro() {
+        let conn = fresh_db();
+        seed_function(&conn, 2, "crates/core/src/lib.rs", 10, "do_thing", false);
+        insert_panic_ref(&conn, 2, 10, 42, "panic");
+
+        let findings = no_panic().run(&conn).expect("query should succeed");
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].signature.as_deref(), Some("panic"));
+    }
+
+    #[test]
+    fn no_panic_flags_todo_and_unimplemented() {
+        let conn = fresh_db();
+        seed_function(&conn, 2, "crates/core/src/lib.rs", 10, "do_thing", false);
+        insert_panic_ref(&conn, 2, 10, 1, "todo");
+        insert_panic_ref(&conn, 2, 10, 2, "unimplemented");
+
+        let findings = no_panic().run(&conn).expect("query should succeed");
+        assert_eq!(findings.len(), 2);
+    }
+
+    #[test]
+    fn no_panic_does_not_flag_unreachable() {
+        // unreachable!() is the canonical replacement when restructuring to
+        // satisfy zero-tolerance — it must NOT be flagged by this gate or
+        // the gate would defeat its own remediation path.
+        let conn = fresh_db();
+        seed_function(&conn, 2, "crates/core/src/lib.rs", 10, "do_thing", false);
+        insert_panic_ref(&conn, 2, 10, 5, "unreachable");
+
+        let findings = no_panic().run(&conn).expect("query should succeed");
+        assert!(
+            findings.is_empty(),
+            "unreachable! is exempt; got {findings:?}"
+        );
+    }
+
+    #[test]
+    fn no_panic_skips_test_marked_functions() {
+        let conn = fresh_db();
+        seed_function(&conn, 2, "crates/core/src/lib.rs", 10, "test_thing", true);
+        insert_panic_ref(&conn, 2, 10, 42, "panic");
+
+        let findings = no_panic().run(&conn).expect("query should succeed");
+        assert!(findings.is_empty());
     }
 }
