@@ -128,6 +128,96 @@ const ALL_GATES: &[Gate] = &[
     },
 ];
 
+/// A `(gate, path, line)` triple acknowledged as a deliberate exception.
+///
+/// CLAUDE.md zero-tolerance is the *default*; this list is the register
+/// of cases where an idiomatic Rust pattern requires `.expect()` (or
+/// similar) and refactoring would only relocate the panic. Each entry
+/// must carry a `reason` long enough for a future reviewer to evaluate
+/// without re-deriving the rationale.
+///
+/// The mechanism deliberately keeps the allowlist *in source code* (not
+/// a TOML / JSON file): adding an exception requires a code change and
+/// shows up in `git blame`, the same audit trail that protects every
+/// other rule in this codebase.
+struct AllowedSite {
+    gate: &'static str,
+    path: &'static str,
+    line: u32,
+    /// Why this site is acknowledged. Read at PR review time.
+    #[expect(
+        dead_code,
+        reason = "human-only documentation; reviewer audit, not a runtime field"
+    )]
+    reason: &'static str,
+}
+
+// Line numbers shift with edits to the target file; when an unrelated edit
+// pushes a registered `.expect()` to a different line, the runner's
+// `stale_allowlist_entries` check fails CI and forces a coordinated
+// `ALLOWED_SITES` update in the same PR. That failure is intentional —
+// it keeps the audit trail current rather than letting orphaned rows
+// silently exempt some unrelated future panic that lands on the old line.
+const ALLOWED_SITES: &[AllowedSite] = &[
+    AllowedSite {
+        gate: "no-unwrap-in-production",
+        path: "crates/kiro-control-center/src-tauri/src/lib.rs",
+        line: 49,
+        reason: "Tauri scaffolding pattern — debug-only `specta_typescript::Typescript::default().export(...)` failure at app startup. Refactoring to `?` propagation would only move the panic into `fn main()`. Idiomatic Rust at the binary entry point.",
+    },
+    AllowedSite {
+        gate: "no-unwrap-in-production",
+        path: "crates/kiro-control-center/src-tauri/src/lib.rs",
+        line: 60,
+        reason: "Tauri scaffolding pattern — `tauri::Builder::run` failure at app startup. Replacing with Result propagation would only move the panic into `fn main()`. Idiomatic Rust at the binary entry point.",
+    },
+];
+
+/// Test-only convenience wrapper preserved so the four existing
+/// `is_allowed_*` regression tests keep their original names. Production
+/// code uses [`find_allowlist_index`] directly so it can record which
+/// entries actually matched (powering stale-allowlist detection).
+#[cfg(test)]
+fn is_allowed(gate: &str, finding: &Finding) -> bool {
+    find_allowlist_index(ALLOWED_SITES, gate, finding).is_some()
+}
+
+/// Locate the [`ALLOWED_SITES`] entry matching `(gate, finding.path,
+/// finding.line)`, returning its index. Returning the index (rather than a
+/// boolean) lets the runner record *which* allowlist entries actually
+/// matched a finding this run, so a follow-up pass can surface stale
+/// entries — sites whose acknowledged `.expect()` was refactored away or
+/// shifted to a different line, leaving the allowlist row protecting
+/// nothing.
+fn find_allowlist_index(sites: &[AllowedSite], gate: &str, finding: &Finding) -> Option<usize> {
+    sites
+        .iter()
+        .position(|s| s.gate == gate && s.path == finding.path && s.line == finding.line)
+}
+
+/// Return references to allowlist entries that were *not* matched by any
+/// finding during a run, restricted to gates that were actually executed.
+/// An entry whose gate was filtered out by `--gate <name>` is correctly
+/// excluded — we cannot tell whether it would have matched without
+/// running its gate.
+///
+/// A non-empty result indicates the allowlist has accumulated stale
+/// rows: the panic-bearing call site moved/disappeared but the
+/// acknowledgement stayed. The runner treats stale entries as findings
+/// so the audit trail can't rot silently.
+fn stale_allowlist_entries<'a>(
+    sites: &'a [AllowedSite],
+    matched_indices: &std::collections::HashSet<usize>,
+    gates_run: &std::collections::HashSet<&str>,
+) -> Vec<&'a AllowedSite> {
+    sites
+        .iter()
+        .enumerate()
+        .filter(|(idx, site)| gates_run.contains(site.gate) && !matched_indices.contains(idx))
+        .map(|(_, s)| s)
+        .collect()
+}
+
 impl Gate {
     fn run(&self, conn: &Connection) -> Result<Vec<Finding>> {
         let mut stmt = conn
@@ -264,27 +354,79 @@ pub fn run(args: impl Iterator<Item = String>) -> Result<usize> {
         .with_context(|| format!("opening tethys index at {}", db_path.display()))?;
 
     let mut total_findings = 0usize;
+    let mut matched_allowlist_indices: std::collections::HashSet<usize> =
+        std::collections::HashSet::new();
+    let mut gates_run: std::collections::HashSet<&str> = std::collections::HashSet::new();
     for gate in ALL_GATES {
         if let Some(name) = &opts.gate_filter
             && gate.name != name
         {
             continue;
         }
-        let findings = gate.run(&conn)?;
+        gates_run.insert(gate.name);
+        let raw = gate.run(&conn)?;
+        let mut allowed: Vec<Finding> = Vec::new();
+        let mut findings: Vec<Finding> = Vec::new();
+        for f in raw {
+            if let Some(idx) = find_allowlist_index(ALLOWED_SITES, gate.name, &f) {
+                matched_allowlist_indices.insert(idx);
+                allowed.push(f);
+            } else {
+                findings.push(f);
+            }
+        }
+
         if findings.is_empty() {
-            println!("{} OK", gate.name);
+            if allowed.is_empty() {
+                println!("{} OK", gate.name);
+            } else {
+                println!(
+                    "{} OK ({} allowlisted exception{})",
+                    gate.name,
+                    allowed.len(),
+                    if allowed.len() == 1 { "" } else { "s" },
+                );
+            }
             continue;
         }
         total_findings += findings.len();
         println!(
-            "{} — {} ({} finding{})",
+            "{} — {} ({} finding{}{})",
             gate.name,
             gate.description,
             findings.len(),
             if findings.len() == 1 { "" } else { "s" },
+            if allowed.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    ", {} allowlisted exception{}",
+                    allowed.len(),
+                    if allowed.len() == 1 { "" } else { "s" },
+                )
+            },
         );
         for f in &findings {
             print_finding(f);
+        }
+    }
+
+    // Surface allowlist entries whose `.expect()` site moved or vanished.
+    // Without this check the audit trail rots silently — a panic at
+    // `lib.rs:49` shifts to `lib.rs:51` after an unrelated edit, the new
+    // line is flagged as a real violation, and the original line-49 entry
+    // outlives its rationale, ready to silently exempt some unrelated
+    // future panic that happens to land on line 49.
+    let stale = stale_allowlist_entries(ALLOWED_SITES, &matched_allowlist_indices, &gates_run);
+    if !stale.is_empty() {
+        total_findings += stale.len();
+        println!(
+            "stale-allowlist — {} entr{} in ALLOWED_SITES matched no finding (line shifted or panic refactored away)",
+            stale.len(),
+            if stale.len() == 1 { "y" } else { "ies" },
+        );
+        for site in &stale {
+            println!("    {}:{}  ({})", site.path, site.line, site.gate);
         }
     }
 
@@ -883,6 +1025,161 @@ mod tests {
         assert!(
             err.to_string().contains("unknown gate"),
             "empty string should be treated as unknown, got: {err}"
+        );
+    }
+
+    // ─── Allowlist mechanism ────────────────────────────────────────────
+
+    #[test]
+    fn is_allowed_matches_gate_path_and_line_exactly() {
+        let f = Finding {
+            path: "crates/kiro-control-center/src-tauri/src/lib.rs".to_string(),
+            line: 49,
+            qualified_name: "run".to_string(),
+            signature: Some("expect".to_string()),
+        };
+        assert!(is_allowed("no-unwrap-in-production", &f));
+    }
+
+    #[test]
+    fn is_allowed_is_per_gate() {
+        // Same path/line registered under no-unwrap must NOT suppress a
+        // gate-4 finding at the same location.
+        let f = Finding {
+            path: "crates/kiro-control-center/src-tauri/src/lib.rs".to_string(),
+            line: 49,
+            qualified_name: "run".to_string(),
+            signature: Some("expect".to_string()),
+        };
+        assert!(!is_allowed("gate-4-external-error-boundary", &f));
+    }
+
+    #[test]
+    fn is_allowed_rejects_unregistered_lines() {
+        // One line off the registered exception is not exempted.
+        let f = Finding {
+            path: "crates/kiro-control-center/src-tauri/src/lib.rs".to_string(),
+            line: 48,
+            qualified_name: "run".to_string(),
+            signature: Some("expect".to_string()),
+        };
+        assert!(!is_allowed("no-unwrap-in-production", &f));
+    }
+
+    #[test]
+    fn is_allowed_rejects_unregistered_paths() {
+        let f = Finding {
+            path: "src/some_other_file.rs".to_string(),
+            line: 49,
+            qualified_name: "run".to_string(),
+            signature: Some("expect".to_string()),
+        };
+        assert!(!is_allowed("no-unwrap-in-production", &f));
+    }
+
+    // ─── Stale-allowlist detection ──────────────────────────────────────
+
+    /// Synthetic allowlist used by stale-detection tests. Decouples the
+    /// tests from the production [`ALLOWED_SITES`] so adding/removing
+    /// production entries doesn't break the regression suite.
+    const SYNTHETIC_SITES: &[AllowedSite] = &[
+        AllowedSite {
+            gate: "no-unwrap-in-production",
+            path: "src/a.rs",
+            line: 10,
+            reason: "test fixture A",
+        },
+        AllowedSite {
+            gate: "no-unwrap-in-production",
+            path: "src/b.rs",
+            line: 20,
+            reason: "test fixture B",
+        },
+        AllowedSite {
+            gate: "gate-4-external-error-boundary",
+            path: "src/c.rs",
+            line: 30,
+            reason: "test fixture C",
+        },
+    ];
+
+    #[test]
+    fn find_allowlist_index_returns_position_for_match() {
+        let f = Finding {
+            path: "src/b.rs".to_string(),
+            line: 20,
+            qualified_name: "x".to_string(),
+            signature: None,
+        };
+        assert_eq!(
+            find_allowlist_index(SYNTHETIC_SITES, "no-unwrap-in-production", &f),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn find_allowlist_index_is_per_gate() {
+        // (path, line) is registered under no-unwrap; querying as gate-4
+        // must return None — the index lookup must be gate-scoped.
+        let f = Finding {
+            path: "src/a.rs".to_string(),
+            line: 10,
+            qualified_name: "x".to_string(),
+            signature: None,
+        };
+        assert_eq!(
+            find_allowlist_index(SYNTHETIC_SITES, "gate-4-external-error-boundary", &f),
+            None
+        );
+    }
+
+    #[test]
+    fn stale_allowlist_entries_returns_unmatched_indices_for_run_gates() {
+        // Nothing matched, but both no-unwrap entries should surface as
+        // stale because their gate was actually run.
+        let matched = std::collections::HashSet::new();
+        let mut gates_run = std::collections::HashSet::new();
+        gates_run.insert("no-unwrap-in-production");
+
+        let stale = stale_allowlist_entries(SYNTHETIC_SITES, &matched, &gates_run);
+        assert_eq!(stale.len(), 2);
+        let stale_paths: Vec<&str> = stale.iter().map(|s| s.path).collect();
+        assert!(stale_paths.contains(&"src/a.rs"));
+        assert!(stale_paths.contains(&"src/b.rs"));
+    }
+
+    #[test]
+    fn stale_allowlist_entries_skips_entries_for_unrun_gates() {
+        // Only no-unwrap was run; gate-4 entries must NOT be reported as
+        // stale because we have no observation of whether they would
+        // have matched. A `--gate <name>` filter must not erode the
+        // allowlist for unrun gates.
+        let matched = std::collections::HashSet::new();
+        let mut gates_run = std::collections::HashSet::new();
+        gates_run.insert("no-unwrap-in-production");
+
+        let stale = stale_allowlist_entries(SYNTHETIC_SITES, &matched, &gates_run);
+        let stale_paths: Vec<&str> = stale.iter().map(|s| s.path).collect();
+        assert!(
+            !stale_paths.contains(&"src/c.rs"),
+            "gate-4 entry must not be reported stale when only no-unwrap ran"
+        );
+    }
+
+    #[test]
+    fn stale_allowlist_entries_returns_empty_when_all_indices_matched() {
+        let mut matched = std::collections::HashSet::new();
+        matched.insert(0);
+        matched.insert(1);
+        matched.insert(2);
+        let mut gates_run = std::collections::HashSet::new();
+        gates_run.insert("no-unwrap-in-production");
+        gates_run.insert("gate-4-external-error-boundary");
+
+        let stale = stale_allowlist_entries(SYNTHETIC_SITES, &matched, &gates_run);
+        assert!(
+            stale.is_empty(),
+            "no entries should be stale when every index matched"
         );
     }
 }

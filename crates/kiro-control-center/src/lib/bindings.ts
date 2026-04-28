@@ -125,8 +125,16 @@ export type DiscoveredProject = {
  *  Machine-readable error classification for frontend conditional logic.
  * 
  *  Serialized as snake_case strings and exported to TypeScript via specta.
+ * 
+ *  `Internal` is reserved for invariant violations the backend believes
+ *  are unreachable (post-condition failures, registry/file-state desync,
+ *  etc.). It is *not* the dustbin variant for unmapped errors — that role
+ *  stays with `Unknown`, whose `From<CoreError>` arm logs a warning to
+ *  signal "we forgot to map this." The frontend can grow special UX for
+ *  `Internal` ("please file an issue") without it being noisy from
+ *  unmapped-but-mundane errors.
  */
-export type ErrorType = "not_found" | "already_exists" | "validation" | "git_error" | "io_error" | "parse_error" | "unknown";
+export type ErrorType = "not_found" | "already_exists" | "validation" | "git_error" | "io_error" | "parse_error" | "internal" | "unknown";
 
 /**
  *  A skill that failed to install, with the reason.
@@ -411,7 +419,7 @@ export type SkillCount =
  *  - [`SkippedReason::DirectoryUnreadable`] — stat failed for any
  *    other reason (permission denied, transient I/O, etc.).
  * 
- *  From [`load_plugin_manifest`]:
+ *  From the `plugin.json` load:
  *  - [`SkippedReason::InvalidManifest`] — `plugin.json` malformed.
  *  - [`SkippedReason::ManifestReadFailed`] — `plugin.json` read
  *    failed after a successful stat.

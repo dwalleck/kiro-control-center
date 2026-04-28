@@ -40,6 +40,27 @@ impl RelativePath {
         Ok(Self(value))
     }
 
+    /// Construct a `RelativePath` from a value the caller has already
+    /// validated upstream. `pub(crate)` so external callers cannot bypass
+    /// `validate_relative_path`.
+    ///
+    /// **Caller contract:** `value` must already satisfy
+    /// `validate_relative_path` — non-empty, no leading `/` or `\`, no
+    /// embedded `\` or NUL, no `..` component. The current caller —
+    /// [`crate::plugin::DiscoveredPlugin::as_relative_path`] — is sound
+    /// only because [`crate::plugin::try_read_plugin`] runs
+    /// `validate_relative_path` against the assembled path before
+    /// constructing the `DiscoveredPlugin`. Adding a new internal caller
+    /// requires re-establishing this argument; the `debug_assert!` below
+    /// catches a contract violation in tests.
+    pub(crate) fn from_internal_unchecked(value: String) -> Self {
+        debug_assert!(
+            validate_relative_path(&value).is_ok(),
+            "from_internal_unchecked called with invalid path: {value:?}"
+        );
+        Self(value)
+    }
+
     /// View the validated path as a `&str`.
     #[must_use]
     pub fn as_str(&self) -> &str {
