@@ -12,7 +12,7 @@ use kiro_market_core::project::KiroProject;
 use kiro_market_core::service::{InstallMode, MarketplaceService};
 use kiro_market_core::steering::{InstallSteeringResult, SteeringInstallContext};
 
-use crate::commands::make_service;
+use crate::commands::{make_service, validate_kiro_project_path};
 use crate::error::CommandError;
 
 /// Install every steering file declared by a plugin into the active
@@ -48,6 +48,7 @@ fn install_plugin_steering_impl(
     mode: InstallMode,
     project_path: &str,
 ) -> Result<InstallSteeringResult, CommandError> {
+    validate_kiro_project_path(project_path)?;
     let ctx = svc
         .resolve_plugin_install_context(marketplace, plugin)
         .map_err(CommandError::from)?;
@@ -100,12 +101,13 @@ mod tests {
 
     #[test]
     fn install_plugin_steering_impl_installs_default_path_files() {
+        use kiro_market_core::project::InstallOutcomeKind;
+
         let (dir, svc) = temp_service();
         let entries = vec![relative_path_entry("myplugin", "plugins/myplugin")];
         let marketplace_path = seed_marketplace_with_registry(dir.path(), &svc, "mp1", &entries);
         let plugin_dir = marketplace_path.join("plugins/myplugin");
         fs::create_dir_all(&plugin_dir).expect("plugin dir");
-        // No plugin.json -> falls back to DEFAULT_STEERING_PATHS = ["./steering/"].
         write_steering_file(&plugin_dir, "steering/code-style.md", "# style\n");
         let project_path = make_kiro_project(dir.path());
 
@@ -123,6 +125,35 @@ mod tests {
             result.failed.is_empty(),
             "no failures expected: {:?}",
             result.failed
+        );
+        // A regression that stops populating `result.warnings` (or that
+        // surfaces a spurious warning on the happy path) would be
+        // invisible to every other test in this file — none assert on it.
+        assert!(
+            result.warnings.is_empty(),
+            "happy path must produce no warnings, got: {:?}",
+            result.warnings
+        );
+        let outcome = &result.installed[0];
+        // Locks the outcome `kind`. Without this assertion, a regression
+        // that returned `Idempotent` or `ForceOverwrote` for a clean
+        // first install would still pass `installed.len() == 1`.
+        assert!(
+            matches!(outcome.kind, InstallOutcomeKind::Installed),
+            "clean first install must report InstallOutcomeKind::Installed, got: {:?}",
+            outcome.kind
+        );
+        assert!(
+            outcome.source.ends_with("steering/code-style.md"),
+            "source must point at the resolved file under the plugin's steering dir, got: {:?}",
+            outcome.source
+        );
+        assert!(
+            outcome
+                .destination
+                .ends_with(".kiro/steering/code-style.md"),
+            "destination must land under the project's .kiro/steering/, got: {:?}",
+            outcome.destination
         );
         assert!(
             std::path::PathBuf::from(&project_path)
@@ -299,6 +330,137 @@ mod tests {
         assert!(
             rendered.contains("guide.md"),
             "rendered error must mention the path, got: {rendered}"
+        );
+    }
+
+    /// A bad scan path declared in `plugin.json` must surface as a
+    /// `SteeringWarning::ScanPathInvalid` at the Tauri command layer
+    /// without aborting the install batch — a legitimate scan path
+    /// alongside it still installs. Without this test, a regression
+    /// where the impl emptied `result.warnings` (or dropped the warning
+    /// vec entirely on the wire format) would survive every other
+    /// assertion in this file.
+    #[test]
+    fn install_plugin_steering_impl_surfaces_scan_path_invalid_warning() {
+        let (dir, svc) = temp_service();
+        let entries = vec![relative_path_entry("myplugin", "plugins/myplugin")];
+        let marketplace_path = seed_marketplace_with_registry(dir.path(), &svc, "mp1", &entries);
+        let plugin_dir = marketplace_path.join("plugins/myplugin");
+        fs::create_dir_all(&plugin_dir).expect("plugin dir");
+        // Mix one legitimate scan path with one path-traversal attempt.
+        // The legitimate one still installs `ok.md`; the traversal
+        // surfaces as a structured warning rather than aborting.
+        fs::write(
+            plugin_dir.join("plugin.json"),
+            br#"{"name": "myplugin", "steering": ["./steering/", "../escape/"]}"#,
+        )
+        .expect("write plugin.json");
+        write_steering_file(&plugin_dir, "steering/ok.md", "# ok\n");
+        let project_path = make_kiro_project(dir.path());
+
+        let result =
+            install_plugin_steering_impl(&svc, "mp1", "myplugin", InstallMode::New, &project_path)
+                .expect("install with mixed scan paths");
+
+        assert_eq!(
+            result.installed.len(),
+            1,
+            "legitimate scan path must still install, got: {:?}",
+            result.installed
+        );
+        assert!(
+            result.failed.is_empty(),
+            "no per-file failures expected: {:?}",
+            result.failed
+        );
+        assert_eq!(
+            result.warnings.len(),
+            1,
+            "bad scan path must surface exactly one warning, got: {:?}",
+            result.warnings
+        );
+        assert!(
+            matches!(
+                &result.warnings[0],
+                kiro_market_core::steering::SteeringWarning::ScanPathInvalid { path, .. }
+                    if path == std::path::Path::new("../escape/")
+            ),
+            "wrong warning variant or path: {:?}",
+            result.warnings[0]
+        );
+
+        // Wire-format lock — the FFI must carry warnings as a string array
+        // tagged with `kind`. A regression to externally-tagged serde or
+        // dropping the vec on the result would silently pass the typed
+        // assertion above.
+        let json = serde_json::to_value(&result).expect("InstallSteeringResult serializes");
+        let warnings = json
+            .pointer("/warnings")
+            .and_then(|w| w.as_array())
+            .expect("/warnings must be a JSON array on the wire format");
+        assert_eq!(warnings.len(), 1, "wire format must carry the warning");
+        assert_eq!(
+            warnings[0]
+                .pointer("/kind")
+                .and_then(|k| k.as_str())
+                .expect("warning must carry a `kind` discriminant"),
+            "scan_path_invalid",
+        );
+    }
+
+    /// `KiroProject::new` is infallible. Without fail-fast validation in
+    /// the wrapper, an empty `project_path` from the FFI lands writes at
+    /// `./.kiro/...` relative to the Tauri process cwd — the user thinks
+    /// the install succeeded, but the bytes are nowhere near their
+    /// project. This test pins the empty-string branch.
+    #[test]
+    fn install_plugin_steering_impl_empty_project_path_returns_validation() {
+        let (_dir, svc) = temp_service();
+        let err = install_plugin_steering_impl(&svc, "mp1", "myplugin", InstallMode::New, "")
+            .expect_err("empty project_path must error");
+        assert_eq!(err.error_type, ErrorType::Validation);
+        assert!(
+            err.message.contains("project_path"),
+            "error message must name the offending field, got: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn install_plugin_steering_impl_nonexistent_project_path_returns_validation() {
+        let (dir, svc) = temp_service();
+        let bogus = dir
+            .path()
+            .join("does-not-exist")
+            .to_str()
+            .expect("utf-8 path")
+            .to_owned();
+        let err = install_plugin_steering_impl(&svc, "mp1", "myplugin", InstallMode::New, &bogus)
+            .expect_err("nonexistent project_path must error");
+        assert_eq!(err.error_type, ErrorType::Validation);
+    }
+
+    #[test]
+    fn install_plugin_steering_impl_missing_kiro_dir_returns_validation() {
+        let (dir, svc) = temp_service();
+        let project_path = dir.path().join("not-a-kiro-project");
+        fs::create_dir_all(&project_path).expect("create dir");
+        // Note: no .kiro/ subdirectory — this is what differentiates
+        // "directory exists" from "directory is a Kiro project".
+        let project_path_str = project_path.to_str().expect("utf-8 path").to_owned();
+        let err = install_plugin_steering_impl(
+            &svc,
+            "mp1",
+            "myplugin",
+            InstallMode::New,
+            &project_path_str,
+        )
+        .expect_err("missing .kiro/ must error");
+        assert_eq!(err.error_type, ErrorType::Validation);
+        assert!(
+            err.message.contains(".kiro"),
+            "error message must mention .kiro/, got: {}",
+            err.message
         );
     }
 }

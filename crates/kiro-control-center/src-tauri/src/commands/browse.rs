@@ -508,7 +508,6 @@ mod tests {
         .expect("first install");
         assert_eq!(first.installed, vec!["alpha".to_string()]);
 
-        // Re-installing with InstallMode::New must skip, not re-install.
         let second_safe = install_skills_impl(
             &svc,
             "mp1",
@@ -524,7 +523,6 @@ mod tests {
             second_safe.installed
         );
 
-        // InstallMode::Force must re-install.
         let third_force = install_skills_impl(
             &svc,
             "mp1",
@@ -567,7 +565,6 @@ mod tests {
 
         assert_eq!(result.installed, vec!["alpha".to_string()]);
 
-        // beta was not requested — it must not appear in the result or on disk.
         let project = KiroProject::new(std::path::PathBuf::from(&project_path));
         let installed = project.load_installed().expect("load installed-skills");
         assert!(

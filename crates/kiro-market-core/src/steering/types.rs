@@ -285,7 +285,7 @@ mod tests {
         // re-introduce the `serde_json::Error` type by walking `.source()`.
         // Re-introducing `#[source]` would silently break this assertion.
         // Mirrors the same lock at
-        // `crate::error::tests::native_manifest_parse_failed_renders_path_and_reason`.
+        // `crate::error::tests::native_manifest_parse_failed_exposes_no_source_chain`.
         assert!(
             err.source().is_none(),
             "TrackingMalformed must not expose a source chain — \
@@ -329,6 +329,47 @@ mod tests {
              SkippedReason / FailedSkillReason / InstallOutcomeKind. Frontend code \
              writes `if (warning.kind === \"scan_path_invalid\")` — reverting this \
              attribute would silently break that pattern."
+        );
+    }
+
+    /// `serialize_steering_error` projects through `error_full_chain`, which
+    /// walks `Error::source()`. The end-to-end test in
+    /// `commands::steering::tests` only exercises
+    /// `ContentChangedRequiresForce` (no `#[source]` field), so a regression
+    /// that stopped walking the source chain would survive that test —
+    /// every source-bearing variant (`SourceReadFailed`, `TrackingIoFailed`,
+    /// `HashFailed`, `StagingWriteFailed`, `DestinationDirFailed`) would
+    /// silently lose its inner detail. Lock the chain walk here using
+    /// `SourceReadFailed` as the canary.
+    #[test]
+    fn serialize_steering_error_renders_source_chain_for_source_bearing_variant() {
+        let io_err = io::Error::new(io::ErrorKind::PermissionDenied, "denied for test");
+        let failed = FailedSteeringFile {
+            source: PathBuf::from("plugin/steering/locked.md"),
+            error: SteeringError::SourceReadFailed {
+                path: PathBuf::from("/abs/plugin/steering/locked.md"),
+                source: io_err,
+            },
+        };
+
+        let json = serde_json::to_value(&failed).expect("FailedSteeringFile serializes");
+        let rendered = json
+            .pointer("/error")
+            .and_then(|e| e.as_str())
+            .expect("error must serialize as string per FFI contract");
+
+        assert!(
+            rendered.contains("locked.md"),
+            "rendered chain must include the path component, got: {rendered}"
+        );
+        // The decisive assertion: a regression that stops walking
+        // `Error::source()` in `error_full_chain` drops the inner
+        // io::Error message, leaving operators with a generic top-level
+        // string and no actionable detail.
+        assert!(
+            rendered.contains("denied for test"),
+            "rendered chain must include the io::Error source message; \
+             got: {rendered}"
         );
     }
 }

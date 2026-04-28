@@ -401,6 +401,38 @@ pub struct PluginInstallContext {
     pub format: Option<crate::plugin::PluginFormat>,
 }
 
+// Compile-time lock for the "Do not add `Serialize`" invariant on
+// `PluginInstallContext`. `plugin_dir` and `skill_dirs` are absolute
+// host paths; serializing them would leak filesystem layout to the
+// frontend. The doc comment on the struct documents the rule, but a
+// future contributor typing `#[derive(Serialize)]` would break the
+// invariant silently — this block turns it into a compile error.
+//
+// Implementation note: uses the standard "two overlapping blanket
+// impls" trick from `static_assertions::assert_not_impl_any!`. The
+// generic parameter on `AmbiguousIfSerialize` is inferable when only
+// the unconditional impl applies (`T: !Serialize`); when `T: Serialize`
+// both impls match and inference becomes ambiguous, producing E0282.
+// Diagnostic is cryptic — read this comment when it fires.
+const _: fn() = || {
+    trait AmbiguousIfSerialize<A> {
+        fn check() {}
+    }
+    impl<T: ?Sized> AmbiguousIfSerialize<()> for T {}
+    impl<T: ?Sized + serde::Serialize> AmbiguousIfSerialize<u8> for T {}
+    <PluginInstallContext as AmbiguousIfSerialize<_>>::check();
+};
+
+#[cfg(feature = "specta")]
+const _: fn() = || {
+    trait AmbiguousIfSpectaType<A> {
+        fn check() {}
+    }
+    impl<T: ?Sized> AmbiguousIfSpectaType<()> for T {}
+    impl<T: ?Sized + specta::Type> AmbiguousIfSpectaType<u8> for T {}
+    <PluginInstallContext as AmbiguousIfSpectaType<_>>::check();
+};
+
 // ---------------------------------------------------------------------------
 // Service methods
 // ---------------------------------------------------------------------------
