@@ -140,6 +140,34 @@ WHERE r.reference_name IN ('panic', 'todo', 'unimplemented')
   AND f.path NOT LIKE '%test_utils%'
 ORDER BY f.path, r.line";
 
+/// CLAUDE.md "Dependencies point inward" — `kiro-market-core` is the
+/// domain core and must stay free of UI / Tauri / async-runtime / frontend
+/// deps. Adding `use tauri::...`, `use tauri_plugin_*::...`, or `use tokio::...`
+/// to a file in `kiro-market-core/src/` would violate this even before
+/// `Cargo.toml` notices.
+///
+/// Queries the `imports` table (one row per `use` statement) and flags
+/// any import in `kiro-market-core/src/` whose `source_module` starts
+/// with one of the forbidden prefixes. `cargo-deny` solves the
+/// crate-Cargo.toml version of this rule; this gate solves the
+/// per-file version, catching the bad import the moment it lands.
+// `imports` does not carry a line column (one row per
+// (file_id, symbol_name, source_module) tuple), so we report `line = 0`
+// as a sentinel and the reviewer greps the file for the import. The
+// path + (symbol_name, source_module) signature is enough to locate it.
+const NO_FRONTEND_DEPS_IN_CORE_SQL: &str = "\
+SELECT f.path, 0 AS line, i.symbol_name AS qualified_name, i.source_module AS signature
+FROM imports i
+JOIN files f ON f.id = i.file_id
+WHERE f.path LIKE '%kiro-market-core/src/%'
+  AND f.path NOT LIKE '%/tests/%'
+  AND (i.source_module LIKE 'tauri::%'
+       OR i.source_module = 'tauri'
+       OR i.source_module LIKE 'tauri_plugin_%'
+       OR i.source_module LIKE 'tokio::%'
+       OR i.source_module = 'tokio')
+ORDER BY f.path, i.symbol_name";
+
 /// CLAUDE.md mandates `#[non_exhaustive]` on error enums so adding a new
 /// variant in core doesn't silently break downstream pattern matches.
 /// This gate flags any public enum in `kiro-market-core` whose name ends
@@ -187,6 +215,11 @@ const ALL_GATES: &[Gate] = &[
         name: "non-exhaustive-error-enum",
         description: "pub Error enum in kiro-market-core missing #[non_exhaustive]",
         sql: NON_EXHAUSTIVE_ERROR_ENUM_SQL,
+    },
+    Gate {
+        name: "no-frontend-deps-in-core",
+        description: "tauri / tokio import in kiro-market-core (dependencies-point-inward)",
+        sql: NO_FRONTEND_DEPS_IN_CORE_SQL,
     },
 ];
 
@@ -580,6 +613,13 @@ mod tests {
             name TEXT NOT NULL,
             args TEXT,
             line INTEGER NOT NULL
+        );
+        CREATE TABLE imports (
+            file_id INTEGER NOT NULL,
+            symbol_name TEXT NOT NULL,
+            source_module TEXT NOT NULL,
+            alias TEXT,
+            PRIMARY KEY (file_id, symbol_name, source_module)
         );
     ";
 
@@ -1405,5 +1445,111 @@ mod tests {
         );
         let findings = non_exhaustive().run(&conn).expect("query");
         assert!(findings.is_empty());
+    }
+
+    // ─── no-frontend-deps-in-core ───────────────────────────────────────
+
+    fn no_frontend_deps() -> &'static Gate {
+        ALL_GATES
+            .iter()
+            .find(|g| g.name == "no-frontend-deps-in-core")
+            .expect("no-frontend-deps gate registered")
+    }
+
+    fn seed_import(conn: &Connection, file_id: i64, path: &str, symbol: &str, source: &str) {
+        conn.execute(
+            "INSERT OR IGNORE INTO files (id, path, language) VALUES (?1, ?2, 'rust')",
+            rusqlite::params![file_id, path],
+        )
+        .expect("file");
+        conn.execute(
+            "INSERT INTO imports (file_id, symbol_name, source_module) VALUES (?1, ?2, ?3)",
+            rusqlite::params![file_id, symbol, source],
+        )
+        .expect("import");
+    }
+
+    #[test]
+    fn no_frontend_deps_flags_tauri_in_core() {
+        let conn = fresh_db();
+        seed_import(
+            &conn,
+            2,
+            "crates/kiro-market-core/src/foo.rs",
+            "Manager",
+            "tauri::Manager",
+        );
+
+        let findings = no_frontend_deps().run(&conn).expect("query");
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].signature.as_deref(), Some("tauri::Manager"));
+    }
+
+    #[test]
+    fn no_frontend_deps_flags_tokio_in_core() {
+        let conn = fresh_db();
+        seed_import(
+            &conn,
+            2,
+            "crates/kiro-market-core/src/foo.rs",
+            "spawn",
+            "tokio::spawn",
+        );
+
+        let findings = no_frontend_deps().run(&conn).expect("query");
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].signature.as_deref(), Some("tokio::spawn"));
+    }
+
+    #[test]
+    fn no_frontend_deps_does_not_flag_tauri_in_other_crates() {
+        // Tauri imports are FINE in the Tauri crate itself.
+        let conn = fresh_db();
+        seed_import(
+            &conn,
+            2,
+            "crates/kiro-control-center/src-tauri/src/lib.rs",
+            "Manager",
+            "tauri::Manager",
+        );
+
+        let findings = no_frontend_deps().run(&conn).expect("query");
+        assert!(
+            findings.is_empty(),
+            "tauri imports outside core are fine; got {findings:?}"
+        );
+    }
+
+    #[test]
+    fn no_frontend_deps_does_not_flag_unrelated_crate_with_similar_name() {
+        // `tauri_anything` would not start with `tauri::` so the LIKE
+        // pattern excludes it. Defensive test in case someone adds a
+        // crate named `tauri_extra` etc. in the future.
+        let conn = fresh_db();
+        seed_import(
+            &conn,
+            2,
+            "crates/kiro-market-core/src/foo.rs",
+            "thing",
+            "taurus::thing", // similar but not tauri::
+        );
+
+        let findings = no_frontend_deps().run(&conn).expect("query");
+        assert!(findings.is_empty());
+    }
+
+    #[test]
+    fn no_frontend_deps_flags_tauri_plugin_imports() {
+        let conn = fresh_db();
+        seed_import(
+            &conn,
+            2,
+            "crates/kiro-market-core/src/foo.rs",
+            "init",
+            "tauri_plugin_dialog::init",
+        );
+
+        let findings = no_frontend_deps().run(&conn).expect("query");
+        assert_eq!(findings.len(), 1);
     }
 }
