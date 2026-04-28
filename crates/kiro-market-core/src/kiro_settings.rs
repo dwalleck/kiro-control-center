@@ -910,7 +910,13 @@ pub fn resolve_settings(json: &JsonValue) -> Vec<SettingEntry> {
 const SETTINGS_FILE: &str = "settings/cli.json";
 
 /// Errors from loading the Kiro CLI settings file.
+///
+/// `#[non_exhaustive]` so future variants (file corruption mid-write,
+/// permission-denied with diagnostics, etc.) are additive without
+/// breaking matches in downstream crates. Pattern matches outside
+/// `kiro-market-core` MUST include a catch-all `_ =>` arm.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum LoadSettingsError {
     /// The file does not exist — use empty defaults.
     #[error("settings file not found")]

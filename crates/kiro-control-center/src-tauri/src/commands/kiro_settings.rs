@@ -66,6 +66,13 @@ fn load_settings(dir: &std::path::Path) -> Result<JsonValue, CommandError> {
             format!("could not read settings file: {e}"),
             ErrorType::IoError,
         )),
+        // `LoadSettingsError` is `#[non_exhaustive]`. A future variant
+        // added in core compiles here without forcing a frontend edit;
+        // its `Display` impl provides the user-facing string.
+        Err(other) => Err(CommandError::new(
+            format!("settings load failed: {other}"),
+            ErrorType::Unknown,
+        )),
     }
 }
 

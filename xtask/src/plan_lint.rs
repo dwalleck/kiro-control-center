@@ -140,6 +140,33 @@ WHERE r.reference_name IN ('panic', 'todo', 'unimplemented')
   AND f.path NOT LIKE '%test_utils%'
 ORDER BY f.path, r.line";
 
+/// CLAUDE.md mandates `#[non_exhaustive]` on error enums so adding a new
+/// variant in core doesn't silently break downstream pattern matches.
+/// This gate flags any public enum in `kiro-market-core` whose name ends
+/// in `Error` and that lacks the attribute.
+///
+/// Scoped to `kiro-market-core` because the rule is about the public
+/// surface of the *library* — Tauri command errors and CLI binary
+/// errors don't carry the same downstream-stability requirement.
+///
+/// `signature` is `NULL` (no useful per-finding text); the gate's
+/// description carries the explanation.
+const NON_EXHAUSTIVE_ERROR_ENUM_SQL: &str = "\
+SELECT f.path, s.line, s.qualified_name, NULL AS signature
+FROM symbols s
+JOIN files f ON f.id = s.file_id
+WHERE s.kind = 'enum'
+  AND s.visibility = 'public'
+  AND s.name LIKE '%Error'
+  AND f.path LIKE '%kiro-market-core/src/%'
+  AND f.path NOT LIKE '%/tests/%'
+  AND NOT EXISTS (
+      SELECT 1 FROM attributes a
+      WHERE a.symbol_id = s.id
+        AND a.name = 'non_exhaustive'
+  )
+ORDER BY f.path, s.line";
+
 const ALL_GATES: &[Gate] = &[
     Gate {
         name: "gate-4-external-error-boundary",
@@ -155,6 +182,11 @@ const ALL_GATES: &[Gate] = &[
         name: "no-panic-in-production",
         description: "panic!, todo!, or unimplemented! in non-test production code",
         sql: NO_PANIC_SQL,
+    },
+    Gate {
+        name: "non-exhaustive-error-enum",
+        description: "pub Error enum in kiro-market-core missing #[non_exhaustive]",
+        sql: NON_EXHAUSTIVE_ERROR_ENUM_SQL,
     },
 ];
 
@@ -1267,6 +1299,111 @@ mod tests {
         insert_panic_ref(&conn, 2, 10, 42, "panic");
 
         let findings = no_panic().run(&conn).expect("query should succeed");
+        assert!(findings.is_empty());
+    }
+
+    // ─── non-exhaustive-error-enum ──────────────────────────────────────
+
+    fn non_exhaustive() -> &'static Gate {
+        ALL_GATES
+            .iter()
+            .find(|g| g.name == "non-exhaustive-error-enum")
+            .expect("non-exhaustive gate registered")
+    }
+
+    fn seed_error_enum(
+        conn: &Connection,
+        sym_id: i64,
+        path: &str,
+        name: &str,
+        with_non_exhaustive: bool,
+    ) {
+        conn.execute(
+            "INSERT OR IGNORE INTO files (id, path, language) VALUES (2, ?1, 'rust')",
+            [path],
+        )
+        .expect("file");
+        conn.execute(
+            "INSERT INTO symbols (id, file_id, name, qualified_name, kind, line, visibility)
+             VALUES (?1, 2, ?2, ?2, 'enum', 1, 'public')",
+            rusqlite::params![sym_id, name],
+        )
+        .expect("enum");
+        if with_non_exhaustive {
+            conn.execute(
+                "INSERT INTO attributes (symbol_id, name, args, line)
+                 VALUES (?1, 'non_exhaustive', NULL, 1)",
+                [sym_id],
+            )
+            .expect("attr");
+        }
+    }
+
+    #[test]
+    fn non_exhaustive_flags_pub_error_enum_without_attribute() {
+        let conn = fresh_db();
+        seed_error_enum(
+            &conn,
+            10,
+            "crates/kiro-market-core/src/error.rs",
+            "PluginError",
+            false,
+        );
+        let findings = non_exhaustive().run(&conn).expect("query");
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].qualified_name, "PluginError");
+    }
+
+    #[test]
+    fn non_exhaustive_passes_when_attribute_present() {
+        let conn = fresh_db();
+        seed_error_enum(
+            &conn,
+            10,
+            "crates/kiro-market-core/src/error.rs",
+            "PluginError",
+            true,
+        );
+        let findings = non_exhaustive().run(&conn).expect("query");
+        assert!(
+            findings.is_empty(),
+            "enum with #[non_exhaustive] is exempt; got {findings:?}"
+        );
+    }
+
+    #[test]
+    fn non_exhaustive_only_scopes_to_kiro_market_core() {
+        // A pub Error enum in the Tauri crate or CLI binary doesn't carry
+        // the same downstream-stability requirement; this gate only fires
+        // on `kiro-market-core` symbols.
+        let conn = fresh_db();
+        seed_error_enum(
+            &conn,
+            10,
+            "crates/kiro-control-center/src-tauri/src/error.rs",
+            "CommandError",
+            false,
+        );
+        let findings = non_exhaustive().run(&conn).expect("query");
+        assert!(
+            findings.is_empty(),
+            "non-core crates exempt from non-exhaustive rule; got {findings:?}"
+        );
+    }
+
+    #[test]
+    fn non_exhaustive_ignores_non_error_enums() {
+        // Heuristic: only enums whose name ends in `Error` are subject to
+        // this rule. `Status`, `Kind`, etc. don't trigger.
+        let conn = fresh_db();
+        seed_error_enum(
+            &conn,
+            10,
+            "crates/kiro-market-core/src/lib.rs",
+            "Status",
+            false,
+        );
+        let findings = non_exhaustive().run(&conn).expect("query");
         assert!(findings.is_empty());
     }
 }

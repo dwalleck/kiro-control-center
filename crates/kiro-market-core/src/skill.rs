@@ -8,7 +8,13 @@ use serde::Deserialize;
 use thiserror::Error;
 
 /// Errors that can occur while parsing `SKILL.md` frontmatter.
+///
+/// `#[non_exhaustive]` so future variants (e.g. NUL-byte rejection,
+/// length cap, schema-version mismatch) are additive without breaking
+/// matches in downstream crates. Pattern matches outside
+/// `kiro-market-core` MUST include a catch-all `_ =>` arm.
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum ParseError {
     /// The file does not start with a `---` frontmatter fence.
     #[error("missing opening `---` frontmatter fence")]
