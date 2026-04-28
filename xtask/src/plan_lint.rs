@@ -152,6 +152,12 @@ struct AllowedSite {
     reason: &'static str,
 }
 
+// Line numbers shift with edits to the target file; when an unrelated edit
+// pushes a registered `.expect()` to a different line, the runner's
+// `stale_allowlist_entries` check fails CI and forces a coordinated
+// `ALLOWED_SITES` update in the same PR. That failure is intentional —
+// it keeps the audit trail current rather than letting orphaned rows
+// silently exempt some unrelated future panic that lands on the old line.
 const ALLOWED_SITES: &[AllowedSite] = &[
     AllowedSite {
         gate: "no-unwrap-in-production",

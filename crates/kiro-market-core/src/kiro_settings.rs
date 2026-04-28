@@ -848,7 +848,26 @@ fn remove_nested_impl(value: &mut JsonValue, segments: &[&str]) -> bool {
 pub fn resolve_setting_for_key(json: &JsonValue, key: &str) -> Option<SettingEntry> {
     let def = registry().iter().find(|d| d.key == key)?;
     let current_value = get_nested(json, def.key).cloned();
-    let value_type = match &def.value_type {
+    Some(SettingEntry {
+        key: def.key.to_owned(),
+        label: def.label.to_owned(),
+        description: def.description.to_owned(),
+        category: def.category,
+        category_label: def.category.label().to_owned(),
+        value_type: setting_type_to_value_info(&def.value_type),
+        default_value: def.default.clone(),
+        current_value,
+    })
+}
+
+/// Project a `SettingType` (the registry's compact representation) into a
+/// `SettingValueInfo` (the wire-format representation the frontend
+/// receives). Shared between [`resolve_setting_for_key`] and
+/// [`resolve_settings`] so a future `SettingType` variant only needs the
+/// arm added in one place — three independent reviewers (gemini-code-assist,
+/// two Kiro re-review passes) flagged the prior duplication.
+fn setting_type_to_value_info(t: &SettingType) -> SettingValueInfo {
+    match t {
         SettingType::Bool => SettingValueInfo::Bool,
         SettingType::String => SettingValueInfo::String,
         SettingType::Number => SettingValueInfo::Number,
@@ -857,17 +876,7 @@ pub fn resolve_setting_for_key(json: &JsonValue, key: &str) -> Option<SettingEnt
         SettingType::Enum(opts) => SettingValueInfo::Enum {
             options: opts.iter().map(|&s| s.to_owned()).collect(),
         },
-    };
-    Some(SettingEntry {
-        key: def.key.to_owned(),
-        label: def.label.to_owned(),
-        description: def.description.to_owned(),
-        category: def.category,
-        category_label: def.category.label().to_owned(),
-        value_type,
-        default_value: def.default.clone(),
-        current_value,
-    })
+    }
 }
 
 /// Resolve all registry settings against a loaded JSON config, returning a
@@ -880,30 +889,15 @@ pub fn resolve_setting_for_key(json: &JsonValue, key: &str) -> Option<SettingEnt
 pub fn resolve_settings(json: &JsonValue) -> Vec<SettingEntry> {
     registry()
         .iter()
-        .map(|def| {
-            let current_value = get_nested(json, def.key).cloned();
-
-            let value_type = match &def.value_type {
-                SettingType::Bool => SettingValueInfo::Bool,
-                SettingType::String => SettingValueInfo::String,
-                SettingType::Number => SettingValueInfo::Number,
-                SettingType::Char => SettingValueInfo::Char,
-                SettingType::StringArray => SettingValueInfo::StringArray,
-                SettingType::Enum(opts) => SettingValueInfo::Enum {
-                    options: opts.iter().map(|&s| s.to_owned()).collect(),
-                },
-            };
-
-            SettingEntry {
-                key: def.key.to_owned(),
-                label: def.label.to_owned(),
-                description: def.description.to_owned(),
-                category: def.category,
-                category_label: def.category.label().to_owned(),
-                value_type,
-                default_value: def.default.clone(),
-                current_value,
-            }
+        .map(|def| SettingEntry {
+            key: def.key.to_owned(),
+            label: def.label.to_owned(),
+            description: def.description.to_owned(),
+            category: def.category,
+            category_label: def.category.label().to_owned(),
+            value_type: setting_type_to_value_info(&def.value_type),
+            default_value: def.default.clone(),
+            current_value: get_nested(json, def.key).cloned(),
         })
         .collect()
 }
