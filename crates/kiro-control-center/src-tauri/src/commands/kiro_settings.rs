@@ -142,13 +142,22 @@ pub async fn set_kiro_setting(
     let json = load_settings(&dir)?;
     // `apply_registered_setting` already validated `key` against the
     // registry, so `resolve_setting_for_key` returns Some by construction.
-    // Surfacing the impossible case as a typed `Internal` error rather
-    // than `.expect()`-panicking keeps the binary panic-free per
-    // CLAUDE.md zero-tolerance, with no observable behaviour change.
+    // Surface the impossible case as a typed `Internal` error rather than
+    // `.expect()`-panicking — `Internal` is distinct from `Unknown` (the
+    // unmapped-error dustbin) so the frontend can grow specific UX for
+    // backend-invariant violations. The `tracing::error!` is the diagnostic
+    // signal a panic backtrace would have provided; without it the
+    // post-condition failure is invisible to operators.
     let Some(entry) = resolve_setting_for_key(&json, &key) else {
+        tracing::error!(
+            key = %key,
+            "set_kiro_setting: key validated by apply_registered_setting but absent on reload — registry/file invariant violated"
+        );
         return Err(CommandError::new(
-            format!("internal: key `{key}` was validated but not found post-write"),
-            ErrorType::Unknown,
+            format!(
+                "internal error: settings update for `{key}` succeeded but the follow-up read could not find it; reload and retry"
+            ),
+            ErrorType::Internal,
         ));
     };
 
