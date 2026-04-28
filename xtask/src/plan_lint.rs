@@ -96,6 +96,11 @@ ORDER BY f.path, s.line";
 ///
 /// `signature` carries the call name (`unwrap` or `expect`) so the same
 /// `Finding` shape works for this gate and Gate 4.
+// `'/' || f.path` prepends a slash so the LIKE pattern matches paths
+// that start with `tests/` or `benches/` at the workspace root the same
+// way it matches `crates/foo/tests/...`. Without this, a contributor
+// adding `tests/integration.rs` at workspace root would have its
+// .unwrap() calls flagged as production violations.
 const NO_UNWRAP_SQL: &str = "\
 SELECT f.path, r.line, s.qualified_name, r.reference_name
 FROM refs r
@@ -104,8 +109,8 @@ JOIN files f ON f.id = r.file_id
 WHERE r.reference_name IN ('unwrap', 'expect')
   AND s.kind IN ('function', 'method')
   AND s.is_test = 0
-  AND f.path NOT LIKE '%/tests/%'
-  AND f.path NOT LIKE '%/benches/%'
+  AND '/' || f.path NOT LIKE '%/tests/%'
+  AND '/' || f.path NOT LIKE '%/benches/%'
   AND f.path NOT LIKE '%test_support%'
   AND f.path NOT LIKE '%test_utils%'
 ORDER BY f.path, r.line";
@@ -749,6 +754,26 @@ mod tests {
         assert!(
             findings.is_empty(),
             "files under tests/ are exempt; got {findings:?}"
+        );
+    }
+
+    #[test]
+    fn no_unwrap_skips_workspace_root_tests_and_benches() {
+        // Regression test for PR #72 review feedback: a file at workspace
+        // root like `tests/integration.rs` (no leading slash, no `/tests/`
+        // substring) was previously NOT excluded by the LIKE pattern.
+        // The `'/' || f.path` prepend in NO_UNWRAP_SQL handles both
+        // workspace-root and crate-nested paths uniformly.
+        let conn = fresh_db();
+        seed_function(&conn, 2, "tests/integration.rs", 10, "test_helper", false);
+        seed_function(&conn, 3, "benches/throughput.rs", 11, "bench_helper", false);
+        insert_panic_ref(&conn, 2, 10, 42, "unwrap");
+        insert_panic_ref(&conn, 3, 11, 42, "unwrap");
+
+        let findings = no_unwrap().run(&conn).expect("query should succeed");
+        assert!(
+            findings.is_empty(),
+            "workspace-root tests/ and benches/ exempt; got {findings:?}"
         );
     }
 
