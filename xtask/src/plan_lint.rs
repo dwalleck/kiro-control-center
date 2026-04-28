@@ -199,7 +199,9 @@ impl Options {
 }
 
 fn print_help() {
-    eprintln!(
+    // Help text on stdout per UNIX convention so
+    // `cargo xtask plan-lint --help | grep TETHYS_BIN` works.
+    println!(
         "cargo xtask plan-lint — run structural lint queries against the tethys index
 
 USAGE:
@@ -236,7 +238,12 @@ fn validate_gate_filter(filter: Option<&str>, gates: &[Gate]) -> Result<()> {
     bail!("unknown gate `{name}`; known gates: {}", known.join(", "));
 }
 
-pub fn run(args: impl Iterator<Item = String>) -> Result<()> {
+/// Run plan-lint and return the count of violations found across all
+/// non-allowlisted gate hits. The caller is responsible for mapping the
+/// count to a process exit code (per the documented contract: 0 for
+/// clean, 1 for findings, 2 for internal error). `Err` returns are
+/// internal errors — propagate them with exit code 2.
+pub fn run(args: impl Iterator<Item = String>) -> Result<usize> {
     let opts = Options::parse(args)?;
 
     // Validate `--gate <name>` before the expensive index step.
@@ -282,9 +289,11 @@ pub fn run(args: impl Iterator<Item = String>) -> Result<()> {
     }
 
     if total_findings > 0 {
-        bail!("plan-lint found {total_findings} violation(s)");
+        // Stderr message; stdout already carries the per-gate output.
+        // The caller (main) maps this count to exit code 1.
+        eprintln!("plan-lint found {total_findings} violation(s)");
     }
-    Ok(())
+    Ok(total_findings)
 }
 
 fn print_finding(f: &Finding) {

@@ -7,21 +7,43 @@
 use std::env;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, ExitCode};
 
 use anyhow::{Context, Result, bail};
 
 mod plan_lint;
 
-fn main() -> Result<()> {
+/// Exit codes documented by `cargo xtask plan-lint --help`:
+/// `0` = clean, `1` = lint findings, `2` = internal error.
+/// The hook subcommands only ever return 0 or 2 (any error is internal).
+fn main() -> ExitCode {
+    match dispatch() {
+        Ok(code) => ExitCode::from(code),
+        Err(e) => {
+            eprintln!("Error: {e:?}");
+            ExitCode::from(2)
+        }
+    }
+}
+
+fn dispatch() -> Result<u8> {
     let mut args = env::args().skip(1);
     let cmd = args.next().context(
         "missing subcommand (expected: hook-post-edit | hook-block-cargo-lock | plan-lint)",
     )?;
     match cmd.as_str() {
-        "hook-post-edit" => hook_post_edit(),
-        "hook-block-cargo-lock" => hook_block_cargo_lock(),
-        "plan-lint" => plan_lint::run(args),
+        "hook-post-edit" => {
+            hook_post_edit()?;
+            Ok(0)
+        }
+        "hook-block-cargo-lock" => {
+            hook_block_cargo_lock()?;
+            Ok(0)
+        }
+        "plan-lint" => {
+            let findings = plan_lint::run(args)?;
+            Ok(u8::from(findings > 0))
+        }
         other => bail!("unknown xtask subcommand: {other}"),
     }
 }
