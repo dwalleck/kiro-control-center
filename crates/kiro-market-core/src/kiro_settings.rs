@@ -96,7 +96,7 @@ impl SettingType {
 ///
 /// Serialized as an internally-tagged enum so the frontend can use a
 /// discriminated union: `entry.value_type.kind === "bool"`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "specta", derive(specta::Type))]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SettingValueInfo {
@@ -202,7 +202,7 @@ pub struct SettingDef {
 // ---------------------------------------------------------------------------
 
 /// A fully-resolved setting entry suitable for serialisation to a frontend.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[cfg_attr(feature = "specta", derive(specta::Type))]
 pub struct SettingEntry {
     /// Dotted JSON key path.
@@ -614,8 +614,11 @@ pub fn get_nested<'a>(value: &'a JsonValue, path: &str) -> Option<&'a JsonValue>
 /// user with `{"chat": "broken"}` calling `set_nested("chat.model", v)`
 /// loses the `"broken"` string, and the warning gives them a trail.
 ///
-/// A path of `""` is treated as a single empty segment ("" is what
-/// `"".split('.').collect::<Vec<_>>()` produces).
+/// Empty paths and paths with empty segments (`""`, `"."`, `".key"`,
+/// `"key."`, `"a..b"`, `".."`) are rejected at the top of the function
+/// with a `tracing::error!` and the JSON value is left unchanged. Use
+/// [`is_well_formed_dotted_path`] to pre-validate if you need a
+/// boolean check rather than the side-effecting skip.
 ///
 /// # Trust contract
 ///
@@ -627,59 +630,98 @@ pub fn get_nested<'a>(value: &'a JsonValue, path: &str) -> Option<&'a JsonValue>
 /// already does both validations; this raw helper exists only because
 /// some callers (test fixtures, future migrations) need to write
 /// arbitrary keys without registry coupling.
-///
-/// # Panics
-///
-/// The internal `expect` calls assert post-conditions established by the
-/// preceding statements (`split('.')` always yields at least one element,
-/// and the `if !current.is_object()` guards ensure object access succeeds).
-/// They are unreachable in practice.
 pub fn set_nested(value: &mut JsonValue, path: &str, val: JsonValue) {
-    let segments: Vec<&str> = path.split('.').collect();
-    let (last, parents) = segments
-        .split_last()
-        .expect("split('.') always yields at least one segment");
+    // Reject malformed dotted paths (empty, leading/trailing/repeated dot)
+    // before walking. Prior versions silently produced shapes like
+    // `{"": {"key": v}}` for `".key"` — invisible in the UI and a real
+    // foot-gun for any future migration that calls `set_nested` directly.
+    // The registry-validated wrapper `apply_registered_setting` never
+    // reaches this branch, so this is defense-in-depth for `pub` callers.
+    if !is_well_formed_dotted_path(path) {
+        tracing::error!(
+            path = %path,
+            "set_nested: malformed dotted path (empty / leading dot / trailing dot / repeated dot); write skipped"
+        );
+        return;
+    }
+
+    // rsplit_once distinguishes "no dot" (e.g. "key") from "trailing dot"
+    // (e.g. ".key"). With no dot, parents is empty and the whole path is
+    // the leaf key; otherwise the prefix splits on '.' to walk segments.
+    let (parents, last): (Vec<&str>, &str) = match path.rsplit_once('.') {
+        Some((rest, last)) => (rest.split('.').collect(), last),
+        None => (Vec::new(), path),
+    };
 
     let mut current = value;
     let mut traversed = String::new();
-    for &segment in parents {
-        if !current.is_object() {
-            tracing::warn!(
+    for segment in parents {
+        ensure_object(current, path, &traversed, "intermediate");
+        let JsonValue::Object(obj) = current else {
+            // `ensure_object` unconditionally produces a `JsonValue::Object`
+            // — reaching this branch means that contract was broken. Surface
+            // it via `tracing::error!` so a future regression in
+            // `ensure_object` is observable, not a silent no-op write.
+            tracing::error!(
                 path = %path,
-                at = %if traversed.is_empty() { "<root>".to_owned() } else { traversed.clone() },
-                replaced_kind = json_kind(current),
-                "set_nested overwrote non-object intermediate with an empty object"
+                at = %traversed,
+                "set_nested: ensure_object did not yield an Object on intermediate; write skipped"
             );
-            *current = serde_json::json!({});
-        }
-        let obj = current
-            .as_object_mut()
-            .expect("just ensured current is an object");
-        if !obj.contains_key(segment) {
-            obj.insert(segment.to_owned(), serde_json::json!({}));
-        }
-        current = obj
-            .get_mut(segment)
-            .expect("just inserted or already present");
+            return;
+        };
+        let entry = obj
+            .entry(segment.to_owned())
+            .or_insert_with(|| JsonValue::Object(serde_json::Map::new()));
         if !traversed.is_empty() {
             traversed.push('.');
         }
         traversed.push_str(segment);
+        current = entry;
     }
 
-    if !current.is_object() {
-        tracing::warn!(
+    ensure_object(current, path, &traversed, "leaf-parent");
+    let JsonValue::Object(obj) = current else {
+        tracing::error!(
             path = %path,
-            at = %if traversed.is_empty() { "<root>".to_owned() } else { traversed },
-            replaced_kind = json_kind(current),
-            "set_nested overwrote non-object leaf parent with an empty object"
+            at = %traversed,
+            "set_nested: ensure_object did not yield an Object at leaf-parent; write skipped"
         );
-        *current = serde_json::json!({});
+        return;
+    };
+    obj.insert(last.to_owned(), val);
+}
+
+/// A dotted path like `"chat.defaultModel"` is well-formed iff every
+/// `.`-delimited segment is non-empty. Rejects `""`, `"."`, `".key"`,
+/// `"key."`, `"a..b"`, and `".."` — the previously-silent corruption
+/// shapes flagged by the silent-failure hunter on PR #73.
+fn is_well_formed_dotted_path(path: &str) -> bool {
+    !path.is_empty() && path.split('.').all(|s| !s.is_empty())
+}
+
+/// Replace a non-Object `JsonValue` with an empty object, logging the
+/// kind that was discarded. Idempotent: if `value` is already an Object,
+/// this is a no-op.
+///
+/// `position` is `"intermediate"` (mid-walk) or `"leaf-parent"` (final
+/// `ensure_object` before the leaf insert). The previous shape collapsed
+/// both into the same log message; preserving the distinction lets log
+/// triage tell apart a destroyed mid-path object from a destroyed leaf
+/// parent. The `at` field uses `%` Display formatting so log parsers
+/// don't see the field rendered with surrounding quotes.
+fn ensure_object(value: &mut JsonValue, path: &str, at: &str, position: &'static str) {
+    if matches!(value, JsonValue::Object(_)) {
+        return;
     }
-    current
-        .as_object_mut()
-        .expect("just ensured current is an object")
-        .insert((*last).to_owned(), val);
+    let at_display = if at.is_empty() { "<root>" } else { at };
+    tracing::warn!(
+        path = %path,
+        at = %at_display,
+        position = position,
+        replaced_kind = json_kind(value),
+        "set_nested overwrote non-object {position} with an empty object"
+    );
+    *value = JsonValue::Object(serde_json::Map::new());
 }
 
 /// Reasons an [`apply_registered_setting`] call can reject the input.
@@ -794,6 +836,49 @@ fn remove_nested_impl(value: &mut JsonValue, segments: &[&str]) -> bool {
     obj.is_empty()
 }
 
+/// Resolve a single registry setting by key against a loaded JSON config,
+/// returning `None` if the key is not registered.
+///
+/// Equivalent to `resolve_settings(json).into_iter().find(|e| e.key == key)`
+/// but avoids materializing the full entry list. Use this from callers that
+/// have a key in hand (e.g. the Tauri `set_kiro_setting` handler that needs
+/// to return the just-updated entry); use [`resolve_settings`] from callers
+/// that need every entry.
+#[must_use]
+pub fn resolve_setting_for_key(json: &JsonValue, key: &str) -> Option<SettingEntry> {
+    let def = registry().iter().find(|d| d.key == key)?;
+    let current_value = get_nested(json, def.key).cloned();
+    Some(SettingEntry {
+        key: def.key.to_owned(),
+        label: def.label.to_owned(),
+        description: def.description.to_owned(),
+        category: def.category,
+        category_label: def.category.label().to_owned(),
+        value_type: setting_type_to_value_info(&def.value_type),
+        default_value: def.default.clone(),
+        current_value,
+    })
+}
+
+/// Project a `SettingType` (the registry's compact representation) into a
+/// `SettingValueInfo` (the wire-format representation the frontend
+/// receives). Shared between [`resolve_setting_for_key`] and
+/// [`resolve_settings`] so a future `SettingType` variant only needs the
+/// arm added in one place — three independent reviewers (gemini-code-assist,
+/// two Kiro re-review passes) flagged the prior duplication.
+fn setting_type_to_value_info(t: &SettingType) -> SettingValueInfo {
+    match t {
+        SettingType::Bool => SettingValueInfo::Bool,
+        SettingType::String => SettingValueInfo::String,
+        SettingType::Number => SettingValueInfo::Number,
+        SettingType::Char => SettingValueInfo::Char,
+        SettingType::StringArray => SettingValueInfo::StringArray,
+        SettingType::Enum(opts) => SettingValueInfo::Enum {
+            options: opts.iter().map(|&s| s.to_owned()).collect(),
+        },
+    }
+}
+
 /// Resolve all registry settings against a loaded JSON config, returning a
 /// [`SettingEntry`] for each definition.
 ///
@@ -804,30 +889,15 @@ fn remove_nested_impl(value: &mut JsonValue, segments: &[&str]) -> bool {
 pub fn resolve_settings(json: &JsonValue) -> Vec<SettingEntry> {
     registry()
         .iter()
-        .map(|def| {
-            let current_value = get_nested(json, def.key).cloned();
-
-            let value_type = match &def.value_type {
-                SettingType::Bool => SettingValueInfo::Bool,
-                SettingType::String => SettingValueInfo::String,
-                SettingType::Number => SettingValueInfo::Number,
-                SettingType::Char => SettingValueInfo::Char,
-                SettingType::StringArray => SettingValueInfo::StringArray,
-                SettingType::Enum(opts) => SettingValueInfo::Enum {
-                    options: opts.iter().map(|&s| s.to_owned()).collect(),
-                },
-            };
-
-            SettingEntry {
-                key: def.key.to_owned(),
-                label: def.label.to_owned(),
-                description: def.description.to_owned(),
-                category: def.category,
-                category_label: def.category.label().to_owned(),
-                value_type,
-                default_value: def.default.clone(),
-                current_value,
-            }
+        .map(|def| SettingEntry {
+            key: def.key.to_owned(),
+            label: def.label.to_owned(),
+            description: def.description.to_owned(),
+            category: def.category,
+            category_label: def.category.label().to_owned(),
+            value_type: setting_type_to_value_info(&def.value_type),
+            default_value: def.default.clone(),
+            current_value: get_nested(json, def.key).cloned(),
         })
         .collect()
 }
@@ -840,7 +910,13 @@ pub fn resolve_settings(json: &JsonValue) -> Vec<SettingEntry> {
 const SETTINGS_FILE: &str = "settings/cli.json";
 
 /// Errors from loading the Kiro CLI settings file.
+///
+/// `#[non_exhaustive]` so future variants (file corruption mid-write,
+/// permission-denied with diagnostics, etc.) are additive without
+/// breaking matches in downstream crates. Pattern matches outside
+/// `kiro-market-core` MUST include a catch-all `_ =>` arm.
 #[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
 pub enum LoadSettingsError {
     /// The file does not exist — use empty defaults.
     #[error("settings file not found")]
@@ -952,6 +1028,29 @@ mod tests {
         let mut seen = HashSet::new();
         for def in reg {
             assert!(seen.insert(def.key), "duplicate registry key: {}", def.key);
+        }
+    }
+
+    /// `apply_registered_setting` calls `set_nested(json, key, val)` and
+    /// unconditionally returns `Ok(())` afterward. `set_nested` silently
+    /// skips writes for malformed dotted paths (with `tracing::error!`).
+    /// If a future registry maintainer ships a malformed key (e.g.
+    /// `chat..defaultModel`, `KIRO_LOG_NO_COLOR.`), the user would see
+    /// "save succeeded" but no value would persist — the kind of silent
+    /// failure the no-unwrap gate exists to prevent.
+    ///
+    /// This test pins the implicit contract: every registered key must
+    /// be a well-formed dotted path that `set_nested` will actually act
+    /// on.
+    #[test]
+    fn every_registry_key_is_well_formed_dotted_path() {
+        for def in registry() {
+            assert!(
+                is_well_formed_dotted_path(def.key),
+                "registry key {:?} is not a well-formed dotted path; \
+                 apply_registered_setting would silently skip writes for it",
+                def.key,
+            );
         }
     }
 
@@ -1137,6 +1236,38 @@ mod tests {
             get_nested(&json, "chat.defaultModel"),
             Some(&JsonValue::String("opus".into()))
         );
+    }
+
+    /// Adversarial inputs that the previous `set_nested` body silently
+    /// corrupted into garbage JSON shapes (e.g. `".key"` →
+    /// `{"": {"key": val}}`). Validation now skips the write and emits a
+    /// `tracing::error!` so the failure is observable instead of writing
+    /// the user's settings into a key they cannot see in the UI.
+    #[rstest]
+    #[case::empty("")]
+    #[case::single_dot(".")]
+    #[case::leading_dot(".key")]
+    #[case::trailing_dot("key.")]
+    #[case::double_dot("a..b")]
+    #[case::only_dots("..")]
+    fn set_nested_rejects_malformed_paths(#[case] path: &str) {
+        let mut v = serde_json::json!({});
+        set_nested(&mut v, path, JsonValue::from(1));
+        assert_eq!(
+            v,
+            serde_json::json!({}),
+            "malformed path {path:?} must not produce any write; got {v}"
+        );
+    }
+
+    #[test]
+    fn set_nested_writes_single_segment_path() {
+        // No-dot path should write at the root (the rsplit_once None
+        // branch). Lock the contract so a future regression doesn't
+        // accidentally start treating "topLevel" as malformed.
+        let mut v = serde_json::json!({});
+        set_nested(&mut v, "topLevel", JsonValue::from(42));
+        assert_eq!(v, serde_json::json!({"topLevel": 42}));
     }
 
     // -----------------------------------------------------------------------
@@ -1425,6 +1556,64 @@ mod tests {
             telemetry.current_value.is_none(),
             "current_value should be None when resolved against empty JSON"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // resolve_setting_for_key
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn resolve_setting_for_key_returns_some_for_known_key_with_current_value() {
+        let json = serde_json::json!({"chat": {"defaultModel": "claude-opus-4"}});
+        let entry =
+            resolve_setting_for_key(&json, "chat.defaultModel").expect("known key must resolve");
+        assert_eq!(entry.key, "chat.defaultModel");
+        assert_eq!(
+            entry.current_value,
+            Some(serde_json::json!("claude-opus-4"))
+        );
+        assert!(matches!(entry.value_type, SettingValueInfo::String));
+    }
+
+    #[test]
+    fn resolve_setting_for_key_returns_some_with_none_current_value_for_absent_key() {
+        let entry = resolve_setting_for_key(&serde_json::json!({}), "telemetry.enabled")
+            .expect("registered key must resolve regardless of file content");
+        assert_eq!(entry.key, "telemetry.enabled");
+        assert!(
+            entry.current_value.is_none(),
+            "current_value should be None when the key is absent from JSON"
+        );
+    }
+
+    #[test]
+    fn resolve_setting_for_key_returns_none_for_unknown_key() {
+        assert!(resolve_setting_for_key(&serde_json::json!({}), "totally.unknown.key").is_none());
+    }
+
+    #[test]
+    fn resolve_setting_for_key_returns_none_for_empty_key() {
+        assert!(resolve_setting_for_key(&serde_json::json!({}), "").is_none());
+    }
+
+    /// Cross-check: every key in `registry()` produces a `SettingEntry`
+    /// that is byte-identical between `resolve_settings` (which builds the
+    /// full list) and `resolve_setting_for_key` (which builds one). Pins
+    /// the duplicated per-entry projection block so a future addition to
+    /// `SettingType` updates both arms or fails this test.
+    #[test]
+    fn resolve_setting_for_key_agrees_with_resolve_settings_for_every_registry_key() {
+        let json = serde_json::json!({"chat": {"defaultModel": "claude-opus-4"}});
+        let full = resolve_settings(&json);
+        for entry in &full {
+            let single = resolve_setting_for_key(&json, &entry.key)
+                .unwrap_or_else(|| panic!("registered key {} must resolve", entry.key));
+            assert_eq!(
+                &single, entry,
+                "single-key resolver disagreed with full-list resolver for {}",
+                entry.key
+            );
+        }
     }
 
     #[test]

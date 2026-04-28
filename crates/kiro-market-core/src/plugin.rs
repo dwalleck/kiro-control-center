@@ -100,15 +100,26 @@ impl DiscoveredPlugin {
         format!("./{unix_path}")
     }
 
+    /// The relative path as a validated [`RelativePath`].
+    ///
+    /// `try_read_plugin` runs `validate_relative_path` against the
+    /// formatted path before constructing a `DiscoveredPlugin`, so this
+    /// method can use [`RelativePath::from_internal_unchecked`] without
+    /// risking a malformed value. Callers that hold a `DiscoveredPlugin`
+    /// should prefer this over
+    /// `RelativePath::new(dp.as_relative_path_string())`, which previously
+    /// required an `.expect("paths from discovery are valid")` call site
+    /// flagged by the `no-unwrap-in-production` plan-lint gate.
+    #[must_use]
+    pub fn as_relative_path(&self) -> crate::validation::RelativePath {
+        crate::validation::RelativePath::from_internal_unchecked(self.as_relative_path_string())
+    }
+
     /// The relative path with forward slashes, suitable for cross-platform
     /// comparison against manifest paths.
     #[must_use]
     pub fn relative_path_unix(&self) -> String {
-        self.relative_path
-            .components()
-            .map(|c| c.as_os_str().to_string_lossy())
-            .collect::<Vec<_>>()
-            .join("/")
+        format_relative_path_unix(&self.relative_path)
     }
 }
 
@@ -235,6 +246,23 @@ fn try_read_plugin(dir: &Path, repo_root: &Path) -> Option<DiscoveredPlugin> {
     }
 
     let relative_path = dir.strip_prefix(repo_root).unwrap_or(dir).to_path_buf();
+
+    // Validate the assembled relative path the same way the wire-format
+    // newtype would. Without this check a directory whose Unix-literal
+    // name contains `\` (legal on ext4, illegal as a Windows separator)
+    // would slip into `RelativePath::from_internal_unchecked` and resolve
+    // outside the marketplace tree once joined on Windows.
+    let formatted = format_relative_path_unix(&relative_path);
+    if let Err(e) = crate::validation::validate_relative_path(&formatted) {
+        warn!(
+            path = %candidate.display(),
+            formatted = %formatted,
+            error = %e,
+            "skipping plugin whose discovered path fails validation"
+        );
+        return None;
+    }
+
     debug!(
         name = %manifest.name,
         path = %relative_path.display(),
@@ -245,6 +273,17 @@ fn try_read_plugin(dir: &Path, repo_root: &Path) -> Option<DiscoveredPlugin> {
         description: manifest.description,
         relative_path,
     })
+}
+
+/// Format a relative `Path` as a `/`-separated string. Used by both
+/// [`DiscoveredPlugin::relative_path_unix`] and the discovery-time
+/// validator in [`try_read_plugin`] so the validated string and the
+/// later-emitted string are byte-identical.
+fn format_relative_path_unix(p: &Path) -> String {
+    p.components()
+        .map(|c| c.as_os_str().to_string_lossy())
+        .collect::<Vec<_>>()
+        .join("/")
 }
 
 fn scan_for_plugins(
@@ -837,5 +876,70 @@ mod tests {
         let discovered = discover_plugins(root, 3).expect("discover should succeed");
         assert_eq!(discovered.len(), 1);
         assert_eq!(discovered[0].name(), "good");
+    }
+
+    /// Regression test for a Windows path-traversal bypass: a marketplace
+    /// could ship a directory whose literal name on Unix contains a
+    /// backslash (e.g. `sub\evil`). `Path::components` treats `\` as a
+    /// literal on Unix but as a separator on Windows, so the resulting
+    /// `RelativePath` would resolve outside the marketplace tree once
+    /// joined on Windows. `try_read_plugin` must reject any discovered
+    /// directory whose assembled relative path fails
+    /// `validate_relative_path`.
+    #[test]
+    #[cfg(unix)]
+    fn discover_plugins_skips_directory_with_backslash_in_name() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+
+        let plugins_root = root.join("plugins");
+        fs::create_dir_all(&plugins_root).expect("plugins root");
+        // Single directory whose literal Unix name contains `\`. mkdir on
+        // Windows would split this into nested dirs, so the test is
+        // Unix-gated; Windows mooting it is itself the desired behavior.
+        let evil_dir = plugins_root.join("sub\\evil");
+        fs::create_dir_all(&evil_dir).expect("create backslash-named dir");
+        fs::write(
+            evil_dir.join("plugin.json"),
+            r#"{"name":"evil","skills":["./skills/"]}"#,
+        )
+        .expect("write evil plugin.json");
+
+        create_plugin_json(&root.join("plugins/good"), "good", None);
+
+        let discovered = discover_plugins(root, 3).expect("discover should succeed");
+
+        let names: Vec<_> = discovered.iter().map(DiscoveredPlugin::name).collect();
+        assert_eq!(
+            discovered.len(),
+            1,
+            "expected only the safe plugin to survive validation, got {names:?}"
+        );
+        assert_eq!(discovered[0].name(), "good");
+    }
+
+    /// Pin the contract `from_internal_unchecked` relies on: every path
+    /// `discover_plugins` produces must also be one `RelativePath::new`
+    /// would accept. Without this test, the unchecked constructor is a
+    /// latent footgun — discovery could silently produce a `RelativePath`
+    /// that downstream code (Tauri serializers, `marketplace_path.join`)
+    /// would refuse on re-validation.
+    #[test]
+    fn discovered_plugin_as_relative_path_round_trips_through_validation() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+
+        create_plugin_json(&root.join("plugins/my-plugin"), "my-plugin", None);
+
+        let discovered = discover_plugins(root, 3).expect("discover");
+        assert_eq!(discovered.len(), 1);
+
+        let unchecked = discovered[0].as_relative_path();
+        let checked = crate::validation::RelativePath::new(discovered[0].as_relative_path_string())
+            .expect("discovery output must validate");
+        assert_eq!(
+            unchecked, checked,
+            "from_internal_unchecked must agree with RelativePath::new for discovered paths"
+        );
     }
 }

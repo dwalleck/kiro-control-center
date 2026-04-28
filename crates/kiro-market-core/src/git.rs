@@ -263,10 +263,11 @@ impl GixCliBackend {
         let mut prepare = gix::prepare_clone(url, dest).map_err(|e| clone_failed(url, e))?;
 
         if opts.git_ref.is_none() {
-            // Shallow clone, depth = 1. NonZeroU32::new(1).unwrap() reads
-            // more clearly here than `NonZeroU32::MIN`, which would force
-            // the reader to remember that NonZeroU32's minimum is 1.
-            let depth = NonZeroU32::new(1).expect("1 is non-zero");
+            // Shallow clone, depth = 1. `NonZeroU32::MIN` is a const-eval
+            // value (= 1) — same intent as the previous `NonZeroU32::new(1)`
+            // but without a runtime `.expect()`. The neighbouring comment
+            // carries the "depth one" intent for the reader.
+            let depth = NonZeroU32::MIN;
             prepare = prepare.with_shallow(gix::remote::fetch::Shallow::DepthAtRemote(depth));
         }
 

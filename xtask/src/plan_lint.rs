@@ -115,6 +115,95 @@ WHERE r.reference_name IN ('unwrap', 'expect')
   AND f.path NOT LIKE '%test_utils%'
 ORDER BY f.path, r.line";
 
+/// Catches `panic!`, `todo!`, and `unimplemented!` macro invocations in
+/// non-test production code. Same JOIN shape as `no-unwrap-in-production`,
+/// just a different `reference_name` list — these macros are not method
+/// calls but tree-sitter-rust extracts `macro_invocation` references the
+/// same way it extracts method calls, so the query is identical in shape.
+///
+/// `unreachable!()` is *not* in the list — it's the canonical replacement
+/// when restructuring code to satisfy zero-tolerance, and treating it as
+/// a violation would defeat its purpose. If `unreachable!()` ever shows
+/// up at a runtime-reachable site, that's a code-review concern, not a
+/// gate concern.
+const NO_PANIC_SQL: &str = "\
+SELECT f.path, r.line, s.qualified_name, r.reference_name
+FROM refs r
+JOIN symbols s ON s.id = r.in_symbol_id
+JOIN files f ON f.id = r.file_id
+WHERE r.reference_name IN ('panic', 'todo', 'unimplemented')
+  AND s.kind IN ('function', 'method')
+  AND s.is_test = 0
+  AND '/' || f.path NOT LIKE '%/tests/%'
+  AND '/' || f.path NOT LIKE '%/benches/%'
+  AND f.path NOT LIKE '%test_support%'
+  AND f.path NOT LIKE '%test_utils%'
+ORDER BY f.path, r.line";
+
+/// CLAUDE.md "Dependencies point inward" — `kiro-market-core` is the
+/// domain core and must stay free of UI / Tauri / async-runtime / frontend
+/// deps. Adding `use tauri::...`, `use tauri_plugin_*::...`, or `use tokio::...`
+/// to a file in `kiro-market-core/src/` would violate this even before
+/// `Cargo.toml` notices.
+///
+/// Queries the `imports` table (one row per `use` statement) and flags
+/// any import in `kiro-market-core/src/` whose `source_module` starts
+/// with one of the forbidden prefixes. `cargo-deny` solves the
+/// crate-Cargo.toml version of this rule; this gate solves the
+/// per-file version, catching the bad import the moment it lands.
+// `imports` does not carry a line column (one row per
+// (file_id, symbol_name, source_module) tuple), so we report `line = 0`
+// as a sentinel and the reviewer greps the file for the import. The
+// path + (symbol_name, source_module) signature is enough to locate it.
+const NO_FRONTEND_DEPS_IN_CORE_SQL: &str = "\
+SELECT f.path, 0 AS line, i.symbol_name AS qualified_name, i.source_module AS signature
+FROM imports i
+JOIN files f ON f.id = i.file_id
+WHERE f.path LIKE '%kiro-market-core/src/%'
+  AND f.path NOT LIKE '%/tests/%'
+  AND (i.source_module LIKE 'tauri::%'
+       OR i.source_module = 'tauri'
+       OR i.source_module LIKE 'tauri_plugin_%'
+       OR i.source_module LIKE 'tokio::%'
+       OR i.source_module = 'tokio')
+ORDER BY f.path, i.symbol_name";
+
+/// CLAUDE.md mandates `#[non_exhaustive]` on error enums so adding a new
+/// variant in core doesn't silently break downstream pattern matches.
+/// This gate flags any public enum in `kiro-market-core` whose name ends
+/// in `Error` and that lacks the attribute.
+///
+/// **Heuristic limitation:** the SQL matches on `LIKE '%Error'` only.
+/// Error-like enums named `*Failure`, `*Kind`, or `*Reason` (e.g.
+/// `NativeParseFailure`, `ParseFailure`) deriving `thiserror::Error` are
+/// invisible to this gate and must carry `#[non_exhaustive]` by manual
+/// review. Widening the SQL would require joining the `attributes` table
+/// to detect `thiserror::Error` derives regardless of name; the current
+/// `*Error` convention catches the common case and the existing
+/// `*Failure` enums in core already opt in.
+///
+/// Scoped to `kiro-market-core` because the rule is about the public
+/// surface of the *library* — Tauri command errors and CLI binary
+/// errors don't carry the same downstream-stability requirement.
+///
+/// `signature` is `NULL` (no useful per-finding text); the gate's
+/// description carries the explanation.
+const NON_EXHAUSTIVE_ERROR_ENUM_SQL: &str = "\
+SELECT f.path, s.line, s.qualified_name, NULL AS signature
+FROM symbols s
+JOIN files f ON f.id = s.file_id
+WHERE s.kind = 'enum'
+  AND s.visibility = 'public'
+  AND s.name LIKE '%Error'
+  AND f.path LIKE '%kiro-market-core/src/%'
+  AND f.path NOT LIKE '%/tests/%'
+  AND NOT EXISTS (
+      SELECT 1 FROM attributes a
+      WHERE a.symbol_id = s.id
+        AND a.name = 'non_exhaustive'
+  )
+ORDER BY f.path, s.line";
+
 const ALL_GATES: &[Gate] = &[
     Gate {
         name: "gate-4-external-error-boundary",
@@ -126,7 +215,112 @@ const ALL_GATES: &[Gate] = &[
         description: ".unwrap() or .expect() in non-test production code",
         sql: NO_UNWRAP_SQL,
     },
+    Gate {
+        name: "no-panic-in-production",
+        description: "panic!, todo!, or unimplemented! in non-test production code",
+        sql: NO_PANIC_SQL,
+    },
+    Gate {
+        name: "non-exhaustive-error-enum",
+        description: "pub *Error-named enum in kiro-market-core missing #[non_exhaustive] (heuristic: name LIKE '%Error' only)",
+        sql: NON_EXHAUSTIVE_ERROR_ENUM_SQL,
+    },
+    Gate {
+        name: "no-frontend-deps-in-core",
+        description: "tauri / tokio import in kiro-market-core (dependencies-point-inward)",
+        sql: NO_FRONTEND_DEPS_IN_CORE_SQL,
+    },
 ];
+
+/// A `(gate, path, line)` triple acknowledged as a deliberate exception.
+///
+/// CLAUDE.md zero-tolerance is the *default*; this list is the register
+/// of cases where an idiomatic Rust pattern requires `.expect()` (or
+/// similar) and refactoring would only relocate the panic. Each entry
+/// must carry a `reason` long enough for a future reviewer to evaluate
+/// without re-deriving the rationale.
+///
+/// The mechanism deliberately keeps the allowlist *in source code* (not
+/// a TOML / JSON file): adding an exception requires a code change and
+/// shows up in `git blame`, the same audit trail that protects every
+/// other rule in this codebase.
+struct AllowedSite {
+    gate: &'static str,
+    path: &'static str,
+    line: u32,
+    /// Why this site is acknowledged. Read at PR review time.
+    #[expect(
+        dead_code,
+        reason = "human-only documentation; reviewer audit, not a runtime field"
+    )]
+    reason: &'static str,
+}
+
+// Line numbers shift with edits to the target file; when an unrelated edit
+// pushes a registered `.expect()` to a different line, the runner's
+// `stale_allowlist_entries` check fails CI and forces a coordinated
+// `ALLOWED_SITES` update in the same PR. That failure is intentional —
+// it keeps the audit trail current rather than letting orphaned rows
+// silently exempt some unrelated future panic that lands on the old line.
+const ALLOWED_SITES: &[AllowedSite] = &[
+    AllowedSite {
+        gate: "no-unwrap-in-production",
+        path: "crates/kiro-control-center/src-tauri/src/lib.rs",
+        line: 49,
+        reason: "Tauri scaffolding pattern — debug-only `specta_typescript::Typescript::default().export(...)` failure at app startup. Refactoring to `?` propagation would only move the panic into `fn main()`. Idiomatic Rust at the binary entry point.",
+    },
+    AllowedSite {
+        gate: "no-unwrap-in-production",
+        path: "crates/kiro-control-center/src-tauri/src/lib.rs",
+        line: 60,
+        reason: "Tauri scaffolding pattern — `tauri::Builder::run` failure at app startup. Replacing with Result propagation would only move the panic into `fn main()`. Idiomatic Rust at the binary entry point.",
+    },
+];
+
+/// Test-only convenience wrapper preserved so the four existing
+/// `is_allowed_*` regression tests keep their original names. Production
+/// code uses [`find_allowlist_index`] directly so it can record which
+/// entries actually matched (powering stale-allowlist detection).
+#[cfg(test)]
+fn is_allowed(gate: &str, finding: &Finding) -> bool {
+    find_allowlist_index(ALLOWED_SITES, gate, finding).is_some()
+}
+
+/// Locate the [`ALLOWED_SITES`] entry matching `(gate, finding.path,
+/// finding.line)`, returning its index. Returning the index (rather than a
+/// boolean) lets the runner record *which* allowlist entries actually
+/// matched a finding this run, so a follow-up pass can surface stale
+/// entries — sites whose acknowledged `.expect()` was refactored away or
+/// shifted to a different line, leaving the allowlist row protecting
+/// nothing.
+fn find_allowlist_index(sites: &[AllowedSite], gate: &str, finding: &Finding) -> Option<usize> {
+    sites
+        .iter()
+        .position(|s| s.gate == gate && s.path == finding.path && s.line == finding.line)
+}
+
+/// Return references to allowlist entries that were *not* matched by any
+/// finding during a run, restricted to gates that were actually executed.
+/// An entry whose gate was filtered out by `--gate <name>` is correctly
+/// excluded — we cannot tell whether it would have matched without
+/// running its gate.
+///
+/// A non-empty result indicates the allowlist has accumulated stale
+/// rows: the panic-bearing call site moved/disappeared but the
+/// acknowledgement stayed. The runner treats stale entries as findings
+/// so the audit trail can't rot silently.
+fn stale_allowlist_entries<'a>(
+    sites: &'a [AllowedSite],
+    matched_indices: &std::collections::HashSet<usize>,
+    gates_run: &std::collections::HashSet<&str>,
+) -> Vec<&'a AllowedSite> {
+    sites
+        .iter()
+        .enumerate()
+        .filter(|(idx, site)| gates_run.contains(site.gate) && !matched_indices.contains(idx))
+        .map(|(_, s)| s)
+        .collect()
+}
 
 impl Gate {
     fn run(&self, conn: &Connection) -> Result<Vec<Finding>> {
@@ -264,27 +458,79 @@ pub fn run(args: impl Iterator<Item = String>) -> Result<usize> {
         .with_context(|| format!("opening tethys index at {}", db_path.display()))?;
 
     let mut total_findings = 0usize;
+    let mut matched_allowlist_indices: std::collections::HashSet<usize> =
+        std::collections::HashSet::new();
+    let mut gates_run: std::collections::HashSet<&str> = std::collections::HashSet::new();
     for gate in ALL_GATES {
         if let Some(name) = &opts.gate_filter
             && gate.name != name
         {
             continue;
         }
-        let findings = gate.run(&conn)?;
+        gates_run.insert(gate.name);
+        let raw = gate.run(&conn)?;
+        let mut allowed: Vec<Finding> = Vec::new();
+        let mut findings: Vec<Finding> = Vec::new();
+        for f in raw {
+            if let Some(idx) = find_allowlist_index(ALLOWED_SITES, gate.name, &f) {
+                matched_allowlist_indices.insert(idx);
+                allowed.push(f);
+            } else {
+                findings.push(f);
+            }
+        }
+
         if findings.is_empty() {
-            println!("{} OK", gate.name);
+            if allowed.is_empty() {
+                println!("{} OK", gate.name);
+            } else {
+                println!(
+                    "{} OK ({} allowlisted exception{})",
+                    gate.name,
+                    allowed.len(),
+                    if allowed.len() == 1 { "" } else { "s" },
+                );
+            }
             continue;
         }
         total_findings += findings.len();
         println!(
-            "{} — {} ({} finding{})",
+            "{} — {} ({} finding{}{})",
             gate.name,
             gate.description,
             findings.len(),
             if findings.len() == 1 { "" } else { "s" },
+            if allowed.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    ", {} allowlisted exception{}",
+                    allowed.len(),
+                    if allowed.len() == 1 { "" } else { "s" },
+                )
+            },
         );
         for f in &findings {
             print_finding(f);
+        }
+    }
+
+    // Surface allowlist entries whose `.expect()` site moved or vanished.
+    // Without this check the audit trail rots silently — a panic at
+    // `lib.rs:49` shifts to `lib.rs:51` after an unrelated edit, the new
+    // line is flagged as a real violation, and the original line-49 entry
+    // outlives its rationale, ready to silently exempt some unrelated
+    // future panic that happens to land on line 49.
+    let stale = stale_allowlist_entries(ALLOWED_SITES, &matched_allowlist_indices, &gates_run);
+    if !stale.is_empty() {
+        total_findings += stale.len();
+        println!(
+            "stale-allowlist — {} entr{} in ALLOWED_SITES matched no finding (line shifted or panic refactored away)",
+            stale.len(),
+            if stale.len() == 1 { "y" } else { "ies" },
+        );
+        for site in &stale {
+            println!("    {}:{}  ({})", site.path, site.line, site.gate);
         }
     }
 
@@ -298,8 +544,22 @@ pub fn run(args: impl Iterator<Item = String>) -> Result<usize> {
 
 fn print_finding(f: &Finding) {
     let signature = f.signature.as_deref().unwrap_or("<no signature>");
-    println!("    {}:{}", f.path, f.line);
+    println!("    {}", format_path_line(&f.path, f.line));
     println!("        {} : {}", f.qualified_name, signature);
+}
+
+/// Format the `path:line` prefix shown for a finding. The
+/// `no-frontend-deps-in-core` gate uses `line = 0` as a sentinel because
+/// the `imports` tethys table has no line column; rendering that as
+/// `path:0` invites editors and CI log parsers to treat it as a real
+/// line reference. This helper substitutes a human-readable hint so the
+/// reviewer knows to grep the file for the import.
+fn format_path_line(path: &str, line: u32) -> String {
+    if line == 0 {
+        format!("{path} (line unknown — grep for import)")
+    } else {
+        format!("{path}:{line}")
+    }
 }
 
 fn ensure_tethys_index(workspace: &Path) -> Result<()> {
@@ -376,6 +636,13 @@ mod tests {
             name TEXT NOT NULL,
             args TEXT,
             line INTEGER NOT NULL
+        );
+        CREATE TABLE imports (
+            file_id INTEGER NOT NULL,
+            symbol_name TEXT NOT NULL,
+            source_module TEXT NOT NULL,
+            alias TEXT,
+            PRIMARY KEY (file_id, symbol_name, source_module)
         );
     ";
 
@@ -842,6 +1109,28 @@ mod tests {
         assert!(findings.is_empty());
     }
 
+    // ─── format_path_line (line=0 sentinel) ─────────────────────────────
+
+    #[test]
+    fn format_path_line_renders_real_line_normally() {
+        assert_eq!(
+            format_path_line("crates/kiro-market-core/src/git.rs", 42),
+            "crates/kiro-market-core/src/git.rs:42"
+        );
+    }
+
+    #[test]
+    fn format_path_line_substitutes_hint_for_zero_line_sentinel() {
+        // The no-frontend-deps-in-core gate uses line=0 as a sentinel
+        // (imports tethys table has no line column). Rendering as
+        // `path:0` would mislead editors and CI parsers into following
+        // a nonexistent line reference.
+        assert_eq!(
+            format_path_line("crates/kiro-market-core/src/foo.rs", 0),
+            "crates/kiro-market-core/src/foo.rs (line unknown — grep for import)"
+        );
+    }
+
     // ─── --gate <name> validation ───────────────────────────────────────
 
     #[test]
@@ -884,5 +1173,528 @@ mod tests {
             err.to_string().contains("unknown gate"),
             "empty string should be treated as unknown, got: {err}"
         );
+    }
+
+    // ─── Allowlist mechanism ────────────────────────────────────────────
+
+    #[test]
+    fn is_allowed_matches_gate_path_and_line_exactly() {
+        let f = Finding {
+            path: "crates/kiro-control-center/src-tauri/src/lib.rs".to_string(),
+            line: 49,
+            qualified_name: "run".to_string(),
+            signature: Some("expect".to_string()),
+        };
+        assert!(is_allowed("no-unwrap-in-production", &f));
+    }
+
+    #[test]
+    fn is_allowed_is_per_gate() {
+        // Same path/line registered under no-unwrap must NOT suppress a
+        // gate-4 finding at the same location.
+        let f = Finding {
+            path: "crates/kiro-control-center/src-tauri/src/lib.rs".to_string(),
+            line: 49,
+            qualified_name: "run".to_string(),
+            signature: Some("expect".to_string()),
+        };
+        assert!(!is_allowed("gate-4-external-error-boundary", &f));
+    }
+
+    #[test]
+    fn is_allowed_rejects_unregistered_lines() {
+        // One line off the registered exception is not exempted.
+        let f = Finding {
+            path: "crates/kiro-control-center/src-tauri/src/lib.rs".to_string(),
+            line: 48,
+            qualified_name: "run".to_string(),
+            signature: Some("expect".to_string()),
+        };
+        assert!(!is_allowed("no-unwrap-in-production", &f));
+    }
+
+    #[test]
+    fn is_allowed_rejects_unregistered_paths() {
+        let f = Finding {
+            path: "src/some_other_file.rs".to_string(),
+            line: 49,
+            qualified_name: "run".to_string(),
+            signature: Some("expect".to_string()),
+        };
+        assert!(!is_allowed("no-unwrap-in-production", &f));
+    }
+
+    // ─── Stale-allowlist detection ──────────────────────────────────────
+
+    /// Synthetic allowlist used by stale-detection tests. Decouples the
+    /// tests from the production [`ALLOWED_SITES`] so adding/removing
+    /// production entries doesn't break the regression suite.
+    const SYNTHETIC_SITES: &[AllowedSite] = &[
+        AllowedSite {
+            gate: "no-unwrap-in-production",
+            path: "src/a.rs",
+            line: 10,
+            reason: "test fixture A",
+        },
+        AllowedSite {
+            gate: "no-unwrap-in-production",
+            path: "src/b.rs",
+            line: 20,
+            reason: "test fixture B",
+        },
+        AllowedSite {
+            gate: "gate-4-external-error-boundary",
+            path: "src/c.rs",
+            line: 30,
+            reason: "test fixture C",
+        },
+    ];
+
+    #[test]
+    fn find_allowlist_index_returns_position_for_match() {
+        let f = Finding {
+            path: "src/b.rs".to_string(),
+            line: 20,
+            qualified_name: "x".to_string(),
+            signature: None,
+        };
+        assert_eq!(
+            find_allowlist_index(SYNTHETIC_SITES, "no-unwrap-in-production", &f),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn find_allowlist_index_is_per_gate() {
+        // (path, line) is registered under no-unwrap; querying as gate-4
+        // must return None — the index lookup must be gate-scoped.
+        let f = Finding {
+            path: "src/a.rs".to_string(),
+            line: 10,
+            qualified_name: "x".to_string(),
+            signature: None,
+        };
+        assert_eq!(
+            find_allowlist_index(SYNTHETIC_SITES, "gate-4-external-error-boundary", &f),
+            None
+        );
+    }
+
+    #[test]
+    fn stale_allowlist_entries_returns_unmatched_indices_for_run_gates() {
+        // Nothing matched, but both no-unwrap entries should surface as
+        // stale because their gate was actually run.
+        let matched = std::collections::HashSet::new();
+        let mut gates_run = std::collections::HashSet::new();
+        gates_run.insert("no-unwrap-in-production");
+
+        let stale = stale_allowlist_entries(SYNTHETIC_SITES, &matched, &gates_run);
+        assert_eq!(stale.len(), 2);
+        let stale_paths: Vec<&str> = stale.iter().map(|s| s.path).collect();
+        assert!(stale_paths.contains(&"src/a.rs"));
+        assert!(stale_paths.contains(&"src/b.rs"));
+    }
+
+    #[test]
+    fn stale_allowlist_entries_skips_entries_for_unrun_gates() {
+        // Only no-unwrap was run; gate-4 entries must NOT be reported as
+        // stale because we have no observation of whether they would
+        // have matched. A `--gate <name>` filter must not erode the
+        // allowlist for unrun gates.
+        let matched = std::collections::HashSet::new();
+        let mut gates_run = std::collections::HashSet::new();
+        gates_run.insert("no-unwrap-in-production");
+
+        let stale = stale_allowlist_entries(SYNTHETIC_SITES, &matched, &gates_run);
+        let stale_paths: Vec<&str> = stale.iter().map(|s| s.path).collect();
+        assert!(
+            !stale_paths.contains(&"src/c.rs"),
+            "gate-4 entry must not be reported stale when only no-unwrap ran"
+        );
+    }
+
+    #[test]
+    fn stale_allowlist_entries_returns_empty_when_all_indices_matched() {
+        let mut matched = std::collections::HashSet::new();
+        matched.insert(0);
+        matched.insert(1);
+        matched.insert(2);
+        let mut gates_run = std::collections::HashSet::new();
+        gates_run.insert("no-unwrap-in-production");
+        gates_run.insert("gate-4-external-error-boundary");
+
+        let stale = stale_allowlist_entries(SYNTHETIC_SITES, &matched, &gates_run);
+        assert!(
+            stale.is_empty(),
+            "no entries should be stale when every index matched"
+        );
+    }
+
+    // ─── no-panic-in-production ─────────────────────────────────────────
+
+    fn no_panic() -> &'static Gate {
+        ALL_GATES
+            .iter()
+            .find(|g| g.name == "no-panic-in-production")
+            .expect("no-panic gate registered")
+    }
+
+    #[test]
+    fn no_panic_flags_panic_macro() {
+        let conn = fresh_db();
+        seed_function(&conn, 2, "crates/core/src/lib.rs", 10, "do_thing", false);
+        insert_panic_ref(&conn, 2, 10, 42, "panic");
+
+        let findings = no_panic().run(&conn).expect("query should succeed");
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].signature.as_deref(), Some("panic"));
+    }
+
+    #[test]
+    fn no_panic_flags_todo_and_unimplemented() {
+        let conn = fresh_db();
+        seed_function(&conn, 2, "crates/core/src/lib.rs", 10, "do_thing", false);
+        insert_panic_ref(&conn, 2, 10, 1, "todo");
+        insert_panic_ref(&conn, 2, 10, 2, "unimplemented");
+
+        let findings = no_panic().run(&conn).expect("query should succeed");
+        assert_eq!(findings.len(), 2);
+    }
+
+    #[test]
+    fn no_panic_does_not_flag_unreachable() {
+        // unreachable!() is the canonical replacement when restructuring to
+        // satisfy zero-tolerance — it must NOT be flagged by this gate or
+        // the gate would defeat its own remediation path.
+        let conn = fresh_db();
+        seed_function(&conn, 2, "crates/core/src/lib.rs", 10, "do_thing", false);
+        insert_panic_ref(&conn, 2, 10, 5, "unreachable");
+
+        let findings = no_panic().run(&conn).expect("query should succeed");
+        assert!(
+            findings.is_empty(),
+            "unreachable! is exempt; got {findings:?}"
+        );
+    }
+
+    #[test]
+    fn no_panic_skips_test_marked_functions() {
+        let conn = fresh_db();
+        seed_function(&conn, 2, "crates/core/src/lib.rs", 10, "test_thing", true);
+        insert_panic_ref(&conn, 2, 10, 42, "panic");
+
+        let findings = no_panic().run(&conn).expect("query should succeed");
+        assert!(findings.is_empty());
+    }
+
+    #[test]
+    fn no_panic_skips_files_under_tests_dir() {
+        // Anything under `tests/` is test code by virtue of where it
+        // lives, even if the function itself isn't `#[test]`-marked
+        // (e.g. helpers in tests/common/). Mirrors the no-unwrap test
+        // so a future SQL edit dropping the `'/' || f.path NOT LIKE
+        // '%/tests/%'` clause regresses both gates symmetrically.
+        let conn = fresh_db();
+        seed_function(
+            &conn,
+            2,
+            "crates/core/tests/common/fixtures.rs",
+            10,
+            "make_fixture",
+            false,
+        );
+        insert_panic_ref(&conn, 2, 10, 42, "panic");
+
+        let findings = no_panic().run(&conn).expect("query should succeed");
+        assert!(
+            findings.is_empty(),
+            "files under tests/ are exempt; got {findings:?}"
+        );
+    }
+
+    #[test]
+    fn no_panic_skips_workspace_root_tests_and_benches() {
+        // The `'/' || f.path` prepend in NO_PANIC_SQL must handle both
+        // workspace-root (`tests/integration.rs`) and crate-nested
+        // (`crates/foo/tests/...`) paths uniformly.
+        let conn = fresh_db();
+        seed_function(&conn, 2, "tests/integration.rs", 10, "test_helper", false);
+        seed_function(&conn, 3, "benches/throughput.rs", 11, "bench_helper", false);
+        insert_panic_ref(&conn, 2, 10, 42, "panic");
+        insert_panic_ref(&conn, 3, 11, 42, "todo");
+
+        let findings = no_panic().run(&conn).expect("query should succeed");
+        assert!(
+            findings.is_empty(),
+            "workspace-root tests/ and benches/ exempt; got {findings:?}"
+        );
+    }
+
+    #[test]
+    fn no_panic_skips_test_support_modules() {
+        let conn = fresh_db();
+        seed_function(
+            &conn,
+            2,
+            "crates/core/src/service/test_support.rs",
+            10,
+            "MarketplaceService::stub",
+            false,
+        );
+        insert_panic_ref(&conn, 2, 10, 42, "unimplemented");
+
+        let findings = no_panic().run(&conn).expect("query should succeed");
+        assert!(
+            findings.is_empty(),
+            "test_support modules exempt; got {findings:?}"
+        );
+    }
+
+    // ─── non-exhaustive-error-enum ──────────────────────────────────────
+
+    fn non_exhaustive() -> &'static Gate {
+        ALL_GATES
+            .iter()
+            .find(|g| g.name == "non-exhaustive-error-enum")
+            .expect("non-exhaustive gate registered")
+    }
+
+    fn seed_error_enum(
+        conn: &Connection,
+        sym_id: i64,
+        path: &str,
+        name: &str,
+        with_non_exhaustive: bool,
+    ) {
+        conn.execute(
+            "INSERT OR IGNORE INTO files (id, path, language) VALUES (2, ?1, 'rust')",
+            [path],
+        )
+        .expect("file");
+        conn.execute(
+            "INSERT INTO symbols (id, file_id, name, qualified_name, kind, line, visibility)
+             VALUES (?1, 2, ?2, ?2, 'enum', 1, 'public')",
+            rusqlite::params![sym_id, name],
+        )
+        .expect("enum");
+        if with_non_exhaustive {
+            conn.execute(
+                "INSERT INTO attributes (symbol_id, name, args, line)
+                 VALUES (?1, 'non_exhaustive', NULL, 1)",
+                [sym_id],
+            )
+            .expect("attr");
+        }
+    }
+
+    #[test]
+    fn non_exhaustive_flags_pub_error_enum_without_attribute() {
+        let conn = fresh_db();
+        seed_error_enum(
+            &conn,
+            10,
+            "crates/kiro-market-core/src/error.rs",
+            "PluginError",
+            false,
+        );
+        let findings = non_exhaustive().run(&conn).expect("query");
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].qualified_name, "PluginError");
+    }
+
+    #[test]
+    fn non_exhaustive_passes_when_attribute_present() {
+        let conn = fresh_db();
+        seed_error_enum(
+            &conn,
+            10,
+            "crates/kiro-market-core/src/error.rs",
+            "PluginError",
+            true,
+        );
+        let findings = non_exhaustive().run(&conn).expect("query");
+        assert!(
+            findings.is_empty(),
+            "enum with #[non_exhaustive] is exempt; got {findings:?}"
+        );
+    }
+
+    #[test]
+    fn non_exhaustive_only_scopes_to_kiro_market_core() {
+        // A pub Error enum in the Tauri crate or CLI binary doesn't carry
+        // the same downstream-stability requirement; this gate only fires
+        // on `kiro-market-core` symbols.
+        let conn = fresh_db();
+        seed_error_enum(
+            &conn,
+            10,
+            "crates/kiro-control-center/src-tauri/src/error.rs",
+            "CommandError",
+            false,
+        );
+        let findings = non_exhaustive().run(&conn).expect("query");
+        assert!(
+            findings.is_empty(),
+            "non-core crates exempt from non-exhaustive rule; got {findings:?}"
+        );
+    }
+
+    #[test]
+    fn non_exhaustive_ignores_non_error_enums() {
+        // Heuristic: only enums whose name ends in `Error` are subject to
+        // this rule. `Status`, `Kind`, etc. don't trigger.
+        let conn = fresh_db();
+        seed_error_enum(
+            &conn,
+            10,
+            "crates/kiro-market-core/src/lib.rs",
+            "Status",
+            false,
+        );
+        let findings = non_exhaustive().run(&conn).expect("query");
+        assert!(findings.is_empty());
+    }
+
+    // ─── no-frontend-deps-in-core ───────────────────────────────────────
+
+    fn no_frontend_deps() -> &'static Gate {
+        ALL_GATES
+            .iter()
+            .find(|g| g.name == "no-frontend-deps-in-core")
+            .expect("no-frontend-deps gate registered")
+    }
+
+    fn seed_import(conn: &Connection, file_id: i64, path: &str, symbol: &str, source: &str) {
+        conn.execute(
+            "INSERT OR IGNORE INTO files (id, path, language) VALUES (?1, ?2, 'rust')",
+            rusqlite::params![file_id, path],
+        )
+        .expect("file");
+        conn.execute(
+            "INSERT INTO imports (file_id, symbol_name, source_module) VALUES (?1, ?2, ?3)",
+            rusqlite::params![file_id, symbol, source],
+        )
+        .expect("import");
+    }
+
+    #[test]
+    fn no_frontend_deps_flags_tauri_in_core() {
+        let conn = fresh_db();
+        seed_import(
+            &conn,
+            2,
+            "crates/kiro-market-core/src/foo.rs",
+            "Manager",
+            "tauri::Manager",
+        );
+
+        let findings = no_frontend_deps().run(&conn).expect("query");
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].signature.as_deref(), Some("tauri::Manager"));
+    }
+
+    #[test]
+    fn no_frontend_deps_flags_tokio_in_core() {
+        let conn = fresh_db();
+        seed_import(
+            &conn,
+            2,
+            "crates/kiro-market-core/src/foo.rs",
+            "spawn",
+            "tokio::spawn",
+        );
+
+        let findings = no_frontend_deps().run(&conn).expect("query");
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].signature.as_deref(), Some("tokio::spawn"));
+    }
+
+    #[test]
+    fn no_frontend_deps_does_not_flag_tauri_in_other_crates() {
+        // Tauri imports are FINE in the Tauri crate itself.
+        let conn = fresh_db();
+        seed_import(
+            &conn,
+            2,
+            "crates/kiro-control-center/src-tauri/src/lib.rs",
+            "Manager",
+            "tauri::Manager",
+        );
+
+        let findings = no_frontend_deps().run(&conn).expect("query");
+        assert!(
+            findings.is_empty(),
+            "tauri imports outside core are fine; got {findings:?}"
+        );
+    }
+
+    #[test]
+    fn no_frontend_deps_does_not_flag_unrelated_crate_with_similar_name() {
+        // `tauri_anything` would not start with `tauri::` so the LIKE
+        // pattern excludes it. Defensive test in case someone adds a
+        // crate named `tauri_extra` etc. in the future.
+        let conn = fresh_db();
+        seed_import(
+            &conn,
+            2,
+            "crates/kiro-market-core/src/foo.rs",
+            "thing",
+            "taurus::thing", // similar but not tauri::
+        );
+
+        let findings = no_frontend_deps().run(&conn).expect("query");
+        assert!(findings.is_empty());
+    }
+
+    #[test]
+    fn no_frontend_deps_flags_tauri_plugin_imports() {
+        let conn = fresh_db();
+        seed_import(
+            &conn,
+            2,
+            "crates/kiro-market-core/src/foo.rs",
+            "init",
+            "tauri_plugin_dialog::init",
+        );
+
+        let findings = no_frontend_deps().run(&conn).expect("query");
+        assert_eq!(findings.len(), 1);
+    }
+
+    #[test]
+    fn no_frontend_deps_flags_bare_tauri_import() {
+        // Covers the `OR i.source_module = 'tauri'` SQL branch — `use
+        // tauri;` (bare crate import, no `::path`). Existing tests only
+        // exercise the `LIKE 'tauri::%'` branch, so a regression that
+        // accidentally changed `=` to `LIKE` would slip past untested.
+        let conn = fresh_db();
+        seed_import(
+            &conn,
+            2,
+            "crates/kiro-market-core/src/foo.rs",
+            "tauri",
+            "tauri",
+        );
+
+        let findings = no_frontend_deps().run(&conn).expect("query");
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].signature.as_deref(), Some("tauri"));
+    }
+
+    #[test]
+    fn no_frontend_deps_flags_bare_tokio_import() {
+        // Covers the `OR i.source_module = 'tokio'` SQL branch.
+        let conn = fresh_db();
+        seed_import(
+            &conn,
+            2,
+            "crates/kiro-market-core/src/foo.rs",
+            "tokio",
+            "tokio",
+        );
+
+        let findings = no_frontend_deps().run(&conn).expect("query");
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].signature.as_deref(), Some("tokio"));
     }
 }
