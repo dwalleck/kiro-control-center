@@ -3,6 +3,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
+use kiro_market_core::error::error_full_chain;
 use kiro_market_core::file_lock::with_file_lock;
 use kiro_market_core::kiro_settings::{
     apply_registered_setting, default_kiro_dir, kiro_settings_path, load_kiro_settings_from,
@@ -55,16 +56,24 @@ fn load_settings(dir: &std::path::Path) -> Result<JsonValue, CommandError> {
     match load_kiro_settings_from(dir) {
         Ok(json) => Ok(json),
         Err(LoadSettingsError::NotFound) => Ok(serde_json::json!({})),
-        Err(LoadSettingsError::InvalidJson(e)) => Err(CommandError::new(
+        Err(e @ LoadSettingsError::InvalidJson(_)) => Err(CommandError::new(
             format!(
-                "settings file contains invalid JSON and cannot be safely updated: {e}. \
-                 Back up or delete ~/.kiro/settings/cli.json and try again."
+                "settings file contains invalid JSON and cannot be safely updated: {chain}. \
+                 Back up or delete ~/.kiro/settings/cli.json and try again.",
+                chain = error_full_chain(&e),
             ),
             ErrorType::ParseError,
         )),
-        Err(LoadSettingsError::Io(e)) => Err(CommandError::new(
-            format!("could not read settings file: {e}"),
+        Err(e @ LoadSettingsError::Io(_)) => Err(CommandError::new(
+            format!("could not read settings file: {}", error_full_chain(&e)),
             ErrorType::IoError,
+        )),
+        // `LoadSettingsError` is `#[non_exhaustive]`. A future variant
+        // added in core compiles here without forcing a frontend edit;
+        // its `Display` impl provides the user-facing string.
+        Err(other) => Err(CommandError::new(
+            format!("settings load failed: {}", error_full_chain(&other)),
+            ErrorType::Unknown,
         )),
     }
 }
