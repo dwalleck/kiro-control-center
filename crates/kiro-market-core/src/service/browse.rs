@@ -412,7 +412,7 @@ pub struct PluginInstallContext {
 // impls" trick from `static_assertions::assert_not_impl_any!`. The
 // generic parameter on `AmbiguousIfSerialize` is inferable when only
 // the unconditional impl applies (`T: !Serialize`); when `T: Serialize`
-// both impls match and inference becomes ambiguous, producing E0282.
+// both impls match and inference becomes ambiguous, producing E0283.
 // Diagnostic is cryptic — read this comment when it fires.
 const _: fn() = || {
     trait AmbiguousIfSerialize<A> {
