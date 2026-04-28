@@ -173,6 +173,15 @@ ORDER BY f.path, i.symbol_name";
 /// This gate flags any public enum in `kiro-market-core` whose name ends
 /// in `Error` and that lacks the attribute.
 ///
+/// **Heuristic limitation:** the SQL matches on `LIKE '%Error'` only.
+/// Error-like enums named `*Failure`, `*Kind`, or `*Reason` (e.g.
+/// `NativeParseFailure`, `ParseFailure`) deriving `thiserror::Error` are
+/// invisible to this gate and must carry `#[non_exhaustive]` by manual
+/// review. Widening the SQL would require joining the `attributes` table
+/// to detect `thiserror::Error` derives regardless of name; the current
+/// `*Error` convention catches the common case and the existing
+/// `*Failure` enums in core already opt in.
+///
 /// Scoped to `kiro-market-core` because the rule is about the public
 /// surface of the *library* — Tauri command errors and CLI binary
 /// errors don't carry the same downstream-stability requirement.
@@ -213,7 +222,7 @@ const ALL_GATES: &[Gate] = &[
     },
     Gate {
         name: "non-exhaustive-error-enum",
-        description: "pub Error enum in kiro-market-core missing #[non_exhaustive]",
+        description: "pub *Error-named enum in kiro-market-core missing #[non_exhaustive] (heuristic: name LIKE '%Error' only)",
         sql: NON_EXHAUSTIVE_ERROR_ENUM_SQL,
     },
     Gate {
@@ -535,8 +544,22 @@ pub fn run(args: impl Iterator<Item = String>) -> Result<usize> {
 
 fn print_finding(f: &Finding) {
     let signature = f.signature.as_deref().unwrap_or("<no signature>");
-    println!("    {}:{}", f.path, f.line);
+    println!("    {}", format_path_line(&f.path, f.line));
     println!("        {} : {}", f.qualified_name, signature);
+}
+
+/// Format the `path:line` prefix shown for a finding. The
+/// `no-frontend-deps-in-core` gate uses `line = 0` as a sentinel because
+/// the `imports` tethys table has no line column; rendering that as
+/// `path:0` invites editors and CI log parsers to treat it as a real
+/// line reference. This helper substitutes a human-readable hint so the
+/// reviewer knows to grep the file for the import.
+fn format_path_line(path: &str, line: u32) -> String {
+    if line == 0 {
+        format!("{path} (line unknown — grep for import)")
+    } else {
+        format!("{path}:{line}")
+    }
 }
 
 fn ensure_tethys_index(workspace: &Path) -> Result<()> {
@@ -1086,6 +1109,28 @@ mod tests {
         assert!(findings.is_empty());
     }
 
+    // ─── format_path_line (line=0 sentinel) ─────────────────────────────
+
+    #[test]
+    fn format_path_line_renders_real_line_normally() {
+        assert_eq!(
+            format_path_line("crates/kiro-market-core/src/git.rs", 42),
+            "crates/kiro-market-core/src/git.rs:42"
+        );
+    }
+
+    #[test]
+    fn format_path_line_substitutes_hint_for_zero_line_sentinel() {
+        // The no-frontend-deps-in-core gate uses line=0 as a sentinel
+        // (imports tethys table has no line column). Rendering as
+        // `path:0` would mislead editors and CI parsers into following
+        // a nonexistent line reference.
+        assert_eq!(
+            format_path_line("crates/kiro-market-core/src/foo.rs", 0),
+            "crates/kiro-market-core/src/foo.rs (line unknown — grep for import)"
+        );
+    }
+
     // ─── --gate <name> validation ───────────────────────────────────────
 
     #[test]
@@ -1342,6 +1387,69 @@ mod tests {
         assert!(findings.is_empty());
     }
 
+    #[test]
+    fn no_panic_skips_files_under_tests_dir() {
+        // Anything under `tests/` is test code by virtue of where it
+        // lives, even if the function itself isn't `#[test]`-marked
+        // (e.g. helpers in tests/common/). Mirrors the no-unwrap test
+        // so a future SQL edit dropping the `'/' || f.path NOT LIKE
+        // '%/tests/%'` clause regresses both gates symmetrically.
+        let conn = fresh_db();
+        seed_function(
+            &conn,
+            2,
+            "crates/core/tests/common/fixtures.rs",
+            10,
+            "make_fixture",
+            false,
+        );
+        insert_panic_ref(&conn, 2, 10, 42, "panic");
+
+        let findings = no_panic().run(&conn).expect("query should succeed");
+        assert!(
+            findings.is_empty(),
+            "files under tests/ are exempt; got {findings:?}"
+        );
+    }
+
+    #[test]
+    fn no_panic_skips_workspace_root_tests_and_benches() {
+        // The `'/' || f.path` prepend in NO_PANIC_SQL must handle both
+        // workspace-root (`tests/integration.rs`) and crate-nested
+        // (`crates/foo/tests/...`) paths uniformly.
+        let conn = fresh_db();
+        seed_function(&conn, 2, "tests/integration.rs", 10, "test_helper", false);
+        seed_function(&conn, 3, "benches/throughput.rs", 11, "bench_helper", false);
+        insert_panic_ref(&conn, 2, 10, 42, "panic");
+        insert_panic_ref(&conn, 3, 11, 42, "todo");
+
+        let findings = no_panic().run(&conn).expect("query should succeed");
+        assert!(
+            findings.is_empty(),
+            "workspace-root tests/ and benches/ exempt; got {findings:?}"
+        );
+    }
+
+    #[test]
+    fn no_panic_skips_test_support_modules() {
+        let conn = fresh_db();
+        seed_function(
+            &conn,
+            2,
+            "crates/core/src/service/test_support.rs",
+            10,
+            "MarketplaceService::stub",
+            false,
+        );
+        insert_panic_ref(&conn, 2, 10, 42, "unimplemented");
+
+        let findings = no_panic().run(&conn).expect("query should succeed");
+        assert!(
+            findings.is_empty(),
+            "test_support modules exempt; got {findings:?}"
+        );
+    }
+
     // ─── non-exhaustive-error-enum ──────────────────────────────────────
 
     fn non_exhaustive() -> &'static Gate {
@@ -1551,5 +1659,42 @@ mod tests {
 
         let findings = no_frontend_deps().run(&conn).expect("query");
         assert_eq!(findings.len(), 1);
+    }
+
+    #[test]
+    fn no_frontend_deps_flags_bare_tauri_import() {
+        // Covers the `OR i.source_module = 'tauri'` SQL branch — `use
+        // tauri;` (bare crate import, no `::path`). Existing tests only
+        // exercise the `LIKE 'tauri::%'` branch, so a regression that
+        // accidentally changed `=` to `LIKE` would slip past untested.
+        let conn = fresh_db();
+        seed_import(
+            &conn,
+            2,
+            "crates/kiro-market-core/src/foo.rs",
+            "tauri",
+            "tauri",
+        );
+
+        let findings = no_frontend_deps().run(&conn).expect("query");
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].signature.as_deref(), Some("tauri"));
+    }
+
+    #[test]
+    fn no_frontend_deps_flags_bare_tokio_import() {
+        // Covers the `OR i.source_module = 'tokio'` SQL branch.
+        let conn = fresh_db();
+        seed_import(
+            &conn,
+            2,
+            "crates/kiro-market-core/src/foo.rs",
+            "tokio",
+            "tokio",
+        );
+
+        let findings = no_frontend_deps().run(&conn).expect("query");
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].signature.as_deref(), Some("tokio"));
     }
 }
