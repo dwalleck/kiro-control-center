@@ -148,10 +148,33 @@ pub struct InstalledSteeringOutcome {
 }
 
 /// Per-file failure entry in a steering install batch.
-#[derive(Debug)]
+///
+/// `error` stays typed in-process so consumers can match on
+/// [`SteeringError`] variants. The wire format projects it to a string
+/// via [`error_full_chain`], mirroring the precedent set by
+/// [`crate::service::FailedAgent`] / `serialize_agent_error` —
+/// [`SteeringError`] carries `io::Error` / `HashError` payloads that
+/// don't implement `Serialize`, and the serialized chain stays stable
+/// across variant additions.
+#[derive(Debug, Serialize)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
 pub struct FailedSteeringFile {
     pub source: PathBuf,
+    #[serde(serialize_with = "serialize_steering_error")]
+    #[cfg_attr(feature = "specta", specta(type = String))]
     pub error: SteeringError,
+}
+
+/// Serialize a [`SteeringError`] as the rendered chain produced by
+/// [`crate::error::error_full_chain`]. Mirrors
+/// [`crate::service::serialize_agent_error`] — the typed variants carry
+/// `io::Error` / `HashError` payloads that don't implement `Serialize`,
+/// so the wire format projects through the chain string instead.
+fn serialize_steering_error<S: serde::Serializer>(
+    err: &SteeringError,
+    serializer: S,
+) -> std::result::Result<S::Ok, S::Error> {
+    serializer.serialize_str(&crate::error::error_full_chain(err))
 }
 
 /// Non-fatal issues raised during steering discovery. Surface
@@ -229,7 +252,8 @@ impl std::fmt::Display for SteeringWarning {
 }
 
 /// Aggregate result of `MarketplaceService::install_plugin_steering`.
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Serialize)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
 pub struct InstallSteeringResult {
     pub installed: Vec<InstalledSteeringOutcome>,
     pub failed: Vec<FailedSteeringFile>,
@@ -257,8 +281,7 @@ mod tests {
         // re-introduce the `serde_json::Error` type by walking `.source()`.
         // Re-introducing `#[source]` would silently break this assertion.
         // Mirrors the same lock at
-        // `crate::error::tests::native_manifest_parse_failed_exposes_no_source_chain`
-        // and `crate::agent::parse_native::tests::invalid_json_materializes_chain_into_reason_and_hides_source`.
+        // `crate::error::tests::native_manifest_parse_failed_renders_path_and_reason`.
         assert!(
             err.source().is_none(),
             "TrackingMalformed must not expose a source chain — \

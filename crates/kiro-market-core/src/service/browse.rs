@@ -371,6 +371,14 @@ pub enum SkillCount {
 /// handler.
 #[derive(Clone, Debug)]
 pub struct PluginInstallContext {
+    /// Resolved plugin root directory. Required by install paths that
+    /// scan the plugin tree directly (agents, steering) rather than
+    /// consuming pre-resolved subdirectory lists like
+    /// [`Self::skill_dirs`]. Always set by the resolver — callers can
+    /// pass `&ctx.plugin_dir` directly to
+    /// [`MarketplaceService::install_plugin_steering`] /
+    /// [`MarketplaceService::install_plugin_agents`].
+    pub plugin_dir: PathBuf,
     pub version: Option<String>,
     pub skill_dirs: Vec<PathBuf>,
     /// Directories to scan for agent `.md` files inside the plugin.
@@ -742,6 +750,7 @@ impl MarketplaceService {
         let steering_scan_paths = steering_scan_paths_for_plugin(manifest.as_ref());
         let format = manifest.as_ref().and_then(|m| m.format);
         Ok(PluginInstallContext {
+            plugin_dir: plugin_dir.to_path_buf(),
             version,
             skill_dirs,
             agent_scan_paths,
