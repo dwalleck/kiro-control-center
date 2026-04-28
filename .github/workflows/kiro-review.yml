@@ -9,9 +9,17 @@ name: Kiro Code Review
 # `github.event.label.name` forces a maintainer to re-apply `safe-to-review`
 # after every fork push before secrets are exposed again. We never execute PR
 # code; only file paths and contents are read.
+#
+# TEMPORARILY DISABLED on feat/plan-lint — Anthropic API budget for Kiro
+# review is constrained as of 2026-04-28; PR #74 has already had two
+# orchestrator passes and further auto-runs would exhaust remaining usage.
+# Restore the `pull_request_target` trigger below (and remove
+# `workflow_dispatch:`) when the budget refreshes. Kept callable via
+# `gh workflow run kiro-review.yml -r <branch>` for ad-hoc reviews.
 on:
-  pull_request_target:
-    types: [opened, synchronize, labeled]
+  workflow_dispatch:
+  # pull_request_target:
+  #   types: [opened, synchronize, labeled]
 
 permissions:
   contents: read
