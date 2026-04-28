@@ -257,7 +257,8 @@ mod tests {
         // re-introduce the `serde_json::Error` type by walking `.source()`.
         // Re-introducing `#[source]` would silently break this assertion.
         // Mirrors the same lock at
-        // `crate::error::tests::native_manifest_parse_failed_renders_path_and_reason`.
+        // `crate::error::tests::native_manifest_parse_failed_exposes_no_source_chain`
+        // and `crate::agent::parse_native::tests::invalid_json_materializes_chain_into_reason_and_hides_source`.
         assert!(
             err.source().is_none(),
             "TrackingMalformed must not expose a source chain — \

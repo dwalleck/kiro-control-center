@@ -599,23 +599,6 @@ pub fn error_full_chain(err: &(dyn std::error::Error + 'static)) -> String {
     detail
 }
 
-/// Construct an [`AgentError::NativeManifestParseFailed`] from a
-/// `serde_json::Error`, materializing the full source chain into the
-/// variant's `reason` field at the adapter boundary.
-///
-/// This is the only in-tree constructor for the variant; every call site
-/// goes through it so the documented invariant — `reason` always carries
-/// the materialized chain rather than an arbitrary string — is structural,
-/// not just prose. The enum is `#[non_exhaustive]`, so external crates
-/// cannot bypass this constructor with a struct literal.
-#[must_use]
-pub(crate) fn native_manifest_parse_failed(path: PathBuf, err: &serde_json::Error) -> AgentError {
-    AgentError::NativeManifestParseFailed {
-        path,
-        reason: error_full_chain(err),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::io;
@@ -887,8 +870,43 @@ mod tests {
         },
         "failed to parse agent at readme.md: missing opening `---` frontmatter fence"
     )]
+    #[case::native_manifest_parse_failed(
+        AgentError::NativeManifestParseFailed {
+            path: PathBuf::from("rev.json"),
+            reason: "expected `,` or `}` at line 3 column 1".into(),
+        },
+        "native agent JSON `rev.json` failed to parse: expected `,` or `}` at line 3 column 1"
+    )]
     fn agent_error_display(#[case] err: AgentError, #[case] expected: &str) {
         assert_eq!(err.to_string(), expected);
+    }
+
+    /// Locks the wire-format contract that
+    /// [`AgentError::NativeManifestParseFailed`] does not expose a
+    /// `source()` chain. The `reason: String` field is the only carrier
+    /// of materialized `serde_json` detail; re-introducing
+    /// `#[source] serde_json::Error` would silently break this assertion
+    /// AND would be caught at lint time by
+    /// `cargo xtask plan-lint --gate gate-4-external-error-boundary`.
+    ///
+    /// Replaces the deleted `native_manifest_parse_failed_renders_path_and_reason`
+    /// test that exercised the now-removed
+    /// `error::native_manifest_parse_failed` constructor — the contract
+    /// still applies even though the constructor is gone, since
+    /// `service::native_parse_failure_to_agent_error` now produces this
+    /// variant directly from `NativeParseFailure::InvalidJson { reason }`.
+    #[test]
+    fn native_manifest_parse_failed_exposes_no_source_chain() {
+        use std::error::Error as _;
+        let err = AgentError::NativeManifestParseFailed {
+            path: PathBuf::from("rev.json"),
+            reason: "stub".into(),
+        };
+        assert!(
+            err.source().is_none(),
+            "NativeManifestParseFailed must not expose a source chain — \
+             reason: String is the only carrier of materialized serde_json detail"
+        );
     }
 
     #[test]
@@ -953,29 +971,6 @@ mod tests {
             roots: vec![PathBuf::from("./agents/"), PathBuf::from("./extra/")],
         };
         assert!(err.to_string().contains("multiple agent scan roots"));
-    }
-
-    #[test]
-    fn native_manifest_parse_failed_renders_path_and_reason() {
-        use std::error::Error as _;
-        let parse_err = serde_json::from_str::<serde_json::Value>("{not").unwrap_err();
-        // Exercise the only in-tree constructor — replicates exactly what
-        // `service::native_parse_failure_to_agent_error` does at the
-        // adapter boundary.
-        let err = native_manifest_parse_failed(PathBuf::from("rev.json"), &parse_err);
-        let rendered = err.to_string();
-        assert!(rendered.contains("rev.json"), "path missing: {rendered}");
-        // The serde_json line/column survives the materialization.
-        assert!(rendered.contains("line 1"), "reason missing: {rendered}");
-        // Wire-format contract: the variant exposes no `source()` chain,
-        // so downstream FFI surfaces (Tauri, CLI text) cannot accidentally
-        // re-introduce the `serde_json::Error` type by walking `.source()`.
-        // Re-introducing `#[source]` would silently break this assertion.
-        assert!(
-            err.source().is_none(),
-            "NativeManifestParseFailed must not expose a source chain — \
-             reason: String is the only carrier of the materialized serde_json detail"
-        );
     }
 
     #[test]

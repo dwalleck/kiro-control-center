@@ -28,9 +28,14 @@ Run all three before committing — CI enforces each:
 - `cargo test --workspace`
 - `cargo clippy --workspace --tests -- -D warnings`
 
-## Hooks (xtask)
+## xtask
 - `cargo xtask hook-post-edit` — wired into Claude Code `PostToolUse` for `.rs` edits. Runs `rustfmt` then `cargo clippy --package <derived> -- -D warnings`. The package is derived by walking up ancestors for the nearest `Cargo.toml` with a `[package]` table (`xtask::derive_package`), so new workspace crates are picked up automatically. Read/parse failures log to stderr; loop exhaust emits a "no usable Cargo.toml" diagnostic.
 - `cargo xtask hook-block-cargo-lock` — blocks direct `Cargo.lock` edits. Override for one session via `KIRO_ALLOW_LOCKFILE_EDIT=1`.
+- `cargo xtask plan-lint` — runs structural lint queries against the [tethys](https://github.com/dwalleck/rivets/tree/main/crates/tethys) index. Gates implemented:
+  - **gate-4-external-error-boundary** — SQL query against `attributes` and `symbols` that flags any `pub` enum variant carrying an external crate's error type (`serde_json`, `gix`, `reqwest`, `toml`) via `#[source]`. Replaces the broken grep in `docs/plan-review-checklist.md`.
+  - **no-unwrap-in-production** — SQL query against `refs` joined to `symbols` and `files` that flags `.unwrap()` and `.expect()` calls in non-test production code, enforcing the CLAUDE.md "zero-tolerance" rule. Filters: `is_test = 0`, plus path-based exemptions for `tests/`, `benches/`, `test_support`, and `test_utils`.
+
+  Requires the `tethys` binary on PATH (or `TETHYS_BIN` env var); pass `--no-reindex` to query the existing `.rivets/index/tethys.db` without re-indexing first; pass `--gate <NAME>` to run a single gate. Exits 1 on findings (CI gate fails).
 
 ## Project Structure
 - `crates/kiro-market-core/` — library crate (types, parsing, git, cache, project state)
@@ -51,7 +56,7 @@ Run all three before committing — CI enforces each:
 - `clippy::all` and `clippy::pedantic` enabled as warnings
 - `unsafe_code` is forbidden
 - **Zero-tolerance in production code** (tests are exempt): no `.unwrap()`, no `.expect()`, no `let _ = ...` discarding a `Result`, no `#[allow(...)]` directives. If a lint or warning is wrong, fix the code or the lint config — don't suppress at the call site. Once one waiver lands, `rg unwrap` stops being a safety check.
-- **Map external errors at the adapter boundary.** `gix`, `io`, `serde_json` errors get translated into typed `ErrorKind` variants inside the module that calls them (e.g. `git.rs`, `cache.rs`) — they never appear in the public API of `kiro-market-core`. Recipe when the variant *would* carry an external error: `#[non_exhaustive]` enum + variant field `reason: String` (not `#[source]`) + a `pub(crate) fn` constructor that calls `error_full_chain(&err)`. Canonical examples: `error::native_manifest_parse_failed` (for `serde_json::Error` in `AgentError::NativeManifestParseFailed`), `steering::tracking_malformed` (for `serde_json::Error` in `SteeringError::TrackingMalformed`). Tests should assert `err.source().is_none()` to lock the contract.
+- **Map external errors at the adapter boundary.** `gix`, `serde_json`, `toml`, `reqwest` errors get translated into typed `ErrorKind` variants inside the module that calls them (e.g. `git.rs`, `cache.rs`, `agent/parse_native.rs`) — they never appear in the public API of `kiro-market-core`. (`io::Error` is std-library and exempted; it can carry through `#[source]`.) Recipe when the variant *would* carry an external error: `#[non_exhaustive]` enum + variant field `reason: String` (not `#[source]`) + a `pub(crate) fn` constructor that calls `error_full_chain(&err)`. Canonical examples: `parse_native::NativeParseFailure::invalid_json` (for `serde_json::Error`), `steering::tracking_malformed` (for `serde_json::Error` in `SteeringError::TrackingMalformed`). Tests should assert `err.source().is_none()` to lock the contract. **Enforced by `cargo xtask plan-lint --gate gate-4-external-error-boundary`** — a SQL query against the tethys index that flags any `pub` enum variant carrying an external crate's error type via `#[source]`.
 
 ## Architecture
 The tool reads Claude Code `marketplace.json` catalogs, discovers plugins and skills,
