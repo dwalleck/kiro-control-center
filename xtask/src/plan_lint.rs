@@ -128,6 +128,51 @@ const ALL_GATES: &[Gate] = &[
     },
 ];
 
+/// A `(gate, path, line)` triple acknowledged as a deliberate exception.
+///
+/// CLAUDE.md zero-tolerance is the *default*; this list is the register
+/// of cases where an idiomatic Rust pattern requires `.expect()` (or
+/// similar) and refactoring would only relocate the panic. Each entry
+/// must carry a `reason` long enough for a future reviewer to evaluate
+/// without re-deriving the rationale.
+///
+/// The mechanism deliberately keeps the allowlist *in source code* (not
+/// a TOML / JSON file): adding an exception requires a code change and
+/// shows up in `git blame`, the same audit trail that protects every
+/// other rule in this codebase.
+struct AllowedSite {
+    gate: &'static str,
+    path: &'static str,
+    line: u32,
+    /// Why this site is acknowledged. Read at PR review time.
+    #[expect(
+        dead_code,
+        reason = "human-only documentation; reviewer audit, not a runtime field"
+    )]
+    reason: &'static str,
+}
+
+const ALLOWED_SITES: &[AllowedSite] = &[
+    AllowedSite {
+        gate: "no-unwrap-in-production",
+        path: "crates/kiro-control-center/src-tauri/src/lib.rs",
+        line: 49,
+        reason: "Tauri scaffolding pattern — debug-only `specta_typescript::Typescript::default().export(...)` failure at app startup. Refactoring to `?` propagation would only move the panic into `fn main()`. Idiomatic Rust at the binary entry point.",
+    },
+    AllowedSite {
+        gate: "no-unwrap-in-production",
+        path: "crates/kiro-control-center/src-tauri/src/lib.rs",
+        line: 60,
+        reason: "Tauri scaffolding pattern — `tauri::Builder::run` failure at app startup. Replacing with Result propagation would only move the panic into `fn main()`. Idiomatic Rust at the binary entry point.",
+    },
+];
+
+fn is_allowed(gate: &str, finding: &Finding) -> bool {
+    ALLOWED_SITES
+        .iter()
+        .any(|s| s.gate == gate && s.path == finding.path && s.line == finding.line)
+}
+
 impl Gate {
     fn run(&self, conn: &Connection) -> Result<Vec<Finding>> {
         let mut stmt = conn
@@ -270,18 +315,39 @@ pub fn run(args: impl Iterator<Item = String>) -> Result<usize> {
         {
             continue;
         }
-        let findings = gate.run(&conn)?;
+        let raw = gate.run(&conn)?;
+        let (allowed, findings): (Vec<_>, Vec<_>) =
+            raw.into_iter().partition(|f| is_allowed(gate.name, f));
+
         if findings.is_empty() {
-            println!("{} OK", gate.name);
+            if allowed.is_empty() {
+                println!("{} OK", gate.name);
+            } else {
+                println!(
+                    "{} OK ({} allowlisted exception{})",
+                    gate.name,
+                    allowed.len(),
+                    if allowed.len() == 1 { "" } else { "s" },
+                );
+            }
             continue;
         }
         total_findings += findings.len();
         println!(
-            "{} — {} ({} finding{})",
+            "{} — {} ({} finding{}{})",
             gate.name,
             gate.description,
             findings.len(),
             if findings.len() == 1 { "" } else { "s" },
+            if allowed.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    ", {} allowlisted exception{}",
+                    allowed.len(),
+                    if allowed.len() == 1 { "" } else { "s" },
+                )
+            },
         );
         for f in &findings {
             print_finding(f);
@@ -884,5 +950,54 @@ mod tests {
             err.to_string().contains("unknown gate"),
             "empty string should be treated as unknown, got: {err}"
         );
+    }
+
+    // ─── Allowlist mechanism ────────────────────────────────────────────
+
+    #[test]
+    fn is_allowed_matches_gate_path_and_line_exactly() {
+        let f = Finding {
+            path: "crates/kiro-control-center/src-tauri/src/lib.rs".to_string(),
+            line: 49,
+            qualified_name: "run".to_string(),
+            signature: Some("expect".to_string()),
+        };
+        assert!(is_allowed("no-unwrap-in-production", &f));
+    }
+
+    #[test]
+    fn is_allowed_is_per_gate() {
+        // Same path/line registered under no-unwrap must NOT suppress a
+        // gate-4 finding at the same location.
+        let f = Finding {
+            path: "crates/kiro-control-center/src-tauri/src/lib.rs".to_string(),
+            line: 49,
+            qualified_name: "run".to_string(),
+            signature: Some("expect".to_string()),
+        };
+        assert!(!is_allowed("gate-4-external-error-boundary", &f));
+    }
+
+    #[test]
+    fn is_allowed_rejects_unregistered_lines() {
+        // One line off the registered exception is not exempted.
+        let f = Finding {
+            path: "crates/kiro-control-center/src-tauri/src/lib.rs".to_string(),
+            line: 48,
+            qualified_name: "run".to_string(),
+            signature: Some("expect".to_string()),
+        };
+        assert!(!is_allowed("no-unwrap-in-production", &f));
+    }
+
+    #[test]
+    fn is_allowed_rejects_unregistered_paths() {
+        let f = Finding {
+            path: "src/some_other_file.rs".to_string(),
+            line: 49,
+            qualified_name: "run".to_string(),
+            signature: Some("expect".to_string()),
+        };
+        assert!(!is_allowed("no-unwrap-in-production", &f));
     }
 }
