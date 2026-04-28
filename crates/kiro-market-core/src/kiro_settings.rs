@@ -627,59 +627,57 @@ pub fn get_nested<'a>(value: &'a JsonValue, path: &str) -> Option<&'a JsonValue>
 /// already does both validations; this raw helper exists only because
 /// some callers (test fixtures, future migrations) need to write
 /// arbitrary keys without registry coupling.
-///
-/// # Panics
-///
-/// The internal `expect` calls assert post-conditions established by the
-/// preceding statements (`split('.')` always yields at least one element,
-/// and the `if !current.is_object()` guards ensure object access succeeds).
-/// They are unreachable in practice.
 pub fn set_nested(value: &mut JsonValue, path: &str, val: JsonValue) {
-    let segments: Vec<&str> = path.split('.').collect();
-    let (last, parents) = segments
-        .split_last()
-        .expect("split('.') always yields at least one segment");
+    // rsplit_once distinguishes "no dot" (e.g. "key") from "trailing dot"
+    // (e.g. ".key"). With no dot, parents is empty and the whole path is
+    // the leaf key; otherwise the prefix splits on '.' to walk segments.
+    let (parents, last): (Vec<&str>, &str) = match path.rsplit_once('.') {
+        Some((rest, last)) => (rest.split('.').collect(), last),
+        None => (Vec::new(), path),
+    };
 
     let mut current = value;
     let mut traversed = String::new();
-    for &segment in parents {
-        if !current.is_object() {
-            tracing::warn!(
-                path = %path,
-                at = %if traversed.is_empty() { "<root>".to_owned() } else { traversed.clone() },
-                replaced_kind = json_kind(current),
-                "set_nested overwrote non-object intermediate with an empty object"
-            );
-            *current = serde_json::json!({});
-        }
-        let obj = current
-            .as_object_mut()
-            .expect("just ensured current is an object");
-        if !obj.contains_key(segment) {
-            obj.insert(segment.to_owned(), serde_json::json!({}));
-        }
-        current = obj
-            .get_mut(segment)
-            .expect("just inserted or already present");
+    for segment in parents {
+        ensure_object(current, path, &traversed);
+        // `ensure_object` just made `current` a `JsonValue::Object`. The
+        // `else { return }` branch is structurally unreachable; falling
+        // through silently rather than panicking preserves the function
+        // signature (no Result) without violating zero-tolerance.
+        let JsonValue::Object(obj) = current else {
+            return;
+        };
+        let entry = obj
+            .entry(segment.to_owned())
+            .or_insert_with(|| JsonValue::Object(serde_json::Map::new()));
         if !traversed.is_empty() {
             traversed.push('.');
         }
         traversed.push_str(segment);
+        current = entry;
     }
 
-    if !current.is_object() {
-        tracing::warn!(
-            path = %path,
-            at = %if traversed.is_empty() { "<root>".to_owned() } else { traversed },
-            replaced_kind = json_kind(current),
-            "set_nested overwrote non-object leaf parent with an empty object"
-        );
-        *current = serde_json::json!({});
+    ensure_object(current, path, &traversed);
+    let JsonValue::Object(obj) = current else {
+        return;
+    };
+    obj.insert(last.to_owned(), val);
+}
+
+/// Replace a non-Object `JsonValue` with an empty object, logging the
+/// kind that was discarded. Idempotent: if `value` is already an Object,
+/// this is a no-op.
+fn ensure_object(value: &mut JsonValue, path: &str, at: &str) {
+    if matches!(value, JsonValue::Object(_)) {
+        return;
     }
-    current
-        .as_object_mut()
-        .expect("just ensured current is an object")
-        .insert((*last).to_owned(), val);
+    tracing::warn!(
+        path = %path,
+        at = if at.is_empty() { "<root>" } else { at },
+        replaced_kind = json_kind(value),
+        "set_nested overwrote non-object intermediate with an empty object"
+    );
+    *value = JsonValue::Object(serde_json::Map::new());
 }
 
 /// Reasons an [`apply_registered_setting`] call can reject the input.
