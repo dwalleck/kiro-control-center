@@ -95,23 +95,12 @@ mod tests {
     use std::fs;
 
     use kiro_market_core::service::test_support::{
-        relative_path_entry, seed_marketplace_with_registry, temp_service,
+        make_kiro_project, relative_path_entry, seed_marketplace_with_registry, temp_service,
     };
 
     use crate::error::ErrorType;
 
     use super::*;
-
-    // TODO(Task 5.0, A-20): hoist to
-    // `kiro_market_core::service::test_support::make_kiro_project` and
-    // delete this local copy. `commands/steering.rs::tests` carries the
-    // same temporary duplicate; both go away once the helper lands in
-    // `service::test_support`.
-    fn make_kiro_project(dir: &std::path::Path) -> String {
-        let project_path = dir.join("kproj");
-        fs::create_dir_all(project_path.join(".kiro")).expect("create .kiro dir");
-        project_path.to_str().expect("utf-8 path").to_owned()
-    }
 
     /// Write a translated-path agent file (markdown + YAML frontmatter
     /// `name`/`description`). The translated install path treats files

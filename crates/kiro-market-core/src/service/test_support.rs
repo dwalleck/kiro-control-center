@@ -108,6 +108,31 @@ pub fn relative_path_entry(name: &str, rel: &str) -> PluginEntry {
     }
 }
 
+/// Build a `.kiro/`-rooted project directory under `dir` and return its
+/// path as a UTF-8 string ready to pass through the Tauri FFI.
+///
+/// Mirrors the inline helper that previously lived in three Tauri
+/// `commands/*::tests` modules (`steering.rs`, `browse.rs`, `agents.rs`).
+/// Hoisted here so new command files (`plugins.rs`) can reuse the same
+/// project-shape contract that
+/// [`crate::commands::validate_kiro_project_path`](../../../../kiro-control-center/src-tauri/src/commands/mod.rs)
+/// expects.
+///
+/// The created path is `<dir>/kproj/` with a `.kiro/` subdirectory; the
+/// returned `String` points at `<dir>/kproj/`.
+///
+/// # Panics
+///
+/// Panics if directory creation fails or the path is not valid UTF-8
+/// (the latter can't happen on `tempdir()`-rooted callers but is asserted
+/// for symmetry with the original inline helpers). Test infrastructure only.
+#[must_use]
+pub fn make_kiro_project(dir: &Path) -> String {
+    let project_path = dir.join("kproj");
+    std::fs::create_dir_all(project_path.join(".kiro")).expect("create .kiro dir");
+    project_path.to_str().expect("utf-8 path").to_owned()
+}
+
 /// Seed a marketplace's plugin registry directly to disk, bypassing
 /// the real `marketplace.json` + fetch flow. Returns the marketplace
 /// root path as a convenience for tests that then place plugin

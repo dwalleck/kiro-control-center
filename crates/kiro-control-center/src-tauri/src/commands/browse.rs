@@ -327,7 +327,8 @@ mod tests {
     use kiro_market_core::cache::MarketplaceSource;
     use kiro_market_core::marketplace::{PluginSource, StructuredSource};
     use kiro_market_core::service::test_support::{
-        make_plugin_with_skills, relative_path_entry, seed_marketplace_with_registry, temp_service,
+        make_kiro_project, make_plugin_with_skills, relative_path_entry,
+        seed_marketplace_with_registry, temp_service,
     };
 
     use super::*;
@@ -433,12 +434,6 @@ mod tests {
     // -----------------------------------------------------------------------
     // install_skills_impl
     // -----------------------------------------------------------------------
-
-    fn make_kiro_project(dir: &std::path::Path) -> String {
-        let project_path = dir.join("kproj");
-        fs::create_dir_all(project_path.join(".kiro")).expect("create .kiro dir");
-        project_path.to_str().expect("utf-8 path").to_owned()
-    }
 
     #[test]
     fn install_skills_impl_threads_resolved_version_into_install_result() {

@@ -78,18 +78,12 @@ mod tests {
     use std::fs;
 
     use kiro_market_core::service::test_support::{
-        relative_path_entry, seed_marketplace_with_registry, temp_service,
+        make_kiro_project, relative_path_entry, seed_marketplace_with_registry, temp_service,
     };
 
     use crate::error::ErrorType;
 
     use super::*;
-
-    fn make_kiro_project(dir: &std::path::Path) -> String {
-        let project_path = dir.join("kproj");
-        fs::create_dir_all(project_path.join(".kiro")).expect("create .kiro dir");
-        project_path.to_str().expect("utf-8 path").to_owned()
-    }
 
     fn write_steering_file(plugin_dir: &std::path::Path, rel: &str, body: &str) {
         let p = plugin_dir.join(rel);
