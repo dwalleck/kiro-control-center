@@ -62,6 +62,13 @@ struct Finding {
 /// The `EXISTS` clause uses `qualified_name`'s `Parent::*` prefix to
 /// walk up to the parent symbol, since `parent_symbol_id` is NULL on
 /// the current tethys schema (a known gap — see the reference memory).
+///
+/// The prefix anchor is `parent.qualified_name || '::%'`, NOT
+/// `parent.name || '::%'`. For an enum nested inside a `mod foo`
+/// block, `parent.name = 'Bar'` but its variants/fields carry
+/// `qualified_name = 'foo::Bar::...'`. A `LIKE 'Bar::%'` pattern
+/// would miss every nested-module case, silently exempting real
+/// gate-4 violations (caught by gemini-code-assist on PR #91).
 const GATE_4_SQL: &str = "\
 SELECT f.path, s.line, s.qualified_name, s.signature
 FROM symbols s
@@ -78,7 +85,7 @@ WHERE s.kind = 'struct_field'
       WHERE parent.kind IN ('enum', 'struct')
         AND parent.visibility = 'public'
         AND parent.file_id = s.file_id
-        AND s.qualified_name LIKE parent.name || '::%'
+        AND s.qualified_name LIKE parent.qualified_name || '::%'
   )
 ORDER BY f.path, s.line";
 
@@ -239,7 +246,11 @@ ORDER BY f.path, s.line";
 ///
 /// `parent_symbol_id` is currently NULL on `enum_variant` rows in tethys
 /// (a known indexer gap), so the variant→parent link uses
-/// `qualified_name LIKE parent.name || '::%'`, matching gate-4's pattern.
+/// `qualified_name LIKE s.qualified_name || '::%'`. The anchor is the
+/// parent enum's full `qualified_name`, NOT its short `name` — a nested
+/// `mod foo { pub enum Bar { ... } }` has `s.name = 'Bar'` but variants
+/// at `qualified_name = 'foo::Bar::Variant'`, and `LIKE 'Bar::%'` would
+/// silently miss them (caught by gemini-code-assist on PR #91).
 const FFI_ENUM_TAG_SQL: &str = "\
 SELECT f.path, s.line, s.qualified_name, NULL AS signature
 FROM symbols s
@@ -262,7 +273,7 @@ WHERE s.kind = 'enum'
       SELECT 1 FROM symbols v
       WHERE v.kind = 'enum_variant'
         AND v.file_id = s.file_id
-        AND v.qualified_name LIKE s.name || '::%'
+        AND v.qualified_name LIKE s.qualified_name || '::%'
         AND v.signature IS NOT NULL
         AND v.signature != ''
   )
@@ -998,6 +1009,45 @@ mod tests {
             findings.is_empty(),
             "pub(crate) parent enum is not public API; got {findings:?}",
         );
+    }
+
+    #[test]
+    fn gate_4_flags_field_inside_nested_module_enum() {
+        // gemini-code-assist (PR #91): for an enum nested inside a
+        // `mod foo` block, `parent.name = 'Bar'` but the field's
+        // `qualified_name = 'foo::Bar::field'`. The earlier prefix
+        // anchor `parent.name || '::%'` would have silently exempted
+        // every nested-module gate-4 violation. Anchor on
+        // `parent.qualified_name` so nesting depth is irrelevant.
+        let conn = fresh_db();
+        // Parent enum with module-qualified name (kind 'enum', public).
+        conn.execute(
+            "INSERT INTO symbols (id, file_id, name, qualified_name, kind, line, visibility)
+             VALUES (1000, 1, 'Inner', 'foo::Inner', 'enum', 1, 'public')",
+            [],
+        )
+        .expect("nested parent enum insert");
+        // Field whose qualified_name carries the same module prefix.
+        conn.execute(
+            "INSERT INTO symbols (id, file_id, name, qualified_name, kind, line, signature)
+             VALUES (1, 1, '0', 'foo::Inner::Bad::0', 'struct_field', 42, 'serde_json::Error')",
+            [],
+        )
+        .expect("nested field insert");
+        conn.execute(
+            "INSERT INTO attributes (symbol_id, name, args, line)
+             VALUES (1, 'source', NULL, 42)",
+            [],
+        )
+        .expect("source attr insert");
+
+        let findings = gate_4().run(&conn).expect("gate query should succeed");
+        assert_eq!(
+            findings.len(),
+            1,
+            "nested-module enum field with #[source] external error must be flagged; got: {findings:?}"
+        );
+        assert_eq!(findings[0].qualified_name, "foo::Inner::Bad::0");
     }
 
     // ─── no-unwrap-in-production ────────────────────────────────────────
@@ -2048,5 +2098,45 @@ mod tests {
             1,
             "unconditional specta derive must also fire; got: {findings:?}"
         );
+    }
+
+    #[test]
+    fn ffi_enum_tag_flags_enum_nested_in_module() {
+        // gemini-code-assist (PR #91): for `mod foo { pub enum Bar { ... } }`,
+        // `s.name = 'Bar'` but variants land at `qualified_name =
+        // 'foo::Bar::Variant'`. Anchoring the variant→parent link on
+        // `s.qualified_name || '::%'` instead of `s.name || '::%'` makes
+        // nesting depth irrelevant. Without this fix the enum looks
+        // unit-only to the gate (variant EXISTS clause never matches),
+        // silently exempting nested-module FFI enums from the rule.
+        let conn = fresh_db();
+        conn.execute(
+            "INSERT INTO symbols (id, file_id, name, qualified_name, kind, line, visibility)
+             VALUES (1, 1, 'Inner', 'outer::Inner', 'enum', 1, 'public')",
+            [],
+        )
+        .expect("nested enum insert");
+        conn.execute(
+            "INSERT INTO attributes (symbol_id, name, args, line)
+             VALUES (1, 'derive', 'Clone, Debug, Serialize', 1),
+                    (1, 'cfg_attr', 'feature = \"specta\", derive(specta::Type)', 1)",
+            [],
+        )
+        .expect("derives insert");
+        conn.execute(
+            "INSERT INTO symbols (file_id, name, qualified_name, kind, line, signature)
+             VALUES (1, 'PayloadVariant', 'outer::Inner::PayloadVariant', 'enum_variant', 10,
+                     '{ value: u32 }')",
+            [],
+        )
+        .expect("nested variant insert");
+
+        let findings = ffi_tag_gate().run(&conn).expect("query");
+        assert_eq!(
+            findings.len(),
+            1,
+            "nested-module enum with payload must be flagged; got: {findings:?}"
+        );
+        assert_eq!(findings[0].qualified_name, "outer::Inner");
     }
 }
