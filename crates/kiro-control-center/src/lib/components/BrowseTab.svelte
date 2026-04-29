@@ -13,8 +13,6 @@
     MarketplaceInfo,
     PluginInfo,
     SkillInfo,
-    SkillCount,
-    SkippedReason,
     SkippedSkill,
     SteeringWarning,
   } from "$lib/bindings";
