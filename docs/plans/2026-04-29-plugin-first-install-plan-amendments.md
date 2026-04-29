@@ -1441,6 +1441,30 @@ lesson so future plan-reviews start with the right tool.
 
 ---
 
+## A-24 — Implementation finding: `remove_skill`'s `NotInstalled` leaves tracking row stale; A-12 cascade counts but doesn't truly drive to absence
+
+**Surfaced during.** Task 3 implementation (commit `7a4718d`). Captured per the "forward motion + audit trail" rule from the Phase 1 execution session — not actioned in Task 3.
+
+**Drift.** A-12's "log + count + continue" recipe assumes that catching `*Error::NotInstalled` from a per-content remove is equivalent to "the entry is now gone." That holds for `remove_steering_file` and `remove_agent` (Tasks 3b/3c — both methods drop the tracking entry as the FIRST step, then unlink, so a missing on-disk file is still success and the tracking row is gone). It does NOT hold for the existing `remove_skill` (`project.rs:562`): when `!skill_dir.exists()`, `remove_skill` returns `Err(SkillError::NotInstalled)` *without* mutating `installed-skills.json`. The orphan tracking row persists.
+
+**User-visible effect.** A user clicks "Remove plugin" on a plugin whose `.kiro/skills/<name>/` was hand-deleted. The cascade reports `skills_removed: 1` and the UI redraws as "removed." But `installed_plugins()` will still surface that orphan tracking row on the next list call — the plugin reappears.
+
+**Why out-of-scope for Task 3.** Fixing `remove_skill` is a behavioral change to a pre-existing public API on `KiroProject` — the asymmetry vs. `remove_steering_file` / `remove_agent` (which Task 3 introduced) is a pre-existing design quirk. Tightening it touches the existing `remove_skill_*` test suite and may surface invariants we'd rather not change mid-implementation.
+
+**Two equally valid future fixes — pick during follow-up:**
+
+1. **Tighten `remove_skill`** to drop the tracking entry on `!dir.exists()` instead of returning `NotInstalled`. Symmetric with the new sibling methods. Risk: a caller relying on the current "tracking unchanged on NotInstalled" contract would break — needs a grep for `SkillError::NotInstalled` consumers to gauge the blast radius.
+
+2. **Tighten the cascade** to manually drop the skill tracking entry when it catches `SkillError::NotInstalled`, via direct `with_file_lock` + `load_installed` + remove + save. The `remove_skill` API stays unchanged; only the cascade's recovery path becomes complete. Risk: the cascade gains intimate knowledge of tracking-file shape that lives elsewhere.
+
+**Recommendation:** option 1, tracked for a Phase 1.5 follow-up PR after Phase 1 ships. The orphan-skill scenario is real but rare (user manually `rm -rf`'d a skill), and the user can recover by clicking "Remove" again after a `Refresh` (which would now show no entry — wait, no, the entry persists; never mind, *the user can hand-edit the tracking JSON*, which is the documented escape hatch per CLAUDE.md "tracking files are user-owned").
+
+The Task 3 orphan-recovery test (`remove_plugin_recovers_from_orphan_skill_tracking_entry`) was written as a regression lock for the cascade's no-abort behavior — NOT as a "drives to absence" test. The test asserts `result.skills_removed == 1` and that the cascade returns `Ok`. It does NOT assert that the tracking is empty afterward, because today it isn't. Future-fix PR should expand that test once `remove_skill` (or the cascade) is tightened.
+
+**Rationale.** Captured for audit trail per the "23 amendments + forward motion" rule. The implementer correctly chose to leave `remove_skill` alone — A-12's recipe didn't mandate "drive to absence," only "log + count + continue." The semantic gap is real but doesn't block Phase 1 from shipping; Phase 1.5 can close it.
+
+---
+
 ## Summary of changes
 
 - A-1: Single line fix in Task 1 step 4 (`self.` → `Self::`).
@@ -1512,6 +1536,11 @@ lesson so future plan-reviews start with the right tool.
   boundary, matching the existing `InstalledSkillInfo.installed_at`
   precedent. `PathBuf` survives — verified `InstalledSteeringOutcome`
   uses it under specta::Type today.
+- A-24: Implementation finding from Task 3. `remove_skill`'s
+  `NotInstalled` doesn't drop the tracking row, so the cascade's
+  A-12 "count as removed" path leaves stale tracking. Out of scope
+  for Phase 1; deferred to Phase 1.5 follow-up. Captured here as
+  audit trail per the "forward motion + amendments" execution rule.
 
 No design-doc revisions required. The amendments are all execution-time
 corrections; the architecture in
