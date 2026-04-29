@@ -1441,6 +1441,40 @@ lesson so future plan-reviews start with the right tool.
 
 ---
 
+## A-25 — Implementation finding: `tauri-specta` 2.0.0-rc.24 rejects `skip_serializing_if` on FFI types
+
+**Surfaced during.** Task 4 implementation (commit `34c96e0`). Hit when registering `install_plugin_agents` triggered the binding-gen pass.
+
+**Drift.** `InstallAgentsResult` (in `service/mod.rs:387`) had `#[serde(default, skip_serializing_if = "Vec::is_empty")]` on `installed_native` and `#[serde(default, skip_serializing_if = "Option::is_none")]` on `installed_companions`. These pre-dated the type crossing FFI. Registering it as a Tauri command return failed validation:
+
+```
+Specta Serde validation failed for command 'install_plugin_agents' result:
+Invalid phased type usage at 'InstallAgentsResult_Serialize.installed_native':
+`skip_serializing_if` requires `apply_phases` because unified mode cannot
+represent conditional omission
+```
+
+**Why `tauri-specta` rejects this.** Unified mode generates one TypeScript type that has to be valid for both serialization and deserialization. `skip_serializing_if` makes a field's *presence* conditional — meaning the deserialization input may have fewer fields than the serialization output. The unified TS type can't represent that without phase-splitting (`InstallAgentsResult_Serialize` vs `_Deserialize`), which `apply_phases` would enable but the project doesn't currently configure.
+
+**Wire-format peers don't have this issue.** `InstallSkillsResult` and `InstallSteeringResult` — both already exported through `bindings.ts` since PRs 83 and 92 — don't use `skip_serializing_if` on any field. The pattern at this codebase is "always serialize, always deserialize, default values for missing fields." `InstallAgentsResult`'s `skip_serializing_if` was an outlier predating its FFI exposure.
+
+**Amended.** Drop `skip_serializing_if` from both fields. Keep `serde(default)` for legacy-JSON tolerance:
+
+```rust
+#[serde(default)]
+pub installed_native: Vec<crate::project::InstalledNativeAgentOutcome>,
+#[serde(default)]
+pub installed_companions: Option<crate::project::InstalledNativeCompanionsOutcome>,
+```
+
+**Wire format change.** Empty `installed_native` now serializes as `[]` instead of being omitted; `installed_companions: None` now serializes as `null` instead of being omitted. No Rust callers asserted on the omitted shape; no tests asserted on the omitted shape. The runtime contract for Rust consumers is preserved. The TypeScript wire shape becomes consistent with the sibling result types.
+
+**Forward-looking rule.** Validation/result types that flow through Tauri must avoid `skip_serializing_if` — match `InstallSkillsResult`'s shape. This is a sibling rule to CLAUDE.md's existing "validation newtypes flowing through Tauri bindings need `#[cfg_attr(feature = "specta", derive(specta::Type))]`" guidance. Worth adding to CLAUDE.md once Phase 1 ships.
+
+**Rationale.** Captured as audit trail per the "forward motion + amendments" execution rule. The implementer correctly identified the root cause, made the minimal fix, and preserved the legacy-JSON tolerance contract. The amendment names the rule for future reviewers.
+
+---
+
 ## A-24 — Implementation finding: `remove_skill`'s `NotInstalled` leaves tracking row stale; A-12 cascade counts but doesn't truly drive to absence
 
 **Surfaced during.** Task 3 implementation (commit `7a4718d`). Captured per the "forward motion + audit trail" rule from the Phase 1 execution session — not actioned in Task 3.
@@ -1541,6 +1575,13 @@ The Task 3 orphan-recovery test (`remove_plugin_recovers_from_orphan_skill_track
   A-12 "count as removed" path leaves stale tracking. Out of scope
   for Phase 1; deferred to Phase 1.5 follow-up. Captured here as
   audit trail per the "forward motion + amendments" execution rule.
+- A-25: Implementation finding from Task 4. `tauri-specta` 2.0.0-rc.24
+  rejects `skip_serializing_if` on Tauri-exposed result types in
+  unified mode. Drop the directives from `InstallAgentsResult.installed_native`
+  and `InstallAgentsResult.installed_companions`; the wire format
+  becomes `[]`/`null` for empty/None instead of omitted, matching
+  `InstallSkillsResult` and `InstallSteeringResult`. Forward-looking
+  rule worth adding to CLAUDE.md.
 
 No design-doc revisions required. The amendments are all execution-time
 corrections; the architecture in
