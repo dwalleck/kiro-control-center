@@ -9,6 +9,7 @@
     skillCountTitle,
   } from "$lib/format";
   import type {
+    InstalledPluginInfo,
     MarketplaceInfo,
     PluginInfo,
     SkillInfo,
@@ -18,6 +19,9 @@
     SteeringWarning,
   } from "$lib/bindings";
   import SkillCard from "./SkillCard.svelte";
+  import PluginCard from "./PluginCard.svelte";
+
+  type BrowseView = "plugins" | "skills";
 
   // Render a SteeringWarning. The explicit `default` arm with a `never`
   // binding is the load-bearing exhaustiveness guard — if a new
@@ -108,6 +112,17 @@
   let forceInstall: boolean = $state(false);
   let popoverOpen: boolean = $state(false);
   let popRef: HTMLDivElement | undefined = $state();
+  let browseView: BrowseView = $state("plugins");
+
+  // Per-plugin in-flight tracker — pluginKey(marketplace, plugin) so two
+  // plugins can install in parallel without colliding (mirrors the shape
+  // of `pendingSteeringInstalls`).
+  let pendingPluginInstalls = new SvelteSet<string>();
+
+  let installedPlugins: InstalledPluginInfo[] = $state([]);
+  let installedPluginKeys = $derived(
+    new Set(installedPlugins.map((p) => pluginKey(p.marketplace, p.plugin))),
+  );
 
   let loadingMarketplaces: boolean = $state(false);
   // Single pending-fetch tracker keyed by ErrorSource — each in-flight fetch
@@ -387,6 +402,26 @@
     );
   }
 
+  async function fetchInstalledPlugins() {
+    if (!projectPath) {
+      installedPlugins = [];
+      return;
+    }
+    try {
+      const result = await commands.listInstalledPlugins(projectPath);
+      installedPlugins = result.status === "ok" ? result.data : [];
+    } catch (e) {
+      console.error("[BrowseTab] listInstalledPlugins rejected", e);
+      installedPlugins = [];
+    }
+  }
+
+  $effect(() => {
+    // Read projectPath to register the dependency.
+    void projectPath;
+    fetchInstalledPlugins();
+  });
+
   $effect(() => {
     for (const mp of selectedMarketplaces) fetchPluginsFor(mp);
   });
@@ -664,6 +699,65 @@
     }
   }
 
+  // Whole-plugin install — runs every install path the plugin declares
+  // (skills + steering + agents) in one coordinated call. Surfaces the
+  // aggregated outcome in installMessage / installError, same as the
+  // skill and steering flows.
+  async function installWholePlugin(marketplace: string, plugin: string) {
+    const key = pluginKey(marketplace, plugin);
+    if (pendingPluginInstalls.has(key)) return;
+    pendingPluginInstalls.add(key);
+    installError = null;
+    installMessage = null;
+
+    try {
+      // 4th arg is `acceptMcp` — Phase 1 hardcodes false. Phase 2 will
+      // wire a UI toggle so a user can opt into installing agents that
+      // declare MCP servers (subprocesses / network connections).
+      const result = await commands.installPlugin(
+        marketplace,
+        plugin,
+        forceInstall,
+        false,
+        projectPath,
+      );
+      if (result.status === "ok") {
+        const r = result.data;
+        const parts: string[] = [];
+        const sInstalled = r.skills.installed.length;
+        const sFailed = r.skills.failed.length;
+        const stInstalled = r.steering.installed.length;
+        const stFailed = r.steering.failed.length;
+        const aInstalled = r.agents.installed.length;
+        const aFailed = r.agents.failed.length;
+        if (sInstalled > 0) parts.push(`${sInstalled} skill${sInstalled === 1 ? "" : "s"}`);
+        if (sFailed > 0) parts.push(`${sFailed} skill${sFailed === 1 ? "" : "s"} failed`);
+        if (stInstalled > 0)
+          parts.push(`${stInstalled} steering file${stInstalled === 1 ? "" : "s"}`);
+        if (stFailed > 0) parts.push(`${stFailed} steering failed`);
+        if (aInstalled > 0) parts.push(`${aInstalled} agent${aInstalled === 1 ? "" : "s"}`);
+        if (aFailed > 0) parts.push(`${aFailed} agent${aFailed === 1 ? "" : "s"} failed`);
+
+        const anyFailed = sFailed + stFailed + aFailed > 0;
+        const anyInstalled = sInstalled + stInstalled + aInstalled > 0;
+        const summary = parts.length > 0 ? parts.join(" · ") : "nothing to install";
+        if (anyFailed && !anyInstalled) {
+          installError = `Plugin install failed for ${plugin}: ${summary}`;
+        } else {
+          installMessage = `Plugin ${plugin}: ${summary}`;
+        }
+        await fetchInstalledPlugins();
+      } else {
+        installError = `Plugin install failed for ${plugin}: ${result.error.message}`;
+      }
+    } catch (e) {
+      const reason = e instanceof Error ? e.message : String(e);
+      installError = `Plugin install failed for ${plugin}: ${reason}`;
+    } finally {
+      pendingPluginInstalls.delete(key);
+    }
+  }
+
   // Steering install operates on whole plugins, so the natural scope is
   // "exactly one plugin in focus." Sources of focus, in priority order:
   //   1. A plugin filter is active (visible chip at the top of the page).
@@ -707,6 +801,7 @@
 
   onMount(() => {
     loadMarketplaces();
+    fetchInstalledPlugins();
   });
 </script>
 
@@ -926,6 +1021,33 @@
     </div>
   {/if}
 
+  <div class="flex items-center gap-1 px-4 py-2 border-b border-kiro-muted bg-kiro-surface/30">
+    <div class="inline-flex rounded-md border border-kiro-muted bg-kiro-overlay overflow-hidden">
+      <button
+        type="button"
+        aria-pressed={browseView === "plugins"}
+        onclick={() => (browseView = "plugins")}
+        class="px-3 py-1.5 text-xs font-medium transition-colors
+          {browseView === 'plugins'
+            ? 'bg-kiro-accent-900/30 text-kiro-accent-300'
+            : 'text-kiro-text-secondary hover:bg-kiro-muted hover:text-kiro-text'}"
+      >
+        Plugins
+      </button>
+      <button
+        type="button"
+        aria-pressed={browseView === "skills"}
+        onclick={() => (browseView = "skills")}
+        class="px-3 py-1.5 text-xs font-medium transition-colors border-l border-kiro-muted
+          {browseView === 'skills'
+            ? 'bg-kiro-accent-900/30 text-kiro-accent-300'
+            : 'text-kiro-text-secondary hover:bg-kiro-muted hover:text-kiro-text'}"
+      >
+        Skills
+      </button>
+    </div>
+  </div>
+
   <div class="flex-1 overflow-y-auto p-4">
     {#if showLoadingSpinner}
       <div class="flex flex-col items-center justify-center h-full text-kiro-subtle gap-3">
@@ -943,54 +1065,8 @@
         </svg>
         <p class="text-sm">Failed to load marketplaces. See error above.</p>
       </div>
-    {:else if filteredSkills.length === 0}
-      {#if !filterText && availablePlugins.length > 0}
-        <!-- Skills are zero but plugins exist (e.g., a marketplace whose
-             plugins ship steering files but no skills). Surface the
-             plugins inline so the user has a direct install path —
-             without this they'd have to discover the filter popover to
-             scope the bottom-bar steering button. -->
-        <div class="flex flex-col gap-4">
-          <p class="text-sm text-kiro-subtle">
-            No skills in {selectedMarketplaces.size === 1 ? "this marketplace" : "these marketplaces"} —
-            install steering for a plugin below.
-          </p>
-          <div class="flex flex-col gap-2">
-            {#each availablePlugins as ap (pluginKey(ap.marketplace, ap.plugin.name))}
-              {@const key = pluginKey(ap.marketplace, ap.plugin.name)}
-              <div class="flex items-center gap-3 px-3 py-2.5 rounded-md border border-kiro-muted bg-kiro-overlay">
-                <div class="flex-1 min-w-0">
-                  <div class="text-sm font-medium text-kiro-text truncate">{ap.plugin.name}</div>
-                  {#if ap.plugin.description}
-                    <div class="text-xs text-kiro-subtle truncate">{ap.plugin.description}</div>
-                  {/if}
-                </div>
-                <span
-                  class="text-[11px] {ap.plugin.skill_count.state === 'manifest_failed' ? 'text-kiro-warning' : 'text-kiro-subtle'} flex-shrink-0"
-                  title={skillCountTitle(ap.plugin.skill_count)}
-                  aria-label={skillCountTitle(ap.plugin.skill_count)}
-                >{skillCountLabel(ap.plugin.skill_count)} skill{ap.plugin.skill_count.state === "known" && ap.plugin.skill_count.count === 1 ? "" : "s"}</span>
-                <button
-                  type="button"
-                  onclick={() => installSteering(ap.marketplace, ap.plugin.name)}
-                  disabled={!projectPath || pendingSteeringInstalls.has(key)}
-                  title={projectPath
-                    ? `Install steering files for ${ap.plugin.name}`
-                    : "Pick a project first"}
-                  aria-label="Install steering files for {ap.plugin.name}"
-                  aria-busy={pendingSteeringInstalls.has(key)}
-                  class="px-3 py-1.5 text-xs font-medium rounded-md transition-colors flex-shrink-0
-                    {projectPath && !pendingSteeringInstalls.has(key)
-                      ? 'bg-kiro-overlay border border-kiro-muted text-kiro-accent-300 hover:bg-kiro-muted hover:text-kiro-accent-200'
-                      : 'bg-kiro-muted text-kiro-subtle border border-transparent cursor-not-allowed'}"
-                >
-                  {pendingSteeringInstalls.has(key) ? "Installing…" : "Install steering"}
-                </button>
-              </div>
-            {/each}
-          </div>
-        </div>
-      {:else}
+    {:else if browseView === "skills"}
+      {#if filteredSkills.length === 0}
         <div class="flex flex-col items-center justify-center h-full text-kiro-subtle gap-3">
           <svg class="w-10 h-10 text-kiro-accent-800" fill="none" stroke="currentColor" viewBox="0 0 24 24">
             <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5"
@@ -1002,22 +1078,43 @@
             {:else if fetchErrors.size > 0}
               Skills unavailable due to errors above
             {:else}
-              No skills available
+              No skills available — try the Plugins view to install plugins that ship steering.
             {/if}
           </p>
         </div>
+      {:else}
+        <div class="grid gap-3 grid-cols-1 lg:grid-cols-2">
+          {#each filteredSkills as skill (skillKey(skill.marketplace, skill.plugin, skill.name))}
+            {@const key = skillKey(skill.marketplace, skill.plugin, skill.name)}
+            <SkillCard
+              {skill}
+              selected={selectedSkills.has(key)}
+              onToggle={() => toggleSkill(key)}
+            />
+          {/each}
+        </div>
       {/if}
     {:else}
-      <div class="grid gap-3 grid-cols-1 lg:grid-cols-2">
-        {#each filteredSkills as skill (skillKey(skill.marketplace, skill.plugin, skill.name))}
-          {@const key = skillKey(skill.marketplace, skill.plugin, skill.name)}
-          <SkillCard
-            {skill}
-            selected={selectedSkills.has(key)}
-            onToggle={() => toggleSkill(key)}
-          />
-        {/each}
-      </div>
+      <!-- browseView === "plugins" -->
+      {#if availablePlugins.length === 0}
+        <div class="flex flex-col items-center justify-center h-full text-kiro-subtle gap-3">
+          <p class="text-sm">No plugins available — pick a marketplace from Filters.</p>
+        </div>
+      {:else}
+        <div class="grid gap-3 grid-cols-1 lg:grid-cols-2">
+          {#each availablePlugins as ap (pluginKey(ap.marketplace, ap.plugin.name))}
+            {@const key = pluginKey(ap.marketplace, ap.plugin.name)}
+            <PluginCard
+              plugin={ap.plugin}
+              marketplace={ap.marketplace}
+              installed={installedPluginKeys.has(key)}
+              installing={pendingPluginInstalls.has(key)}
+              projectPicked={!!projectPath}
+              onInstall={() => installWholePlugin(ap.marketplace, ap.plugin.name)}
+            />
+          {/each}
+        </div>
+      {/if}
     {/if}
   </div>
 
