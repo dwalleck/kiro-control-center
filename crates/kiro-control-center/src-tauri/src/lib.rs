@@ -35,6 +35,9 @@ fn create_builder() -> Builder<tauri::Wry> {
         commands::kiro_settings::reset_kiro_setting,
         commands::steering::install_plugin_steering,
         commands::agents::install_plugin_agents,
+        commands::plugins::install_plugin,
+        commands::plugins::list_installed_plugins,
+        commands::plugins::remove_plugin,
     ])
 }
 

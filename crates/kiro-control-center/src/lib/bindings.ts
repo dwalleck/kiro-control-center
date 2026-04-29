@@ -106,6 +106,42 @@ export const commands = {
 	 *  runtime.
 	 */
 	installPluginAgents: (marketplace: string, plugin: string, force: boolean, acceptMcp: boolean, projectPath: string) => typedError<InstallAgentsResult_Serialize, CommandError>(__TAURI_INVOKE("install_plugin_agents", { marketplace, plugin, force, acceptMcp, projectPath })),
+	/**
+	 *  Install every skill, steering file, and agent declared by a plugin
+	 *  into the active project's `.kiro/` tree in one call.
+	 * 
+	 *  The wrapper exists only to construct a [`MarketplaceService`] from
+	 *  process globals and translate the FFI `force: bool` into an
+	 *  [`InstallMode`]; the install itself runs in [`install_plugin_impl`]
+	 *  so it can be tested without a Tauri runtime.
+	 * 
+	 *  `accept_mcp` is the per-call MCP opt-in gate (A-18). The Phase 1
+	 *  frontend hardcodes `false` at the call site until a user-toggle UI
+	 *  lands; the parameter is plumbed through so a later PR can flip it
+	 *  without touching this signature.
+	 */
+	installPlugin: (marketplace: string, plugin: string, force: boolean, acceptMcp: boolean, projectPath: string) => typedError<InstallPluginResult_Serialize, CommandError>(__TAURI_INVOKE("install_plugin", { marketplace, plugin, force, acceptMcp, projectPath })),
+	/**
+	 *  List every installed plugin in the project, aggregated by
+	 *  `(marketplace, plugin)` pair across the three tracking files.
+	 * 
+	 *  No `_impl` split (A-19): the body is inline in the wrapper because
+	 *  the command consumes `KiroProject` only — there's no
+	 *  `MarketplaceService` to thread through. Mirrors the existing
+	 *  [`crate::commands::installed::list_installed_skills`] shape; tests
+	 *  exercise the wrapper directly via `#[tokio::test]`.
+	 */
+	listInstalledPlugins: (projectPath: string) => typedError<InstalledPluginInfo[], CommandError>(__TAURI_INVOKE("list_installed_plugins", { projectPath })),
+	/**
+	 *  Remove every skill, steering file, and agent for a given
+	 *  `(marketplace, plugin)` pair from the project, returning per-content
+	 *  removal counts.
+	 * 
+	 *  No `_impl` split (A-19): same rationale as
+	 *  [`list_installed_plugins`] above — `KiroProject`-only read/write,
+	 *  no service.
+	 */
+	removePlugin: (marketplace: string, plugin: string, projectPath: string) => typedError<RemovePluginResult, CommandError>(__TAURI_INVOKE("remove_plugin", { marketplace, plugin, projectPath })),
 };
 
 /* Types */
@@ -460,6 +496,63 @@ export type InstallOutcomeKind =
  */
 "force_overwrote";
 
+/**
+ *  Aggregate result of [`MarketplaceService::install_plugin`] — the
+ *  outcome of running every install path a plugin declares (skills,
+ *  steering, agents) in one coordinated call.
+ * 
+ *  Sub-results are always populated. The underlying scan-path
+ *  fallbacks (`agent_scan_paths_for_plugin` /
+ *  `steering_scan_paths_for_plugin`) guarantee at least one attempt;
+ *  `install_skills` returns a fully-formed default for empty input.
+ *  Empty `installed` / `failed` vecs on a sub-result indicate "this
+ *  content type was attempted with nothing to do" — distinct from a
+ *  missing field.
+ */
+export type InstallPluginResult = InstallPluginResult_Serialize | InstallPluginResult_Deserialize;
+
+/**
+ *  Aggregate result of [`MarketplaceService::install_plugin`] — the
+ *  outcome of running every install path a plugin declares (skills,
+ *  steering, agents) in one coordinated call.
+ * 
+ *  Sub-results are always populated. The underlying scan-path
+ *  fallbacks (`agent_scan_paths_for_plugin` /
+ *  `steering_scan_paths_for_plugin`) guarantee at least one attempt;
+ *  `install_skills` returns a fully-formed default for empty input.
+ *  Empty `installed` / `failed` vecs on a sub-result indicate "this
+ *  content type was attempted with nothing to do" — distinct from a
+ *  missing field.
+ */
+export type InstallPluginResult_Deserialize = {
+	plugin: string,
+	version: string | null,
+	skills: InstallSkillsResult,
+	steering: InstallSteeringResult_Deserialize,
+	agents: InstallAgentsResult_Deserialize,
+};
+
+/**
+ *  Aggregate result of [`MarketplaceService::install_plugin`] — the
+ *  outcome of running every install path a plugin declares (skills,
+ *  steering, agents) in one coordinated call.
+ * 
+ *  Sub-results are always populated. The underlying scan-path
+ *  fallbacks (`agent_scan_paths_for_plugin` /
+ *  `steering_scan_paths_for_plugin`) guarantee at least one attempt;
+ *  `install_skills` returns a fully-formed default for empty input.
+ *  Empty `installed` / `failed` vecs on a sub-result indicate "this
+ *  content type was attempted with nothing to do" — distinct from a
+ *  missing field.
+ */
+export type InstallPluginResult_Serialize = {
+	plugin: string,
+	version: string | null,
+	skills: InstallSkillsResult,
+	steering: InstallSteeringResult_Serialize,
+	agents: InstallAgentsResult_Serialize,
+};
+
 // Outcome of installing a list of skill directories from one plugin.
 export type InstallSkillsResult = {
 	// Skill names successfully installed.
@@ -560,6 +653,39 @@ export type InstalledNativeCompanionsOutcome = {
 	kind: InstallOutcomeKind,
 	source_hash: string,
 	installed_hash: string,
+};
+
+/**
+ *  Aggregated view of a single installed plugin — the union of
+ *  what's tracked across `installed-skills.json`,
+ *  `installed-steering.json`, and `installed-agents.json` for a
+ *  given `(marketplace, plugin)` pair.
+ * 
+ *  Returned by [`KiroProject::installed_plugins`]. The frontend
+ *  renders one row per `InstalledPluginInfo`.
+ * 
+ *  `installed_version` is the version of the **most recent install**
+ *  by `installed_at` timestamp — not a lexicographic max. See A-6
+ *  in the plan amendments doc for why string-compare is wrong here.
+ * 
+ *  `earliest_install` and `latest_install` are RFC3339-formatted
+ *  strings to match the FFI shape used by `InstalledSkillInfo`
+ *  (specta's chrono feature isn't enabled in this crate).
+ */
+export type InstalledPluginInfo = {
+	marketplace: string,
+	plugin: string,
+	installed_version: string | null,
+	skill_count: number,
+	steering_count: number,
+	agent_count: number,
+	installed_skills: string[],
+	installed_steering: string[],
+	installed_agents: string[],
+	// RFC3339-formatted timestamp.
+	earliest_install: string,
+	// RFC3339-formatted timestamp.
+	latest_install: string,
 };
 
 // Information about a single installed skill.
@@ -731,6 +857,26 @@ export type ProjectInfo = {
  *  rejects traversal at parse time.
  */
 export type RelativePath = string;
+
+/**
+ *  Aggregated counts returned by
+ *  [`KiroProject::remove_plugin`] — one tally per content type so the
+ *  caller (CLI / Tauri) can render a one-line "removed N skills,
+ *  M steering files, K agents" summary without re-reading the tracking
+ *  files.
+ * 
+ *  Counts are post-cascade and include orphan-tracking recoveries
+ *  (A-12): a tracking entry with no on-disk file still counts as
+ *  "removed" because the cascade dropped the entry. The cascade
+ *  never partially succeeds — either every entry is removed and the
+ *  counts reflect the full work, or an error short-circuits before
+ *  the result returns.
+ */
+export type RemovePluginResult = {
+	skills_removed: number,
+	steering_removed: number,
+	agents_removed: number,
+};
 
 // Top-level category for a Kiro CLI setting.
 export type SettingCategory = "telemetry" | "chat" | "knowledge" | "key_bindings" | "features" | "api" | "mcp" | "environment";

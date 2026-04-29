@@ -3,6 +3,7 @@ pub mod browse;
 pub mod installed;
 pub mod kiro_settings;
 pub mod marketplaces;
+pub mod plugins;
 pub mod settings;
 pub mod steering;
 
