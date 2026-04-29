@@ -302,18 +302,47 @@ pub struct InstalledPluginInfo {
 /// M steering files, K agents" summary without re-reading the tracking
 /// files.
 ///
-/// Counts are post-cascade and include orphan-tracking recoveries
-/// (A-12): a tracking entry with no on-disk file still counts as
-/// "removed" because the cascade dropped the entry. The cascade
-/// never partially succeeds — either every entry is removed and the
-/// counts reflect the full work, or an error short-circuits before
-/// the result returns.
+/// Counts are post-cascade across every per-content removal that
+/// completed successfully. A per-step error during the cascade does
+/// **not** abort the work — the cascade keeps going on the remaining
+/// content types and records the failure in `failed`. Only "failed
+/// to even read the initial tracking files" is surfaced as the
+/// cascade's outer `Err` (I5). Orphan-tracking recoveries (A-12) still
+/// count as "removed" because the per-content remove drops the
+/// tracking row and treats the missing on-disk entry as success.
 #[derive(Debug, Clone, Default, Serialize)]
 #[cfg_attr(feature = "specta", derive(specta::Type))]
 pub struct RemovePluginResult {
     pub skills_removed: u32,
     pub steering_removed: u32,
     pub agents_removed: u32,
+    /// Per-step errors encountered during the cascade. The cascade
+    /// keeps making progress on remaining content types when one
+    /// step fails — same policy as `InstallPluginResult`'s sub-result
+    /// `failed` vecs (A-15). Empty on a clean cascade.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub failed: Vec<RemovePluginFailure>,
+}
+
+/// One per-step failure recorded by [`KiroProject::remove_plugin`] when
+/// a per-content removal fails mid-cascade. The cascade keeps going on
+/// remaining content types; the caller surfaces these to the user as a
+/// partial-failure summary.
+#[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
+pub struct RemovePluginFailure {
+    /// Which content type errored: `"skill"` / `"steering"` / `"agent"`
+    /// / `"native_companions"`.
+    pub content_type: String,
+    /// The item identifier — skill or agent name, or steering rel-path
+    /// rendered via `Path::display()`. Empty string for the
+    /// `"native_companions"` row, which is plugin-scoped rather than
+    /// per-item.
+    pub item: String,
+    /// Rendered error chain via [`crate::error::error_full_chain`] —
+    /// wire format per CLAUDE.md "in any wire-format `reason`/`error:
+    /// String` field that crosses the FFI, use `error_full_chain(&err)`".
+    pub error: String,
 }
 
 /// Per-`(marketplace, plugin)` accumulator used by
@@ -564,6 +593,76 @@ fn validate_tracking_companion_files(
     Ok(())
 }
 
+/// Validate every name key in a freshly-loaded [`InstalledSkills`]
+/// tracking record. Tracking files are user-owned; a tampered or
+/// hand-edited entry containing `../../etc/passwd` as a skill name
+/// would, without this check, flow into `skills_dir.join(name)` at
+/// removal time (`fs::remove_dir_all`) and delete files outside the
+/// install boundary. Mirrors [`validate_tracking_steering_files`]'s
+/// shape.
+fn validate_tracking_skill_keys(
+    installed: &InstalledSkills,
+    tracking_path: &Path,
+) -> crate::error::Result<()> {
+    for name in installed.skills.keys() {
+        if let Err(reason) = validation::validate_name(name) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "tracking file {} has invalid skill name `{}`: {}",
+                    tracking_path.display(),
+                    name,
+                    reason
+                ),
+            )
+            .into());
+        }
+    }
+    Ok(())
+}
+
+/// Validate every name key in a freshly-loaded [`InstalledAgents`]
+/// tracking record — both per-agent (`agents`) and per-plugin
+/// (`native_companions`). Same rationale as
+/// [`validate_tracking_skill_keys`]: a tampered name reaches
+/// `agents_dir.join(format!("{name}.json"))` /
+/// `agent_prompts_dir.join(format!("{name}.md"))` at removal time,
+/// or shows up unfiltered in `installed_plugins()` on the wire.
+fn validate_tracking_agent_keys(
+    installed: &InstalledAgents,
+    tracking_path: &Path,
+) -> crate::error::Result<()> {
+    for name in installed.agents.keys() {
+        if let Err(reason) = validation::validate_name(name) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "tracking file {} has invalid agent name `{}`: {}",
+                    tracking_path.display(),
+                    name,
+                    reason
+                ),
+            )
+            .into());
+        }
+    }
+    for plugin in installed.native_companions.keys() {
+        if let Err(reason) = validation::validate_name(plugin) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "tracking file {} has invalid native_companions plugin key `{}`: {}",
+                    tracking_path.display(),
+                    plugin,
+                    reason
+                ),
+            )
+            .into());
+        }
+    }
+    Ok(())
+}
+
 /// Validate every relative path key in a freshly-loaded
 /// [`InstalledSteering`] tracking record. Same rationale as
 /// [`validate_tracking_companion_files`]: a tampered key like
@@ -631,6 +730,7 @@ impl KiroProject {
         match fs::read(&path) {
             Ok(bytes) => {
                 let installed: InstalledSkills = serde_json::from_slice(&bytes)?;
+                validate_tracking_skill_keys(&installed, &path)?;
                 Ok(installed)
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -779,6 +879,7 @@ impl KiroProject {
         match fs::read(&path) {
             Ok(bytes) => {
                 let installed: InstalledAgents = serde_json::from_slice(&bytes)?;
+                validate_tracking_agent_keys(&installed, &path)?;
                 validate_tracking_companion_files(&installed, &path)?;
                 Ok(installed)
             }
@@ -896,10 +997,19 @@ impl KiroProject {
         let now = chrono::Utc::now();
         Ok(by_pair
             .into_iter()
-            .map(|((marketplace, plugin), acc)| {
+            .map(|((marketplace, plugin), mut acc)| {
                 let (latest_install_dt, installed_version) =
                     acc.latest.map_or_else(|| (now, None), |(t, v)| (t, v));
                 let earliest_install_dt = acc.earliest.unwrap_or(now);
+                // Sort the per-plugin item Vecs (I1) so the wire-format
+                // ordering doesn't depend on HashMap iteration order.
+                // Without this, the same tracking files could yield
+                // different `installed_skills` orderings across runs —
+                // breaks UI snapshot tests and confuses humans reading
+                // the JSON.
+                acc.skills.sort();
+                acc.steering.sort();
+                acc.agents.sort();
                 InstalledPluginInfo {
                     marketplace,
                     plugin,
@@ -3274,6 +3384,128 @@ mod tests {
     }
 
     #[test]
+    fn load_installed_rejects_path_traversal_in_skills_key() {
+        // I9 regression: a tampered `installed-skills.json` containing
+        // a path-traversal key like `../../etc` as a skill name would,
+        // without validation, flow into `skills_dir.join(name)` at
+        // removal time (`fs::remove_dir_all`) and escape the install
+        // boundary. Mirrors
+        // [`load_installed_steering_rejects_path_traversal_in_files_key`].
+        let (_dir, project) = temp_project();
+        let tracking_path = project.root.join(".kiro/installed-skills.json");
+        fs::create_dir_all(tracking_path.parent().unwrap()).unwrap();
+        let tampered = serde_json::json!({
+            "skills": {
+                "../../etc": {
+                    "marketplace": "m",
+                    "plugin": "p",
+                    "version": null,
+                    "installed_at": chrono::Utc::now(),
+                    "source_hash": "blake3:abc",
+                }
+            }
+        });
+        fs::write(&tracking_path, tampered.to_string()).unwrap();
+
+        let err = project
+            .load_installed()
+            .expect_err("traversal must be refused at load time");
+        match err {
+            crate::error::Error::Io(io_err) => {
+                assert_eq!(io_err.kind(), std::io::ErrorKind::InvalidData);
+                let msg = io_err.to_string();
+                assert!(
+                    msg.contains("../../etc"),
+                    "error must name the offending key, got: {msg}"
+                );
+            }
+            other => panic!("expected Error::Io(InvalidData), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn load_installed_agents_rejects_path_traversal_in_agents_key() {
+        // I9 regression: a tampered `installed-agents.json` containing
+        // a path-traversal key like `../../etc` as an agent name
+        // would, without validation, flow into both
+        // `agents_dir.join(format!("{name}.json"))` and
+        // `agent_prompts_dir.join(format!("{name}.md"))` at removal
+        // time, escaping the install boundary.
+        let (_dir, project) = temp_project();
+        let tracking_path = project.root.join(".kiro/installed-agents.json");
+        fs::create_dir_all(tracking_path.parent().unwrap()).unwrap();
+        let tampered = serde_json::json!({
+            "agents": {
+                "../../etc": {
+                    "marketplace": "m",
+                    "plugin": "p",
+                    "version": null,
+                    "installed_at": chrono::Utc::now(),
+                    "dialect": "claude",
+                }
+            }
+        });
+        fs::write(&tracking_path, tampered.to_string()).unwrap();
+
+        let err = project
+            .load_installed_agents()
+            .expect_err("traversal must be refused at load time");
+        match err {
+            crate::error::Error::Io(io_err) => {
+                assert_eq!(io_err.kind(), std::io::ErrorKind::InvalidData);
+                let msg = io_err.to_string();
+                assert!(
+                    msg.contains("../../etc"),
+                    "error must name the offending agent name, got: {msg}"
+                );
+            }
+            other => panic!("expected Error::Io(InvalidData), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn load_installed_agents_rejects_path_traversal_in_native_companions_key() {
+        // I9 regression: a tampered `installed-agents.json` whose
+        // `native_companions` map keys (plugin names) contain a
+        // traversal entry would, without validation, flow into
+        // `installed_plugins()` on the wire and corrupt downstream
+        // marketplace/plugin string handling.
+        let (_dir, project) = temp_project();
+        let tracking_path = project.root.join(".kiro/installed-agents.json");
+        fs::create_dir_all(tracking_path.parent().unwrap()).unwrap();
+        let tampered = serde_json::json!({
+            "agents": {},
+            "native_companions": {
+                "../../evil": {
+                    "marketplace": "m",
+                    "plugin": "evil",
+                    "version": null,
+                    "installed_at": chrono::Utc::now(),
+                    "files": [],
+                    "source_hash": "blake3:abc",
+                    "installed_hash": "blake3:abc",
+                }
+            }
+        });
+        fs::write(&tracking_path, tampered.to_string()).unwrap();
+
+        let err = project
+            .load_installed_agents()
+            .expect_err("traversal must be refused at load time");
+        match err {
+            crate::error::Error::Io(io_err) => {
+                assert_eq!(io_err.kind(), std::io::ErrorKind::InvalidData);
+                let msg = io_err.to_string();
+                assert!(
+                    msg.contains("../../evil"),
+                    "error must name the offending plugin key, got: {msg}"
+                );
+            }
+            other => panic!("expected Error::Io(InvalidData), got {other:?}"),
+        }
+    }
+
+    #[test]
     fn load_installed_agents_rejects_path_traversal_in_companion_files() {
         // Closes marketplace-security-reviewer Important finding: a
         // tampered `installed-agents.json` containing a traversal entry
@@ -3464,6 +3696,123 @@ mod tests {
             Some("1.0.0"),
             "tied timestamps must keep first-iterated version (skills); \
              got steering's 2.0.0 — A-17 `>` tie-break broken"
+        );
+    }
+
+    #[test]
+    fn installed_plugins_returns_sorted_vecs_per_plugin() {
+        // I1 regression: per-plugin Vecs (`installed_skills`,
+        // `installed_steering`, `installed_agents`) are pushed in
+        // HashMap iteration order, which is nondeterministic. Sorting
+        // post-fold gives a stable wire format. Seed three skills,
+        // three steering files, and three agents in non-alphabetic
+        // tracking order; the result Vecs must be alphabetically
+        // sorted regardless of which order the HashMap chose to yield.
+        use chrono::Utc;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let project = KiroProject::new(dir.path().to_path_buf());
+        std::fs::create_dir_all(project.kiro_dir()).expect("kiro dir");
+
+        let now = Utc::now();
+        let skills_json = serde_json::json!({
+            "skills": {
+                "gamma": {
+                    "marketplace": "mp", "plugin": "p",
+                    "version": "1.0.0", "installed_at": now,
+                    "source_hash": "x"
+                },
+                "alpha": {
+                    "marketplace": "mp", "plugin": "p",
+                    "version": "1.0.0", "installed_at": now,
+                    "source_hash": "x"
+                },
+                "beta": {
+                    "marketplace": "mp", "plugin": "p",
+                    "version": "1.0.0", "installed_at": now,
+                    "source_hash": "x"
+                }
+            }
+        });
+        std::fs::write(
+            project.kiro_dir().join("installed-skills.json"),
+            serde_json::to_vec_pretty(&skills_json).expect("ser skills"),
+        )
+        .expect("skills");
+
+        let steering_json = serde_json::json!({
+            "files": {
+                "z-guide.md": {
+                    "marketplace": "mp", "plugin": "p",
+                    "version": "1.0.0", "installed_at": now,
+                    "source_hash": "x", "installed_hash": "x"
+                },
+                "a-guide.md": {
+                    "marketplace": "mp", "plugin": "p",
+                    "version": "1.0.0", "installed_at": now,
+                    "source_hash": "x", "installed_hash": "x"
+                },
+                "m-guide.md": {
+                    "marketplace": "mp", "plugin": "p",
+                    "version": "1.0.0", "installed_at": now,
+                    "source_hash": "x", "installed_hash": "x"
+                }
+            }
+        });
+        std::fs::write(
+            project.kiro_dir().join("installed-steering.json"),
+            serde_json::to_vec_pretty(&steering_json).expect("ser steering"),
+        )
+        .expect("steering");
+
+        let agents_json = serde_json::json!({
+            "agents": {
+                "zeta": {
+                    "marketplace": "mp", "plugin": "p",
+                    "version": "1.0.0", "installed_at": now,
+                    "dialect": "claude"
+                },
+                "alpha-agent": {
+                    "marketplace": "mp", "plugin": "p",
+                    "version": "1.0.0", "installed_at": now,
+                    "dialect": "claude"
+                },
+                "mid-agent": {
+                    "marketplace": "mp", "plugin": "p",
+                    "version": "1.0.0", "installed_at": now,
+                    "dialect": "claude"
+                }
+            }
+        });
+        std::fs::write(
+            project.kiro_dir().join("installed-agents.json"),
+            serde_json::to_vec_pretty(&agents_json).expect("ser agents"),
+        )
+        .expect("agents");
+
+        let result = project.installed_plugins().expect("installed_plugins");
+        assert_eq!(result.len(), 1);
+        assert_eq!(
+            result[0].installed_skills,
+            vec!["alpha".to_string(), "beta".to_string(), "gamma".to_string(),],
+            "skills must be sorted post-fold; HashMap iteration order leak"
+        );
+        assert_eq!(
+            result[0].installed_steering,
+            vec![
+                std::path::PathBuf::from("a-guide.md"),
+                std::path::PathBuf::from("m-guide.md"),
+                std::path::PathBuf::from("z-guide.md"),
+            ],
+            "steering must be sorted post-fold"
+        );
+        assert_eq!(
+            result[0].installed_agents,
+            vec![
+                "alpha-agent".to_string(),
+                "mid-agent".to_string(),
+                "zeta".to_string(),
+            ],
+            "agents must be sorted post-fold"
         );
     }
 
