@@ -1329,14 +1329,20 @@ impl MarketplaceService {
         project: &crate::project::KiroProject,
         plugin_dir: &Path,
         scan_paths: &[String],
-        format: Option<crate::plugin::PluginFormat>,
+        format: crate::plugin::PluginFormat,
         ctx: AgentInstallContext<'_>,
     ) -> InstallAgentsResult {
+        // I8: exhaustive match on the explicit `Translated` variant
+        // (vs. `Option<PluginFormat>::None`) so a future variant
+        // (e.g. `Cursor`) forces a compile-time decision here instead
+        // of silently routing through the translated path.
         match format {
-            Some(crate::plugin::PluginFormat::KiroCli) => {
+            crate::plugin::PluginFormat::KiroCli => {
                 Self::install_native_kiro_cli_agents_inner(project, plugin_dir, scan_paths, ctx)
             }
-            None => Self::install_translated_agents_inner(project, plugin_dir, scan_paths, ctx),
+            crate::plugin::PluginFormat::Translated => {
+                Self::install_translated_agents_inner(project, plugin_dir, scan_paths, ctx)
+            }
         }
     }
 
@@ -2182,7 +2188,7 @@ mod tests {
             &project,
             plugin_tmp.path(),
             &["./agents/".to_string()],
-            None,
+            crate::plugin::PluginFormat::Translated,
             AgentInstallContext {
                 mode: InstallMode::New,
                 accept_mcp: false, // existing fixtures don't carry MCP servers
@@ -2261,7 +2267,7 @@ mod tests {
             &project,
             plugin_tmp.path(),
             &["./agents/".to_string()],
-            None,
+            crate::plugin::PluginFormat::Translated,
             AgentInstallContext {
                 mode: InstallMode::New,
                 accept_mcp: false,
@@ -2309,7 +2315,7 @@ mod tests {
             &project,
             plugin_tmp.path(),
             &["./agents/".to_string()],
-            None,
+            crate::plugin::PluginFormat::Translated,
             AgentInstallContext {
                 mode: InstallMode::New,
                 accept_mcp: false,
@@ -2364,7 +2370,7 @@ mod tests {
             &project,
             plugin_tmp.path(),
             &["./agents/".to_string()],
-            None,
+            crate::plugin::PluginFormat::Translated,
             AgentInstallContext {
                 mode: InstallMode::New,
                 accept_mcp: false,
@@ -2413,7 +2419,7 @@ mod tests {
             &project,
             plugin_tmp.path(),
             &["./agents/".to_string()],
-            None,
+            crate::plugin::PluginFormat::Translated,
             AgentInstallContext {
                 mode: InstallMode::New,
                 accept_mcp: false, // gate must fire
@@ -2468,7 +2474,7 @@ mod tests {
             &project,
             plugin_tmp.path(),
             &["./agents/".to_string()],
-            None,
+            crate::plugin::PluginFormat::Translated,
             AgentInstallContext {
                 mode: InstallMode::New,
                 accept_mcp: true, // gate is bypassed
@@ -2537,7 +2543,7 @@ mod tests {
             &project,
             plugin_tmp.path(),
             &["./agents/".to_string()],
-            None,
+            crate::plugin::PluginFormat::Translated,
             AgentInstallContext {
                 mode: InstallMode::New,
                 accept_mcp: false,
@@ -2593,7 +2599,7 @@ mod tests {
             &project,
             plugin_tmp.path(),
             &["./agents/".to_string()],
-            None,
+            crate::plugin::PluginFormat::Translated,
             AgentInstallContext {
                 mode: InstallMode::Force, // force, but...
                 accept_mcp: false,        // accept_mcp = false should still gate
@@ -2634,7 +2640,7 @@ mod tests {
             &project,
             plugin_tmp.path(),
             &["./agents/".to_string()],
-            None,
+            crate::plugin::PluginFormat::Translated,
             AgentInstallContext {
                 mode: InstallMode::New,
                 accept_mcp: false,
@@ -2651,7 +2657,7 @@ mod tests {
             &project,
             plugin_tmp.path(),
             &["./agents/".to_string()],
-            None,
+            crate::plugin::PluginFormat::Translated,
             AgentInstallContext {
                 mode: InstallMode::New,
                 accept_mcp: false,
@@ -2690,7 +2696,7 @@ mod tests {
             &project,
             plugin_tmp.path(),
             &["./agents/".to_string()],
-            None,
+            crate::plugin::PluginFormat::Translated,
             AgentInstallContext {
                 mode: InstallMode::New,
                 accept_mcp: false,
@@ -2714,7 +2720,7 @@ mod tests {
             &project,
             plugin_tmp.path(),
             &["./agents/".to_string()],
-            None,
+            crate::plugin::PluginFormat::Translated,
             AgentInstallContext {
                 mode: InstallMode::Force,
                 accept_mcp: false,
@@ -2780,7 +2786,7 @@ mod tests {
             &project,
             plugin_tmp.path(),
             &["./agents/".to_string()],
-            None,
+            crate::plugin::PluginFormat::Translated,
             AgentInstallContext {
                 mode: InstallMode::New,
                 accept_mcp: false,
@@ -2842,7 +2848,7 @@ mod tests {
             &project,
             plugin_tmp.path(),
             &["./agents/".to_string()],
-            Some(crate::plugin::PluginFormat::KiroCli),
+            crate::plugin::PluginFormat::KiroCli,
             AgentInstallContext {
                 mode: InstallMode::New,
                 accept_mcp: false, // fixture has no MCP servers
@@ -2911,7 +2917,7 @@ mod tests {
             &project,
             plugin_tmp.path(),
             &["./agents/".to_string()],
-            Some(crate::plugin::PluginFormat::KiroCli),
+            crate::plugin::PluginFormat::KiroCli,
             AgentInstallContext {
                 mode: InstallMode::New,
                 accept_mcp: false, // gate fires
@@ -2971,7 +2977,7 @@ mod tests {
             &project,
             plugin_tmp.path(),
             &["./agents/".to_string(), "./extras/".to_string()],
-            Some(crate::plugin::PluginFormat::KiroCli),
+            crate::plugin::PluginFormat::KiroCli,
             AgentInstallContext {
                 mode: InstallMode::New,
                 accept_mcp: false,

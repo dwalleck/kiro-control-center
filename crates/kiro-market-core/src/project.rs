@@ -3699,6 +3699,21 @@ mod tests {
         );
     }
 
+    /// Build a tracking JSON map with three entries keyed by `keys`,
+    /// where each value is a tracking-meta object built by `value_for`.
+    /// Used by [`installed_plugins_returns_sorted_vecs_per_plugin`] to
+    /// keep the test under clippy's `too_many_lines` threshold.
+    fn build_tracking_map<F>(keys: [&str; 3], value_for: F) -> serde_json::Value
+    where
+        F: Fn() -> serde_json::Value,
+    {
+        let mut map = serde_json::Map::new();
+        for k in keys {
+            map.insert(k.to_string(), value_for());
+        }
+        serde_json::Value::Object(map)
+    }
+
     #[test]
     fn installed_plugins_returns_sorted_vecs_per_plugin() {
         // I1 regression: per-plugin Vecs (`installed_skills`,
@@ -3714,75 +3729,50 @@ mod tests {
         std::fs::create_dir_all(project.kiro_dir()).expect("kiro dir");
 
         let now = Utc::now();
+        let skill_meta = || {
+            serde_json::json!({
+                "marketplace": "mp", "plugin": "p",
+                "version": "1.0.0", "installed_at": now,
+                "source_hash": "x"
+            })
+        };
+        let steering_meta = || {
+            serde_json::json!({
+                "marketplace": "mp", "plugin": "p",
+                "version": "1.0.0", "installed_at": now,
+                "source_hash": "x", "installed_hash": "x"
+            })
+        };
+        let agent_meta = || {
+            serde_json::json!({
+                "marketplace": "mp", "plugin": "p",
+                "version": "1.0.0", "installed_at": now,
+                "dialect": "claude"
+            })
+        };
+
+        // Non-alphabetic order on every tracking file — exercises
+        // the sort-post-fold contract regardless of HashMap order.
         let skills_json = serde_json::json!({
-            "skills": {
-                "gamma": {
-                    "marketplace": "mp", "plugin": "p",
-                    "version": "1.0.0", "installed_at": now,
-                    "source_hash": "x"
-                },
-                "alpha": {
-                    "marketplace": "mp", "plugin": "p",
-                    "version": "1.0.0", "installed_at": now,
-                    "source_hash": "x"
-                },
-                "beta": {
-                    "marketplace": "mp", "plugin": "p",
-                    "version": "1.0.0", "installed_at": now,
-                    "source_hash": "x"
-                }
-            }
+            "skills": build_tracking_map(["gamma", "alpha", "beta"], skill_meta),
         });
+        let steering_json = serde_json::json!({
+            "files": build_tracking_map(["z-guide.md", "a-guide.md", "m-guide.md"], steering_meta),
+        });
+        let agents_json = serde_json::json!({
+            "agents": build_tracking_map(["zeta", "alpha-agent", "mid-agent"], agent_meta),
+        });
+
         std::fs::write(
             project.kiro_dir().join("installed-skills.json"),
             serde_json::to_vec_pretty(&skills_json).expect("ser skills"),
         )
         .expect("skills");
-
-        let steering_json = serde_json::json!({
-            "files": {
-                "z-guide.md": {
-                    "marketplace": "mp", "plugin": "p",
-                    "version": "1.0.0", "installed_at": now,
-                    "source_hash": "x", "installed_hash": "x"
-                },
-                "a-guide.md": {
-                    "marketplace": "mp", "plugin": "p",
-                    "version": "1.0.0", "installed_at": now,
-                    "source_hash": "x", "installed_hash": "x"
-                },
-                "m-guide.md": {
-                    "marketplace": "mp", "plugin": "p",
-                    "version": "1.0.0", "installed_at": now,
-                    "source_hash": "x", "installed_hash": "x"
-                }
-            }
-        });
         std::fs::write(
             project.kiro_dir().join("installed-steering.json"),
             serde_json::to_vec_pretty(&steering_json).expect("ser steering"),
         )
         .expect("steering");
-
-        let agents_json = serde_json::json!({
-            "agents": {
-                "zeta": {
-                    "marketplace": "mp", "plugin": "p",
-                    "version": "1.0.0", "installed_at": now,
-                    "dialect": "claude"
-                },
-                "alpha-agent": {
-                    "marketplace": "mp", "plugin": "p",
-                    "version": "1.0.0", "installed_at": now,
-                    "dialect": "claude"
-                },
-                "mid-agent": {
-                    "marketplace": "mp", "plugin": "p",
-                    "version": "1.0.0", "installed_at": now,
-                    "dialect": "claude"
-                }
-            }
-        });
         std::fs::write(
             project.kiro_dir().join("installed-agents.json"),
             serde_json::to_vec_pretty(&agents_json).expect("ser agents"),
@@ -3793,7 +3783,7 @@ mod tests {
         assert_eq!(result.len(), 1);
         assert_eq!(
             result[0].installed_skills,
-            vec!["alpha".to_string(), "beta".to_string(), "gamma".to_string(),],
+            vec!["alpha".to_string(), "beta".to_string(), "gamma".to_string()],
             "skills must be sorted post-fold; HashMap iteration order leak"
         );
         assert_eq!(

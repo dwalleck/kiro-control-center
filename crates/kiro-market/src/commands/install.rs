@@ -196,7 +196,7 @@ fn run_agent_install(
     plugin_dir: &Path,
     agent_scan_paths: &[String],
     skill_filter: Option<&str>,
-    format: Option<kiro_market_core::plugin::PluginFormat>,
+    format: kiro_market_core::plugin::PluginFormat,
     ctx: kiro_market_core::service::AgentInstallContext<'_>,
 ) -> InstallAgentsResult {
     // A `--skill <name>` filter narrows the install to one skill and never

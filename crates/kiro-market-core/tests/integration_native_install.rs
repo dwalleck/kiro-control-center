@@ -54,7 +54,7 @@ impl IntegrationHarness {
         marketplace: &str,
         plugin: &str,
         mode: InstallMode,
-    ) -> (Option<PluginFormat>, InstallAgentsResult) {
+    ) -> (PluginFormat, InstallAgentsResult) {
         let ctx = MarketplaceService::resolve_plugin_install_context_from_dir(plugin_dir)
             .expect("resolve plugin install context");
         let install_ctx = AgentInstallContext {
@@ -220,7 +220,7 @@ fn end_to_end_native_plugin_with_agents_and_companions(harness: IntegrationHarne
         "fake-reviewers",
         InstallMode::New,
     );
-    assert_eq!(format, Some(PluginFormat::KiroCli));
+    assert_eq!(format, PluginFormat::KiroCli);
 
     assert!(result.failed.is_empty(), "no failures: {:?}", result.failed);
     assert_eq!(result.installed.len(), 3);
@@ -281,7 +281,11 @@ fn end_to_end_translated_plugin_unaffected_by_native_dispatch(harness: Integrati
         stage_translated_plugin(harness.plugin_root.path(), "translated-plugin", "rev");
 
     let (format, result) = harness.install(&plugin_dir, "m", "translated-plugin", InstallMode::New);
-    assert!(format.is_none(), "translated plugin has no format field");
+    assert_eq!(
+        format,
+        PluginFormat::Translated,
+        "translated plugin defaults to PluginFormat::Translated when format field omitted (I8)"
+    );
 
     assert!(result.failed.is_empty(), "no failures: {:?}", result.failed);
     assert_eq!(result.installed, vec!["rev".to_string()]);
@@ -346,7 +350,7 @@ fn end_to_end_native_plugin_with_agents_companions_and_steering(harness: Integra
         "fake-reviewers",
         InstallMode::New,
     );
-    assert_eq!(format, Some(PluginFormat::KiroCli));
+    assert_eq!(format, PluginFormat::KiroCli);
     assert!(
         agent_result.failed.is_empty(),
         "no agent failures: {:?}",

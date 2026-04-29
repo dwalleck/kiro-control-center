@@ -395,10 +395,17 @@ pub struct PluginInstallContext {
     /// [`MarketplaceService::install_plugin_steering`].
     pub steering_scan_paths: Vec<String>,
     /// Authoring format declared by the plugin manifest. Drives dispatch
-    /// in [`MarketplaceService::install_plugin_agents`]: `Some(KiroCli)`
-    /// validates-and-copies native JSON; `None` (legacy) parses-and-translates
-    /// markdown agents.
-    pub format: Option<crate::plugin::PluginFormat>,
+    /// in [`MarketplaceService::install_plugin_agents`]:
+    /// [`PluginFormat::KiroCli`] validates-and-copies native JSON;
+    /// [`PluginFormat::Translated`] parses-and-translates markdown
+    /// agents. Plugins that omit the `format` field default to
+    /// [`PluginFormat::Translated`] via [`PluginFormat`]'s `Default`
+    /// impl, preserving the legacy install path.
+    ///
+    /// [`PluginFormat`]: crate::plugin::PluginFormat
+    /// [`PluginFormat::KiroCli`]: crate::plugin::PluginFormat::KiroCli
+    /// [`PluginFormat::Translated`]: crate::plugin::PluginFormat::Translated
+    pub format: crate::plugin::PluginFormat,
 }
 
 // Compile-time lock for the "Do not add `Serialize`" invariant on
@@ -781,7 +788,12 @@ impl MarketplaceService {
         let skill_dirs = discover_skills_for_plugin(plugin_dir, manifest.as_ref());
         let agent_scan_paths = agent_scan_paths_for_plugin(manifest.as_ref());
         let steering_scan_paths = steering_scan_paths_for_plugin(manifest.as_ref());
-        let format = manifest.as_ref().and_then(|m| m.format);
+        // I8: omitted `format` defaults to `PluginFormat::Translated`
+        // via the type's `Default` impl. `unwrap_or_default()` here
+        // (vs. `and_then`) makes the Option<...> → enum collapse
+        // explicit and lets the dispatch in `install_plugin_agents`
+        // be exhaustive.
+        let format = manifest.as_ref().map(|m| m.format).unwrap_or_default();
         Ok(PluginInstallContext {
             plugin_dir: plugin_dir.to_path_buf(),
             version,
@@ -3002,11 +3014,16 @@ mod tests {
 
         let ctx = MarketplaceService::resolve_plugin_install_context_from_dir(&plugin_dir)
             .expect("happy path");
-        assert_eq!(ctx.format, Some(crate::plugin::PluginFormat::KiroCli));
+        assert_eq!(ctx.format, crate::plugin::PluginFormat::KiroCli);
     }
 
     #[test]
-    fn resolve_plugin_install_context_format_absent_is_none() {
+    fn resolve_plugin_install_context_format_absent_defaults_to_translated() {
+        // I8 regression: a plugin manifest with no `format` field
+        // routes to `PluginFormat::Translated` via the type's
+        // `Default` impl. Preserves the legacy "no format means
+        // translated agents" behavior, but encodes the default in
+        // the type rather than as `Option<...>::None`.
         let (dir, _svc) = temp_service();
         let plugin_dir = dir.path().join("plugin");
         fs::create_dir_all(&plugin_dir).expect("create plugin dir");
@@ -3014,6 +3031,17 @@ mod tests {
 
         let ctx = MarketplaceService::resolve_plugin_install_context_from_dir(&plugin_dir)
             .expect("happy path");
-        assert!(ctx.format.is_none());
+        assert_eq!(ctx.format, crate::plugin::PluginFormat::Translated);
+    }
+
+    #[test]
+    fn plugin_manifest_defaults_to_translated_when_format_omitted() {
+        // I8 regression at the manifest deserialization boundary:
+        // a `plugin.json` with no `format` field deserializes to
+        // `PluginFormat::Translated` via `#[serde(default)]` on the
+        // field combined with `#[derive(Default)]` on the enum.
+        let manifest =
+            crate::plugin::PluginManifest::from_json(br#"{"name": "p"}"#).expect("parse");
+        assert_eq!(manifest.format, crate::plugin::PluginFormat::Translated);
     }
 }
