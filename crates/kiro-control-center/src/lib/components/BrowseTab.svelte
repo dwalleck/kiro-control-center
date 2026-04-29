@@ -8,6 +8,13 @@
     skillCountLabel,
     skillCountTitle,
   } from "$lib/format";
+  import {
+    DELIM,
+    pluginKey,
+    skillKey,
+    parsePluginKey,
+    parseSkillKey,
+  } from "$lib/keys";
   import type {
     InstalledPluginInfo,
     MarketplaceInfo,
@@ -44,22 +51,6 @@
   }
 
   let { projectPath }: { projectPath: string } = $props();
-
-  // Composite-key helpers. The ASCII Unit Separator (\u001f) is reserved for
-  // exactly this purpose and cannot occur in marketplace/plugin/skill names,
-  // so it never collides the way "/" or ":" would.
-  const DELIM = "\u001f";
-  const pluginKey = (mp: string, plugin: string) => `${mp}${DELIM}${plugin}`;
-  const skillKey = (mp: string, plugin: string, name: string) =>
-    `${mp}${DELIM}${plugin}${DELIM}${name}`;
-  const parsePluginKey = (key: string) => {
-    const [marketplace, plugin] = key.split(DELIM);
-    return { marketplace, plugin };
-  };
-  const parseSkillKey = (key: string) => {
-    const [marketplace, plugin, name] = key.split(DELIM);
-    return { marketplace, plugin, name };
-  };
 
   // Error-source key family. The `plugins\u001f` / `skills\u001f` /
   // `bulk-skills\u001f` prefixes embed DELIM so a marketplace literally
