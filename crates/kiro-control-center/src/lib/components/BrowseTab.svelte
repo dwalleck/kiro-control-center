@@ -3,8 +3,10 @@
   import { SvelteMap, SvelteSet } from "svelte/reactivity";
   import { commands } from "$lib/bindings";
   import {
+    formatInstallWarning,
     formatSkippedSkill,
     formatSkippedSkillsForPlugin,
+    formatSteeringWarning,
     skillCountLabel,
     skillCountTitle,
   } from "$lib/format";
@@ -21,34 +23,11 @@
     PluginInfo,
     SkillInfo,
     SkippedSkill,
-    SteeringWarning,
   } from "$lib/bindings";
   import SkillCard from "./SkillCard.svelte";
   import PluginCard from "./PluginCard.svelte";
 
   type BrowseView = "plugins" | "skills";
-
-  // Render a SteeringWarning. The explicit `default` arm with a `never`
-  // binding is the load-bearing exhaustiveness guard — if a new
-  // SteeringWarning variant lands in core (regenerating bindings.ts),
-  // the assignment fails to compile because the new variant isn't `never`.
-  // A return-type-narrowing approach (no default arm, function returns
-  // `string`) would also catch it via TS2366, but only as long as the
-  // return type stays non-`undefined` — refactoring to `void`-returning
-  // logging would silently disable the check. The assertNever pattern
-  // survives both.
-  function formatSteeringWarning(w: SteeringWarning): string {
-    switch (w.kind) {
-      case "scan_path_invalid":
-        return `invalid scan path '${w.path}': ${w.reason}`;
-      case "scan_dir_unreadable":
-        return `could not read steering dir '${w.path}': ${w.reason}`;
-      default: {
-        const _exhaustive: never = w;
-        throw new Error(`unhandled SteeringWarning variant: ${JSON.stringify(_exhaustive)}`);
-      }
-    }
-  }
 
   let { projectPath }: { projectPath: string } = $props();
 
@@ -60,8 +39,13 @@
   const SKILLS_ERR_PREFIX = `skills${DELIM}` as const;
   const BULK_SKILLS_ERR_PREFIX = `bulk-skills${DELIM}` as const;
   const ERR_MARKETPLACES = "marketplaces" as const;
+  // Standalone (non-prefixed) keys for top-level fetches that have no
+  // (marketplace, plugin) tuple. Adding more standalone keys later means
+  // extending the union in `ErrorSource` and the dispatch in `errLabel`.
+  const ERR_INSTALLED_PLUGINS = "installed-plugins" as const;
   type ErrorSource =
     | typeof ERR_MARKETPLACES
+    | typeof ERR_INSTALLED_PLUGINS
     | `${typeof PLUGINS_ERR_PREFIX}${string}`
     | `${typeof SKILLS_ERR_PREFIX}${string}${typeof DELIM}${string}`
     | `${typeof BULK_SKILLS_ERR_PREFIX}${string}`;
@@ -79,6 +63,7 @@
   // enough context to disambiguate N stacked identical-looking controls.
   function errLabel(key: ErrorSource): string {
     if (key === ERR_MARKETPLACES) return "Dismiss marketplaces error";
+    if (key === ERR_INSTALLED_PLUGINS) return "Dismiss installed-plugins error";
     if (key.startsWith(PLUGINS_ERR_PREFIX)) {
       return `Dismiss error for ${key.slice(PLUGINS_ERR_PREFIX.length)}`;
     }
@@ -127,6 +112,12 @@
   let fetchErrors = new SvelteMap<ErrorSource, string>();
   let installError: string | null = $state(null);
   let installMessage: string | null = $state(null);
+  // Non-fatal install detail (skipped idempotent items, MCP-gated agents,
+  // unmapped tools, per-skill read failures, steering scan-path warnings).
+  // Distinct from `installError` (red, fatal) and `installMessage` (green,
+  // success summary) so the user sees BOTH "installed N items" AND "agent
+  // X requires --accept-mcp" simultaneously.
+  let installWarning: string | null = $state(null);
 
   let availablePlugins = $derived.by(() => {
     const out: { marketplace: string; plugin: PluginInfo }[] = [];
@@ -394,14 +385,48 @@
   async function fetchInstalledPlugins() {
     if (!projectPath) {
       installedPlugins = [];
+      fetchErrors.delete(ERR_INSTALLED_PLUGINS);
       return;
     }
     try {
       const result = await commands.listInstalledPlugins(projectPath);
-      installedPlugins = result.status === "ok" ? result.data : [];
+      if (result.status === "ok") {
+        // Wire format is `InstalledPluginsView` (I13) — read `.plugins`,
+        // not `.data` directly. Surfacing partial-load warnings via
+        // `fetchErrors` keeps them in the same banner stack as every
+        // other failure on this tab; a console-only log would let the
+        // user wonder why a plugin they just installed shows "Install"
+        // again instead of "Installed".
+        installedPlugins = result.data.plugins;
+        const warnings = result.data.partial_load_warnings ?? [];
+        if (warnings.length > 0) {
+          const summary = warnings
+            .map((w) => `${w.tracking_file}: ${w.error}`)
+            .join("; ");
+          fetchErrors.set(
+            ERR_INSTALLED_PLUGINS,
+            `Installed plugins partially loaded — ${summary}`,
+          );
+        } else {
+          fetchErrors.delete(ERR_INSTALLED_PLUGINS);
+        }
+      } else {
+        // Real Tauri-layer error (e.g. validate_kiro_project_path failed).
+        // Surface — don't silently fall back to an empty array, which
+        // would re-show "Install" buttons for plugins that may already
+        // be installed and re-enable double-installs.
+        console.error("[BrowseTab] listInstalledPlugins error", result.error);
+        fetchErrors.set(
+          ERR_INSTALLED_PLUGINS,
+          `Could not load installed plugins: ${result.error.message}`,
+        );
+      }
     } catch (e) {
       console.error("[BrowseTab] listInstalledPlugins rejected", e);
-      installedPlugins = [];
+      fetchErrors.set(
+        ERR_INSTALLED_PLUGINS,
+        `Could not load installed plugins: ${e instanceof Error ? e.message : String(e)}`,
+      );
     }
   }
 
@@ -519,6 +544,7 @@
     installing = true;
     installError = null;
     installMessage = null;
+    installWarning = null;
 
     type Group = { marketplace: string; plugin: string; names: string[] };
     const groups = new Map<string, Group>();
@@ -633,6 +659,7 @@
     pendingSteeringInstalls.add(key);
     installError = null;
     installMessage = null;
+    installWarning = null;
 
     try {
       const result = await commands.installPluginSteering(
@@ -690,14 +717,27 @@
 
   // Whole-plugin install — runs every install path the plugin declares
   // (skills + steering + agents) in one coordinated call. Surfaces the
-  // aggregated outcome in installMessage / installError, same as the
-  // skill and steering flows.
+  // aggregated outcome across THREE banner states:
+  //   - `installMessage` (green): success summary including idempotent skips
+  //   - `installError`   (red):   fatal — at least one failure and zero installs
+  //   - `installWarning` (amber): non-fatal detail (skipped_skills, steering
+  //                               scan warnings, MCP-gated agents, unmapped
+  //                               tools). Mirrors `installSelected`'s
+  //                               accumulation pattern.
+  //
+  // The MCP-gated path is the security-critical one: with `accept_mcp = false`
+  // an agent declaring `mcp_servers` produces `InstallWarning::McpServersRequireOptIn`
+  // and never lands in `installed` or `failed`. Previously the count would
+  // silently disappear ("1 of 2 agents installed" with no explanation); the
+  // new warning banner names the agent and lists its transports so the user
+  // can re-run with the opt-in if they want it.
   async function installWholePlugin(marketplace: string, plugin: string) {
     const key = pluginKey(marketplace, plugin);
     if (pendingPluginInstalls.has(key)) return;
     pendingPluginInstalls.add(key);
     installError = null;
     installMessage = null;
+    installWarning = null;
 
     try {
       // 4th arg is `acceptMcp` — Phase 1 hardcodes false. Phase 2 will
@@ -712,28 +752,92 @@
       );
       if (result.status === "ok") {
         const r = result.data;
-        const parts: string[] = [];
-        const sInstalled = r.skills.installed.length;
-        const sFailed = r.skills.failed.length;
-        const stInstalled = r.steering.installed.length;
-        const stFailed = r.steering.failed.length;
-        const aInstalled = r.agents.installed.length;
-        const aFailed = r.agents.failed.length;
-        if (sInstalled > 0) parts.push(`${sInstalled} skill${sInstalled === 1 ? "" : "s"}`);
-        if (sFailed > 0) parts.push(`${sFailed} skill${sFailed === 1 ? "" : "s"} failed`);
-        if (stInstalled > 0)
-          parts.push(`${stInstalled} steering file${stInstalled === 1 ? "" : "s"}`);
-        if (stFailed > 0) parts.push(`${stFailed} steering failed`);
-        if (aInstalled > 0) parts.push(`${aInstalled} agent${aInstalled === 1 ? "" : "s"}`);
-        if (aFailed > 0) parts.push(`${aFailed} agent${aFailed === 1 ? "" : "s"} failed`);
+        const summaryParts: string[] = [];
+        const warningParts: string[] = [];
 
-        const anyFailed = sFailed + stFailed + aFailed > 0;
-        const anyInstalled = sInstalled + stInstalled + aInstalled > 0;
-        const summary = parts.length > 0 ? parts.join(" · ") : "nothing to install";
+        // Skills: installed / failed / skipped (idempotent) / skipped_skills
+        // (per-file read or parse failures). `skipped_skills` is the
+        // structurally-distinct "couldn't even attempt to install" bucket.
+        {
+          const skills = r.skills;
+          if (skills.installed.length > 0) {
+            const noun = skills.installed.length === 1 ? "skill" : "skills";
+            summaryParts.push(`${skills.installed.length} ${noun}`);
+          }
+          if (skills.failed.length > 0) {
+            const noun = skills.failed.length === 1 ? "skill" : "skills";
+            summaryParts.push(`${skills.failed.length} ${noun} failed`);
+          }
+          if (skills.skipped.length > 0) {
+            const noun = skills.skipped.length === 1 ? "skill" : "skills";
+            summaryParts.push(`${skills.skipped.length} ${noun} already installed`);
+          }
+          if (skills.skipped_skills.length > 0) {
+            warningParts.push(formatSkippedSkillsForPlugin(skills.skipped_skills));
+          }
+        }
+
+        // Steering: idempotent reinstalls land in `installed` with
+        // `kind = idempotent` (not a separate `skipped` field — see
+        // `InstalledSteeringOutcome.kind`). Surfacing the breakdown is
+        // a Phase 2 follow-up; for now the count is the lump sum.
+        {
+          const steering = r.steering;
+          if (steering.installed.length > 0) {
+            const noun = steering.installed.length === 1 ? "file" : "files";
+            summaryParts.push(`${steering.installed.length} steering ${noun}`);
+          }
+          if (steering.failed.length > 0) {
+            summaryParts.push(`${steering.failed.length} steering failed`);
+          }
+          if (steering.warnings.length > 0) {
+            for (const w of steering.warnings) {
+              warningParts.push(formatSteeringWarning(w));
+            }
+          }
+        }
+
+        // Agents: includes `skipped` (idempotent native reinstalls) and
+        // `warnings` (MCP-gated, unmapped tools, parse failures on
+        // non-agent files in the scan dir). Without surfacing warnings
+        // here, `McpServersRequireOptIn` would silently drop agents.
+        {
+          const agents = r.agents;
+          if (agents.installed.length > 0) {
+            const noun = agents.installed.length === 1 ? "agent" : "agents";
+            summaryParts.push(`${agents.installed.length} ${noun}`);
+          }
+          if (agents.failed.length > 0) {
+            const noun = agents.failed.length === 1 ? "agent" : "agents";
+            summaryParts.push(`${agents.failed.length} ${noun} failed`);
+          }
+          if (agents.skipped.length > 0) {
+            const noun = agents.skipped.length === 1 ? "agent" : "agents";
+            summaryParts.push(`${agents.skipped.length} ${noun} already installed`);
+          }
+          if (agents.warnings.length > 0) {
+            for (const w of agents.warnings) {
+              warningParts.push(formatInstallWarning(w));
+            }
+          }
+        }
+
+        const anyFailed =
+          r.skills.failed.length + r.steering.failed.length + r.agents.failed.length > 0;
+        const anyInstalled =
+          r.skills.installed.length +
+            r.steering.installed.length +
+            r.agents.installed.length >
+          0;
+        const summary = summaryParts.length > 0 ? summaryParts.join(" · ") : "nothing to install";
+
         if (anyFailed && !anyInstalled) {
           installError = `Plugin install failed for ${plugin}: ${summary}`;
         } else {
           installMessage = `Plugin ${plugin}: ${summary}`;
+        }
+        if (warningParts.length > 0) {
+          installWarning = `Plugin ${plugin}: ${warningParts.join(" | ")}`;
         }
         await fetchInstalledPlugins();
       } else {
@@ -1007,6 +1111,23 @@
   {#if installMessage}
     <div class="mx-4 mt-3 px-4 py-3 rounded-md bg-kiro-success/10 border border-kiro-success/30">
       <p class="text-sm text-kiro-success">{installMessage}</p>
+    </div>
+  {/if}
+
+  {#if installWarning}
+    <div
+      data-testid="install-warning"
+      class="mx-4 mt-3 px-4 py-3 rounded-md bg-kiro-warning/10 border border-kiro-warning/30 flex items-start gap-3"
+    >
+      <p class="text-sm text-kiro-warning flex-1">{installWarning}</p>
+      <button
+        type="button"
+        onclick={() => (installWarning = null)}
+        aria-label="Dismiss install warning"
+        class="text-kiro-warning/70 hover:text-kiro-warning text-lg leading-none flex-shrink-0 focus:outline-none focus:ring-2 focus:ring-kiro-accent-500 rounded"
+      >
+        ×
+      </button>
     </div>
   {/if}
 

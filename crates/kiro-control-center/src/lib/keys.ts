@@ -20,16 +20,31 @@ export const skillKey = (
   name: string,
 ): string => `${marketplace}${DELIM}${plugin}${DELIM}${name}`;
 
+// Throw on malformed input rather than returning `{ plugin: undefined }`
+// dressed up as `{ plugin: string }`. Every call site round-trips through
+// `pluginKey` / `skillKey`, so a malformed key is a programmer bug —
+// throwing makes the bug loud instead of silent (e.g. `fetchErrors.keys()`
+// later produces an `undefined` field that flows into a banner).
 export const parsePluginKey = (
   key: string,
 ): { marketplace: string; plugin: string } => {
-  const [marketplace, plugin] = key.split(DELIM);
-  return { marketplace, plugin };
+  const parts = key.split(DELIM);
+  if (parts.length !== 2 || parts[0] === "" || parts[1] === "") {
+    throw new Error(
+      `parsePluginKey: malformed key (expected exactly one DELIM separator): ${JSON.stringify(key)}`,
+    );
+  }
+  return { marketplace: parts[0], plugin: parts[1] };
 };
 
 export const parseSkillKey = (
   key: string,
 ): { marketplace: string; plugin: string; name: string } => {
-  const [marketplace, plugin, name] = key.split(DELIM);
-  return { marketplace, plugin, name };
+  const parts = key.split(DELIM);
+  if (parts.length !== 3 || parts.some((p) => p === "")) {
+    throw new Error(
+      `parseSkillKey: malformed key (expected exactly two DELIM separators): ${JSON.stringify(key)}`,
+    );
+  }
+  return { marketplace: parts[0], plugin: parts[1], name: parts[2] };
 };

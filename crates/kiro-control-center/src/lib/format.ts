@@ -1,4 +1,11 @@
-import type { SkillCount, SkippedReason, SkippedSkill } from "$lib/bindings";
+import type {
+  InstallWarning,
+  ParseFailure,
+  SkillCount,
+  SkippedReason,
+  SkippedSkill,
+  SteeringWarning,
+} from "$lib/bindings";
 
 // Render a structured SkippedReason as a one-line string. Total over
 // all eight variants (not just the six reachable via SkillCount) —
@@ -54,10 +61,12 @@ export function skillCountTitle(sc: SkillCount): string | undefined {
 // sites that consume SkippedSkill.
 export function formatSkippedSkill(s: SkippedSkill): string {
   const label = s.name_hint ?? "<unnamed>";
-  // SkippedSkillReason is a discriminated union on `kind`. A future
-  // variant would land here as an unknown kind with a generic
-  // "unreadable" label rather than a compile error — consistent with
-  // the Rust #[non_exhaustive] attribute on the enum.
+  // SkippedSkillReason is a discriminated union on `kind`. The default
+  // arm uses an assertNever binding so a new variant lands as a
+  // compile-time error here rather than a silent "unreadable"
+  // collapse — `#[non_exhaustive]` on the Rust side is for runtime
+  // forward-compat, but the UI side benefits from the type system
+  // forcing a renderer update when bindings.ts grows.
   let reason: string;
   switch (s.reason.kind) {
     case "read_failed":
@@ -66,10 +75,89 @@ export function formatSkippedSkill(s: SkippedSkill): string {
     case "frontmatter_invalid":
       reason = `malformed frontmatter: ${s.reason.reason}`;
       break;
-    default:
-      reason = "unreadable";
+    default: {
+      const _exhaustive: never = s.reason;
+      throw new Error(
+        `unhandled SkippedSkillReason variant: ${JSON.stringify(_exhaustive)}`,
+      );
+    }
   }
   return `${label}: ${reason}`;
+}
+
+// Render a SteeringWarning as a one-line label. Lifted from BrowseTab
+// once a second consumer (installWholePlugin) appeared — keeping it
+// inline would have meant two drift-prone copies of the assertNever
+// guard.
+export function formatSteeringWarning(w: SteeringWarning): string {
+  switch (w.kind) {
+    case "scan_path_invalid":
+      return `invalid scan path '${w.path}': ${w.reason}`;
+    case "scan_dir_unreadable":
+      return `could not read steering dir '${w.path}': ${w.reason}`;
+    default: {
+      const _exhaustive: never = w;
+      throw new Error(
+        `unhandled SteeringWarning variant: ${JSON.stringify(_exhaustive)}`,
+      );
+    }
+  }
+}
+
+// Render an `InstallWarning` (from agent installs) as a one-line
+// label. The `mcp_servers_require_opt_in` variant is the
+// security-sensitive one — an agent declaring MCP servers was
+// refused because `accept_mcp` is false. Surfacing the listed
+// transports lets the user understand the risk surface before
+// re-running with the opt-in.
+export function formatInstallWarning(w: InstallWarning): string {
+  switch (w.kind) {
+    case "unmapped_tool":
+      return `agent '${w.agent}' dropped unmapped tool '${w.tool}' (${w.reason})`;
+    case "agent_parse_failed":
+      return `agent file '${w.path}' could not be parsed: ${formatParseFailure(w.failure)}`;
+    case "mcp_servers_require_opt_in": {
+      const transports = w.transports.length > 0
+        ? ` [${w.transports.join(", ")}]`
+        : "";
+      return `agent '${w.agent}' declares MCP servers${transports} — re-run with --accept-mcp to install`;
+    }
+    default: {
+      const _exhaustive: never = w;
+      throw new Error(
+        `unhandled InstallWarning variant: ${JSON.stringify(_exhaustive)}`,
+      );
+    }
+  }
+}
+
+// Helper for `agent_parse_failed`. Kept module-private — the only
+// consumer today is `formatInstallWarning`, but the shape is the same
+// assertNever-guarded discriminated-union switch the other formatters
+// use, so a future caller can lift it without rework.
+function formatParseFailure(f: ParseFailure): string {
+  switch (f.kind) {
+    case "missing_frontmatter":
+      return "missing frontmatter fence";
+    case "unclosed_frontmatter":
+      return "unclosed frontmatter fence";
+    case "invalid_yaml":
+      return `invalid YAML: ${f.reason}`;
+    case "missing_name":
+      return "missing 'name' in frontmatter";
+    case "invalid_name":
+      return `invalid name: ${f.reason}`;
+    case "io_error":
+      return `I/O error: ${f.reason}`;
+    case "unsupported_dialect":
+      return "unsupported dialect for this code path";
+    default: {
+      const _exhaustive: never = f;
+      throw new Error(
+        `unhandled ParseFailure variant: ${JSON.stringify(_exhaustive)}`,
+      );
+    }
+  }
 }
 
 export function formatSkippedSkillsForPlugin(list: readonly SkippedSkill[]): string {

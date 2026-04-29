@@ -110,12 +110,17 @@ test.describe("Marketplace workflow", () => {
   });
 
   test("install plugin from browse tab and verify in installed tab", async ({ page }) => {
-    await page.getByRole("button", { name: "Browse", exact: true }).click();
+    await page.goto("/");
 
     // The earlier "add local marketplace" test seeds FIXTURE_MARKETPLACE_PATH.
     // Skip if the fixture isn't available (matches the skill-install pattern).
+    // Pre-skip BEFORE clicking the Browse rail so a missing fixture doesn't
+    // race a hard-fail click against the skip — sibling tests at lines 91-110
+    // and 64-89 set the precedent.
     const fixturePath = process.env.FIXTURE_MARKETPLACE_PATH;
     test.skip(!fixturePath, "FIXTURE_MARKETPLACE_PATH not set");
+
+    await page.getByRole("button", { name: "Browse", exact: true }).click();
 
     // Switch to the Plugins view if the toggle isn't already on it. The
     // Plugins button is the default per Task 7's BrowseView state, but

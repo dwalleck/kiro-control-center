@@ -13,6 +13,10 @@
   let skills: InstalledSkillInfo[] = $state([]);
   let loading: boolean = $state(true);
   let loadError: string | null = $state(null);
+  // Non-fatal partial-load detail (one or more `installed-*.json` tracking
+  // files failed to parse; the others loaded). Distinct from `loadError`
+  // (red, fatal) — the table still has rows from the files that DID load.
+  let loadWarning: string | null = $state(null);
   // Single removal in flight at a time — `remove_plugin` reads/writes the
   // installed-skills/steering/agents tracking files, so racing two removes
   // could clobber each other. Disabling all Remove buttons while one is
@@ -22,13 +26,25 @@
   async function refresh() {
     loading = true;
     loadError = null;
+    loadWarning = null;
     try {
       const [pluginsResult, skillsResult] = await Promise.all([
         commands.listInstalledPlugins(projectPath),
         commands.listInstalledSkills(projectPath),
       ]);
       if (pluginsResult.status === "ok") {
-        plugins = pluginsResult.data;
+        // Wire format is `InstalledPluginsView` (I13): `.plugins` carries
+        // the rows, `.partial_load_warnings` carries per-tracking-file
+        // load failures (corrupt installed-*.json) so the table renders
+        // the partial state instead of a misleading empty list.
+        plugins = pluginsResult.data.plugins;
+        const warnings = pluginsResult.data.partial_load_warnings ?? [];
+        if (warnings.length > 0) {
+          const summary = warnings
+            .map((w) => `${w.tracking_file}: ${w.error}`)
+            .join("; ");
+          loadWarning = `Installed plugins partially loaded — ${summary}`;
+        }
       } else {
         loadError = pluginsResult.error.message;
       }
@@ -102,6 +118,22 @@
         <p class="text-sm text-kiro-error">{loadError}</p>
       </div>
     {:else}
+      {#if loadWarning}
+        <div
+          data-testid="installed-load-warning"
+          class="mb-4 px-4 py-3 rounded-md bg-kiro-warning/10 border border-kiro-warning/30 flex items-start gap-3"
+        >
+          <p class="text-sm text-kiro-warning flex-1">{loadWarning}</p>
+          <button
+            type="button"
+            onclick={() => (loadWarning = null)}
+            aria-label="Dismiss installed-plugins warning"
+            class="text-kiro-warning/70 hover:text-kiro-warning text-lg leading-none flex-shrink-0 focus:outline-none focus:ring-2 focus:ring-kiro-accent-500 rounded"
+          >
+            ×
+          </button>
+        </div>
+      {/if}
       <section class="mb-6">
         <h2 class="text-sm font-semibold text-kiro-text mb-3">Installed plugins</h2>
         {#if plugins.length === 0}
