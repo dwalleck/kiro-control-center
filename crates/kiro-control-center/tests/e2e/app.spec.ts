@@ -109,6 +109,46 @@ test.describe("Marketplace workflow", () => {
     await expect(page.getByText(/test-skill/i).first()).toBeVisible();
   });
 
+  test("install plugin from browse tab and verify in installed tab", async ({ page }) => {
+    await page.getByRole("button", { name: "Browse", exact: true }).click();
+
+    // The earlier "add local marketplace" test seeds FIXTURE_MARKETPLACE_PATH.
+    // Skip if the fixture isn't available (matches the skill-install pattern).
+    const fixturePath = process.env.FIXTURE_MARKETPLACE_PATH;
+    test.skip(!fixturePath, "FIXTURE_MARKETPLACE_PATH not set");
+
+    // Switch to the Plugins view if the toggle isn't already on it. The
+    // Plugins button is the default per Task 7's BrowseView state, but
+    // switching defensively keeps the test robust to a future default change.
+    const pluginsToggle = page.getByRole("button", { name: "Plugins", exact: true });
+    if (await pluginsToggle.isVisible({ timeout: 2_000 }).catch(() => false)) {
+      await pluginsToggle.click();
+    }
+
+    // Find a plugin card with the test fixture's plugin name. PluginCard
+    // exposes "Install plugin" via aria-label="Install <name>".
+    const testPlugin = page.getByText(/test-plugin/i).first();
+    if (!(await testPlugin.isVisible({ timeout: 5_000 }).catch(() => false))) {
+      test.skip(true, "No marketplace with test-plugin available");
+    }
+
+    const installButton = page
+      .getByRole("button", { name: /install test-plugin/i })
+      .first();
+    await installButton.click();
+
+    // Wait for the success banner. Matches the success-banner pattern from
+    // the skill-install test.
+    await expect(page.getByText(/Plugin test-plugin/i)).toBeVisible({
+      timeout: 30_000,
+    });
+
+    // Navigate to Installed tab and assert the plugin row appears.
+    await page.getByRole("button", { name: "Installed", exact: true }).click();
+    await expect(page.getByRole("heading", { name: /installed plugins/i })).toBeVisible();
+    await expect(page.getByText(/test-plugin/i).first()).toBeVisible();
+  });
+
   test("broken marketplace surfaces dismissible banner that clears on deselect", async ({ page }) => {
     const brokenPath = process.env.FIXTURE_BROKEN_MARKETPLACE_PATH;
     if (!brokenPath) {
