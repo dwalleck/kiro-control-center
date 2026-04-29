@@ -113,6 +113,17 @@ pub enum SteeringError {
     #[non_exhaustive]
     #[error("steering tracking JSON malformed at `{path}`: {reason}")]
     TrackingMalformed { path: PathBuf, reason: String },
+
+    /// The steering file is not tracked in `installed-steering.json`.
+    /// Returned by `KiroProject::remove_steering_file` when the caller
+    /// asks to remove a `rel` path that has no tracking entry. Mirrors
+    /// [`crate::error::SkillError::NotInstalled`] /
+    /// [`crate::error::AgentError::NotInstalled`] so the
+    /// `remove_plugin` cascade can match on a uniform "tracking entry
+    /// missing" shape across all three content types.
+    #[non_exhaustive]
+    #[error("steering file `{rel}` is not tracked in installed-steering.json")]
+    NotInstalled { rel: PathBuf },
 }
 
 /// Construct a [`SteeringError::TrackingMalformed`] from a `serde_json::Error`,
@@ -329,6 +340,35 @@ mod tests {
              SkippedReason / FailedSkillReason / InstallOutcomeKind. Frontend code \
              writes `if (warning.kind === \"scan_path_invalid\")` — reverting this \
              attribute would silently break that pattern."
+        );
+    }
+
+    /// `SteeringError::NotInstalled` is the cascade-uniform "missing
+    /// tracking entry" variant used by
+    /// [`crate::project::KiroProject::remove_steering_file`] and the
+    /// `remove_plugin` cascade. The variant carries no `#[source]` —
+    /// the orphaned-tracking case isn't an underlying I/O / parse
+    /// failure, just a state mismatch. Locking that here keeps a
+    /// future variant addition from accidentally introducing a chain.
+    #[test]
+    fn not_installed_renders_rel_and_exposes_no_source_chain() {
+        use std::error::Error as _;
+        let err = SteeringError::NotInstalled {
+            rel: PathBuf::from("guide.md"),
+        };
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains("guide.md"),
+            "rendered message must name the offending rel path, got: {rendered}"
+        );
+        assert!(
+            rendered.contains("not tracked"),
+            "rendered message must convey the not-tracked semantic, got: {rendered}"
+        );
+        assert!(
+            err.source().is_none(),
+            "NotInstalled is a state mismatch, not an underlying I/O failure — \
+             must not expose a source chain"
         );
     }
 

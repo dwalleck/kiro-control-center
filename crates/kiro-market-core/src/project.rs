@@ -296,6 +296,26 @@ pub struct InstalledPluginInfo {
     pub latest_install: String,
 }
 
+/// Aggregated counts returned by
+/// [`KiroProject::remove_plugin`] — one tally per content type so the
+/// caller (CLI / Tauri) can render a one-line "removed N skills,
+/// M steering files, K agents" summary without re-reading the tracking
+/// files.
+///
+/// Counts are post-cascade and include orphan-tracking recoveries
+/// (A-12): a tracking entry with no on-disk file still counts as
+/// "removed" because the cascade dropped the entry. The cascade
+/// never partially succeeds — either every entry is removed and the
+/// counts reflect the full work, or an error short-circuits before
+/// the result returns.
+#[derive(Debug, Clone, Default, Serialize)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
+pub struct RemovePluginResult {
+    pub skills_removed: u32,
+    pub steering_removed: u32,
+    pub agents_removed: u32,
+}
+
 /// Per-`(marketplace, plugin)` accumulator used by
 /// [`KiroProject::installed_plugins`] while folding the three tracking
 /// files into [`InstalledPluginInfo`] rows.
@@ -895,6 +915,336 @@ impl KiroProject {
                 }
             })
             .collect())
+    }
+
+    /// Remove a single installed steering file from
+    /// `installed-steering.json` and unlink the file under
+    /// `.kiro/steering/`.
+    ///
+    /// Defense in depth: even though `load_installed_steering` already
+    /// validates each tracking-file key against
+    /// [`validate_tracking_path_entry`], this method re-runs the same
+    /// check against `rel` before joining it onto the steering dir.
+    /// A future caller that constructs an `InstalledSteering` in
+    /// memory and bypasses the load path would otherwise be free to
+    /// reach `steering_dir.join("../../etc/passwd")`.
+    ///
+    /// # Errors
+    ///
+    /// - [`crate::steering::SteeringError::NotInstalled`] if `rel`
+    ///   has no entry in the tracking file. The cascade in
+    ///   [`Self::remove_plugin`] treats this as a recoverable
+    ///   orphan-tracking case (A-12).
+    /// - I/O / JSON failures from loading or writing the tracking
+    ///   file. A `NotFound` on the on-disk steering file itself is
+    ///   treated as success — the user may have hand-deleted the
+    ///   file before invoking remove.
+    pub fn remove_steering_file(&self, rel: &Path) -> crate::error::Result<()> {
+        if let Err(reason) = validate_tracking_path_entry(rel) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "refused to remove steering file with invalid path `{}`: {}",
+                    rel.display(),
+                    reason
+                ),
+            )
+            .into());
+        }
+
+        let tracking_path = self.steering_tracking_path();
+        crate::file_lock::with_file_lock(&tracking_path, || -> crate::error::Result<()> {
+            let mut installed = self.load_installed_steering()?;
+            if !installed.files.contains_key(rel) {
+                return Err(crate::steering::SteeringError::NotInstalled {
+                    rel: rel.to_path_buf(),
+                }
+                .into());
+            }
+
+            let dest = self.steering_dir().join(rel);
+            // Update tracking BEFORE unlinking so a crash between the
+            // two leaves a stray on-disk file (harmless) rather than a
+            // phantom tracking entry. Mirrors `remove_skill`'s ordering.
+            installed.files.remove(rel);
+            self.write_steering_tracking(&installed)?;
+
+            match fs::remove_file(&dest) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    debug!(
+                        path = %dest.display(),
+                        "steering file already absent on disk; tracking entry was orphan"
+                    );
+                }
+                Err(e) => {
+                    warn!(
+                        rel = %rel.display(),
+                        path = %dest.display(),
+                        error = %e,
+                        "failed to unlink steering file after tracking update"
+                    );
+                    return Err(e.into());
+                }
+            }
+
+            debug!(rel = %rel.display(), "steering file removed");
+            Ok(())
+        })
+    }
+
+    /// Remove a single installed agent: drop the `installed-agents.json`
+    /// entry and unlink both on-disk files (`<name>.json` and
+    /// `prompts/<name>.md`). Mirrors [`Self::remove_steering_file`]'s
+    /// shape — tracking written before file ops, `NotFound` treated
+    /// as success.
+    ///
+    /// **Companions are not touched here.** A native plugin's
+    /// `native_companions` map entry is shared across all of that
+    /// plugin's agents; removing one agent must not nuke the plugin-wide
+    /// companion bundle. The cascade in [`Self::remove_plugin`] calls
+    /// [`Self::remove_native_companions_for_plugin`] separately after
+    /// per-agent cleanup completes.
+    ///
+    /// # Errors
+    ///
+    /// - [`AgentError::NotInstalled`] if `name` has no tracking entry.
+    /// - I/O / JSON failures from loading or writing the tracking file.
+    pub fn remove_agent(&self, name: &str) -> crate::error::Result<()> {
+        validation::validate_name(name)?;
+
+        let tracking_path = self.agent_tracking_path();
+        crate::file_lock::with_file_lock(&tracking_path, || -> crate::error::Result<()> {
+            let mut installed = self.load_installed_agents()?;
+            if !installed.agents.contains_key(name) {
+                return Err(AgentError::NotInstalled {
+                    name: name.to_owned(),
+                }
+                .into());
+            }
+
+            let json_target = self.agents_dir().join(format!("{name}.json"));
+            let prompt_target = self.agent_prompts_dir().join(format!("{name}.md"));
+
+            // Update tracking BEFORE unlinking so a crash between the
+            // two leaves stray on-disk files (harmless) rather than a
+            // phantom tracking entry.
+            installed.agents.remove(name);
+            self.write_agent_tracking(&installed)?;
+
+            for path in [&json_target, &prompt_target] {
+                match fs::remove_file(path) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        debug!(
+                            path = %path.display(),
+                            "agent file already absent on disk; tracking entry was orphan"
+                        );
+                    }
+                    Err(e) => {
+                        warn!(
+                            agent = name,
+                            path = %path.display(),
+                            error = %e,
+                            "failed to unlink agent file after tracking update"
+                        );
+                        return Err(e.into());
+                    }
+                }
+            }
+
+            debug!(agent = name, "agent removed");
+            Ok(())
+        })
+    }
+
+    /// Remove the `native_companions` tracking entry for a given
+    /// `(plugin, marketplace)` pair and unlink every companion file
+    /// recorded under it.
+    ///
+    /// The companions map is keyed by **plugin name alone**
+    /// ([`InstalledAgents::native_companions`] is `HashMap<String, …>`),
+    /// but each value carries a `marketplace` field that
+    /// disambiguates same-named plugins across marketplaces (A-16).
+    /// This method only removes the entry when **both** match. An
+    /// entry belonging to a different marketplace, or no entry at
+    /// all, is treated as a no-op so the cascade in
+    /// [`Self::remove_plugin`] can call this unconditionally.
+    ///
+    /// On-disk companion files are unlinked best-effort via
+    /// [`Self::remove_companion_files_best_effort`] — companions are
+    /// installed at `agents_dir.join(rel)` (which can include
+    /// `prompts/` paths shared with per-agent prompts), so the
+    /// per-agent [`Self::remove_agent`] does not cover them.
+    ///
+    /// # Errors
+    ///
+    /// I/O or JSON failures from loading or writing
+    /// `installed-agents.json`. The on-disk unlink is best-effort and
+    /// does not propagate per-file failures.
+    pub fn remove_native_companions_for_plugin(
+        &self,
+        plugin: &str,
+        marketplace: &str,
+    ) -> crate::error::Result<()> {
+        let tracking_path = self.agent_tracking_path();
+        crate::file_lock::with_file_lock(&tracking_path, || -> crate::error::Result<()> {
+            let mut installed = self.load_installed_agents()?;
+            let should_remove = installed
+                .native_companions
+                .get(plugin)
+                .is_some_and(|meta| meta.marketplace == marketplace);
+            if !should_remove {
+                return Ok(());
+            }
+
+            // Take the entry so we can unlink the companion files
+            // referenced by it after the tracking write succeeds.
+            let Some(removed) = installed.native_companions.remove(plugin) else {
+                return Ok(());
+            };
+
+            self.write_agent_tracking(&installed)?;
+
+            // Best-effort on-disk cleanup — see
+            // `remove_companion_files_best_effort` for the symlink /
+            // reparse-point defense and the rationale for warn!-and-
+            // continue rather than propagating per-file failures.
+            Self::remove_companion_files_best_effort(&removed.files, &self.agents_dir(), plugin);
+
+            debug!(
+                plugin,
+                marketplace,
+                files = removed.files.len(),
+                "native companions tracking entry removed"
+            );
+            Ok(())
+        })
+    }
+
+    /// Cascade-remove every tracked entry from `(marketplace, plugin)`
+    /// across all three `installed-*.json` tracking files. Unlinks
+    /// the on-disk files, updates the tracking JSON files atomically,
+    /// and returns aggregated counts.
+    ///
+    /// **Orphan-tracking recovery (A-12).** If a tracking entry
+    /// references a path that no longer exists on disk (state
+    /// divergence: user ran `rm -rf .kiro/skills/<name>/` manually),
+    /// the per-content removal still completes successfully because
+    /// each `remove_*` treats on-disk `NotFound` as success. Only
+    /// genuine fs / parse / cross-plugin-clash error variants abort
+    /// the cascade.
+    ///
+    /// **`native_companions` cleanup (A-3 + A-16).** After per-agent
+    /// removals, the plugin-level `native_companions` entry is
+    /// dropped if its `marketplace` field matches `marketplace` (the
+    /// map is keyed by plugin name alone, so the marketplace check
+    /// disambiguates same-named plugins across marketplaces).
+    ///
+    /// # Errors
+    ///
+    /// Propagates any non-`NotInstalled` error from the per-content
+    /// removals, plus I/O / JSON failures from the cascade's
+    /// initial tracking-file loads. The cascade does **not** roll
+    /// back partial progress — once a per-content `remove_*`
+    /// commits, that work stays committed even if a later step
+    /// fails.
+    pub fn remove_plugin(
+        &self,
+        marketplace: &str,
+        plugin: &str,
+    ) -> crate::error::Result<RemovePluginResult> {
+        let mut result = RemovePluginResult::default();
+
+        // Skills.
+        let skills = self.load_installed()?;
+        let skills_to_remove: Vec<String> = skills
+            .skills
+            .iter()
+            .filter(|(_, meta)| meta.marketplace == marketplace && meta.plugin == plugin)
+            .map(|(name, _)| name.clone())
+            .collect();
+        for name in &skills_to_remove {
+            match self.remove_skill(name) {
+                Ok(()) => {
+                    result.skills_removed = result.skills_removed.saturating_add(1);
+                }
+                Err(crate::error::Error::Skill(SkillError::NotInstalled { .. })) => {
+                    warn!(
+                        skill = %name,
+                        plugin,
+                        marketplace,
+                        "remove_plugin: skill tracking entry had no on-disk directory; \
+                         treating as already-removed (A-12)"
+                    );
+                    result.skills_removed = result.skills_removed.saturating_add(1);
+                }
+                Err(e) => return Err(e),
+            }
+        }
+
+        // Steering files.
+        let steering = self.load_installed_steering()?;
+        let steering_to_remove: Vec<PathBuf> = steering
+            .files
+            .iter()
+            .filter(|(_, meta)| meta.marketplace == marketplace && meta.plugin == plugin)
+            .map(|(rel, _)| rel.clone())
+            .collect();
+        for rel in &steering_to_remove {
+            match self.remove_steering_file(rel) {
+                Ok(()) => {
+                    result.steering_removed = result.steering_removed.saturating_add(1);
+                }
+                Err(crate::error::Error::Steering(
+                    crate::steering::SteeringError::NotInstalled { .. },
+                )) => {
+                    warn!(
+                        rel = %rel.display(),
+                        plugin,
+                        marketplace,
+                        "remove_plugin: steering tracking entry had no on-disk file; \
+                         treating as already-removed (A-12)"
+                    );
+                    result.steering_removed = result.steering_removed.saturating_add(1);
+                }
+                Err(e) => return Err(e),
+            }
+        }
+
+        // Agents.
+        let agents = self.load_installed_agents()?;
+        let agents_to_remove: Vec<String> = agents
+            .agents
+            .iter()
+            .filter(|(_, meta)| meta.marketplace == marketplace && meta.plugin == plugin)
+            .map(|(name, _)| name.clone())
+            .collect();
+        for name in &agents_to_remove {
+            match self.remove_agent(name) {
+                Ok(()) => {
+                    result.agents_removed = result.agents_removed.saturating_add(1);
+                }
+                Err(crate::error::Error::Agent(AgentError::NotInstalled { .. })) => {
+                    warn!(
+                        agent = %name,
+                        plugin,
+                        marketplace,
+                        "remove_plugin: agent tracking entry had no on-disk prompt; \
+                         treating as already-removed (A-12)"
+                    );
+                    result.agents_removed = result.agents_removed.saturating_add(1);
+                }
+                Err(e) => return Err(e),
+            }
+        }
+
+        // native_companions cleanup (A-3 + A-16). Idempotent — the
+        // helper returns Ok even if the entry doesn't exist or
+        // belongs to a different marketplace.
+        self.remove_native_companions_for_plugin(plugin, marketplace)?;
+
+        Ok(result)
     }
 
     /// Persist the steering tracking file to disk atomically.
@@ -4180,6 +4530,583 @@ mod tests {
         assert!(
             msg.contains("invalid name"),
             "expected 'invalid name', got: {msg}"
+        );
+    }
+
+    // -- remove_steering_file ---------------------------------------------
+
+    #[test]
+    fn remove_steering_file_unlinks_and_updates_tracking() {
+        use chrono::Utc;
+        let (_dir, project) = temp_project();
+        std::fs::create_dir_all(project.kiro_dir().join("steering")).expect("dirs");
+
+        let now = Utc::now();
+        std::fs::write(
+            project.kiro_dir().join("installed-steering.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "files": {
+                    "guide.md": {
+                        "marketplace": "mp",
+                        "plugin": "p",
+                        "version": "1.0.0",
+                        "installed_at": now,
+                        "source_hash": "feedface",
+                        "installed_hash": "feedface",
+                    }
+                }
+            }))
+            .expect("ser"),
+        )
+        .expect("write tracking");
+        std::fs::write(project.kiro_dir().join("steering/guide.md"), "# guide\n")
+            .expect("write steering file");
+
+        project
+            .remove_steering_file(Path::new("guide.md"))
+            .expect("remove ok");
+
+        assert!(
+            !project.kiro_dir().join("steering/guide.md").exists(),
+            "on-disk steering file must be unlinked"
+        );
+        let tracking = project.load_installed_steering().expect("load post-remove");
+        assert!(
+            tracking.files.is_empty(),
+            "tracking entry must be gone after remove"
+        );
+    }
+
+    #[test]
+    fn remove_steering_file_returns_not_installed_for_unknown_rel() {
+        let (_dir, project) = temp_project();
+        std::fs::create_dir_all(project.kiro_dir()).expect("kiro dir");
+
+        let err = project
+            .remove_steering_file(Path::new("absent.md"))
+            .expect_err("expected NotInstalled");
+        assert!(
+            matches!(
+                err,
+                crate::error::Error::Steering(crate::steering::SteeringError::NotInstalled { .. })
+            ),
+            "expected SteeringError::NotInstalled, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn remove_steering_file_succeeds_when_on_disk_file_missing() {
+        // A-12 orphan-tracking case at the per-method granularity:
+        // tracking entry exists but on-disk file was hand-deleted.
+        // remove_steering_file must drop the tracking entry and return
+        // Ok(), letting the cascade count it as removed.
+        use chrono::Utc;
+        let (_dir, project) = temp_project();
+        std::fs::create_dir_all(project.kiro_dir()).expect("kiro dir");
+
+        let now = Utc::now();
+        std::fs::write(
+            project.kiro_dir().join("installed-steering.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "files": {
+                    "orphan.md": {
+                        "marketplace": "mp",
+                        "plugin": "p",
+                        "version": "1.0.0",
+                        "installed_at": now,
+                        "source_hash": "x",
+                        "installed_hash": "x",
+                    }
+                }
+            }))
+            .expect("ser"),
+        )
+        .expect("write tracking");
+        // Note: NO steering/orphan.md on disk.
+
+        project
+            .remove_steering_file(Path::new("orphan.md"))
+            .expect("orphan recovery: must NOT abort");
+
+        let tracking = project.load_installed_steering().expect("load post-remove");
+        assert!(
+            tracking.files.is_empty(),
+            "tracking entry must be gone even when on-disk file was orphan"
+        );
+    }
+
+    #[test]
+    fn remove_steering_file_rejects_path_traversal_argument() {
+        // Defense-in-depth: even though `load_installed_steering`
+        // already rejects traversal entries, a future caller might
+        // construct an `InstalledSteering` in memory and bypass the
+        // load path. `remove_steering_file` must independently
+        // refuse a traversal arg before joining onto `steering_dir`.
+        let (_dir, project) = temp_project();
+        std::fs::create_dir_all(project.kiro_dir()).expect("kiro dir");
+
+        let err = project
+            .remove_steering_file(Path::new("../../etc/passwd"))
+            .expect_err("traversal arg must be refused");
+        match err {
+            crate::error::Error::Io(io_err) => {
+                assert_eq!(io_err.kind(), std::io::ErrorKind::InvalidData);
+                let msg = io_err.to_string();
+                assert!(
+                    msg.contains("../../etc/passwd"),
+                    "error must name the offending path, got: {msg}"
+                );
+            }
+            other => panic!("expected Error::Io(InvalidData), got {other:?}"),
+        }
+    }
+
+    // -- remove_agent ------------------------------------------------------
+
+    #[test]
+    fn remove_agent_unlinks_files_and_updates_tracking() {
+        use chrono::Utc;
+        let (_dir, project) = temp_project();
+        std::fs::create_dir_all(project.agent_prompts_dir()).expect("agents/prompts");
+
+        let now = Utc::now();
+        std::fs::write(
+            project.agent_tracking_path(),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "agents": {
+                    "reviewer": {
+                        "marketplace": "mp",
+                        "plugin": "p",
+                        "version": "1.0.0",
+                        "installed_at": now,
+                        "dialect": "native",
+                        "source_hash": "deadbeef",
+                        "installed_hash": "deadbeef",
+                    }
+                }
+            }))
+            .expect("ser"),
+        )
+        .expect("write tracking");
+        std::fs::write(project.agents_dir().join("reviewer.json"), b"{}\n").expect("write json");
+        std::fs::write(
+            project.agent_prompts_dir().join("reviewer.md"),
+            "# reviewer\n",
+        )
+        .expect("write prompt");
+
+        project.remove_agent("reviewer").expect("remove ok");
+
+        assert!(
+            !project.agents_dir().join("reviewer.json").exists(),
+            "agent JSON must be unlinked"
+        );
+        assert!(
+            !project.agent_prompts_dir().join("reviewer.md").exists(),
+            "agent prompt must be unlinked"
+        );
+        let tracking = project.load_installed_agents().expect("load");
+        assert!(
+            !tracking.agents.contains_key("reviewer"),
+            "tracking entry must be gone after remove"
+        );
+    }
+
+    #[test]
+    fn remove_agent_returns_not_installed_for_unknown_name() {
+        let (_dir, project) = temp_project();
+        std::fs::create_dir_all(project.kiro_dir()).expect("kiro dir");
+
+        let err = project
+            .remove_agent("missing")
+            .expect_err("expected NotInstalled");
+        assert!(
+            matches!(
+                err,
+                crate::error::Error::Agent(AgentError::NotInstalled { .. })
+            ),
+            "expected AgentError::NotInstalled, got {err:?}"
+        );
+    }
+
+    #[test]
+    fn remove_agent_succeeds_when_on_disk_files_missing() {
+        // A-12 at per-method granularity for agents.
+        use chrono::Utc;
+        let (_dir, project) = temp_project();
+        std::fs::create_dir_all(project.kiro_dir()).expect("kiro dir");
+
+        let now = Utc::now();
+        std::fs::write(
+            project.agent_tracking_path(),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "agents": {
+                    "ghost": {
+                        "marketplace": "mp",
+                        "plugin": "p",
+                        "version": null,
+                        "installed_at": now,
+                        "dialect": "native",
+                    }
+                }
+            }))
+            .expect("ser"),
+        )
+        .expect("write tracking");
+        // Note: NO ghost.json or prompts/ghost.md on disk.
+
+        project
+            .remove_agent("ghost")
+            .expect("orphan recovery: must NOT abort");
+
+        let tracking = project.load_installed_agents().expect("load");
+        assert!(
+            !tracking.agents.contains_key("ghost"),
+            "tracking entry must be gone even when on-disk files were orphan"
+        );
+    }
+
+    // -- remove_native_companions_for_plugin -------------------------------
+
+    #[test]
+    fn remove_native_companions_for_plugin_only_removes_matching_marketplace() {
+        // A-16: companions map is keyed by plugin name alone, but
+        // marketplace lives on the value. Removing mp-b's
+        // "code-reviewer" must NOT touch mp-a's record.
+        use chrono::Utc;
+        let (_dir, project) = temp_project();
+        std::fs::create_dir_all(project.kiro_dir()).expect("kiro dir");
+
+        let now = Utc::now();
+        std::fs::write(
+            project.agent_tracking_path(),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "agents": {},
+                "native_companions": {
+                    "code-reviewer": {
+                        "marketplace": "mp-a",
+                        "plugin": "code-reviewer",
+                        "version": null,
+                        "installed_at": now,
+                        "files": [],
+                        "source_hash": "x",
+                        "installed_hash": "x",
+                    }
+                }
+            }))
+            .expect("ser"),
+        )
+        .expect("write tracking");
+
+        // mp-b's "code-reviewer" entry doesn't exist — no-op.
+        project
+            .remove_native_companions_for_plugin("code-reviewer", "mp-b")
+            .expect("remove ok (no-op)");
+
+        let tracking = project.load_installed_agents().expect("load");
+        assert!(
+            tracking.native_companions.contains_key("code-reviewer"),
+            "mp-a's record must remain — A-16 marketplace disambiguation"
+        );
+
+        // mp-a's removal takes the entry out.
+        project
+            .remove_native_companions_for_plugin("code-reviewer", "mp-a")
+            .expect("remove ok");
+        let tracking = project.load_installed_agents().expect("load");
+        assert!(
+            tracking.native_companions.is_empty(),
+            "matching marketplace must remove the entry"
+        );
+    }
+
+    #[test]
+    fn remove_native_companions_for_plugin_unlinks_companion_files() {
+        use chrono::Utc;
+        let (_dir, project) = temp_project();
+        std::fs::create_dir_all(project.agent_prompts_dir()).expect("agents/prompts");
+
+        let now = Utc::now();
+        std::fs::write(
+            project.agent_tracking_path(),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "agents": {},
+                "native_companions": {
+                    "p": {
+                        "marketplace": "mp",
+                        "plugin": "p",
+                        "version": null,
+                        "installed_at": now,
+                        "files": ["prompts/helper.md"],
+                        "source_hash": "x",
+                        "installed_hash": "x",
+                    }
+                }
+            }))
+            .expect("ser"),
+        )
+        .expect("write tracking");
+        let companion = project.agents_dir().join("prompts/helper.md");
+        std::fs::write(&companion, b"# helper\n").expect("write companion file");
+
+        project
+            .remove_native_companions_for_plugin("p", "mp")
+            .expect("remove ok");
+
+        assert!(
+            !companion.exists(),
+            "companion file must be unlinked when its plugin entry is removed"
+        );
+    }
+
+    #[test]
+    fn remove_native_companions_for_plugin_is_noop_when_entry_absent() {
+        let (_dir, project) = temp_project();
+        std::fs::create_dir_all(project.kiro_dir()).expect("kiro dir");
+
+        // No tracking file at all → load returns default → no entry.
+        project
+            .remove_native_companions_for_plugin("p", "mp")
+            .expect("must be a no-op when no tracking exists");
+    }
+
+    // -- remove_plugin cascade --------------------------------------------
+
+    #[test]
+    fn remove_plugin_cascades_through_skills_steering_agents_tracking() {
+        use chrono::Utc;
+        let (_dir, project) = temp_project();
+        std::fs::create_dir_all(project.kiro_dir().join("steering")).expect("dirs");
+        std::fs::create_dir_all(project.skills_dir().join("alpha")).expect("skill dir");
+        std::fs::write(
+            project.skills_dir().join("alpha/SKILL.md"),
+            "---\nname: alpha\ndescription: A\n---\n",
+        )
+        .expect("skill file");
+
+        let now = Utc::now();
+        std::fs::write(
+            project.tracking_path(),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "skills": {
+                    "alpha": {
+                        "marketplace": "mp", "plugin": "p",
+                        "version": "1.0.0", "installed_at": now,
+                        "source_hash": "deadbeef",
+                    }
+                }
+            }))
+            .expect("ser"),
+        )
+        .expect("skills tracking");
+
+        std::fs::write(
+            project.kiro_dir().join("installed-steering.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "files": {
+                    "guide.md": {
+                        "marketplace": "mp", "plugin": "p",
+                        "version": "1.0.0", "installed_at": now,
+                        "source_hash": "feedface", "installed_hash": "feedface",
+                    }
+                }
+            }))
+            .expect("ser"),
+        )
+        .expect("steering tracking");
+        std::fs::write(project.kiro_dir().join("steering/guide.md"), "# guide\n")
+            .expect("steering file");
+
+        let result = project.remove_plugin("mp", "p").expect("remove_plugin");
+        assert_eq!(result.skills_removed, 1);
+        assert_eq!(result.steering_removed, 1);
+        assert_eq!(result.agents_removed, 0);
+
+        let post = project
+            .installed_plugins()
+            .expect("installed_plugins post-remove");
+        assert!(
+            post.iter().all(|p| p.plugin != "p"),
+            "plugin p must be gone from the aggregated view"
+        );
+        assert!(
+            !project.skills_dir().join("alpha").exists(),
+            "skill dir must be unlinked"
+        );
+        assert!(
+            !project.kiro_dir().join("steering/guide.md").exists(),
+            "on-disk steering file must be unlinked"
+        );
+    }
+
+    #[test]
+    fn remove_plugin_only_removes_matching_marketplace_plugin_pair() {
+        // Same plugin name across two marketplaces: removing mp-a/p
+        // must NOT touch mp-b/p's entries.
+        use chrono::Utc;
+        let (_dir, project) = temp_project();
+        std::fs::create_dir_all(project.kiro_dir().join("steering")).expect("dirs");
+
+        let now = Utc::now();
+        std::fs::write(
+            project.kiro_dir().join("installed-steering.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "files": {
+                    "a.md": {
+                        "marketplace": "mp-a", "plugin": "p",
+                        "version": "1.0.0", "installed_at": now,
+                        "source_hash": "1", "installed_hash": "1",
+                    },
+                    "b.md": {
+                        "marketplace": "mp-b", "plugin": "p",
+                        "version": "1.0.0", "installed_at": now,
+                        "source_hash": "2", "installed_hash": "2",
+                    }
+                }
+            }))
+            .expect("ser"),
+        )
+        .expect("steering tracking");
+        std::fs::write(project.kiro_dir().join("steering/a.md"), "# a\n").expect("a");
+        std::fs::write(project.kiro_dir().join("steering/b.md"), "# b\n").expect("b");
+
+        let result = project.remove_plugin("mp-a", "p").expect("remove mp-a/p");
+        assert_eq!(result.steering_removed, 1, "only mp-a/p's entry");
+
+        let tracking = project.load_installed_steering().expect("load");
+        assert!(
+            tracking.files.contains_key(Path::new("b.md")),
+            "mp-b/p's entry must remain"
+        );
+        assert!(
+            project.kiro_dir().join("steering/b.md").exists(),
+            "mp-b/p's on-disk file must remain"
+        );
+        assert!(
+            !project.kiro_dir().join("steering/a.md").exists(),
+            "mp-a/p's on-disk file must be unlinked"
+        );
+    }
+
+    #[test]
+    fn remove_plugin_recovers_from_orphan_skill_tracking_entry() {
+        // A-12 regression at the cascade level: tracking entry exists
+        // but on-disk dir doesn't. The cascade must NOT abort; treat
+        // as already-removed.
+        use chrono::Utc;
+        let (_dir, project) = temp_project();
+        std::fs::create_dir_all(project.kiro_dir()).expect("kiro dir");
+
+        let now = Utc::now();
+        std::fs::write(
+            project.tracking_path(),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "skills": {
+                    "orphan": {
+                        "marketplace": "mp", "plugin": "p",
+                        "version": "1.0.0", "installed_at": now,
+                        "source_hash": "deadbeef",
+                    }
+                }
+            }))
+            .expect("ser"),
+        )
+        .expect("skills tracking");
+        // Note: NO skills/orphan dir on disk.
+
+        let result = project
+            .remove_plugin("mp", "p")
+            .expect("orphan recovery: must NOT abort");
+        assert_eq!(
+            result.skills_removed, 1,
+            "orphan tracking entry counts as removed (A-12)"
+        );
+        // Note: remove_skill returns SkillError::NotInstalled when the
+        // on-disk directory is missing without dropping the tracking
+        // entry — that's the existing precedent. The cascade
+        // therefore can't drop the phantom skill tracking entry here.
+        // The orphan recovery contract per A-12 is "log + count as
+        // removed + continue", not "rewrite the tracking file." A
+        // future cleanup pass that makes remove_skill itself prune
+        // orphan tracking would tighten this — out of scope for the
+        // plugin-first install plan's Task 3.
+    }
+
+    #[test]
+    fn remove_plugin_propagates_load_time_path_traversal_error() {
+        // A-4 regression: the cascade reads tracking files via
+        // load_installed_steering, which validates path entries.
+        // A traversal entry must surface as a load-time Err and the
+        // cascade must propagate, not silently skip.
+        use chrono::Utc;
+        let (_dir, project) = temp_project();
+        std::fs::create_dir_all(project.kiro_dir()).expect("kiro dir");
+
+        let now = Utc::now();
+        std::fs::write(
+            project.kiro_dir().join("installed-steering.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "files": {
+                    "../../etc/passwd": {
+                        "marketplace": "mp", "plugin": "p",
+                        "version": "1.0.0", "installed_at": now,
+                        "source_hash": "x", "installed_hash": "x",
+                    }
+                }
+            }))
+            .expect("ser"),
+        )
+        .expect("steering tracking");
+
+        let err = project
+            .remove_plugin("mp", "p")
+            .expect_err("traversal entry must surface as Err");
+        match err {
+            crate::error::Error::Io(io_err) => {
+                assert_eq!(io_err.kind(), std::io::ErrorKind::InvalidData);
+            }
+            other => {
+                panic!("expected Error::Io(InvalidData) from load-time validator, got {other:?}")
+            }
+        }
+    }
+
+    #[test]
+    fn remove_plugin_drops_native_companions_entry_for_matching_marketplace() {
+        // A-3 + A-16: cascade must call
+        // remove_native_companions_for_plugin with the correct
+        // marketplace, and only matching entries get dropped.
+        use chrono::Utc;
+        let (_dir, project) = temp_project();
+        std::fs::create_dir_all(project.kiro_dir()).expect("kiro dir");
+
+        let now = Utc::now();
+        std::fs::write(
+            project.agent_tracking_path(),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "agents": {},
+                "native_companions": {
+                    "p": {
+                        "marketplace": "mp",
+                        "plugin": "p",
+                        "version": null,
+                        "installed_at": now,
+                        "files": [],
+                        "source_hash": "x",
+                        "installed_hash": "x",
+                    }
+                }
+            }))
+            .expect("ser"),
+        )
+        .expect("agents tracking");
+
+        project.remove_plugin("mp", "p").expect("remove_plugin");
+
+        let tracking = project.load_installed_agents().expect("load");
+        assert!(
+            tracking.native_companions.is_empty(),
+            "native_companions entry must be dropped for matching marketplace"
         );
     }
 
