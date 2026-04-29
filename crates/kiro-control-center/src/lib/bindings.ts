@@ -131,7 +131,7 @@ export const commands = {
 	 *  [`crate::commands::installed::list_installed_skills`] shape; tests
 	 *  exercise the wrapper directly via `#[tokio::test]`.
 	 */
-	listInstalledPlugins: (projectPath: string) => typedError<InstalledPluginInfo[], CommandError>(__TAURI_INVOKE("list_installed_plugins", { projectPath })),
+	listInstalledPlugins: (projectPath: string) => typedError<InstalledPluginsView, CommandError>(__TAURI_INVOKE("list_installed_plugins", { projectPath })),
 	/**
 	 *  Remove every skill, steering file, and agent for a given
 	 *  `(marketplace, plugin)` pair from the project, returning per-content
@@ -688,6 +688,41 @@ export type InstalledPluginInfo = {
 	latest_install: string,
 };
 
+/**
+ *  Wire-format wrapper around [`Vec<InstalledPluginInfo>`] that also
+ *  carries per-tracking-file load failures so the UI can render a
+ *  partial state when one of the three `installed-*.json` files is
+ *  corrupt or unreadable (I13).
+ * 
+ *  Rationale: previously, `installed_plugins()` failed the entire
+ *  aggregator on any `?`-chain load failure, leaving the user with
+ *  "zero installed plugins" even when two of three tracking files
+ *  loaded cleanly. The view here surfaces what loaded AND what
+ *  didn't, so the UI can show a "partial state — N tracking files
+ *  failed to load" banner instead of a misleading empty list.
+ */
+export type InstalledPluginsView = {
+	/**
+	 *  Per-`(marketplace, plugin)` rows assembled from the tracking
+	 *  files that loaded successfully. May be empty if every file
+	 *  failed; the [`Self::partial_load_warnings`] vec then carries
+	 *  the explanation.
+	 */
+	plugins: InstalledPluginInfo[],
+	/**
+	 *  One entry per `installed-*.json` whose load failed. The
+	 *  corresponding content type's contributions are missing from
+	 *  `plugins`. Empty on a clean state.
+	 * 
+	 *  `serde(default)` is kept for legacy-JSON tolerance.
+	 *  `skip_serializing_if` is intentionally absent — `tauri-specta`
+	 *  2.0.0-rc.24 unified mode rejects it (see A-25 in plan
+	 *  amendments). Empty Vec serializes as `[]` rather than being
+	 *  omitted, matching `InstallSkillsResult.failed` etc.
+	 */
+	partial_load_warnings?: TrackingLoadWarning[],
+};
+
 // Information about a single installed skill.
 export type InstalledSkillInfo = {
 	name: string,
@@ -859,23 +894,64 @@ export type ProjectInfo = {
 export type RelativePath = string;
 
 /**
+ *  One per-step failure recorded by [`KiroProject::remove_plugin`] when
+ *  a per-content removal fails mid-cascade. The cascade keeps going on
+ *  remaining content types; the caller surfaces these to the user as a
+ *  partial-failure summary.
+ */
+export type RemovePluginFailure = {
+	/**
+	 *  Which content type errored: `"skill"` / `"steering"` / `"agent"`
+	 *  / `"native_companions"`.
+	 */
+	content_type: string,
+	/**
+	 *  The item identifier — skill or agent name, or steering rel-path
+	 *  rendered via `Path::display()`. Empty string for the
+	 *  `"native_companions"` row, which is plugin-scoped rather than
+	 *  per-item.
+	 */
+	item: string,
+	/**
+	 *  Rendered error chain via [`crate::error::error_full_chain`] —
+	 *  wire format per CLAUDE.md "in any wire-format `reason`/`error:
+	 *  String` field that crosses the FFI, use `error_full_chain(&err)`".
+	 */
+	error: string,
+};
+
+/**
  *  Aggregated counts returned by
  *  [`KiroProject::remove_plugin`] — one tally per content type so the
  *  caller (CLI / Tauri) can render a one-line "removed N skills,
  *  M steering files, K agents" summary without re-reading the tracking
  *  files.
  * 
- *  Counts are post-cascade and include orphan-tracking recoveries
- *  (A-12): a tracking entry with no on-disk file still counts as
- *  "removed" because the cascade dropped the entry. The cascade
- *  never partially succeeds — either every entry is removed and the
- *  counts reflect the full work, or an error short-circuits before
- *  the result returns.
+ *  Counts are post-cascade across every per-content removal that
+ *  completed successfully. A per-step error during the cascade does
+ *  **not** abort the work — the cascade keeps going on the remaining
+ *  content types and records the failure in `failed`. Only "failed
+ *  to even read the initial tracking files" is surfaced as the
+ *  cascade's outer `Err` (I5). Orphan-tracking recoveries (A-12) still
+ *  count as "removed" because the per-content remove drops the
+ *  tracking row and treats the missing on-disk entry as success.
  */
 export type RemovePluginResult = {
 	skills_removed: number,
 	steering_removed: number,
 	agents_removed: number,
+	/**
+	 *  Per-step errors encountered during the cascade. The cascade
+	 *  keeps making progress on remaining content types when one
+	 *  step fails — same policy as `InstallPluginResult`'s sub-result
+	 *  `failed` vecs (A-15). Empty on a clean cascade.
+	 * 
+	 *  `serde(default)` is kept for legacy-JSON tolerance.
+	 *  `skip_serializing_if` is intentionally absent — `tauri-specta`
+	 *  2.0.0-rc.24 unified mode rejects it (A-25). Empty Vec serializes
+	 *  as `[]` rather than being omitted.
+	 */
+	failed?: RemovePluginFailure[],
 };
 
 // Top-level category for a Kiro CLI setting.
@@ -1170,6 +1246,26 @@ export type StructuredSource =
  *  exist in-memory — `RelativePath::new` is the only way in.
  */
 path: RelativePath; ref: string | null; sha: string | null };
+
+/**
+ *  Per-tracking-file load failure surfaced by
+ *  [`KiroProject::installed_plugins`] (I13).
+ */
+export type TrackingLoadWarning = {
+	/**
+	 *  Filename relative to `.kiro/`: `"installed-skills.json"` /
+	 *  `"installed-steering.json"` / `"installed-agents.json"`. Just
+	 *  the basename — the absolute path leaks layout information the
+	 *  frontend doesn't need.
+	 */
+	tracking_file: string,
+	/**
+	 *  Rendered error chain via [`crate::error::error_full_chain`] —
+	 *  wire format per CLAUDE.md "in any wire-format `reason`/`error:
+	 *  String` field that crosses the FFI, use `error_full_chain(&err)`".
+	 */
+	error: string,
+};
 
 export type UnmappedReason = 
 // Claude `PascalCase` name with no Kiro equivalent (e.g. `NotebookEdit`).

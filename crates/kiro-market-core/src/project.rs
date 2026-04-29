@@ -318,7 +318,13 @@ pub struct InstalledPluginsView {
     /// One entry per `installed-*.json` whose load failed. The
     /// corresponding content type's contributions are missing from
     /// `plugins`. Empty on a clean state.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    ///
+    /// `serde(default)` is kept for legacy-JSON tolerance.
+    /// `skip_serializing_if` is intentionally absent — `tauri-specta`
+    /// 2.0.0-rc.24 unified mode rejects it (see A-25 in plan
+    /// amendments). Empty Vec serializes as `[]` rather than being
+    /// omitted, matching `InstallSkillsResult.failed` etc.
+    #[serde(default)]
     pub partial_load_warnings: Vec<TrackingLoadWarning>,
 }
 
@@ -362,7 +368,12 @@ pub struct RemovePluginResult {
     /// keeps making progress on remaining content types when one
     /// step fails — same policy as `InstallPluginResult`'s sub-result
     /// `failed` vecs (A-15). Empty on a clean cascade.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    ///
+    /// `serde(default)` is kept for legacy-JSON tolerance.
+    /// `skip_serializing_if` is intentionally absent — `tauri-specta`
+    /// 2.0.0-rc.24 unified mode rejects it (A-25). Empty Vec serializes
+    /// as `[]` rather than being omitted.
+    #[serde(default)]
     pub failed: Vec<RemovePluginFailure>,
 }
 
