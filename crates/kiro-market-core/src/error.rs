@@ -852,7 +852,9 @@ mod tests {
     #[case::agent_parse_invalid_yaml(
         AgentError::ParseFailed {
             path: PathBuf::from("a.md"),
-            failure: ParseFailure::InvalidYaml("bad yaml".into()),
+            failure: ParseFailure::InvalidYaml {
+                reason: "bad yaml".into(),
+            },
         },
         "failed to parse agent at a.md: invalid YAML: bad yaml"
     )]

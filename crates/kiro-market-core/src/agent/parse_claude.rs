@@ -29,17 +29,25 @@ struct ClaudeFrontmatter {
 /// path and lifts into `AgentError::ParseFailed`.
 pub fn parse_claude_agent(content: &str) -> Result<AgentDefinition, ParseFailure> {
     let (yaml_block, body) = split_frontmatter(content)?;
-    let fm: ClaudeFrontmatter = serde_yaml_ng::from_str(yaml_block)
-        .map_err(|e| ParseFailure::InvalidYaml(e.to_string()))?;
+    let fm: ClaudeFrontmatter =
+        serde_yaml_ng::from_str(yaml_block).map_err(|e| ParseFailure::InvalidYaml {
+            reason: e.to_string(),
+        })?;
 
     let name = fm.name.ok_or(ParseFailure::MissingName)?;
     // Validate the name at parse time so downstream fs operations (and the
     // file:// URI in the emitted JSON) can trust it without re-checking.
     crate::validation::validate_name(&name).map_err(|e| match e {
-        crate::error::ValidationError::InvalidName { reason, .. } => {
-            ParseFailure::InvalidName(reason)
+        // Both ValidationError variants project to ParseFailure::InvalidName
+        // because validate_name only emits InvalidName in practice; the
+        // InvalidRelativePath arm is defensive against a future change to
+        // validate_name's contract. Listed explicitly (rather than via `_ =>`)
+        // so a new ValidationError variant forces a compile-time decision per
+        // CLAUDE.md "Classifier functions enumerate every variant".
+        crate::error::ValidationError::InvalidName { reason, .. }
+        | crate::error::ValidationError::InvalidRelativePath { reason, .. } => {
+            ParseFailure::InvalidName { reason }
         }
-        other => ParseFailure::InvalidName(other.to_string()),
     })?;
     // Normalize `model: inherit` (Claude's "use parent model" sentinel) to None
     // so the Kiro emitter omits the field and defers to the CLI default.
@@ -105,7 +113,7 @@ mod tests {
         let src = "---\nname: ../escape\n---\nbody\n";
         let err = parse_claude_agent(src).unwrap_err();
         assert!(
-            matches!(err, ParseFailure::InvalidName(_)),
+            matches!(err, ParseFailure::InvalidName { .. }),
             "expected InvalidName for traversal, got {err:?}"
         );
     }
@@ -114,7 +122,7 @@ mod tests {
     fn parse_rejects_empty_name() {
         let src = "---\nname: \"\"\n---\nbody\n";
         let err = parse_claude_agent(src).unwrap_err();
-        assert!(matches!(err, ParseFailure::InvalidName(_)));
+        assert!(matches!(err, ParseFailure::InvalidName { .. }));
     }
 
     #[test]

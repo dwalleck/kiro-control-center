@@ -62,6 +62,13 @@ struct Finding {
 /// The `EXISTS` clause uses `qualified_name`'s `Parent::*` prefix to
 /// walk up to the parent symbol, since `parent_symbol_id` is NULL on
 /// the current tethys schema (a known gap — see the reference memory).
+///
+/// The prefix anchor is `parent.qualified_name || '::%'`, NOT
+/// `parent.name || '::%'`. For an enum nested inside a `mod foo`
+/// block, `parent.name = 'Bar'` but its variants/fields carry
+/// `qualified_name = 'foo::Bar::...'`. A `LIKE 'Bar::%'` pattern
+/// would miss every nested-module case, silently exempting real
+/// gate-4 violations (caught by gemini-code-assist on PR #91).
 const GATE_4_SQL: &str = "\
 SELECT f.path, s.line, s.qualified_name, s.signature
 FROM symbols s
@@ -78,7 +85,7 @@ WHERE s.kind = 'struct_field'
       WHERE parent.kind IN ('enum', 'struct')
         AND parent.visibility = 'public'
         AND parent.file_id = s.file_id
-        AND s.qualified_name LIKE parent.name || '::%'
+        AND s.qualified_name LIKE parent.qualified_name || '::%'
   )
 ORDER BY f.path, s.line";
 
@@ -204,6 +211,80 @@ WHERE s.kind = 'enum'
   )
 ORDER BY f.path, s.line";
 
+/// CLAUDE.md "Validation newtypes flowing through Tauri bindings need
+/// `cfg_attr(specta::Type)`" — and any pub enum that crosses the FFI must
+/// carry an explicit serde tagging directive. PR #83 commit 1 shipped
+/// `SteeringWarning` with default external tagging; the bindings.ts shape
+/// it generated was an awkward intersection type
+/// (`({ Foo: ... }) & { Bar?: never }`) that frontend code patterns like
+/// `if (warning.kind === "...")` would silently never match. Caught at
+/// review, fixed in commit 2 with `#[serde(tag = "kind", rename_all =
+/// "snake_case")]`.
+///
+/// This gate flags any public enum that:
+/// - derives both `Serialize` AND `specta::Type` (the tells that it
+///   crosses the FFI),
+/// - has at least one non-unit variant (default external tagging is
+///   structurally fine for unit-only enums — they serialize as plain
+///   strings and TS sees a clean union of string literals), AND
+/// - lacks an explicit `#[serde(tag = "...")]` or `#[serde(untagged)]`
+///   directive.
+///
+/// Detecting `specta::Type` covers both unconditional `derive(specta::
+/// Type)` and the codebase's canonical `cfg_attr(feature = "specta",
+/// derive(specta::Type))` form — both store the type name in
+/// `attributes.args` regardless of whether the wrapping attribute is
+/// `derive` or `cfg_attr`.
+///
+/// The non-unit-variant check uses tethys's sub-symbol extraction (rivets
+/// PR #58): enum variants are stored as `enum_variant` rows whose
+/// `signature` is NULL/empty for unit variants and carries the field list
+/// otherwise. Without this filter, every all-unit `pub enum` deriving
+/// `Serialize + specta::Type` (`SourceType`, `ErrorType`, etc.) would be
+/// a false positive — they don't need tagging because external tagging
+/// produces plain string literals for them.
+///
+/// `parent_symbol_id` is currently NULL on `enum_variant` rows in tethys
+/// (a known indexer gap), so the variant→parent link uses
+/// `qualified_name LIKE s.qualified_name || '::%'`. The anchor is the
+/// parent enum's full `qualified_name`, NOT its short `name` — a nested
+/// `mod foo { pub enum Bar { ... } }` has `s.name = 'Bar'` but variants
+/// at `qualified_name = 'foo::Bar::Variant'`, and `LIKE 'Bar::%'` would
+/// silently miss them (caught by gemini-code-assist on PR #91).
+const FFI_ENUM_TAG_SQL: &str = "\
+SELECT f.path, s.line, s.qualified_name, NULL AS signature
+FROM symbols s
+JOIN files f ON f.id = s.file_id
+WHERE s.kind = 'enum'
+  AND s.visibility = 'public'
+  AND EXISTS (
+      SELECT 1 FROM attributes a
+      WHERE a.symbol_id = s.id
+        AND ((a.name = 'derive' AND a.args LIKE '%Serialize%')
+             OR (a.name = 'cfg_attr' AND a.args LIKE '%Serialize%'))
+  )
+  AND EXISTS (
+      SELECT 1 FROM attributes a
+      WHERE a.symbol_id = s.id
+        AND ((a.name = 'derive' AND a.args LIKE '%specta::Type%')
+             OR (a.name = 'cfg_attr' AND a.args LIKE '%specta::Type%'))
+  )
+  AND EXISTS (
+      SELECT 1 FROM symbols v
+      WHERE v.kind = 'enum_variant'
+        AND v.file_id = s.file_id
+        AND v.qualified_name LIKE s.qualified_name || '::%'
+        AND v.signature IS NOT NULL
+        AND v.signature != ''
+  )
+  AND NOT EXISTS (
+      SELECT 1 FROM attributes a
+      WHERE a.symbol_id = s.id
+        AND a.name = 'serde'
+        AND (a.args LIKE '%tag = %' OR a.args LIKE '%untagged%')
+  )
+ORDER BY f.path, s.line";
+
 const ALL_GATES: &[Gate] = &[
     Gate {
         name: "gate-4-external-error-boundary",
@@ -229,6 +310,11 @@ const ALL_GATES: &[Gate] = &[
         name: "no-frontend-deps-in-core",
         description: "tauri / tokio import in kiro-market-core (dependencies-point-inward)",
         sql: NO_FRONTEND_DEPS_IN_CORE_SQL,
+    },
+    Gate {
+        name: "ffi-enum-serde-tag",
+        description: "pub Serialize+specta::Type enum with non-unit variants missing #[serde(tag = \"...\")] / #[serde(untagged)]",
+        sql: FFI_ENUM_TAG_SQL,
     },
 ];
 
@@ -266,13 +352,13 @@ const ALLOWED_SITES: &[AllowedSite] = &[
     AllowedSite {
         gate: "no-unwrap-in-production",
         path: "crates/kiro-control-center/src-tauri/src/lib.rs",
-        line: 49,
+        line: 50,
         reason: "Tauri scaffolding pattern — debug-only `specta_typescript::Typescript::default().export(...)` failure at app startup. Refactoring to `?` propagation would only move the panic into `fn main()`. Idiomatic Rust at the binary entry point.",
     },
     AllowedSite {
         gate: "no-unwrap-in-production",
         path: "crates/kiro-control-center/src-tauri/src/lib.rs",
-        line: 60,
+        line: 61,
         reason: "Tauri scaffolding pattern — `tauri::Builder::run` failure at app startup. Replacing with Result propagation would only move the panic into `fn main()`. Idiomatic Rust at the binary entry point.",
     },
 ];
@@ -925,6 +1011,45 @@ mod tests {
         );
     }
 
+    #[test]
+    fn gate_4_flags_field_inside_nested_module_enum() {
+        // gemini-code-assist (PR #91): for an enum nested inside a
+        // `mod foo` block, `parent.name = 'Bar'` but the field's
+        // `qualified_name = 'foo::Bar::field'`. The earlier prefix
+        // anchor `parent.name || '::%'` would have silently exempted
+        // every nested-module gate-4 violation. Anchor on
+        // `parent.qualified_name` so nesting depth is irrelevant.
+        let conn = fresh_db();
+        // Parent enum with module-qualified name (kind 'enum', public).
+        conn.execute(
+            "INSERT INTO symbols (id, file_id, name, qualified_name, kind, line, visibility)
+             VALUES (1000, 1, 'Inner', 'foo::Inner', 'enum', 1, 'public')",
+            [],
+        )
+        .expect("nested parent enum insert");
+        // Field whose qualified_name carries the same module prefix.
+        conn.execute(
+            "INSERT INTO symbols (id, file_id, name, qualified_name, kind, line, signature)
+             VALUES (1, 1, '0', 'foo::Inner::Bad::0', 'struct_field', 42, 'serde_json::Error')",
+            [],
+        )
+        .expect("nested field insert");
+        conn.execute(
+            "INSERT INTO attributes (symbol_id, name, args, line)
+             VALUES (1, 'source', NULL, 42)",
+            [],
+        )
+        .expect("source attr insert");
+
+        let findings = gate_4().run(&conn).expect("gate query should succeed");
+        assert_eq!(
+            findings.len(),
+            1,
+            "nested-module enum field with #[source] external error must be flagged; got: {findings:?}"
+        );
+        assert_eq!(findings[0].qualified_name, "foo::Inner::Bad::0");
+    }
+
     // ─── no-unwrap-in-production ────────────────────────────────────────
 
     fn no_unwrap() -> &'static Gate {
@@ -1181,7 +1306,7 @@ mod tests {
     fn is_allowed_matches_gate_path_and_line_exactly() {
         let f = Finding {
             path: "crates/kiro-control-center/src-tauri/src/lib.rs".to_string(),
-            line: 49,
+            line: 50,
             qualified_name: "run".to_string(),
             signature: Some("expect".to_string()),
         };
@@ -1696,5 +1821,322 @@ mod tests {
         let findings = no_frontend_deps().run(&conn).expect("query");
         assert_eq!(findings.len(), 1);
         assert_eq!(findings[0].signature.as_deref(), Some("tokio"));
+    }
+
+    // ─── ffi-enum-serde-tag ─────────────────────────────────────────────
+
+    fn ffi_tag_gate() -> &'static Gate {
+        ALL_GATES
+            .iter()
+            .find(|g| g.name == "ffi-enum-serde-tag")
+            .expect("ffi-enum-serde-tag gate registered")
+    }
+
+    /// Seed a `pub enum` row, optionally tagged with Serialize / specta
+    /// derives and a serde directive, then attach the requested variants.
+    /// `serde_args` is `None` for "no serde attribute"; `Some("tag = ...")`
+    /// or `Some("untagged")` for the two TS-friendly tagging modes.
+    /// `variants` carries `(name, signature_or_none)` — `None` is a unit
+    /// variant; `Some("{ ... }")` is a struct/tuple variant.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "knobs map 1:1 to the gate's predicate inputs; collapsing into a struct \
+                  would obscure the per-test intent at the call site"
+    )]
+    fn seed_ffi_candidate(
+        conn: &Connection,
+        sym_id: i64,
+        name: &str,
+        visibility: &str,
+        with_serialize: bool,
+        with_specta: bool,
+        serde_args: Option<&str>,
+        variants: &[(&str, Option<&str>)],
+    ) {
+        conn.execute(
+            "INSERT INTO symbols (id, file_id, name, qualified_name, kind, line, visibility)
+             VALUES (?1, 1, ?2, ?2, 'enum', 1, ?3)",
+            rusqlite::params![sym_id, name, visibility],
+        )
+        .expect("enum insert");
+        if with_serialize {
+            conn.execute(
+                "INSERT INTO attributes (symbol_id, name, args, line)
+                 VALUES (?1, 'derive', 'Clone, Debug, Serialize', 1)",
+                rusqlite::params![sym_id],
+            )
+            .expect("derive(Serialize) insert");
+        }
+        if with_specta {
+            // Mirrors the canonical codebase shape:
+            // `#[cfg_attr(feature = "specta", derive(specta::Type))]`.
+            conn.execute(
+                "INSERT INTO attributes (symbol_id, name, args, line)
+                 VALUES (?1, 'cfg_attr', 'feature = \"specta\", derive(specta::Type)', 1)",
+                rusqlite::params![sym_id],
+            )
+            .expect("cfg_attr(specta) insert");
+        }
+        if let Some(args) = serde_args {
+            conn.execute(
+                "INSERT INTO attributes (symbol_id, name, args, line)
+                 VALUES (?1, 'serde', ?2, 1)",
+                rusqlite::params![sym_id, args],
+            )
+            .expect("serde insert");
+        }
+        for (i, (vname, vsig)) in variants.iter().enumerate() {
+            let qualified = format!("{name}::{vname}");
+            let line = 10 + u32::try_from(i).expect("test fixture index fits u32");
+            conn.execute(
+                "INSERT INTO symbols (file_id, name, qualified_name, kind, line, signature)
+                 VALUES (1, ?1, ?2, 'enum_variant', ?3, ?4)",
+                rusqlite::params![vname, qualified, line, vsig],
+            )
+            .expect("variant insert");
+        }
+    }
+
+    #[test]
+    fn ffi_enum_tag_flags_untagged_pub_enum_with_payload() {
+        // The canonical SteeringWarning-shape bug pre-PR-83: pub enum,
+        // Serialize + specta, has struct variants, no serde tag.
+        let conn = fresh_db();
+        seed_ffi_candidate(
+            &conn,
+            1,
+            "Warning",
+            "public",
+            true,
+            true,
+            None,
+            &[
+                ("ScanPathInvalid", Some("{ path: PathBuf, reason: String }")),
+                (
+                    "ScanDirUnreadable",
+                    Some("{ path: PathBuf, reason: String }"),
+                ),
+            ],
+        );
+
+        let findings = ffi_tag_gate().run(&conn).expect("query");
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].qualified_name, "Warning");
+    }
+
+    #[test]
+    fn ffi_enum_tag_passes_when_serde_tag_present() {
+        let conn = fresh_db();
+        seed_ffi_candidate(
+            &conn,
+            1,
+            "Warning",
+            "public",
+            true,
+            true,
+            Some("tag = \"kind\", rename_all = \"snake_case\""),
+            &[("ScanPathInvalid", Some("{ path: PathBuf, reason: String }"))],
+        );
+
+        let findings = ffi_tag_gate().run(&conn).expect("query");
+        assert!(
+            findings.is_empty(),
+            "explicit serde(tag = ...) satisfies the gate; got: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn ffi_enum_tag_passes_when_untagged() {
+        // SettingValue uses #[serde(untagged)] — produces a TS union of
+        // primitive shapes without a discriminant. Also acceptable.
+        let conn = fresh_db();
+        seed_ffi_candidate(
+            &conn,
+            1,
+            "Value",
+            "public",
+            true,
+            true,
+            Some("untagged"),
+            &[("Bool", Some("(bool)")), ("Number", Some("(f64)"))],
+        );
+
+        let findings = ffi_tag_gate().run(&conn).expect("query");
+        assert!(
+            findings.is_empty(),
+            "explicit serde(untagged) satisfies the gate; got: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn ffi_enum_tag_exempts_unit_only_enum() {
+        // SourceType / ErrorType / GitProtocol / etc. — every variant is
+        // a bare identifier. Default external tagging serializes each
+        // variant as a plain string, producing a clean TS union of
+        // string literals. No serde(tag) directive is needed.
+        let conn = fresh_db();
+        seed_ffi_candidate(
+            &conn,
+            1,
+            "SourceType",
+            "public",
+            true,
+            true,
+            None,
+            &[("GitHub", None), ("Git", None), ("Local", None)],
+        );
+
+        let findings = ffi_tag_gate().run(&conn).expect("query");
+        assert!(
+            findings.is_empty(),
+            "unit-only enums are TS-friendly under default tagging; got: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn ffi_enum_tag_exempts_non_serialize_enum() {
+        // No `Serialize` derive means the type cannot be emitted by serde
+        // at all — there is no wire format to worry about.
+        let conn = fresh_db();
+        seed_ffi_candidate(
+            &conn,
+            1,
+            "Warning",
+            "public",
+            false,
+            true,
+            None,
+            &[("Variant", Some("{ x: u32 }"))],
+        );
+
+        let findings = ffi_tag_gate().run(&conn).expect("query");
+        assert!(
+            findings.is_empty(),
+            "non-Serialize enum doesn't cross FFI; got: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn ffi_enum_tag_exempts_non_specta_enum() {
+        // Serialize alone doesn't materialize the type in `bindings.ts`;
+        // specta::Type is the FFI tell. An internal Serialize-only enum
+        // is fine without serde tagging — JSON consumers in-process
+        // tolerate the default shape.
+        let conn = fresh_db();
+        seed_ffi_candidate(
+            &conn,
+            1,
+            "Internal",
+            "public",
+            true,
+            false,
+            None,
+            &[("Variant", Some("{ x: u32 }"))],
+        );
+
+        let findings = ffi_tag_gate().run(&conn).expect("query");
+        assert!(
+            findings.is_empty(),
+            "Serialize without specta doesn't cross FFI; got: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn ffi_enum_tag_exempts_private_enum() {
+        // The rule scopes to the *public* surface; pub(crate) and bare
+        // (private) enums don't materialize in bindings even with the
+        // derives present.
+        let conn = fresh_db();
+        seed_ffi_candidate(
+            &conn,
+            1,
+            "Internal",
+            "private",
+            true,
+            true,
+            None,
+            &[("Variant", Some("{ x: u32 }"))],
+        );
+
+        let findings = ffi_tag_gate().run(&conn).expect("query");
+        assert!(
+            findings.is_empty(),
+            "private enum is not public API; got: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn ffi_enum_tag_flags_unconditional_specta_derive() {
+        // Less common shape: Serialize + specta::Type both inside one
+        // unconditional `#[derive(...)]` (no cfg_attr feature gate).
+        // Tethys stores this as a single `derive` attribute whose args
+        // list includes `specta::Type`; the SQL must match this branch
+        // as well as the `cfg_attr` form.
+        let conn = fresh_db();
+        conn.execute(
+            "INSERT INTO symbols (id, file_id, name, qualified_name, kind, line, visibility)
+             VALUES (1, 1, 'Foo', 'Foo', 'enum', 1, 'public')",
+            [],
+        )
+        .expect("enum insert");
+        conn.execute(
+            "INSERT INTO attributes (symbol_id, name, args, line)
+             VALUES (1, 'derive', 'Clone, Debug, Serialize, specta::Type', 1)",
+            [],
+        )
+        .expect("derive insert");
+        conn.execute(
+            "INSERT INTO symbols (file_id, name, qualified_name, kind, line, signature)
+             VALUES (1, 'V', 'Foo::V', 'enum_variant', 10, '{ x: u32 }')",
+            [],
+        )
+        .expect("variant insert");
+
+        let findings = ffi_tag_gate().run(&conn).expect("query");
+        assert_eq!(
+            findings.len(),
+            1,
+            "unconditional specta derive must also fire; got: {findings:?}"
+        );
+    }
+
+    #[test]
+    fn ffi_enum_tag_flags_enum_nested_in_module() {
+        // gemini-code-assist (PR #91): for `mod foo { pub enum Bar { ... } }`,
+        // `s.name = 'Bar'` but variants land at `qualified_name =
+        // 'foo::Bar::Variant'`. Anchoring the variant→parent link on
+        // `s.qualified_name || '::%'` instead of `s.name || '::%'` makes
+        // nesting depth irrelevant. Without this fix the enum looks
+        // unit-only to the gate (variant EXISTS clause never matches),
+        // silently exempting nested-module FFI enums from the rule.
+        let conn = fresh_db();
+        conn.execute(
+            "INSERT INTO symbols (id, file_id, name, qualified_name, kind, line, visibility)
+             VALUES (1, 1, 'Inner', 'outer::Inner', 'enum', 1, 'public')",
+            [],
+        )
+        .expect("nested enum insert");
+        conn.execute(
+            "INSERT INTO attributes (symbol_id, name, args, line)
+             VALUES (1, 'derive', 'Clone, Debug, Serialize', 1),
+                    (1, 'cfg_attr', 'feature = \"specta\", derive(specta::Type)', 1)",
+            [],
+        )
+        .expect("derives insert");
+        conn.execute(
+            "INSERT INTO symbols (file_id, name, qualified_name, kind, line, signature)
+             VALUES (1, 'PayloadVariant', 'outer::Inner::PayloadVariant', 'enum_variant', 10,
+                     '{ value: u32 }')",
+            [],
+        )
+        .expect("nested variant insert");
+
+        let findings = ffi_tag_gate().run(&conn).expect("query");
+        assert_eq!(
+            findings.len(),
+            1,
+            "nested-module enum with payload must be flagged; got: {findings:?}"
+        );
+        assert_eq!(findings[0].qualified_name, "outer::Inner");
     }
 }
