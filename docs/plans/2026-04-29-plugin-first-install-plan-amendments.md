@@ -420,6 +420,192 @@ the source tree and quote the drift verbatim. That's the bar.
 
 ---
 
+## A-10 — Gate 1: Task 8's inline `pluginKey` drops the US-delimiter
+
+**Original (plan Task 8, Step 1):**
+
+```typescript
+function pluginKey(mp: string, plugin: string): string {
+  return `${mp}${plugin}`;
+}
+```
+
+**Drift.** BrowseTab.svelte (PR 92) already defines `pluginKey` with an
+ASCII Unit-Separator (``) delimiter precisely so a marketplace
+literally named `"foo"` + plugin `"bar"` cannot collide with a
+marketplace `"fooba"` + plugin `"r"`. From `BrowseTab.svelte:108-111`:
+
+```typescript
+const DELIM = "";
+const pluginKey = (mp: string, plugin: string) => `${mp}${DELIM}${plugin}`;
+```
+
+My Task 8 InstalledTab redefinition uses naive concatenation, breaking
+the collision-safe contract. The two files would then key the same
+plugin differently — anything that round-trips a key between the
+components (none does today, but the temptation is real once
+`installedPluginKeys` proves useful) would silently mismatch.
+
+**Amended.** Two equivalent fixes; pick one:
+
+**(a) Inline the delimiter** in Task 8's script block:
+
+```typescript
+const DELIM = "";
+function pluginKey(mp: string, plugin: string): string {
+  return `${mp}${DELIM}${plugin}`;
+}
+```
+
+**(b) Extract to `$lib/keys.ts`** (preferred — matches Task 6's
+extraction-first pattern and avoids any future drift):
+
+```typescript
+// crates/kiro-control-center/src/lib/keys.ts
+const DELIM = "";
+export const pluginKey = (mp: string, plugin: string): string =>
+  `${mp}${DELIM}${plugin}`;
+export const skillKey = (mp: string, plugin: string, name: string): string =>
+  `${mp}${DELIM}${plugin}${DELIM}${name}`;
+export const parsePluginKey = (key: string): { marketplace: string; plugin: string } => {
+  const [marketplace, plugin] = key.split(DELIM);
+  return { marketplace, plugin };
+};
+```
+
+Then BOTH BrowseTab.svelte and InstalledTab.svelte import from
+`$lib/keys`, and the BrowseTab in-script copy of these helpers
+(currently at `BrowseTab.svelte:108-118`) gets deleted.
+
+**Recommendation:** (b). The `pluginKey` helper is the kind of
+single-source-of-truth utility that earns its keep across the
+codebase — and the lift is mechanical, ~6 lines of diff plus the
+imports. Setting the precedent here also paves the way for the
+future Phase 1.5 / Phase 2 work that'll need the same key shape.
+
+**Rationale.** Gate 1 — "every API the plan references actually
+exists at the SHA the plan was written against" expanded to "and
+matches the existing contract." A `pluginKey` whose collision-safety
+silently differs from BrowseTab's is a contract violation even
+though the symbol exists.
+
+---
+
+## A-11 — Gate 1: Task 7's conditional structure under-specifies how `browseView` composes with the existing empty-state branch
+
+**Original (plan Task 7, Step 5):**
+
+```svelte
+{:else if browseView === "skills"}
+  <div class="grid gap-3 grid-cols-1 lg:grid-cols-2">
+    {#each filteredSkills as skill ... }
+      <SkillCard ... />
+    {/each}
+  </div>
+{:else}
+  {#if availablePlugins.length === 0}
+    ... (plugin empty state)
+  {:else}
+    ... (plugin grid)
+  {/if}
+{/if}
+```
+
+Plus a free-floating note:
+
+> "the existing `{:else if filteredSkills.length === 0}` empty-state
+> block (PR 92's per-plugin steering install in the empty state)
+> needs to be removed in favor of the new Plugins view"
+
+**Drift.** The note is correct but the code block doesn't show how to
+compose with the parent `{#if showLoadingSpinner}` chain. The
+implementer has to figure out where the existing
+`{:else if filteredSkills.length === 0}` branch goes — keep it gated
+on `browseView === "skills"`, or remove it entirely? Both are
+defensible; the plan should pick one and show the full structure.
+
+**Amended.** Show the complete conditional, with PR 92's empty-state
+removed (the Plugins view is the new home for plugin-based install):
+
+```svelte
+{#if showLoadingSpinner}
+  <div class="flex flex-col items-center justify-center h-full text-kiro-subtle gap-3">
+    <!-- existing loading spinner unchanged -->
+  </div>
+{:else if initialLoadFailed}
+  <div class="flex flex-col items-center justify-center h-full text-kiro-subtle gap-3">
+    <!-- existing initial-load-failed message unchanged -->
+  </div>
+{:else if browseView === "skills"}
+  {#if filteredSkills.length === 0}
+    <div class="flex flex-col items-center justify-center h-full text-kiro-subtle gap-3">
+      <svg class="w-10 h-10 text-kiro-accent-800" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+        <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5"
+          d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" />
+      </svg>
+      <p class="text-sm">
+        {#if filterText}
+          No skills match the filter
+        {:else if fetchErrors.size > 0}
+          Skills unavailable due to errors above
+        {:else}
+          No skills available — try the Plugins view to install plugins that ship steering.
+        {/if}
+      </p>
+    </div>
+  {:else}
+    <div class="grid gap-3 grid-cols-1 lg:grid-cols-2">
+      {#each filteredSkills as skill (skillKey(skill.marketplace, skill.plugin, skill.name))}
+        {@const key = skillKey(skill.marketplace, skill.plugin, skill.name)}
+        <SkillCard
+          {skill}
+          selected={selectedSkills.has(key)}
+          onToggle={() => toggleSkill(key)}
+        />
+      {/each}
+    </div>
+  {/if}
+{:else}
+  <!-- browseView === "plugins" -->
+  {#if availablePlugins.length === 0}
+    <div class="flex flex-col items-center justify-center h-full text-kiro-subtle gap-3">
+      <p class="text-sm">No plugins available — pick a marketplace from Filters.</p>
+    </div>
+  {:else}
+    <div class="grid gap-3 grid-cols-1 lg:grid-cols-2">
+      {#each availablePlugins as ap (pluginKey(ap.marketplace, ap.plugin.name))}
+        {@const key = pluginKey(ap.marketplace, ap.plugin.name)}
+        <PluginCard
+          plugin={ap.plugin}
+          marketplace={ap.marketplace}
+          installed={installedPluginKeys.has(key)}
+          installing={pendingPluginInstalls.has(key)}
+          projectPicked={!!projectPath}
+          onInstall={() => installWholePlugin(ap.marketplace, ap.plugin.name)}
+        />
+      {/each}
+    </div>
+  {/if}
+{/if}
+```
+
+**Concretely deleted by this amendment** — the current BrowseTab
+empty-state plugin-card list added in PR 92 commit `0102ec5` (the
+`{:else if !filterText && availablePlugins.length > 0}` branch
+introduced when the user reported "I don't see anything in the UI
+to install steering"). That UI moves into the new Plugins view as
+the *primary* surface; the empty-state is just "No skills available
+— try the Plugins view" text now.
+
+**Rationale.** Gate 1 — the plan's "remove PR 92's empty-state"
+note moved a non-trivial chunk of working code into "implementer's
+discretion." Showing the explicit before/after structure removes
+the ambiguity. Also lands a small UX win: the skill empty-state
+now points users at the Plugins view, completing the discovery
+loop.
+
+---
+
 ## A-9 — Performance: hoist `Utc::now()` out of `installed_plugins`'s map closure
 
 **Original (plan Task 2, Step 4):**
@@ -541,6 +727,13 @@ lesson so future plan-reviews start with the right tool.
   closure. Caught by gemini-code-assist on PR #93. Surfaces a
   separate semantic concern — `unwrap_or(now)` may be papering over
   a malformed-tracking case that should fail loudly instead.
+- A-10: Task 8's inline `pluginKey` drops BrowseTab's `` delim,
+  breaking the collision-safe contract. Lift `pluginKey`/`skillKey`/
+  `parsePluginKey` to `$lib/keys.ts`; both files import.
+- A-11: Task 7's conditional structure under-specifies how
+  `browseView` composes with the existing chain. Explicit before/
+  after rendering tree shown. PR 92's empty-state plugin cards
+  retired in favor of the new Plugins view as primary surface.
 
 No design-doc revisions required. The amendments are all execution-time
 corrections; the architecture in
