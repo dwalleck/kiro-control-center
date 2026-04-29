@@ -743,44 +743,64 @@ impl KiroProject {
 
     /// Remove an installed skill.
     ///
-    /// Deletes the skill directory and removes the entry from the tracking
-    /// file.
+    /// Drops the entry from `installed-skills.json` and unlinks the
+    /// skill directory. `NotInstalled` is reserved for "no tracking
+    /// entry" — a tracking row whose on-disk dir was hand-deleted is
+    /// recovered: the tracking row is dropped and the call returns
+    /// `Ok` (I3). Mirrors [`Self::remove_steering_file`] /
+    /// [`Self::remove_agent`]'s shape so the cascade in
+    /// [`Self::remove_plugin`] sees a uniform contract.
     ///
     /// # Errors
     ///
-    /// - [`SkillError::NotInstalled`] if the skill is not installed.
-    /// - I/O or JSON serialisation errors.
+    /// - [`SkillError::NotInstalled`] if `name` has no tracking entry.
+    /// - I/O or JSON serialisation errors. A `NotFound` on the
+    ///   on-disk directory itself is treated as success (orphan
+    ///   tracking row was just dropped).
     pub fn remove_skill(&self, name: &str) -> crate::error::Result<()> {
         validation::validate_name(name)?;
 
         crate::file_lock::with_file_lock(&self.tracking_path(), || -> crate::error::Result<()> {
             let dir = self.skill_dir(name);
 
-            if !dir.exists() {
-                return Err(SkillError::NotInstalled {
-                    name: name.to_owned(),
-                }
-                .into());
-            }
-
-            // Update tracking BEFORE deleting the directory so a crash
-            // between the two operations leaves the directory on disk
-            // (harmless) rather than a phantom tracking entry (confusing).
+            // Tracking-first removal (I3). Mirrors `remove_steering_file`
+            // and `remove_agent`: drop the tracking entry before any fs
+            // op so a crash between the two leaves the directory on
+            // disk (harmless) rather than a phantom tracking entry
+            // (which would resurrect the plugin in `installed_plugins()`).
             let mut installed = self.load_installed()?;
-            let saved_meta = installed.skills.remove(name);
+            let saved_meta =
+                installed
+                    .skills
+                    .remove(name)
+                    .ok_or_else(|| SkillError::NotInstalled {
+                        name: name.to_owned(),
+                    })?;
             self.write_tracking(&installed)?;
 
-            if let Err(e) = fs::remove_dir_all(&dir) {
-                // Directory delete failed after tracking was already updated.
-                // Re-insert the entry so the tracking file stays consistent.
-                warn!(
-                    name,
-                    error = %e,
-                    "failed to delete skill directory after tracking update; \
-                     restoring tracking entry"
-                );
-                if let Some(meta) = saved_meta {
-                    installed.skills.insert(name.to_owned(), meta);
+            match fs::remove_dir_all(&dir) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    // Orphan recovery: tracking row dropped, dir was
+                    // already gone (user hand-deleted it). I3 closes
+                    // the gap that previously made the cascade's
+                    // A-12 path leave persistent orphans.
+                    debug!(
+                        name,
+                        path = %dir.display(),
+                        "skill dir already absent on disk; orphan tracking row dropped"
+                    );
+                }
+                Err(e) => {
+                    // Restore tracking on non-NotFound fs failure so
+                    // the file system stays consistent with tracking.
+                    warn!(
+                        name,
+                        error = %e,
+                        "failed to delete skill directory after tracking update; \
+                         restoring tracking entry"
+                    );
+                    installed.skills.insert(name.to_owned(), saved_meta);
                     if let Err(restore_err) = self.write_tracking(&installed) {
                         warn!(
                             name,
@@ -789,14 +809,8 @@ impl KiroProject {
                              untracked on disk"
                         );
                     }
-                } else {
-                    debug!(
-                        name,
-                        "skill directory exists on disk but had no tracking \
-                         entry; no restore needed"
-                    );
+                    return Err(e.into());
                 }
-                return Err(e.into());
             }
 
             Ok(())
@@ -1065,18 +1079,16 @@ impl KiroProject {
         let tracking_path = self.steering_tracking_path();
         crate::file_lock::with_file_lock(&tracking_path, || -> crate::error::Result<()> {
             let mut installed = self.load_installed_steering()?;
-            if !installed.files.contains_key(rel) {
-                return Err(crate::steering::SteeringError::NotInstalled {
+            let saved_meta = installed.files.remove(rel).ok_or_else(|| {
+                crate::steering::SteeringError::NotInstalled {
                     rel: rel.to_path_buf(),
                 }
-                .into());
-            }
+            })?;
 
             let dest = self.steering_dir().join(rel);
             // Update tracking BEFORE unlinking so a crash between the
             // two leaves a stray on-disk file (harmless) rather than a
             // phantom tracking entry. Mirrors `remove_skill`'s ordering.
-            installed.files.remove(rel);
             self.write_steering_tracking(&installed)?;
 
             match fs::remove_file(&dest) {
@@ -1088,12 +1100,26 @@ impl KiroProject {
                     );
                 }
                 Err(e) => {
+                    // I4: restore tracking on non-NotFound fs failure
+                    // so the tracking file stays consistent with the
+                    // file system (and a retry will see the same
+                    // tracking entry).
                     warn!(
                         rel = %rel.display(),
                         path = %dest.display(),
                         error = %e,
-                        "failed to unlink steering file after tracking update"
+                        "failed to unlink steering file after tracking update; \
+                         restoring tracking entry"
                     );
+                    installed.files.insert(rel.to_path_buf(), saved_meta);
+                    if let Err(restore_err) = self.write_steering_tracking(&installed) {
+                        warn!(
+                            rel = %rel.display(),
+                            error = %restore_err,
+                            "failed to restore steering tracking entry — \
+                             file may be untracked on disk"
+                        );
+                    }
                     return Err(e.into());
                 }
             }
@@ -1126,12 +1152,13 @@ impl KiroProject {
         let tracking_path = self.agent_tracking_path();
         crate::file_lock::with_file_lock(&tracking_path, || -> crate::error::Result<()> {
             let mut installed = self.load_installed_agents()?;
-            if !installed.agents.contains_key(name) {
-                return Err(AgentError::NotInstalled {
-                    name: name.to_owned(),
-                }
-                .into());
-            }
+            let saved_meta =
+                installed
+                    .agents
+                    .remove(name)
+                    .ok_or_else(|| AgentError::NotInstalled {
+                        name: name.to_owned(),
+                    })?;
 
             let json_target = self.agents_dir().join(format!("{name}.json"));
             let prompt_target = self.agent_prompts_dir().join(format!("{name}.md"));
@@ -1139,7 +1166,6 @@ impl KiroProject {
             // Update tracking BEFORE unlinking so a crash between the
             // two leaves stray on-disk files (harmless) rather than a
             // phantom tracking entry.
-            installed.agents.remove(name);
             self.write_agent_tracking(&installed)?;
 
             for path in [&json_target, &prompt_target] {
@@ -1152,12 +1178,29 @@ impl KiroProject {
                         );
                     }
                     Err(e) => {
+                        // I4: restore tracking on non-NotFound fs
+                        // failure. The dual-file unlink can be
+                        // half-successful — one file unlinked, the
+                        // other failed. Restoring tracking keeps the
+                        // file system consistent with tracking, even
+                        // though the on-disk state is now partial.
+                        // The caller can retry or inspect.
                         warn!(
                             agent = name,
                             path = %path.display(),
                             error = %e,
-                            "failed to unlink agent file after tracking update"
+                            "failed to unlink agent file after tracking update; \
+                             restoring tracking entry"
                         );
+                        installed.agents.insert(name.to_owned(), saved_meta);
+                        if let Err(restore_err) = self.write_agent_tracking(&installed) {
+                            warn!(
+                                agent = name,
+                                error = %restore_err,
+                                "failed to restore agent tracking entry — \
+                                 agent may be untracked on disk"
+                            );
+                        }
                         return Err(e.into());
                     }
                 }
@@ -1237,28 +1280,35 @@ impl KiroProject {
     /// the on-disk files, updates the tracking JSON files atomically,
     /// and returns aggregated counts.
     ///
-    /// **Orphan-tracking recovery (A-12).** If a tracking entry
+    /// **Orphan-tracking recovery (A-12 + I3).** If a tracking entry
     /// references a path that no longer exists on disk (state
     /// divergence: user ran `rm -rf .kiro/skills/<name>/` manually),
-    /// the per-content removal still completes successfully because
-    /// each `remove_*` treats on-disk `NotFound` as success. Only
-    /// genuine fs / parse / cross-plugin-clash error variants abort
-    /// the cascade.
+    /// the per-content `remove_*` drops the tracking row and treats
+    /// the missing on-disk file as success. The cascade therefore
+    /// counts the orphan as removed AND the tracking row no longer
+    /// resurrects the plugin in `installed_plugins()`.
+    ///
+    /// **Per-step failures (I5).** A per-content removal that fails
+    /// mid-cascade does NOT abort. The failure is recorded in
+    /// `result.failed`; the cascade keeps going on the remaining
+    /// content types so partial progress isn't lost. Same policy as
+    /// `InstallPluginResult`'s sub-result `failed` vecs (A-15).
     ///
     /// **`native_companions` cleanup (A-3 + A-16).** After per-agent
     /// removals, the plugin-level `native_companions` entry is
     /// dropped if its `marketplace` field matches `marketplace` (the
     /// map is keyed by plugin name alone, so the marketplace check
-    /// disambiguates same-named plugins across marketplaces).
+    /// disambiguates same-named plugins across marketplaces). A
+    /// failure here also lands in `result.failed` rather than
+    /// short-circuiting the cascade.
     ///
     /// # Errors
     ///
-    /// Propagates any non-`NotInstalled` error from the per-content
-    /// removals, plus I/O / JSON failures from the cascade's
-    /// initial tracking-file loads. The cascade does **not** roll
-    /// back partial progress — once a per-content `remove_*`
-    /// commits, that work stays committed even if a later step
-    /// fails.
+    /// Reserved for "failed to even read the initial tracking files"
+    /// (the three `load_installed*()` calls). Per-step errors during
+    /// the loop go into `result.failed`. Tracking-file loads can fail
+    /// with I/O errors, JSON parse errors, or path-traversal
+    /// validation errors (A-4).
     pub fn remove_plugin(
         &self,
         marketplace: &str,
@@ -1279,17 +1329,25 @@ impl KiroProject {
                 Ok(()) => {
                     result.skills_removed = result.skills_removed.saturating_add(1);
                 }
-                Err(crate::error::Error::Skill(SkillError::NotInstalled { .. })) => {
+                Err(e) => {
+                    // I5: collect, don't abort. I3 closed the orphan-
+                    // tracking gap so `SkillError::NotInstalled` from
+                    // here is now "no tracking entry" — which the
+                    // cascade's `filter` already excluded. So this
+                    // arm is for genuine fs / serialisation failures.
                     warn!(
                         skill = %name,
                         plugin,
                         marketplace,
-                        "remove_plugin: skill tracking entry had no on-disk directory; \
-                         treating as already-removed (A-12)"
+                        error = %e,
+                        "remove_plugin: skill removal failed; recording in `failed`"
                     );
-                    result.skills_removed = result.skills_removed.saturating_add(1);
+                    result.failed.push(RemovePluginFailure {
+                        content_type: "skill".to_string(),
+                        item: name.clone(),
+                        error: crate::error::error_full_chain(&e),
+                    });
                 }
-                Err(e) => return Err(e),
             }
         }
 
@@ -1306,19 +1364,20 @@ impl KiroProject {
                 Ok(()) => {
                     result.steering_removed = result.steering_removed.saturating_add(1);
                 }
-                Err(crate::error::Error::Steering(
-                    crate::steering::SteeringError::NotInstalled { .. },
-                )) => {
+                Err(e) => {
                     warn!(
                         rel = %rel.display(),
                         plugin,
                         marketplace,
-                        "remove_plugin: steering tracking entry had no on-disk file; \
-                         treating as already-removed (A-12)"
+                        error = %e,
+                        "remove_plugin: steering removal failed; recording in `failed`"
                     );
-                    result.steering_removed = result.steering_removed.saturating_add(1);
+                    result.failed.push(RemovePluginFailure {
+                        content_type: "steering".to_string(),
+                        item: rel.display().to_string(),
+                        error: crate::error::error_full_chain(&e),
+                    });
                 }
-                Err(e) => return Err(e),
             }
         }
 
@@ -1335,24 +1394,40 @@ impl KiroProject {
                 Ok(()) => {
                     result.agents_removed = result.agents_removed.saturating_add(1);
                 }
-                Err(crate::error::Error::Agent(AgentError::NotInstalled { .. })) => {
+                Err(e) => {
                     warn!(
                         agent = %name,
                         plugin,
                         marketplace,
-                        "remove_plugin: agent tracking entry had no on-disk prompt; \
-                         treating as already-removed (A-12)"
+                        error = %e,
+                        "remove_plugin: agent removal failed; recording in `failed`"
                     );
-                    result.agents_removed = result.agents_removed.saturating_add(1);
+                    result.failed.push(RemovePluginFailure {
+                        content_type: "agent".to_string(),
+                        item: name.clone(),
+                        error: crate::error::error_full_chain(&e),
+                    });
                 }
-                Err(e) => return Err(e),
             }
         }
 
         // native_companions cleanup (A-3 + A-16). Idempotent — the
         // helper returns Ok even if the entry doesn't exist or
-        // belongs to a different marketplace.
-        self.remove_native_companions_for_plugin(plugin, marketplace)?;
+        // belongs to a different marketplace. Per I5 a failure here
+        // also lands in `result.failed` rather than aborting.
+        if let Err(e) = self.remove_native_companions_for_plugin(plugin, marketplace) {
+            warn!(
+                plugin,
+                marketplace,
+                error = %e,
+                "remove_plugin: native_companions cleanup failed; recording in `failed`"
+            );
+            result.failed.push(RemovePluginFailure {
+                content_type: "native_companions".to_string(),
+                item: String::new(),
+                error: crate::error::error_full_chain(&e),
+            });
+        }
 
         Ok(result)
     }
@@ -4872,6 +4947,45 @@ mod tests {
         );
     }
 
+    #[test]
+    fn remove_skill_drops_tracking_on_orphan_dir() {
+        // I3: when the on-disk skill dir is missing but a tracking
+        // entry exists, `remove_skill` must drop the tracking row and
+        // return `Ok(())`. Closes A-24 — the cascade's A-12 path no
+        // longer creates persistent orphans because the per-method
+        // contract now drives to absence.
+        use chrono::Utc;
+        let (_dir, project) = temp_project();
+        std::fs::create_dir_all(project.kiro_dir()).expect("kiro dir");
+
+        let now = Utc::now();
+        std::fs::write(
+            project.tracking_path(),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "skills": {
+                    "orphan": {
+                        "marketplace": "mp", "plugin": "p",
+                        "version": "1.0.0", "installed_at": now,
+                        "source_hash": "deadbeef",
+                    }
+                }
+            }))
+            .expect("ser"),
+        )
+        .expect("skills tracking");
+        // Note: NO skills/orphan dir on disk.
+
+        project
+            .remove_skill("orphan")
+            .expect("orphan removal must succeed");
+
+        let installed = project.load_installed().expect("reload");
+        assert!(
+            installed.skills.is_empty(),
+            "I3: orphan tracking row must be dropped on remove_skill"
+        );
+    }
+
     // -- remove_steering_file ---------------------------------------------
 
     #[test]
@@ -4971,6 +5085,55 @@ mod tests {
         assert!(
             tracking.files.is_empty(),
             "tracking entry must be gone even when on-disk file was orphan"
+        );
+    }
+
+    #[test]
+    fn remove_steering_file_restores_tracking_on_unlink_failure() {
+        // I4: when fs::remove_file fails with a non-NotFound error,
+        // the tracking entry must be restored so the file system
+        // and tracking stay consistent. Trick: stage a directory at
+        // the destination path, so `remove_file` returns EISDIR
+        // (kind Other / IsADirectory) — not NotFound — which the
+        // restore branch handles.
+        use chrono::Utc;
+        let (_dir, project) = temp_project();
+        std::fs::create_dir_all(project.kiro_dir().join("steering/guide.md"))
+            .expect("stage directory at destination so unlink fails with EISDIR");
+
+        let now = Utc::now();
+        std::fs::write(
+            project.kiro_dir().join("installed-steering.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "files": {
+                    "guide.md": {
+                        "marketplace": "mp",
+                        "plugin": "p",
+                        "version": "1.0.0",
+                        "installed_at": now,
+                        "source_hash": "x",
+                        "installed_hash": "x",
+                    }
+                }
+            }))
+            .expect("ser"),
+        )
+        .expect("write tracking");
+
+        let err = project
+            .remove_steering_file(Path::new("guide.md"))
+            .expect_err("EISDIR must surface as Err");
+        assert!(
+            matches!(err, crate::error::Error::Io(_)),
+            "expected Error::Io, got {err:?}"
+        );
+
+        let tracking = project
+            .load_installed_steering()
+            .expect("reload steering tracking");
+        assert!(
+            tracking.files.contains_key(Path::new("guide.md")),
+            "I4: tracking entry must be restored after unlink failure"
         );
     }
 
@@ -5102,6 +5265,64 @@ mod tests {
         assert!(
             !tracking.agents.contains_key("ghost"),
             "tracking entry must be gone even when on-disk files were orphan"
+        );
+    }
+
+    #[test]
+    fn remove_agent_restores_tracking_on_unlink_failure() {
+        // I4: stage a directory at the agent JSON destination so
+        // `fs::remove_file` returns EISDIR; the tracking row must be
+        // restored. This exercises the half-success case (one file
+        // unlinks, the other fails) by relying on the JSON path
+        // being unlinkable as a directory.
+        use chrono::Utc;
+        let (_dir, project) = temp_project();
+        // Create the parent so we can stage a directory at the JSON path.
+        std::fs::create_dir_all(project.agents_dir().join("reviewer.json"))
+            .expect("stage directory at agent JSON path so unlink fails with EISDIR");
+        std::fs::create_dir_all(project.agent_prompts_dir()).expect("agents/prompts dir");
+        // Empty prompt file so the second unlink would succeed —
+        // the failure must come from the directory at reviewer.json.
+        std::fs::write(
+            project.agent_prompts_dir().join("reviewer.md"),
+            "# reviewer\n",
+        )
+        .expect("write prompt");
+
+        let now = Utc::now();
+        std::fs::write(
+            project.agent_tracking_path(),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "agents": {
+                    "reviewer": {
+                        "marketplace": "mp",
+                        "plugin": "p",
+                        "version": "1.0.0",
+                        "installed_at": now,
+                        "dialect": "native",
+                        "source_hash": "deadbeef",
+                        "installed_hash": "deadbeef",
+                    }
+                }
+            }))
+            .expect("ser"),
+        )
+        .expect("write tracking");
+
+        let err = project
+            .remove_agent("reviewer")
+            .expect_err("EISDIR must surface as Err");
+        assert!(
+            matches!(err, crate::error::Error::Io(_)),
+            "expected Error::Io, got {err:?}"
+        );
+
+        let tracking = project
+            .load_installed_agents()
+            .expect("reload agent tracking");
+        assert!(
+            tracking.agents.contains_key("reviewer"),
+            "I4: tracking entry must be restored after unlink failure"
         );
     }
 
@@ -5329,9 +5550,10 @@ mod tests {
 
     #[test]
     fn remove_plugin_recovers_from_orphan_skill_tracking_entry() {
-        // A-12 regression at the cascade level: tracking entry exists
-        // but on-disk dir doesn't. The cascade must NOT abort; treat
-        // as already-removed.
+        // A-12 + I3 regression at the cascade level: tracking entry
+        // exists but on-disk dir doesn't. The cascade must NOT abort
+        // AND the tracking row must be dropped so the plugin doesn't
+        // resurrect on the next `installed_plugins()` call.
         use chrono::Utc;
         let (_dir, project) = temp_project();
         std::fs::create_dir_all(project.kiro_dir()).expect("kiro dir");
@@ -5360,15 +5582,116 @@ mod tests {
             result.skills_removed, 1,
             "orphan tracking entry counts as removed (A-12)"
         );
-        // Note: remove_skill returns SkillError::NotInstalled when the
-        // on-disk directory is missing without dropping the tracking
-        // entry — that's the existing precedent. The cascade
-        // therefore can't drop the phantom skill tracking entry here.
-        // The orphan recovery contract per A-12 is "log + count as
-        // removed + continue", not "rewrite the tracking file." A
-        // future cleanup pass that makes remove_skill itself prune
-        // orphan tracking would tighten this — out of scope for the
-        // plugin-first install plan's Task 3.
+        assert!(
+            result.failed.is_empty(),
+            "I3: orphan recovery is no longer a `failed` entry; remove_skill \
+             drops the tracking row and treats missing on-disk dir as success"
+        );
+        // I3: remove_skill now drops the tracking row on the orphan
+        // path, so installed_plugins() must NOT surface this plugin
+        // anymore. Closes A-24.
+        let installed = project.load_installed().expect("reload skills tracking");
+        assert!(
+            installed.skills.is_empty(),
+            "I3: orphan tracking row must be dropped post-cascade"
+        );
+        let plugins = project.installed_plugins().expect("installed_plugins");
+        assert!(
+            plugins.is_empty(),
+            "I3: cleared tracking means `installed_plugins()` reports nothing — \
+             plugin no longer resurrects after a `Remove` click"
+        );
+    }
+
+    #[test]
+    fn remove_plugin_partial_failure_collects_failed_and_keeps_succeeded() {
+        // I5: stage one removable skill plus a steering tracking row
+        // whose unlink fails (directory at destination). The cascade
+        // must:
+        //   - count the skill as removed
+        //   - record the steering failure in `result.failed` (NOT
+        //     short-circuit)
+        //   - still return Ok(result)
+        use chrono::Utc;
+        let (_dir, project) = temp_project();
+        std::fs::create_dir_all(project.kiro_dir()).expect("kiro dir");
+
+        // Removable skill: install a real one so remove_skill drives
+        // to absence cleanly.
+        let src = tempfile::tempdir().expect("skill tempdir");
+        std::fs::write(
+            src.path().join("SKILL.md"),
+            "---\nname: removable\ndescription: Goes away\n---\n",
+        )
+        .expect("write skill");
+        project
+            .install_skill_from_dir(
+                "removable",
+                src.path(),
+                InstalledSkillMeta {
+                    marketplace: "mp".into(),
+                    plugin: "p".into(),
+                    version: Some("1.0.0".into()),
+                    installed_at: Utc::now(),
+                    source_hash: Some("deadbeef".into()),
+                    installed_hash: Some("deadbeef".into()),
+                },
+            )
+            .expect("install skill");
+
+        // Stage steering tracking entry whose dest is a directory →
+        // remove_file returns EISDIR → I5 captures the failure.
+        std::fs::create_dir_all(project.kiro_dir().join("steering/guide.md"))
+            .expect("stage directory at steering destination");
+        let now = Utc::now();
+        std::fs::write(
+            project.kiro_dir().join("installed-steering.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "files": {
+                    "guide.md": {
+                        "marketplace": "mp",
+                        "plugin": "p",
+                        "version": "1.0.0",
+                        "installed_at": now,
+                        "source_hash": "x",
+                        "installed_hash": "x",
+                    }
+                }
+            }))
+            .expect("ser"),
+        )
+        .expect("write steering tracking");
+
+        let result = project
+            .remove_plugin("mp", "p")
+            .expect("I5: cascade returns Ok even with per-step failures");
+
+        assert_eq!(
+            result.skills_removed, 1,
+            "I5: skill removal succeeded and counted"
+        );
+        assert_eq!(
+            result.steering_removed, 0,
+            "I5: steering removal failed — count must NOT increment"
+        );
+        assert_eq!(
+            result.failed.len(),
+            1,
+            "I5: exactly one failed entry expected, got {:?}",
+            result.failed
+        );
+        assert_eq!(
+            result.failed[0].content_type, "steering",
+            "I5: content_type must identify which sub-step errored"
+        );
+        assert_eq!(
+            result.failed[0].item, "guide.md",
+            "I5: item must identify which entry errored"
+        );
+        assert!(
+            !result.failed[0].error.is_empty(),
+            "I5: error string must be populated via error_full_chain"
+        );
     }
 
     #[test]

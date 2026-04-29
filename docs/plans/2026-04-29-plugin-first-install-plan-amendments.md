@@ -1475,7 +1475,24 @@ pub installed_companions: Option<crate::project::InstalledNativeCompanionsOutcom
 
 ---
 
-## A-24 — Implementation finding: `remove_skill`'s `NotInstalled` leaves tracking row stale; A-12 cascade counts but doesn't truly drive to absence
+## A-24 — [CLOSED in PR #94 review fixup] Implementation finding: `remove_skill`'s `NotInstalled` leaves tracking row stale; A-12 cascade counts but doesn't truly drive to absence
+
+**Status.** Closed via PR #94's I3 review-fixup commit. The fix
+is option 1 from the original "two equally valid future fixes" list:
+`remove_skill` now drops the tracking row before any fs op and treats
+`fs::remove_dir_all` `NotFound` as success. The cascade's match arms
+were simultaneously reworked under I5 (per-step failures collected
+into `RemovePluginResult.failed`) so the orphan path is no longer
+even an exceptional case — `remove_skill` returns `Ok(())` and the
+cascade increments `skills_removed` like any other clean removal.
+
+Regression locks:
+- `remove_skill_drops_tracking_on_orphan_dir` — per-method contract.
+- `remove_plugin_recovers_from_orphan_skill_tracking_entry` —
+  expanded to assert tracking is empty post-cascade AND
+  `installed_plugins()` returns `[]` (no resurrection).
+
+The original A-24 narrative is preserved below for audit trail.
 
 **Surfaced during.** Task 3 implementation (commit `7a4718d`). Captured per the "forward motion + audit trail" rule from the Phase 1 execution session — not actioned in Task 3.
 
