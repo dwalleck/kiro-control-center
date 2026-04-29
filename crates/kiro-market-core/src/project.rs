@@ -296,6 +296,48 @@ pub struct InstalledPluginInfo {
     pub latest_install: String,
 }
 
+/// Wire-format wrapper around [`Vec<InstalledPluginInfo>`] that also
+/// carries per-tracking-file load failures so the UI can render a
+/// partial state when one of the three `installed-*.json` files is
+/// corrupt or unreadable (I13).
+///
+/// Rationale: previously, `installed_plugins()` failed the entire
+/// aggregator on any `?`-chain load failure, leaving the user with
+/// "zero installed plugins" even when two of three tracking files
+/// loaded cleanly. The view here surfaces what loaded AND what
+/// didn't, so the UI can show a "partial state — N tracking files
+/// failed to load" banner instead of a misleading empty list.
+#[derive(Debug, Clone, Default, Serialize)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
+pub struct InstalledPluginsView {
+    /// Per-`(marketplace, plugin)` rows assembled from the tracking
+    /// files that loaded successfully. May be empty if every file
+    /// failed; the [`Self::partial_load_warnings`] vec then carries
+    /// the explanation.
+    pub plugins: Vec<InstalledPluginInfo>,
+    /// One entry per `installed-*.json` whose load failed. The
+    /// corresponding content type's contributions are missing from
+    /// `plugins`. Empty on a clean state.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub partial_load_warnings: Vec<TrackingLoadWarning>,
+}
+
+/// Per-tracking-file load failure surfaced by
+/// [`KiroProject::installed_plugins`] (I13).
+#[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
+pub struct TrackingLoadWarning {
+    /// Filename relative to `.kiro/`: `"installed-skills.json"` /
+    /// `"installed-steering.json"` / `"installed-agents.json"`. Just
+    /// the basename — the absolute path leaks layout information the
+    /// frontend doesn't need.
+    pub tracking_file: String,
+    /// Rendered error chain via [`crate::error::error_full_chain`] —
+    /// wire format per CLAUDE.md "in any wire-format `reason`/`error:
+    /// String` field that crosses the FFI, use `error_full_chain(&err)`".
+    pub error: String,
+}
+
 /// Aggregated counts returned by
 /// [`KiroProject::remove_plugin`] — one tally per content type so the
 /// caller (CLI / Tauri) can render a one-line "removed N skills,
@@ -967,16 +1009,40 @@ impl KiroProject {
     /// the first-iterated version (skills → steering → agents) — see
     /// [`update_latest`] for the rationale.
     ///
+    /// # Partial-load tolerance (I13)
+    ///
+    /// A failure to load one of the three tracking files is recorded
+    /// in [`InstalledPluginsView::partial_load_warnings`] and the
+    /// other two files still contribute. Previously a single corrupt
+    /// tracking file would surface as the user seeing zero installed
+    /// plugins; the view now lets the UI render the partial state with
+    /// an explicit "N tracking files failed to load" banner.
+    ///
     /// # Errors
     ///
-    /// Propagates I/O or JSON parse failures from the three
-    /// `load_installed*` methods.
-    pub fn installed_plugins(&self) -> crate::error::Result<Vec<InstalledPluginInfo>> {
+    /// Infallible at the function level — even if every tracking
+    /// file fails to load, the returned view carries the warnings
+    /// and an empty `plugins` Vec. The `Result` return type is
+    /// preserved purely for API stability and future-proofing
+    /// (a panic-on-corrupt-tempdir style failure would fit there).
+    pub fn installed_plugins(&self) -> crate::error::Result<InstalledPluginsView> {
         use std::collections::BTreeMap;
 
         let mut by_pair: BTreeMap<(String, String), Acc> = BTreeMap::new();
+        let mut warnings: Vec<TrackingLoadWarning> = Vec::new();
 
-        let skills = self.load_installed()?;
+        // I13: each tracking-file load failure is recorded as a
+        // warning; the other two files still contribute. The
+        // `unwrap_or_else` shape is a deliberate fall-back to the
+        // `Default` value (empty maps) so the rest of the fold
+        // doesn't have to special-case missing data.
+        let skills = self.load_installed().unwrap_or_else(|e| {
+            warnings.push(TrackingLoadWarning {
+                tracking_file: INSTALLED_SKILLS_FILE.to_string(),
+                error: crate::error::error_full_chain(&e),
+            });
+            InstalledSkills::default()
+        });
         for (name, meta) in &skills.skills {
             let acc = by_pair
                 .entry((meta.marketplace.clone(), meta.plugin.clone()))
@@ -985,7 +1051,13 @@ impl KiroProject {
             update_latest(acc, meta.version.as_deref(), meta.installed_at);
         }
 
-        let steering = self.load_installed_steering()?;
+        let steering = self.load_installed_steering().unwrap_or_else(|e| {
+            warnings.push(TrackingLoadWarning {
+                tracking_file: INSTALLED_STEERING_FILE.to_string(),
+                error: crate::error::error_full_chain(&e),
+            });
+            InstalledSteering::default()
+        });
         for (rel, meta) in &steering.files {
             let acc = by_pair
                 .entry((meta.marketplace.clone(), meta.plugin.clone()))
@@ -994,7 +1066,13 @@ impl KiroProject {
             update_latest(acc, meta.version.as_deref(), meta.installed_at);
         }
 
-        let agents = self.load_installed_agents()?;
+        let agents = self.load_installed_agents().unwrap_or_else(|e| {
+            warnings.push(TrackingLoadWarning {
+                tracking_file: INSTALLED_AGENTS_FILE.to_string(),
+                error: crate::error::error_full_chain(&e),
+            });
+            InstalledAgents::default()
+        });
         for (name, meta) in &agents.agents {
             let acc = by_pair
                 .entry((meta.marketplace.clone(), meta.plugin.clone()))
@@ -1009,7 +1087,7 @@ impl KiroProject {
         // tracking file shouldn't produce; substituting "now" is a
         // fallback the UI accepts but a future reader can scrutinize.
         let now = chrono::Utc::now();
-        Ok(by_pair
+        let plugins: Vec<InstalledPluginInfo> = by_pair
             .into_iter()
             .map(|((marketplace, plugin), mut acc)| {
                 let (latest_install_dt, installed_version) =
@@ -1038,7 +1116,11 @@ impl KiroProject {
                     latest_install: latest_install_dt.to_rfc3339(),
                 }
             })
-            .collect())
+            .collect();
+        Ok(InstalledPluginsView {
+            plugins,
+            partial_load_warnings: warnings,
+        })
     }
 
     /// Remove a single installed steering file from
@@ -3702,9 +3784,14 @@ mod tests {
         .expect("steering tracking");
 
         let result = project.installed_plugins().expect("installed_plugins");
-        assert_eq!(result.len(), 2, "two plugins expected");
+        assert_eq!(result.plugins.len(), 2, "two plugins expected");
+        assert!(
+            result.partial_load_warnings.is_empty(),
+            "clean state must produce no warnings"
+        );
 
         let plug_a = result
+            .plugins
             .iter()
             .find(|p| p.plugin == "plug-a")
             .expect("plug-a present");
@@ -3715,6 +3802,7 @@ mod tests {
         assert_eq!(plug_a.installed_version.as_deref(), Some("1.0.0"));
 
         let plug_b = result
+            .plugins
             .iter()
             .find(|p| p.plugin == "plug-b")
             .expect("plug-b present");
@@ -3765,9 +3853,9 @@ mod tests {
         .expect("steering");
 
         let result = project.installed_plugins().expect("installed_plugins");
-        assert_eq!(result.len(), 1);
+        assert_eq!(result.plugins.len(), 1);
         assert_eq!(
-            result[0].installed_version.as_deref(),
+            result.plugins[0].installed_version.as_deref(),
             Some("1.0.0"),
             "tied timestamps must keep first-iterated version (skills); \
              got steering's 2.0.0 — A-17 `>` tie-break broken"
@@ -3855,14 +3943,14 @@ mod tests {
         .expect("agents");
 
         let result = project.installed_plugins().expect("installed_plugins");
-        assert_eq!(result.len(), 1);
+        assert_eq!(result.plugins.len(), 1);
         assert_eq!(
-            result[0].installed_skills,
+            result.plugins[0].installed_skills,
             vec!["alpha".to_string(), "beta".to_string(), "gamma".to_string()],
             "skills must be sorted post-fold; HashMap iteration order leak"
         );
         assert_eq!(
-            result[0].installed_steering,
+            result.plugins[0].installed_steering,
             vec![
                 std::path::PathBuf::from("a-guide.md"),
                 std::path::PathBuf::from("m-guide.md"),
@@ -3871,13 +3959,94 @@ mod tests {
             "steering must be sorted post-fold"
         );
         assert_eq!(
-            result[0].installed_agents,
+            result.plugins[0].installed_agents,
             vec![
                 "alpha-agent".to_string(),
                 "mid-agent".to_string(),
                 "zeta".to_string(),
             ],
             "agents must be sorted post-fold"
+        );
+    }
+
+    #[test]
+    fn installed_plugins_returns_full_view_with_empty_warnings_on_clean_state() {
+        // I13 regression: a clean (no tracking files) state must
+        // surface as an empty view with no warnings — not as an error.
+        let (_dir, project) = temp_project();
+
+        let view = project.installed_plugins().expect("clean state");
+        assert!(
+            view.plugins.is_empty(),
+            "no plugins installed yet, got: {:?}",
+            view.plugins
+        );
+        assert!(
+            view.partial_load_warnings.is_empty(),
+            "missing tracking files are NOT corruption — warnings must be empty, got: {:?}",
+            view.partial_load_warnings
+        );
+    }
+
+    #[test]
+    fn installed_plugins_returns_partial_view_when_one_tracking_file_corrupt() {
+        // I13 regression: a corrupt tracking file (invalid JSON) must
+        // NOT abort the aggregator. The other two tracking files
+        // contribute their plugins; the corruption is recorded as a
+        // `partial_load_warnings` entry so the UI can render a banner.
+        use chrono::Utc;
+        let (_dir, project) = temp_project();
+        std::fs::create_dir_all(project.kiro_dir()).expect("kiro dir");
+
+        // Steering: clean — must contribute its plugin to the view.
+        let now = Utc::now();
+        std::fs::write(
+            project.kiro_dir().join("installed-steering.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "files": {
+                    "guide.md": {
+                        "marketplace": "mp", "plugin": "p",
+                        "version": "1.0.0", "installed_at": now,
+                        "source_hash": "x", "installed_hash": "x",
+                    }
+                }
+            }))
+            .expect("ser steering"),
+        )
+        .expect("write steering");
+
+        // Skills: corrupt JSON — must surface as a load warning,
+        // not abort the aggregator.
+        std::fs::write(
+            project.kiro_dir().join("installed-skills.json"),
+            "{ this is not valid JSON",
+        )
+        .expect("write corrupt skills");
+
+        let view = project.installed_plugins().expect("partial-load tolerant");
+        assert_eq!(
+            view.plugins.len(),
+            1,
+            "steering loaded; one plugin expected, got: {:?}",
+            view.plugins
+        );
+        assert_eq!(view.plugins[0].plugin, "p");
+        assert_eq!(view.plugins[0].steering_count, 1);
+        assert_eq!(view.plugins[0].skill_count, 0);
+
+        assert_eq!(
+            view.partial_load_warnings.len(),
+            1,
+            "expected one warning for corrupt skills tracking, got: {:?}",
+            view.partial_load_warnings
+        );
+        assert_eq!(
+            view.partial_load_warnings[0].tracking_file, "installed-skills.json",
+            "warning must identify which tracking file failed"
+        );
+        assert!(
+            !view.partial_load_warnings[0].error.is_empty(),
+            "warning's error string must be populated via error_full_chain"
         );
     }
 
@@ -5486,7 +5655,7 @@ mod tests {
             .installed_plugins()
             .expect("installed_plugins post-remove");
         assert!(
-            post.iter().all(|p| p.plugin != "p"),
+            post.plugins.iter().all(|p| p.plugin != "p"),
             "plugin p must be gone from the aggregated view"
         );
         assert!(
@@ -5597,7 +5766,7 @@ mod tests {
         );
         let plugins = project.installed_plugins().expect("installed_plugins");
         assert!(
-            plugins.is_empty(),
+            plugins.plugins.is_empty(),
             "I3: cleared tracking means `installed_plugins()` reports nothing — \
              plugin no longer resurrects after a `Remove` click"
         );

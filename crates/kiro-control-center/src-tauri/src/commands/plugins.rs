@@ -18,7 +18,7 @@
 
 use std::path::PathBuf;
 
-use kiro_market_core::project::{InstalledPluginInfo, KiroProject, RemovePluginResult};
+use kiro_market_core::project::{InstalledPluginsView, KiroProject, RemovePluginResult};
 use kiro_market_core::service::{InstallMode, InstallPluginResult, MarketplaceService};
 
 use crate::commands::{make_service, validate_kiro_project_path};
@@ -82,7 +82,7 @@ fn install_plugin_impl(
 #[specta::specta]
 pub async fn list_installed_plugins(
     project_path: String,
-) -> Result<Vec<InstalledPluginInfo>, CommandError> {
+) -> Result<InstalledPluginsView, CommandError> {
     validate_kiro_project_path(&project_path)?;
     let project = KiroProject::new(PathBuf::from(&project_path));
     project.installed_plugins().map_err(CommandError::from)
@@ -370,13 +370,18 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let project_path = make_kiro_project(dir.path());
 
-        let plugins = list_installed_plugins(project_path)
+        let view = list_installed_plugins(project_path)
             .await
             .expect("aggregator on fresh project");
 
         assert!(
-            plugins.is_empty(),
-            "fresh project must aggregate to an empty list, got: {plugins:?}"
+            view.plugins.is_empty(),
+            "fresh project must aggregate to an empty list, got: {view:?}"
+        );
+        assert!(
+            view.partial_load_warnings.is_empty(),
+            "fresh project: no warnings expected, got: {:?}",
+            view.partial_load_warnings
         );
     }
 
@@ -406,16 +411,16 @@ mod tests {
         )
         .expect("seed via install_plugin_impl");
 
-        let plugins = list_installed_plugins(project_path)
+        let view = list_installed_plugins(project_path)
             .await
             .expect("aggregator after install");
 
         assert_eq!(
-            plugins.len(),
+            view.plugins.len(),
             1,
-            "expected one plugin row, got: {plugins:?}"
+            "expected one plugin row, got: {view:?}"
         );
-        let row = &plugins[0];
+        let row = &view.plugins[0];
         assert_eq!(row.marketplace, "mp1");
         assert_eq!(row.plugin, "myplugin");
         assert_eq!(row.skill_count, 1);
@@ -423,6 +428,7 @@ mod tests {
         assert_eq!(row.agent_count, 1);
         assert_eq!(row.installed_skills, vec!["alpha".to_string()]);
         assert_eq!(row.installed_agents, vec!["reviewer".to_string()]);
+        assert!(view.partial_load_warnings.is_empty());
     }
 
     /// An empty `project_path` must surface as `ErrorType::Validation`,
@@ -499,12 +505,12 @@ mod tests {
         assert_eq!(counts.steering_removed, 1);
         assert_eq!(counts.agents_removed, 1);
 
-        let plugins_after = list_installed_plugins(project_path)
+        let view_after = list_installed_plugins(project_path)
             .await
             .expect("aggregator after remove");
         assert!(
-            plugins_after.is_empty(),
-            "all tracking entries must be gone after remove_plugin, got: {plugins_after:?}"
+            view_after.plugins.is_empty(),
+            "all tracking entries must be gone after remove_plugin, got: {view_after:?}"
         );
     }
 
