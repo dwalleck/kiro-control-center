@@ -263,6 +263,77 @@ pub struct InstalledNativeCompanionsOutcome {
     pub installed_hash: String,
 }
 
+/// Aggregated view of a single installed plugin — the union of
+/// what's tracked across `installed-skills.json`,
+/// `installed-steering.json`, and `installed-agents.json` for a
+/// given `(marketplace, plugin)` pair.
+///
+/// Returned by [`KiroProject::installed_plugins`]. The frontend
+/// renders one row per `InstalledPluginInfo`.
+///
+/// `installed_version` is the version of the **most recent install**
+/// by `installed_at` timestamp — not a lexicographic max. See A-6
+/// in the plan amendments doc for why string-compare is wrong here.
+///
+/// `earliest_install` and `latest_install` are RFC3339-formatted
+/// strings to match the FFI shape used by `InstalledSkillInfo`
+/// (specta's chrono feature isn't enabled in this crate).
+#[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
+pub struct InstalledPluginInfo {
+    pub marketplace: String,
+    pub plugin: String,
+    pub installed_version: Option<String>,
+    pub skill_count: u32,
+    pub steering_count: u32,
+    pub agent_count: u32,
+    pub installed_skills: Vec<String>,
+    pub installed_steering: Vec<std::path::PathBuf>,
+    pub installed_agents: Vec<String>,
+    /// RFC3339-formatted timestamp.
+    pub earliest_install: String,
+    /// RFC3339-formatted timestamp.
+    pub latest_install: String,
+}
+
+/// Per-`(marketplace, plugin)` accumulator used by
+/// [`KiroProject::installed_plugins`] while folding the three tracking
+/// files into [`InstalledPluginInfo`] rows.
+#[derive(Default)]
+struct Acc {
+    /// `(installed_at, version)` of the most recent tracking entry seen
+    /// across the three content types — the version of the latest
+    /// install, which is what the UI wants under "this plugin's
+    /// installed version."
+    latest: Option<(chrono::DateTime<chrono::Utc>, Option<String>)>,
+    earliest: Option<chrono::DateTime<chrono::Utc>>,
+    skills: Vec<String>,
+    steering: Vec<std::path::PathBuf>,
+    agents: Vec<String>,
+}
+
+fn update_latest(
+    acc: &mut Acc,
+    version: Option<&str>,
+    installed_at: chrono::DateTime<chrono::Utc>,
+) {
+    let new_version = version.map(str::to_string);
+    // `>` (not `>=`): on tied timestamps, first-seen wins. The
+    // aggregator iterates skills → steering → agents, so on equal
+    // timestamps the first of those three with a tracking entry
+    // contributes the displayed version. Stable across process
+    // restarts; `>=` would leak HashMap iteration order into the
+    // wire format.
+    let should_replace = acc
+        .latest
+        .as_ref()
+        .is_none_or(|(when, _)| installed_at > *when);
+    if should_replace {
+        acc.latest = Some((installed_at, new_version));
+    }
+    acc.earliest = Some(acc.earliest.map_or(installed_at, |e| e.min(installed_at)));
+}
+
 // ---------------------------------------------------------------------------
 // KiroProject
 // ---------------------------------------------------------------------------
@@ -749,6 +820,81 @@ impl KiroProject {
             }
             Err(e) => Err(e.into()),
         }
+    }
+
+    /// Aggregate the three `installed-*.json` tracking files into one
+    /// row per `(marketplace, plugin)` pair, the shape the
+    /// `InstalledTab` UI renders.
+    ///
+    /// The returned `installed_version` reflects the *most recent*
+    /// install across all three content types (skills, steering,
+    /// agents), measured by `installed_at`. Tied timestamps keep
+    /// the first-iterated version (skills → steering → agents) — see
+    /// [`update_latest`] for the rationale.
+    ///
+    /// # Errors
+    ///
+    /// Propagates I/O or JSON parse failures from the three
+    /// `load_installed*` methods.
+    pub fn installed_plugins(&self) -> crate::error::Result<Vec<InstalledPluginInfo>> {
+        use std::collections::BTreeMap;
+
+        let mut by_pair: BTreeMap<(String, String), Acc> = BTreeMap::new();
+
+        let skills = self.load_installed()?;
+        for (name, meta) in &skills.skills {
+            let acc = by_pair
+                .entry((meta.marketplace.clone(), meta.plugin.clone()))
+                .or_default();
+            acc.skills.push(name.clone());
+            update_latest(acc, meta.version.as_deref(), meta.installed_at);
+        }
+
+        let steering = self.load_installed_steering()?;
+        for (rel, meta) in &steering.files {
+            let acc = by_pair
+                .entry((meta.marketplace.clone(), meta.plugin.clone()))
+                .or_default();
+            acc.steering.push(rel.clone());
+            update_latest(acc, meta.version.as_deref(), meta.installed_at);
+        }
+
+        let agents = self.load_installed_agents()?;
+        for (name, meta) in &agents.agents {
+            let acc = by_pair
+                .entry((meta.marketplace.clone(), meta.plugin.clone()))
+                .or_default();
+            acc.agents.push(name.clone());
+            update_latest(acc, meta.version.as_deref(), meta.installed_at);
+        }
+
+        // Hoist `Utc::now()` out of the map closure (A-9): one syscall
+        // not N. Also makes the fallback substitution explicit at one
+        // site — a missing `installed_at` is a degenerate state the
+        // tracking file shouldn't produce; substituting "now" is a
+        // fallback the UI accepts but a future reader can scrutinize.
+        let now = chrono::Utc::now();
+        Ok(by_pair
+            .into_iter()
+            .map(|((marketplace, plugin), acc)| {
+                let (latest_install_dt, installed_version) =
+                    acc.latest.map_or_else(|| (now, None), |(t, v)| (t, v));
+                let earliest_install_dt = acc.earliest.unwrap_or(now);
+                InstalledPluginInfo {
+                    marketplace,
+                    plugin,
+                    installed_version,
+                    skill_count: u32::try_from(acc.skills.len()).unwrap_or(u32::MAX),
+                    steering_count: u32::try_from(acc.steering.len()).unwrap_or(u32::MAX),
+                    agent_count: u32::try_from(acc.agents.len()).unwrap_or(u32::MAX),
+                    installed_skills: acc.skills,
+                    installed_steering: acc.steering,
+                    installed_agents: acc.agents,
+                    earliest_install: earliest_install_dt.to_rfc3339(),
+                    latest_install: latest_install_dt.to_rfc3339(),
+                }
+            })
+            .collect())
     }
 
     /// Persist the steering tracking file to disk atomically.
@@ -2845,6 +2991,130 @@ mod tests {
         let loaded = project.load_installed_steering().unwrap();
         assert_eq!(loaded.files.len(), 1);
         assert!(loaded.files.contains_key(std::path::Path::new("guide.md")));
+    }
+
+    #[test]
+    fn installed_plugins_groups_skills_steering_agents_by_marketplace_plugin_pair() {
+        use chrono::Utc;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let project = KiroProject::new(dir.path().to_path_buf());
+        std::fs::create_dir_all(project.kiro_dir()).expect("kiro dir");
+
+        let now = Utc::now();
+        let skills_json = serde_json::json!({
+            "skills": {
+                "alpha": {
+                    "marketplace": "mp",
+                    "plugin": "plug-a",
+                    "version": "1.0.0",
+                    "installed_at": now,
+                    "source_hash": "deadbeef"
+                }
+            }
+        });
+        std::fs::write(
+            project.kiro_dir().join("installed-skills.json"),
+            serde_json::to_vec_pretty(&skills_json).expect("ser skills"),
+        )
+        .expect("skills tracking");
+
+        let steering_json = serde_json::json!({
+            "files": {
+                "guide.md": {
+                    "marketplace": "mp",
+                    "plugin": "plug-a",
+                    "version": "1.0.0",
+                    "installed_at": now,
+                    "source_hash": "cafebabe",
+                    "installed_hash": "cafebabe"
+                },
+                "review.md": {
+                    "marketplace": "mp",
+                    "plugin": "plug-b",
+                    "version": "0.5.0",
+                    "installed_at": now,
+                    "source_hash": "feedface",
+                    "installed_hash": "feedface"
+                }
+            }
+        });
+        std::fs::write(
+            project.kiro_dir().join("installed-steering.json"),
+            serde_json::to_vec_pretty(&steering_json).expect("ser steering"),
+        )
+        .expect("steering tracking");
+
+        let result = project.installed_plugins().expect("installed_plugins");
+        assert_eq!(result.len(), 2, "two plugins expected");
+
+        let plug_a = result
+            .iter()
+            .find(|p| p.plugin == "plug-a")
+            .expect("plug-a present");
+        assert_eq!(plug_a.skill_count, 1);
+        assert_eq!(plug_a.steering_count, 1);
+        assert_eq!(plug_a.agent_count, 0);
+        assert_eq!(plug_a.installed_skills, vec!["alpha".to_string()]);
+        assert_eq!(plug_a.installed_version.as_deref(), Some("1.0.0"));
+
+        let plug_b = result
+            .iter()
+            .find(|p| p.plugin == "plug-b")
+            .expect("plug-b present");
+        assert_eq!(plug_b.skill_count, 0);
+        assert_eq!(plug_b.steering_count, 1);
+        assert_eq!(plug_b.agent_count, 0);
+    }
+
+    #[test]
+    fn installed_plugins_uses_strict_greater_for_latest_tie_break() {
+        use chrono::Utc;
+        let dir = tempfile::tempdir().expect("tempdir");
+        let project = KiroProject::new(dir.path().to_path_buf());
+        std::fs::create_dir_all(project.kiro_dir()).expect("kiro dir");
+
+        // Same timestamp on skill (v1) and steering (v2). Skills are
+        // iterated first; `>` keeps skill's version. `>=` would let
+        // steering (iterated second) overwrite, producing v2.
+        let same_time = Utc::now();
+        let skills_json = serde_json::json!({
+            "skills": {
+                "alpha": {
+                    "marketplace": "mp", "plugin": "p",
+                    "version": "1.0.0", "installed_at": same_time,
+                    "source_hash": "deadbeef"
+                }
+            }
+        });
+        std::fs::write(
+            project.kiro_dir().join("installed-skills.json"),
+            serde_json::to_vec_pretty(&skills_json).expect("ser"),
+        )
+        .expect("skills");
+
+        let steering_json = serde_json::json!({
+            "files": {
+                "guide.md": {
+                    "marketplace": "mp", "plugin": "p",
+                    "version": "2.0.0", "installed_at": same_time,
+                    "source_hash": "cafebabe", "installed_hash": "cafebabe"
+                }
+            }
+        });
+        std::fs::write(
+            project.kiro_dir().join("installed-steering.json"),
+            serde_json::to_vec_pretty(&steering_json).expect("ser"),
+        )
+        .expect("steering");
+
+        let result = project.installed_plugins().expect("installed_plugins");
+        assert_eq!(result.len(), 1);
+        assert_eq!(
+            result[0].installed_version.as_deref(),
+            Some("1.0.0"),
+            "tied timestamps must keep first-iterated version (skills); \
+             got steering's 2.0.0 — A-17 `>` tie-break broken"
+        );
     }
 
     /// `rstest` fixture for steering install collision tests. Stages a
