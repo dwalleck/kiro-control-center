@@ -352,13 +352,13 @@ const ALLOWED_SITES: &[AllowedSite] = &[
     AllowedSite {
         gate: "no-unwrap-in-production",
         path: "crates/kiro-control-center/src-tauri/src/lib.rs",
-        line: 50,
+        line: 54,
         reason: "Tauri scaffolding pattern — debug-only `specta_typescript::Typescript::default().export(...)` failure at app startup. Refactoring to `?` propagation would only move the panic into `fn main()`. Idiomatic Rust at the binary entry point.",
     },
     AllowedSite {
         gate: "no-unwrap-in-production",
         path: "crates/kiro-control-center/src-tauri/src/lib.rs",
-        line: 61,
+        line: 65,
         reason: "Tauri scaffolding pattern — `tauri::Builder::run` failure at app startup. Replacing with Result propagation would only move the panic into `fn main()`. Idiomatic Rust at the binary entry point.",
     },
 ];
