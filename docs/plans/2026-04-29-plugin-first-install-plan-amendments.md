@@ -664,6 +664,626 @@ having it scattered across N closure invocations.
 
 ---
 
+## A-12 — Gate 1: `remove_plugin` cascade aborts on orphan tracking entries
+
+**Original (plan Task 3, Step 3):**
+
+```rust
+for name in &to_remove {
+    self.remove_skill(name)?;     // <- propagates SkillError::NotInstalled
+    result.skills_removed = result.skills_removed.saturating_add(1);
+}
+// ...steering and agents follow the same pattern
+```
+
+**Drift.** `KiroProject::remove_skill` returns `SkillError::NotInstalled`
+when the on-disk skill *directory* is absent (verified at
+`project.rs:568-572`) — a normal state-divergence case the user can
+reach by running `rm -rf .kiro/skills/<name>/` manually. The
+cascade's `?` aborts on the first such error, dropping the
+`result.skills_removed` count and skipping steering + agents
+entirely. Result: a single orphan tracking entry stalls every
+subsequent removal in the same plugin. The user has no path to
+recover except hand-editing tracking JSON.
+
+**Amended.** Treat per-entry "not installed" as a *recoverable*
+case — log + count it as removed, continue the cascade:
+
+```rust
+for name in &to_remove {
+    match self.remove_skill(name) {
+        Ok(()) => {
+            result.skills_removed = result.skills_removed.saturating_add(1);
+        }
+        // Orphan tracking entry — directory was already gone. The
+        // cascade's job is to drive the project to "no entries from
+        // this plugin"; absent directory is a step in the right
+        // direction, not an error.
+        Err(crate::error::Error::Skill(SkillError::NotInstalled { .. })) => {
+            tracing::warn!(
+                skill = %name, plugin, marketplace,
+                "remove_plugin: skill tracking entry had no on-disk directory; \
+                 treating as already-removed",
+            );
+            result.skills_removed = result.skills_removed.saturating_add(1);
+        }
+        Err(e) => return Err(e),
+    }
+}
+```
+
+Mirror the same `match` pattern in the steering and agent loops.
+Other error variants (`Skill(_)`, `Plugin(_)`, `Io(_)`) still abort
+the cascade — they indicate genuine problems, not state divergence.
+
+**Rationale.** Gate 2 / Gate 5 (semantic correctness): the `?`
+collapses two distinct cases into one error path, losing the
+recoverable-vs-fatal distinction that the typed error variants
+were designed to encode. `remove_plugin` is a "drive toward
+absence" operation; finding things already absent is not a
+failure.
+
+---
+
+## A-13 — Gate 1: `SteeringError::NotInstalled` does not exist
+
+**Original (plan Task 3a, Step 3):**
+
+> "If absent → return `SteeringError::NotInstalled` (or whatever
+> the project's not-found-on-remove convention is)..."
+
+**Drift.** Verified by `grep "NotInstalled"` against
+`crates/kiro-market-core/src/steering/types.rs`: `SteeringError`
+has no `NotInstalled` variant. Variants present:
+`SourceReadFailed`, `SourceHardlinked`, `PathOwnedByOtherPlugin`,
+`OrphanFileAtDestination`, `ContentChangedRequiresForce`,
+`TrackingIoFailed`, `HashFailed`, `StagingWriteFailed`,
+`DestinationDirFailed`, `TrackingMalformed`. The "not installed"
+case isn't represented today because `install_plugin_steering`
+never had a corresponding `remove_*` operation.
+
+**Amended.** Task 3a step 3 must add a new typed variant before
+the `remove_steering_file` method can return it:
+
+```rust
+// crates/kiro-market-core/src/steering/types.rs — add to SteeringError
+#[non_exhaustive]
+#[error("steering file `{rel}` is not tracked in installed-steering.json")]
+NotInstalled { rel: PathBuf },
+```
+
+Update the existing `cargo xtask plan-lint --gate
+ffi-enum-serde-tag` cycle: the new variant is a unit-payload-bearing
+addition, so the `tag = "kind"` discriminant attribute stays valid;
+the JSON-shape rstest at `steering/types.rs:298-333` should grow a
+case for `NotInstalled`.
+
+Same pattern for `AgentError::NotInstalled` already exists at
+`error.rs:276` — confirm by reading the variant before reusing.
+The agent path's Task 3b can use the existing `AgentError::NotInstalled`
+without adding anything.
+
+**Rationale.** Gate 1 — naming a fictitious variant in a code block
+is the exact failure mode the checklist is designed to catch.
+A-2's "if missing, write the test first" hedge passed the buck;
+this amendment names the variant that needs to land.
+
+---
+
+## A-14 — Gate 1: Task 4's wrapper has the same `Self::` drift as A-1
+
+**Original (plan Task 4, Step 1, the example wrapper body):**
+
+```rust
+fn install_plugin_agents_impl(
+    svc: &MarketplaceService,
+    ...
+) -> Result<InstallAgentsResult, CommandError> {
+    ...
+    Ok(svc.install_plugin_agents(   // <- method call on associated function
+        &project,
+        &ctx.plugin_dir,
+        ...
+    ))
+}
+```
+
+**Drift.** `MarketplaceService::install_plugin_agents` is an
+associated function (no `&self`) at `service/mod.rs:1299`, same
+shape as `install_plugin_steering`. The plan's example uses
+`svc.install_plugin_agents(...)` — method-call syntax —
+which won't compile.
+
+A-1 covered the same drift in Task 1's orchestrator but not in
+Task 4's standalone Tauri command. Cross-task consistency check
+missed.
+
+**Amended.** Task 4's `_impl` should call the function via its
+absolute path:
+
+```rust
+Ok(MarketplaceService::install_plugin_agents(
+    &project,
+    &ctx.plugin_dir,
+    &ctx.agent_scan_paths,
+    ctx.format,
+    AgentInstallContext { ... },
+))
+```
+
+Strip `svc` from the `_impl` signature too — the function doesn't
+use the receiver. The wrapper still calls `make_service()?` for
+its own error path but the `_impl` doesn't need it. Or: keep
+`svc` in the signature for symmetry with the steering `_impl` and
+just unused-bind it; the existing `commands/steering.rs::install_plugin_steering_impl`
+takes `svc: &MarketplaceService` even though it calls
+`MarketplaceService::install_plugin_steering(...)` as an
+associated function — same shape applies here.
+
+**Rationale.** Gate 1 — cross-task consistency. When fixing one
+instance of a drift pattern, search for the same pattern in
+sibling tasks. This is a "did you grep for the bug shape, not just
+the bug instance" failure.
+
+---
+
+## A-15 — Gate 1: orchestrator's `is_empty()` branches are unreachable dead code
+
+**Original (plan Task 1, Step 4):**
+
+```rust
+let agents = if ctx.agent_scan_paths.is_empty() {
+    None
+} else {
+    Some(Self::install_plugin_agents(...))  // (A-1's fix applied)
+};
+// same shape for skills and steering
+```
+
+**Drift.** `agent_scan_paths_for_plugin` at `service/browse.rs:884-901`
+falls back to `crate::DEFAULT_AGENT_PATHS` (`["./agents/"]`)
+whenever the manifest is absent or its `agents` list is empty.
+`steering_scan_paths_for_plugin` at `:907-916` does the same with
+`DEFAULT_STEERING_PATHS`. Both functions ALWAYS return at least
+one element. Therefore `ctx.agent_scan_paths.is_empty()` and
+`ctx.steering_scan_paths.is_empty()` are tautologically false —
+the `None` branches never fire.
+
+The skills branch is similarly affected: `ctx.skill_dirs` comes
+from a different code path (registry-driven discovery), but for
+plugins that declare no `skills/` directory, the discovery yields
+an empty `Vec` — so the skills `is_empty()` MIGHT fire. Need to
+verify with LSP / read.
+
+**Amended.** Drop the conditional entirely for steering and
+agents — always run those install paths, let them return empty
+`installed`/`failed`/`warnings` vecs when nothing's there. Update
+`InstallPluginResult` to make `skills`/`steering`/`agents` non-
+optional:
+
+```rust
+#[derive(Debug, Default, Serialize)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
+pub struct InstallPluginResult {
+    pub plugin: String,
+    pub version: Option<String>,
+    pub skills: InstallSkillsResult,
+    pub steering: InstallSteeringResult,
+    pub agents: InstallAgentsResult,
+}
+```
+
+Frontend consumers check `result.skills.installed.length > 0`
+etc. directly — no `Option` unwrap needed. The "did this plugin
+have any of X content" question is implicitly answered by
+`installed.is_empty() && failed.is_empty() && warnings.is_empty()`.
+
+Updates the JSON-shape lock from A-5: instead of asserting `null`
+for unattempted content types, assert empty vecs.
+
+**Rationale.** Gate 1 + Gate 5 — the original design's `Option<T>`
+distinction ("applicable vs. attempted but empty") was based on a
+pre-condition check (`is_empty()`) that doesn't actually catch
+the "not applicable" case because of the default fallback. The
+distinction was illusory; encoding it in the type was wrong.
+Removing the `Option` simplifies the wire format AND eliminates
+the dead branches.
+
+---
+
+## A-16 — Gate 1: `native_companions` cleanup over-deletes across marketplaces
+
+**Original (A-3 amendment text):**
+
+```rust
+let agents_post = self.load_installed_agents()?;
+if agents_post.native_companions.contains_key(plugin) {
+    self.remove_native_companions_for_plugin(plugin)?;
+}
+```
+
+**Drift.** `InstalledAgents.native_companions: HashMap<String,
+InstalledNativeCompanionsMeta>` is keyed by **plugin name only**
+(`project.rs:114`). `InstalledNativeCompanionsMeta` carries a
+`marketplace: String` field at `project.rs:97` precisely so two
+different marketplaces shipping a plugin with the same name can
+coexist.
+
+A-3's `contains_key(plugin)` test ignores the marketplace
+distinction. If marketplace A and marketplace B both ship a plugin
+named `"code-reviewer"`, removing marketplace A's entry would
+match-and-delete marketplace B's `native_companions` record too
+— a cross-marketplace data corruption.
+
+**Amended.** Match on BOTH plugin name AND marketplace:
+
+```rust
+let agents_post = self.load_installed_agents()?;
+if let Some(meta) = agents_post.native_companions.get(plugin) {
+    if meta.marketplace == marketplace {
+        self.remove_native_companions_for_plugin(plugin, marketplace)?;
+    }
+    // else: this `plugin` name belongs to a different marketplace's
+    // record. Leave it alone — the `(marketplace, plugin)` pair we
+    // were asked to remove is not represented in native_companions.
+}
+```
+
+The new `remove_native_companions_for_plugin` helper signature
+takes `(plugin: &str, marketplace: &str)` and only removes when
+both match. The HashMap keying-by-plugin-only is a pre-existing
+data-model quirk that this fix works around at the read site;
+restructuring `native_companions` to be keyed on `(marketplace,
+plugin)` is a larger change and out of scope.
+
+**Rationale.** Gate 1 + Gate 2 (data-corruption threat from a
+plausible same-name-across-marketplaces scenario). A-3 surfaced
+the field but didn't grep its `Meta` struct to discover the
+disambiguator. LSP `documentSymbol` would have shown
+`InstalledNativeCompanionsMeta.marketplace` immediately, but A-3
+predated the A-8 LSP-first discipline.
+
+---
+
+## A-17 — Gate 5: `>=` tie-break in `update_latest` is non-deterministic
+
+**Original (A-6 amendment code):**
+
+```rust
+let should_replace = acc
+    .latest
+    .as_ref()
+    .map_or(true, |(when, _)| installed_at >= *when);
+```
+
+**Drift.** `install_plugin` runs the three install paths in a
+single call, all sharing the `Utc::now()` snapshot — so when the
+aggregator iterates the three tracking maps, the `installed_at`
+timestamps for entries from one `install_plugin` call are equal.
+With `>=`, equal timestamps always replace, so the
+`installed_version` that wins depends on which content type's
+`HashMap` was iterated last. `HashMap` iteration order is
+non-deterministic in Rust (per `std::collections::HashMap` docs).
+
+User-visible effect: the `installed_version` field on
+`InstalledPluginInfo` flickers between content-type values across
+process restarts when the three sub-results' versions differ
+(e.g. plugin manifest's `version` is one of them, but the entries
+might have been written by older code paths with stale versions).
+
+**Amended.** Use `>` instead — first-seen wins on ties:
+
+```rust
+let should_replace = acc
+    .latest
+    .as_ref()
+    .map_or(true, |(when, _)| installed_at > *when);
+```
+
+Document the iteration order explicitly: the aggregator iterates
+skills, then steering, then agents — so on tied timestamps, the
+*first* of those three with a tracking entry contributes the
+displayed `installed_version`. Stable across process restarts.
+
+**Rationale.** Gate 5 (encode invariants in semantics, not in
+HashMap-iteration-order accidents). `>=` looks innocent but
+silently couples the result to a non-deterministic substrate;
+`>` makes the iteration order load-bearing in a documented way.
+
+---
+
+## A-18 — Gate 2: Task 5's `install_plugin` Tauri wrapper drops `accept_mcp`
+
+**Original (plan Task 5, Step 2):**
+
+> "Same wrapper + `_impl` pattern as steering. Calls
+> `svc.install_plugin(...)` from Task 1."
+
+**Drift.** Steering's `install_plugin_steering` Tauri command
+takes `(marketplace, plugin, force, project_path)` — no
+`accept_mcp`. Following that template literally for `install_plugin`
+gives the same signature, but `svc.install_plugin(...)` from
+Task 1 takes `accept_mcp: bool` as its 5th parameter. The
+implementer would either (a) omit `accept_mcp` from the wrapper
+and hardcode `false` in the `_impl`, silently bypassing the
+user's MCP opt-in, or (b) hand-add it without reading the design
+doc's Gate 2 action item that explicitly calls this out.
+
+**Amended.** Task 5 Step 2's wrapper signature MUST include
+`accept_mcp: bool`:
+
+```rust
+#[tauri::command]
+#[specta::specta]
+pub async fn install_plugin(
+    marketplace: String,
+    plugin: String,
+    force: bool,
+    accept_mcp: bool,
+    project_path: String,
+) -> Result<InstallPluginResult, CommandError> {
+    let svc = make_service()?;
+    install_plugin_impl(
+        &svc,
+        &marketplace,
+        &plugin,
+        InstallMode::from(force),
+        accept_mcp,
+        &project_path,
+    )
+}
+
+fn install_plugin_impl(
+    svc: &MarketplaceService,
+    marketplace: &str,
+    plugin: &str,
+    mode: InstallMode,
+    accept_mcp: bool,
+    project_path: &str,
+) -> Result<InstallPluginResult, CommandError> {
+    validate_kiro_project_path(project_path)?;
+    let project = KiroProject::new(PathBuf::from(project_path));
+    svc.install_plugin(&project, marketplace, plugin, mode, accept_mcp)
+        .map_err(CommandError::from)
+}
+```
+
+Frontend `commands.installPlugin(marketplace, plugin, force,
+acceptMcp, projectPath)` — `acceptMcp` defaults to `false` at the
+Svelte caller (per the design doc's `accept_mcp` is opt-in
+default-deny rule). When/where the user toggles MCP consent in
+the UI is a Phase 2 concern; for Phase 1, ship the binding with
+`acceptMcp: false` hardcoded at the BrowseTab call site and wire
+a real toggle later.
+
+**Rationale.** Gate 2 — the design doc explicitly listed
+"plumb `accept_mcp` through `install_plugin` from the Tauri
+layer" as an action item. The plan's Task 5 silently dropped
+it. CLAUDE.md "frontend error-path rigor" applies: a security-
+sensitive flag the design doc said to plumb cannot be left
+implicit.
+
+---
+
+## A-19 — Gate 1: `list_installed_plugins` and `remove_plugin` don't follow the `_impl(svc, ...)` pattern; existing `list_installed_skills` doesn't either
+
+**Original (plan Task 5, Steps 3-4):**
+
+```rust
+fn list_installed_plugins_impl(
+    project_path: &str,
+) -> Result<Vec<InstalledPluginInfo>, CommandError> { ... }
+
+fn remove_plugin_impl(
+    marketplace: &str,
+    plugin: &str,
+    project_path: &str,
+) -> Result<RemovePluginResult, CommandError> { ... }
+```
+
+**Drift.** CLAUDE.md says `_impl(svc: &MarketplaceService, ...)`.
+My code drops `svc` because these commands operate on
+`KiroProject` only — no service needed. Claude's review flagged
+this as a CLAUDE.md violation.
+
+**Update via LSP read of existing `commands/installed.rs`:**
+`list_installed_skills` and `remove_skill` are BOTH defined
+without an `_impl` — the body is inline in the wrapper:
+
+```rust
+pub async fn list_installed_skills(
+    project_path: String,
+) -> Result<Vec<InstalledSkillInfo>, CommandError> {
+    let project = KiroProject::new(PathBuf::from(&project_path));
+    let installed = project.load_installed().map_err(CommandError::from)?;
+    // ... transform + return
+}
+```
+
+So the existing convention is "no `_impl` for non-service-
+consuming commands." CLAUDE.md's wrapper-`_impl`-svc rule
+applies to commands that consume `MarketplaceService`; it doesn't
+apply to project-only reads.
+
+**Amended.** Two equivalent shapes — pick one and document the
+choice:
+
+**(a) Match the existing `list_installed_skills` precedent** — no
+`_impl`, body inline:
+
+```rust
+#[tauri::command]
+#[specta::specta]
+pub async fn list_installed_plugins(
+    project_path: String,
+) -> Result<Vec<InstalledPluginInfo>, CommandError> {
+    validate_kiro_project_path(&project_path)?;
+    let project = KiroProject::new(PathBuf::from(&project_path));
+    project.installed_plugins().map_err(CommandError::from)
+}
+```
+
+**(b) Keep the `_impl` for testability without `svc`** — document
+the deviation from CLAUDE.md's rule with a one-line comment:
+
+```rust
+// `_impl` exists for direct unit-test access without spinning up
+// a full MarketplaceService. CLAUDE.md's wrapper-`_impl`-svc rule
+// applies to service-consuming commands; this one operates on
+// KiroProject only.
+fn list_installed_plugins_impl(project_path: &str) -> Result<...>
+```
+
+**Recommendation:** (a). Match the existing precedent.
+`commands/installed.rs::tests` already shows that wrapper-only
+commands can be unit-tested by calling them directly (it's
+async, but `#[tokio::test]` handles that). No `_impl` needed.
+
+`remove_plugin` (Task 5 Step 4) gets the same treatment — body
+inline in the wrapper.
+
+**Rationale.** Gate 1 — Claude's reading of CLAUDE.md was strict;
+the actual project convention is more permissive. Verifying via
+LSP-read of an existing peer command (`commands/installed.rs`)
+gives the right answer instead of guessing from the doc text.
+A-8's LSP-first discipline applies: when the rule and the
+practice diverge, read the practice.
+
+---
+
+## A-20 — Gate 1: `make_kiro_project` test helper is private to `commands/steering.rs::tests`
+
+**Original (plan Task 5, Step 1 test code):**
+
+```rust
+let project_path = make_kiro_project(dir.path());
+```
+
+**Drift.** `make_kiro_project` is defined at
+`commands/steering.rs:88-92` (per LSP `documentSymbol`) inside
+`#[cfg(test)] mod tests` — it's private to that module. Tests in
+a NEW `commands/plugins.rs` file cannot import it. The PR 92
+review's `code-simplifier` agent flagged the same helper as
+duplicated between `steering.rs::tests` and `browse.rs::tests`
+and recommended hoisting to `kiro_market_core::service::test_support`,
+but that recommendation was deferred.
+
+**Amended.** Add a sub-task before Task 5's tests can be written:
+
+### Task 5.0 (new, prerequisite to 5.1+ tests): Hoist `make_kiro_project` to `service::test_support`
+
+1. Add `pub fn make_kiro_project(dir: &Path) -> String` to
+   `crates/kiro-market-core/src/service/test_support.rs` (gated
+   `#[cfg(any(test, feature = "test-support"))]` per the existing
+   pattern). Same body as the inline helper in `steering.rs:88-92`.
+2. Update `commands/steering.rs::tests` to import from
+   `kiro_market_core::service::test_support::make_kiro_project`
+   instead of defining locally.
+3. Update `commands/browse.rs::tests` (which defines an identical
+   inline copy at `browse.rs:451-455` per the PR 92 review) to
+   import the same.
+4. The new `commands/plugins.rs::tests` (Task 5.1+) imports from
+   the same location.
+5. Test: existing `steering.rs::tests` and `browse.rs::tests` all
+   continue to pass.
+6. Commit: `refactor(test): hoist make_kiro_project to service::test_support`.
+
+This pre-task closes a real PR-92 follow-up (the
+`code-simplifier`'s "high-value simplification #1") AND unblocks
+Task 5's tests in one stroke. Roughly ~10 lines moved across
+three files.
+
+**Rationale.** Gate 1 — naming a function that doesn't exist at
+the call site. The original Task 5 plan wrote test code referencing
+`make_kiro_project` as if it were globally available; LSP
+`documentSymbol` would have shown it scoped to `steering.rs::tests`
+only. Test code is code; the same naming-resolution rules apply.
+
+---
+
+## A-21 — Gate 1 (process): A-1 over-claimed scope
+
+**Original (A-1 amendment):**
+
+> "Same fix for `install_plugin_steering` (already at
+> `service/mod.rs:1330`, no `&self`)..."
+
+**Drift.** The original Task 1 plan code already used
+`MarketplaceService::install_plugin_steering(...)` (associated-
+function form, correct). My A-1 amendment text claimed "same fix
+for steering" implying drift; there was no drift in steering's
+call site. The agents arm (`self.install_plugin_agents`) was the
+sole drift A-1 addressed.
+
+**Amended.** Strike the steering reference from A-1's body. The
+amendment applies to the agents arm only. The steering call site
+is correct as originally written.
+
+**Rationale.** Process — amendments are statements of fact about
+plan drift. Over-broad amendment text dilutes the audit trail
+and may cause the implementer to "fix" already-correct code.
+Cross-reference Claude's review at PR #93 (round 3) for the
+original flag.
+
+---
+
+## A-22 — Process: code-reviewer-style audit catches what LSP-first cannot
+
+**Observation.** After A-1 through A-11 (rigorous LSP-first gate
+review), Claude's three-round review on PR #93 surfaced 9
+substantive findings I missed:
+
+- A-12 (`remove_plugin` cascade abort on orphan) — behavioral
+  semantic concern about a `?` operator
+- A-13 (`SteeringError::NotInstalled` fictitious) — variant
+  enumeration
+- A-14 (Task 4 `Self::` drift) — same shape as A-1 in a sibling
+  task
+- A-15 (dead `is_empty()` branches) — logical reachability
+- A-16 (`native_companions` over-delete) — cross-marketplace
+  ambiguity given a HashMap-key-by-name-only data shape
+- A-17 (`>=` tie-break) — non-determinism from HashMap iteration
+- A-18 (`accept_mcp` plumbing) — design-doc action-item drift
+- A-19 (`_impl(svc, ...)` rule mismatch with practice) — CLAUDE.md
+  vs. actual existing-code convention
+- A-20 (`make_kiro_project` private helper) — module-scope
+  visibility
+
+**Pattern.** LSP-first answers "does this symbol exist?" and
+"what's its signature?" — strong on shape, weak on semantics.
+The 9 findings above need a different review lens:
+
+- **Reachability analysis** (which branches are actually taken):
+  A-15
+- **Semantic equivalence** (do these two error paths have the
+  same recoverable-vs-fatal contract?): A-12, A-19
+- **Cross-task / cross-instance consistency** (when fixing
+  pattern X in task N, is the same pattern in tasks M and P also
+  fixed?): A-14, A-21
+- **Data-shape correctness across hidden disambiguators** (is
+  this HashMap keyed by enough fields?): A-16, A-17
+- **Action-item-vs-task linkage** (did the design doc say to do
+  X, and does the plan actually do X?): A-18
+- **Test-code naming resolution** (is this helper visible from
+  where the test calls it?): A-20
+
+**Mitigation going forward.** After the LSP-first Gate 1 pass,
+schedule a code-reviewer-style second pass that walks each task
+and asks the six questions above explicitly. This is what
+Claude did on PR #93 — the rigor isn't unique to a bot; it's
+the *checklist of review angles* that's the artifact. The next
+plan-review pass should run both:
+
+1. LSP-first (A-8): catches signature drift, missing exports,
+   field-access typos.
+2. Code-reviewer-style (A-22): catches behavioral semantics,
+   cross-task drift, action-item linkage.
+
+These are complementary, not substitutable. A plan that passes
+only one is half-reviewed.
+
+---
+
 ## A-8 — Tooling: use LSP `documentSymbol` for Gate 1, not grep
 
 **Process drift.** The original Gate 1 pass used `grep -n` to spot
@@ -734,6 +1354,40 @@ lesson so future plan-reviews start with the right tool.
   `browseView` composes with the existing chain. Explicit before/
   after rendering tree shown. PR 92's empty-state plugin cards
   retired in favor of the new Plugins view as primary surface.
+- A-12: `remove_plugin` cascade aborts on orphan tracking entries.
+  Use `match` + log + count-as-removed for `NotInstalled`; only
+  abort on genuine fs/parse errors.
+- A-13: `SteeringError::NotInstalled` is fictitious. Add the
+  variant before Task 3a can use it. `AgentError::NotInstalled`
+  already exists.
+- A-14: Task 4's wrapper has the same `Self::` drift as Task 1.
+  A-1 didn't grep sibling tasks for the bug shape.
+- A-15: `is_empty()` checks on `agent_scan_paths`/`steering_scan_paths`
+  are dead code (defaults always populate). Drop `Option<...>` from
+  `InstallPluginResult` sub-results — always populate.
+- A-16: `native_companions` cleanup over-deletes when two
+  marketplaces ship same-named plugins. Match on
+  `(plugin, marketplace)`, not `plugin` alone.
+- A-17: `>=` tie-break in `update_latest` is non-deterministic
+  given equal timestamps + HashMap iteration order. Use `>` for
+  stable first-seen-wins.
+- A-18: Task 5's wrapper drops `accept_mcp`. Plumb it through
+  per the design doc's Gate 2 action item.
+- A-19: `list_installed_plugins_impl` and `remove_plugin_impl`
+  don't follow CLAUDE.md's `_impl(svc, ...)` rule. The existing
+  `list_installed_skills` precedent is "no `_impl` for non-
+  service-consuming commands." Match precedent (a).
+- A-20: `make_kiro_project` is private to `commands/steering.rs::tests`.
+  Hoist to `service::test_support::make_kiro_project` as
+  prerequisite Task 5.0.
+- A-21: A-1's amendment text over-claimed scope — the steering
+  call was already correct, only the agents arm needed the fix.
+  Strike the steering reference.
+- A-22: Process — Claude's three-round review on PR #93 surfaced
+  9 findings (A-12 to A-20) that the LSP-first pass missed. The
+  rigor lives in the checklist of review angles, not in any one
+  tool. Future plan-reviews run BOTH LSP-first AND
+  code-reviewer-style.
 
 No design-doc revisions required. The amendments are all execution-time
 corrections; the architecture in
