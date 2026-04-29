@@ -60,12 +60,12 @@ pub fn parse_copilot_agent(content: &str) -> Result<AgentDefinition, ParseFailur
     // Validate the name at parse time so downstream fs operations (and the
     // file:// URI in the emitted JSON) can trust it without re-checking.
     crate::validation::validate_name(&name).map_err(|e| match e {
-        crate::error::ValidationError::InvalidName { reason, .. } => {
+        // See parse_claude.rs for rationale on the explicit two-arm form
+        // — same CLAUDE.md classifier-exhaustiveness discipline.
+        crate::error::ValidationError::InvalidName { reason, .. }
+        | crate::error::ValidationError::InvalidRelativePath { reason, .. } => {
             ParseFailure::InvalidName { reason }
         }
-        other => ParseFailure::InvalidName {
-            reason: other.to_string(),
-        },
     })?;
 
     Ok(AgentDefinition {

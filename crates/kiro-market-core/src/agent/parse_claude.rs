@@ -38,12 +38,16 @@ pub fn parse_claude_agent(content: &str) -> Result<AgentDefinition, ParseFailure
     // Validate the name at parse time so downstream fs operations (and the
     // file:// URI in the emitted JSON) can trust it without re-checking.
     crate::validation::validate_name(&name).map_err(|e| match e {
-        crate::error::ValidationError::InvalidName { reason, .. } => {
+        // Both ValidationError variants project to ParseFailure::InvalidName
+        // because validate_name only emits InvalidName in practice; the
+        // InvalidRelativePath arm is defensive against a future change to
+        // validate_name's contract. Listed explicitly (rather than via `_ =>`)
+        // so a new ValidationError variant forces a compile-time decision per
+        // CLAUDE.md "Classifier functions enumerate every variant".
+        crate::error::ValidationError::InvalidName { reason, .. }
+        | crate::error::ValidationError::InvalidRelativePath { reason, .. } => {
             ParseFailure::InvalidName { reason }
         }
-        other => ParseFailure::InvalidName {
-            reason: other.to_string(),
-        },
     })?;
     // Normalize `model: inherit` (Claude's "use parent model" sentinel) to None
     // so the Kiro emitter omits the field and defers to the CLI default.

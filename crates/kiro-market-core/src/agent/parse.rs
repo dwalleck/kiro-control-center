@@ -38,7 +38,7 @@ pub fn parse_agent_file(path: &Path) -> Result<AgentDefinition, AgentError> {
     let content = fs::read_to_string(path).map_err(|e| AgentError::ParseFailed {
         path: path.to_path_buf(),
         failure: ParseFailure::IoError {
-            reason: e.to_string(),
+            reason: crate::error::error_full_chain(&e),
         },
     })?;
     let dialect = detect_dialect(path);
