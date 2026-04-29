@@ -1227,6 +1227,124 @@ original flag.
 
 ---
 
+## A-23 — Gate 1 + Gate 3: `DateTime<Utc>` fields are incompatible with the project's `specta` feature config
+
+**Original (plan Task 2, Step 3):**
+
+```rust
+#[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
+pub struct InstalledPluginInfo {
+    ...
+    pub earliest_install: chrono::DateTime<chrono::Utc>,
+    pub latest_install: chrono::DateTime<chrono::Utc>,
+}
+```
+
+**Drift.** `kiro-market-core/Cargo.toml:30` declares:
+
+```toml
+specta = { version = "2.0.0-rc.24", optional = true, features = ["derive", "serde_json"] }
+```
+
+The `"chrono"` feature is NOT in that list. Without it,
+`chrono::DateTime<chrono::Utc>` does not implement `specta::Type`.
+The Tauri crate always enables the `specta` feature on
+`kiro-market-core` (since its commands call `specta::specta` to
+generate bindings), so compiling with the new
+`InstalledPluginInfo` would fail with `the trait specta::Type is
+not implemented for chrono::DateTime<chrono::Utc>`.
+
+The existing precedent at `commands/installed.rs:17-25`
+(`InstalledSkillInfo.installed_at: String`) shows the project's
+established pattern: convert to `String` at the FFI boundary,
+filled via `.to_rfc3339()` in the wrapper. Every `DateTime<Utc>`
+field in `project.rs` lives on a struct that intentionally does
+NOT derive `specta::Type` (`InstalledSkillMeta`,
+`InstalledSteeringMeta`, `InstalledAgentMeta`,
+`InstalledNativeCompanionsMeta` — verified via LSP
+`documentSymbol`).
+
+`InstalledPluginInfo` is meant to cross the FFI (it's the return
+type of `commands.listInstalledPlugins`), so it MUST follow the
+String-at-boundary pattern.
+
+**Amended.** Two changes to Task 2:
+
+1. **Field types**: `earliest_install` and `latest_install` become
+   `String`:
+
+```rust
+#[derive(Debug, Clone, Serialize)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
+pub struct InstalledPluginInfo {
+    pub marketplace: String,
+    pub plugin: String,
+    pub installed_version: Option<String>,
+    pub skill_count: u32,
+    pub steering_count: u32,
+    pub agent_count: u32,
+    pub installed_skills: Vec<String>,
+    pub installed_steering: Vec<std::path::PathBuf>, // PathBuf has specta::Type
+    pub installed_agents: Vec<String>,
+    /// RFC3339-formatted timestamp. Matches the shape used by
+    /// [`commands/installed.rs::InstalledSkillInfo`].
+    pub earliest_install: String,
+    pub latest_install: String,
+}
+```
+
+2. **Construction in `installed_plugins()`**: keep the
+   `DateTime<Utc>` internally in the `Acc` struct (so A-17's
+   timestamp-based "latest wins" tie-break still works), then
+   convert at the final field assignment:
+
+```rust
+let now = chrono::Utc::now();
+Ok(by_pair
+    .into_iter()
+    .map(|((marketplace, plugin), acc)| {
+        let (latest_install_dt, installed_version) = acc
+            .latest
+            .map_or_else(|| (now, None), |(t, v)| (t, v));
+        let earliest_install_dt = acc.earliest.unwrap_or(now);
+        InstalledPluginInfo {
+            marketplace,
+            plugin,
+            installed_version,
+            skill_count: u32::try_from(acc.skills.len()).unwrap_or(u32::MAX),
+            steering_count: u32::try_from(acc.steering.len()).unwrap_or(u32::MAX),
+            agent_count: u32::try_from(acc.agents.len()).unwrap_or(u32::MAX),
+            installed_skills: acc.skills,
+            installed_steering: acc.steering,
+            installed_agents: acc.agents,
+            earliest_install: earliest_install_dt.to_rfc3339(),
+            latest_install: latest_install_dt.to_rfc3339(),
+        }
+    })
+    .collect())
+```
+
+The frontend's `formatDate(p.latest_install)` already does
+`new Date(iso)` — works directly with the RFC3339 string. No
+frontend changes needed.
+
+**Verified `PathBuf` survives unchanged.** `installed_steering:
+Vec<PathBuf>` is fine — `PathBuf` does implement `specta::Type`
+out of the box (specta serializes it as a TS `string`). Confirmed
+by the existing `InstalledSteeringOutcome.source: PathBuf` /
+`destination: PathBuf` at `steering/types.rs:142-148`, which DOES
+derive `specta::Type` and renders as `string` in `bindings.ts:351-358`.
+
+**Rationale.** Gate 1 + Gate 3 — the field type doesn't
+implement the trait the derive requires, with the project's
+specific Cargo.toml config. Catching this at plan-review is
+cheaper than at first-build of Task 2. Also a Gate 5 win:
+String-at-boundary makes the wire format more predictable for
+the frontend (no chrono-specific JS deserialization needed).
+
+---
+
 ## A-22 — Process: code-reviewer-style audit catches what LSP-first cannot
 
 **Observation.** After A-1 through A-11 (rigorous LSP-first gate
@@ -1388,6 +1506,12 @@ lesson so future plan-reviews start with the right tool.
   rigor lives in the checklist of review angles, not in any one
   tool. Future plan-reviews run BOTH LSP-first AND
   code-reviewer-style.
+- A-23: `DateTime<Utc>` fields on `InstalledPluginInfo` are
+  incompatible with `kiro-market-core`'s specta feature config
+  (no `"chrono"` flag). Convert to `String` (RFC3339) at the FFI
+  boundary, matching the existing `InstalledSkillInfo.installed_at`
+  precedent. `PathBuf` survives — verified `InstalledSteeringOutcome`
+  uses it under specta::Type today.
 
 No design-doc revisions required. The amendments are all execution-time
 corrections; the architecture in
