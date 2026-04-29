@@ -420,6 +420,64 @@ the source tree and quote the drift verbatim. That's the bar.
 
 ---
 
+## A-9 — Performance: hoist `Utc::now()` out of `installed_plugins`'s map closure
+
+**Original (plan Task 2, Step 4):**
+
+```rust
+Ok(by_pair
+    .into_iter()
+    .map(|((marketplace, plugin), acc)| {
+        let now = chrono::Utc::now();   // <- called per plugin
+        InstalledPluginInfo {
+            ...
+            earliest_install: acc.earliest.unwrap_or(now),
+            latest_install: acc.latest.unwrap_or(now),
+        }
+    })
+    .collect())
+```
+
+**Drift.** `chrono::Utc::now()` is a syscall (reads the system clock).
+Calling it inside the `map` closure means one syscall per plugin in the
+result vec. For a project with 50 installed plugins that's 50 redundant
+clock reads, all returning effectively the same value. The whole vec is
+built in well under a millisecond — semantically the timestamps would
+differ by nanoseconds at most — but the code shape is wasteful, and the
+fix is mechanical. Caught by gemini-code-assist on PR #93.
+
+**Amended.** Capture the time once before the loop, reuse the binding:
+
+```rust
+let now = chrono::Utc::now();
+Ok(by_pair
+    .into_iter()
+    .map(|((marketplace, plugin), acc)| {
+        InstalledPluginInfo {
+            ...
+            earliest_install: acc.earliest.unwrap_or(now),
+            latest_install: acc.latest.unwrap_or(now),
+        }
+    })
+    .collect())
+```
+
+Same hoist applies to the A-6 rewrite — the `now` in
+`acc.latest.map_or_else(|| (now, None), |(t, v)| (t, v))` should come
+from a single binding outside the closure too.
+
+**Rationale.** Strictly speaking this is a perf nit; the cost is
+negligible at expected plugin counts. But the `unwrap_or(now)` arm is
+also semantically suspect — a missing `installed_at` from the tracking
+file is a degenerate state (every install path writes one), so we're
+substituting "right now" for "we don't actually know" and presenting it
+to the UI as a real install timestamp. The hoisting fix sidesteps the
+multi-call concern AND makes the substitution explicit at one site
+where a future reviewer can ask "is this fallback right?" rather than
+having it scattered across N closure invocations.
+
+---
+
 ## A-8 — Tooling: use LSP `documentSymbol` for Gate 1, not grep
 
 **Process drift.** The original Gate 1 pass used `grep -n` to spot
@@ -479,6 +537,10 @@ lesson so future plan-reviews start with the right tool.
 - A-8: Tooling correction — use LSP `documentSymbol` for Gate 1,
   not grep. Spot fix that LSP would have surfaced earlier and at
   lower cost.
+- A-9: Hoist `chrono::Utc::now()` out of `installed_plugins`'s map
+  closure. Caught by gemini-code-assist on PR #93. Surfaces a
+  separate semantic concern — `unwrap_or(now)` may be papering over
+  a malformed-tracking case that should fail loudly instead.
 
 No design-doc revisions required. The amendments are all execution-time
 corrections; the architecture in
