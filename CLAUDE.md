@@ -16,6 +16,8 @@ cargo test -p kiro-control-center --lib -- --ignored   # regenerate bindings.ts
 ## Frontend (Tauri crate)
 From `crates/kiro-control-center/`:
 - `npm run check` — Svelte + TypeScript typecheck via `svelte-check`. Run after any core type change that flows through `bindings.ts`.
+- `npm run dev` — vite serves on `http://localhost:1420` (Tauri convention; NOT vite's default 5173).
+- `npm run test:e2e` — Playwright e2e at `tests/e2e/app.spec.ts`. Tests gate on `FIXTURE_MARKETPLACE_PATH` and `test.skip` cleanly when unset.
 
 ## Lint
 ```bash
@@ -40,9 +42,20 @@ Run all three before committing — CI enforces each:
 ## Planning
 After writing a plan and before starting implementation, apply the 5 gates in `docs/plan-review-checklist.md` (Grounding / Threat Model / Wire Format / External Type Boundary / Type Design). The gates also fire as code-review questions on any change touching the public API of `kiro-market-core`. Originated from the PR #64 retrospective — the gates codify the categories of issues that cost a follow-up commit each on PR #64. Complement to (not replacement for) the upstream `superpowers:writing-plans` skill: invoke that skill first, then run the gates as a self-review pass before declaring the plan implementation-ready.
 
+Plan-review = **two complementary passes**, not one:
+1. **LSP-first** — `documentSymbol` on every file the plan modifies; `workspaceSymbol` to confirm cross-file references. Catches signature drift, missing exports, field-access typos in one call (vs. many greps). Cheap; do this first.
+2. **Code-reviewer-style** — walk each task asking "does this do the right thing?" Catches behavioral semantics (cascade abort patterns, recoverable-vs-fatal classification), cross-task drift (when fixing pattern X in task N, search siblings for the same shape), action-item linkage (did the design doc say to do X, does any task actually do X?), and data-shape ambiguity (HashMap keyed by enough fields?).
+
+Neither pass substitutes for the other. PR #93's experience: 11 LSP-first findings + 12 code-reviewer-style findings, almost no overlap. A plan that passes only LSP is half-reviewed. Diminishing-returns signal: when findings shrink to compiler-catchable shapes (`DateTime<Utc>` vs. specta features, `self.` vs. `Self::` for associated functions), stop adding plan-time amendments and let the implementation forcing-functions catch the rest.
+
 ## Project Structure
 - `crates/kiro-market-core/` — library crate (types, parsing, git, cache, project state)
 - `crates/kiro-market/` — binary crate (CLI commands)
+
+## Worktree convention
+Feature branches go in sibling directories: `~/repos/kiro-marketplace-cli-<topic>` (e.g. `kiro-marketplace-cli-plugin-impl`). Each worktree has its own `target/` and `node_modules/` — run `npm install` in `crates/kiro-control-center/` after creating a fresh worktree. Tethys also indexes per-worktree under `.rivets/index/`; the parent's index doesn't transfer.
+
+Pattern: `git worktree add /home/dwalleck/repos/kiro-marketplace-cli-<topic> -b <branch> origin/main`. Cleanup after merge: `git worktree remove <path> && git branch -d <branch> && git pull --ff-only`.
 
 ## Code Style
 - Edition 2024, rust-version 1.85.0
@@ -52,6 +65,7 @@ After writing a plan and before starting implementation, apply the 5 gates in `d
 - Prefer dedicated enum variants over `reason: String` sentinels when callers might branch on the semantic (e.g. `NotADirectory` / `SymlinkRefused` vs. a shared `DirectoryUnreadable { reason }`). `io::Error` goes directly in `#[source]` — no `Box` needed, it's `Send + Sync + 'static`.
 - **Parse, don't validate, at deserialization boundaries.** Untrusted string fields from manifests (`marketplace.json`, `plugin.json`, agent frontmatter) get wrapped in a newtype with a private inner field and a fallible `new` — see `RelativePath` (`validation.rs:28`), `GitRef` (`git.rs:34`), and `AgentName` (`validation.rs`) as templates. Implement `Deserialize` to route through `new` so `serde_json::from_slice` rejects bad input at parse time, not later. A free `validate_xyz(&Thing) -> Result<()>` that nothing constructs is usually a missed newtype. **Exception:** keep raw `Option<String>` on a transient projection struct when post-parse routing needs to split failures across distinct error variants (e.g. `NativeAgentProjection.name` stays `Option<String>` so `MissingName` / `InvalidName(reason)` / `InvalidJson` route to three distinct `AgentError` variants instead of collapsing into `InvalidJson(serde_json::Error)`). The type-level guarantee still lands at the *bundle* boundary (`NativeAgentBundle.name: AgentName`).
 - **Validation newtypes that may flow through Tauri bindings need `#[cfg_attr(feature = "specta", derive(specta::Type))]`** so they emit a TypeScript alias via `bindings.ts`. Match `RelativePath`'s shape (`validation.rs:26`). Skipping this on initial creation is a latent break — adding it later is harmless, but the moment a `#[tauri::command]` returns a type embedding the newtype, the Tauri crate stops compiling.
+- **`chrono::DateTime<Utc>` cannot appear on `specta::Type`-derived structs.** `kiro-market-core`'s `specta` feature set is `["derive", "serde_json"]` — no `"chrono"` flag. Convert to `String` at the FFI boundary via `.to_rfc3339()` (precedent: `commands/installed.rs::InstalledSkillInfo.installed_at`). Every `DateTime<Utc>` in `project.rs` lives on a struct that intentionally does NOT derive `specta::Type`.
 - **Classifier functions over error enums enumerate every variant.** `SkippedReason::from_plugin_error`, `PluginError::remediation_hint`, and any similar "project a `PluginError` into a narrower type or pick a branch per variant" function must match every variant explicitly — no `_ => None` / `_ => default`. A new `PluginError` variant should then force a compile-time classification decision rather than silently defaulting. Two classifiers that share the same input enum drift one `_` apart otherwise.
 - **Classifier idempotent-payload rule.** When `classify_*_collision` returns `CollisionDecision::Idempotent(Box<T>)`, `T` must contain only data the classifier *actually sees* — not data the caller has but didn't pass in. The steering classifier shipped a bug where `T = InstalledSteeringOutcome` led it to substitute `dest` for the missing `source` path, leaking the destination into the wire-format `source` field on idempotent reinstalls. Fix: classifier returns a minimal echo type (e.g. `SteeringIdempotentEcho { prior_installed_hash: String }`) and the caller assembles the full outcome where `source.source` is in scope.
 - `anyhow` for error propagation in kiro-market binary
@@ -77,6 +91,8 @@ Domain logic is never duplicated between frontends.
 
 ### Tauri command handlers
 Each `#[tauri::command]` splits into a thin wrapper plus a private `fn <name>_impl(svc: &MarketplaceService, ...) -> Result<T, CommandError>`. The wrapper does the globals work (`make_service()?`) and calls the `_impl`; the `_impl` is pure Rust and takes the service + primitives by reference. Tests exercise `_impl` directly using fixtures from `kiro_market_core::service::test_support` (activated via a `dev-dependencies` feature override). See `install_skills_impl` in `crates/kiro-control-center/src-tauri/src/commands/browse.rs` and its `#[cfg(test)] mod tests` for the exemplar. New commands follow this shape so their bodies are testable without a Tauri runtime.
+
+The `_impl(svc, ...)` rule applies to **service-consuming** commands. Project-only reads (no `MarketplaceService` needed — e.g. `list_installed_skills`, `remove_skill` in `commands/installed.rs`) put the body inline in the wrapper with no `_impl` at all. Don't add an unused `svc` parameter to satisfy the rule mechanically.
 
 ### Git Abstraction
 Git operations are abstracted behind the `GitBackend` trait (`kiro-market-core::git`).
