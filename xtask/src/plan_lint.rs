@@ -1306,7 +1306,7 @@ mod tests {
     fn is_allowed_matches_gate_path_and_line_exactly() {
         let f = Finding {
             path: "crates/kiro-control-center/src-tauri/src/lib.rs".to_string(),
-            line: 50,
+            line: 54,
             qualified_name: "run".to_string(),
             signature: Some("expect".to_string()),
         };
