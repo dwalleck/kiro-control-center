@@ -9,6 +9,7 @@
     SkillCount,
     SkippedReason,
     SkippedSkill,
+    SteeringWarning,
   } from "$lib/bindings";
   import SkillCard from "./SkillCard.svelte";
 
@@ -97,6 +98,17 @@
     return overflow > 0
       ? `${list.length} skill(s) failed to load — ${joined}; +${overflow} more`
       : `${list.length} skill(s) failed to load — ${joined}`;
+  }
+
+  // Render a SteeringWarning. Total over both variants — TypeScript's
+  // exhaustiveness check forces full coverage if a new variant lands.
+  function formatSteeringWarning(w: SteeringWarning): string {
+    switch (w.kind) {
+      case "scan_path_invalid":
+        return `invalid scan path '${w.path}': ${w.reason}`;
+      case "scan_dir_unreadable":
+        return `could not read steering dir '${w.path}': ${w.reason}`;
+    }
   }
 
   let { projectPath }: { projectPath: string } = $props();
@@ -648,6 +660,71 @@
     }
   }
 
+  // Per-plugin in-flight tracker for steering installs. Keyed on
+  // pluginKey(marketplace, plugin) so two plugins can install in
+  // parallel without colliding, and so a stuck install on plugin A
+  // doesn't disable plugin B's button.
+  let pendingSteeringInstalls = new SvelteSet<string>();
+
+  // Whole-plugin steering install — the install model is coarser than
+  // skills (no per-file picker; backend installs every steering file
+  // declared by plugin.json or under the default `./steering/` path).
+  // Surfaces both per-file failures and discovery-time warnings via
+  // the existing installMessage / installError banners so we don't
+  // need a new toast surface for this MVP.
+  async function installSteering(marketplace: string, plugin: string) {
+    const key = pluginKey(marketplace, plugin);
+    if (pendingSteeringInstalls.has(key)) return;
+    pendingSteeringInstalls.add(key);
+    installError = null;
+    installMessage = null;
+
+    try {
+      const result = await commands.installPluginSteering(
+        marketplace,
+        plugin,
+        forceInstall,
+        projectPath
+      );
+      if (result.status === "ok") {
+        const r = result.data;
+        const parts: string[] = [];
+        if (r.installed.length > 0) {
+          const noun = r.installed.length === 1 ? "file" : "files";
+          parts.push(`Installed ${r.installed.length} steering ${noun}`);
+        }
+        if (r.failed.length > 0) {
+          parts.push(
+            `Failed: ${r.failed.map((f) => `${f.source} (${f.error})`).join(", ")}`
+          );
+        }
+        if (r.warnings.length > 0) {
+          parts.push(`Warnings: ${r.warnings.map(formatSteeringWarning).join(", ")}`);
+        }
+        if (parts.length === 0) {
+          // No installed, no failed, no warnings — plugin declares no
+          // steering or every file was already idempotent. Tell the
+          // user something rather than letting the click feel inert.
+          installMessage = `Steering for ${plugin}: nothing to install`;
+        } else if (r.failed.length === 0) {
+          installMessage = `Steering for ${plugin}: ${parts.join(" | ")}`;
+        } else {
+          // Mixed-result: still surface as message (not error) since the
+          // batch ran and some files may have installed; user can see
+          // both sides in one banner.
+          installMessage = `Steering for ${plugin}: ${parts.join(" | ")}`;
+        }
+      } else {
+        installError = `Steering install failed for ${plugin}: ${result.error.message}`;
+      }
+    } catch (e) {
+      const reason = e instanceof Error ? e.message : String(e);
+      installError = `Steering install failed for ${plugin}: ${reason}`;
+    } finally {
+      pendingSteeringInstalls.delete(key);
+    }
+  }
+
   $effect(() => {
     if (!popoverOpen) return;
     const onMouseDown = (e: MouseEvent) => {
@@ -741,20 +818,40 @@
               <div class="mb-1.5 text-[10px] font-semibold uppercase tracking-wider text-kiro-subtle">Plugin</div>
               {#each availablePlugins as ap (pluginKey(ap.marketplace, ap.plugin.name))}
                 {@const key = pluginKey(ap.marketplace, ap.plugin.name)}
-                <label class="flex items-center gap-2 px-1.5 py-1 text-[13px] text-kiro-text-secondary rounded hover:bg-kiro-accent-900/15 hover:text-kiro-text cursor-pointer">
-                  <input
-                    type="checkbox"
-                    checked={selectedPlugins.has(key)}
-                    onchange={() => togglePlugin(key)}
-                    class="h-3.5 w-3.5 rounded border-kiro-muted text-kiro-accent-500"
-                  />
-                  <span class="flex-1 truncate">{ap.plugin.name}</span>
-                  <span
-                    class="text-[11px] {ap.plugin.skill_count.state === 'manifest_failed' ? 'text-kiro-warning' : 'text-kiro-subtle'}"
-                    title={skillCountTitle(ap.plugin.skill_count)}
-                    aria-label={skillCountTitle(ap.plugin.skill_count)}
-                  >{skillCountLabel(ap.plugin.skill_count)}</span>
-                </label>
+                <!-- Wrapper: label (filter checkbox) + steering button as
+                     siblings, not nested. Putting the button inside the
+                     label would forward its click to the input element,
+                     toggling the filter every time the user installs
+                     steering. The flex/hover styling lives on the wrapper
+                     so the visual effect spans both controls. -->
+                <div class="flex items-center gap-1 rounded hover:bg-kiro-accent-900/15">
+                  <label class="flex flex-1 items-center gap-2 px-1.5 py-1 text-[13px] text-kiro-text-secondary cursor-pointer">
+                    <input
+                      type="checkbox"
+                      checked={selectedPlugins.has(key)}
+                      onchange={() => togglePlugin(key)}
+                      class="h-3.5 w-3.5 rounded border-kiro-muted text-kiro-accent-500"
+                    />
+                    <span class="flex-1 truncate">{ap.plugin.name}</span>
+                    <span
+                      class="text-[11px] {ap.plugin.skill_count.state === 'manifest_failed' ? 'text-kiro-warning' : 'text-kiro-subtle'}"
+                      title={skillCountTitle(ap.plugin.skill_count)}
+                      aria-label={skillCountTitle(ap.plugin.skill_count)}
+                    >{skillCountLabel(ap.plugin.skill_count)}</span>
+                  </label>
+                  <button
+                    type="button"
+                    onclick={() => installSteering(ap.marketplace, ap.plugin.name)}
+                    disabled={!projectPath || pendingSteeringInstalls.has(key)}
+                    title={projectPath
+                      ? `Install steering files for ${ap.plugin.name}`
+                      : "Pick a project first"}
+                    aria-label="Install steering files for {ap.plugin.name}"
+                    class="mr-1 px-1.5 py-0.5 text-[10px] font-medium text-kiro-accent-300 hover:text-kiro-accent-400 disabled:text-kiro-muted disabled:cursor-not-allowed"
+                  >
+                    {pendingSteeringInstalls.has(key) ? "…" : "Steering"}
+                  </button>
+                </div>
               {/each}
             </div>
           {/if}
