@@ -95,6 +95,17 @@ export const commands = {
 	 *  runtime.
 	 */
 	installPluginSteering: (marketplace: string, plugin: string, force: boolean, projectPath: string) => typedError<InstallSteeringResult_Serialize, CommandError>(__TAURI_INVOKE("install_plugin_steering", { marketplace, plugin, force, projectPath })),
+	/**
+	 *  Install every agent declared by a plugin into the active project's
+	 *  `.kiro/agents/` directory.
+	 * 
+	 *  The wrapper exists only to construct a [`MarketplaceService`] from
+	 *  process globals and translate the FFI `force: bool` into an
+	 *  [`InstallMode`]; the install itself runs in
+	 *  [`install_plugin_agents_impl`] so it can be tested without a Tauri
+	 *  runtime.
+	 */
+	installPluginAgents: (marketplace: string, plugin: string, force: boolean, acceptMcp: boolean, projectPath: string) => typedError<InstallAgentsResult_Serialize, CommandError>(__TAURI_INVOKE("install_plugin_agents", { marketplace, plugin, force, acceptMcp, projectPath })),
 };
 
 /* Types */
@@ -146,6 +157,57 @@ export type DiscoveredProject = {
  *  unmapped-but-mundane errors.
  */
 export type ErrorType = "not_found" | "already_exists" | "validation" | "git_error" | "io_error" | "parse_error" | "internal" | "unknown";
+
+/**
+ *  An agent that failed to install, with the typed error.
+ * 
+ *  `name` is `Some` once parsing has identified the agent; pre-parse
+ *  failures use `source_path` as the fallback identifier. `error` is the
+ *  typed [`AgentError`] so frontends can branch on cause without
+ *  substring-matching the rendered message; a custom `Serialize` impl
+ *  projects it to the chain string for the wire format.
+ */
+export type FailedAgent = FailedAgent_Serialize | FailedAgent_Deserialize;
+
+/**
+ *  An agent that failed to install, with the typed error.
+ * 
+ *  `name` is `Some` once parsing has identified the agent; pre-parse
+ *  failures use `source_path` as the fallback identifier. `error` is the
+ *  typed [`AgentError`] so frontends can branch on cause without
+ *  substring-matching the rendered message; a custom `Serialize` impl
+ *  projects it to the chain string for the wire format.
+ */
+export type FailedAgent_Deserialize = {
+	name: string | null,
+	source_path: string,
+	/**
+	 *  Typed error. `Serialize` renders it as a string via
+	 *  [`crate::error::error_full_chain`] so the wire shape stays string;
+	 *  in-process consumers can match on the typed variants directly.
+	 */
+	error: string,
+};
+
+/**
+ *  An agent that failed to install, with the typed error.
+ * 
+ *  `name` is `Some` once parsing has identified the agent; pre-parse
+ *  failures use `source_path` as the fallback identifier. `error` is the
+ *  typed [`AgentError`] so frontends can branch on cause without
+ *  substring-matching the rendered message; a custom `Serialize` impl
+ *  projects it to the chain string for the wire format.
+ */
+export type FailedAgent_Serialize = {
+	name: string | null,
+	source_path: string,
+	/**
+	 *  Typed error. `Serialize` renders it as a string via
+	 *  [`crate::error::error_full_chain`] so the wire shape stays string;
+	 *  in-process consumers can match on the typed variants directly.
+	 */
+	error: string,
+};
 
 /**
  *  A skill that failed to install, with the reason.
@@ -272,6 +334,112 @@ export type GitProtocol =
 "ssh";
 
 /**
+ *  Outcome of installing the agents from one plugin.
+ * 
+ *  Mirrors [`InstallSkillsResult`]: per-agent successes and failures are
+ *  collected so a single broken agent never aborts the rest of the batch,
+ *  and accumulated warnings always reach the caller even when some agents
+ *  fail.
+ */
+export type InstallAgentsResult = InstallAgentsResult_Serialize | InstallAgentsResult_Deserialize;
+
+/**
+ *  Outcome of installing the agents from one plugin.
+ * 
+ *  Mirrors [`InstallSkillsResult`]: per-agent successes and failures are
+ *  collected so a single broken agent never aborts the rest of the batch,
+ *  and accumulated warnings always reach the caller even when some agents
+ *  fail.
+ */
+export type InstallAgentsResult_Deserialize = {
+	/**
+	 *  Agent names successfully installed (both translated and native paths
+	 *  populate this). Native idempotent reinstalls go to `skipped`.
+	 */
+	installed: string[],
+	/**
+	 *  Agent names that were already installed and left untouched.
+	 *  Native paths populate this for idempotent reinstalls
+	 *  (`kind == InstallOutcomeKind::Idempotent`).
+	 */
+	skipped: string[],
+	// Agents whose install attempt failed (parse, validation, or fs error).
+	failed: FailedAgent_Deserialize[],
+	/**
+	 *  Non-fatal issues (unmapped tools, skipped non-agent files,
+	 *  MCP-gated agents).
+	 */
+	warnings: InstallWarning[],
+	/**
+	 *  Per-native-agent rich outcome (`kind`, hashes). Empty for
+	 *  translated-only installs. Frontends that want the rich detail
+	 *  consume this; legacy presenters keep using `installed: Vec<String>`.
+	 * 
+	 *  `serde` `default` is kept for round-trip parsing of legacy JSON
+	 *  blobs that omit the field. `skip_serializing_if` was removed so
+	 *  the type can flow through Tauri/Specta bindings — `tauri-specta`
+	 *  2.0.0-rc.24's unified mode rejects conditional field omission.
+	 *  Mirrors [`InstallSkillsResult`] and [`crate::steering::InstallSteeringResult`],
+	 *  neither of which use `skip_serializing_if` either.
+	 */
+	installed_native?: InstalledNativeAgentOutcome[],
+	/**
+	 *  Per-plugin native companion bundle outcome. `None` for translated
+	 *  plugins or for native plugins with zero companion files. See
+	 *  [`Self::installed_native`] for why `skip_serializing_if` is absent.
+	 */
+	installed_companions?: InstalledNativeCompanionsOutcome | null,
+};
+
+/**
+ *  Outcome of installing the agents from one plugin.
+ * 
+ *  Mirrors [`InstallSkillsResult`]: per-agent successes and failures are
+ *  collected so a single broken agent never aborts the rest of the batch,
+ *  and accumulated warnings always reach the caller even when some agents
+ *  fail.
+ */
+export type InstallAgentsResult_Serialize = {
+	/**
+	 *  Agent names successfully installed (both translated and native paths
+	 *  populate this). Native idempotent reinstalls go to `skipped`.
+	 */
+	installed: string[],
+	/**
+	 *  Agent names that were already installed and left untouched.
+	 *  Native paths populate this for idempotent reinstalls
+	 *  (`kind == InstallOutcomeKind::Idempotent`).
+	 */
+	skipped: string[],
+	// Agents whose install attempt failed (parse, validation, or fs error).
+	failed: FailedAgent_Serialize[],
+	/**
+	 *  Non-fatal issues (unmapped tools, skipped non-agent files,
+	 *  MCP-gated agents).
+	 */
+	warnings: InstallWarning[],
+	/**
+	 *  Per-native-agent rich outcome (`kind`, hashes). Empty for
+	 *  translated-only installs. Frontends that want the rich detail
+	 *  consume this; legacy presenters keep using `installed: Vec<String>`.
+	 * 
+	 *  `serde` `default` is kept for round-trip parsing of legacy JSON
+	 *  blobs that omit the field. `skip_serializing_if` was removed so
+	 *  the type can flow through Tauri/Specta bindings — `tauri-specta`
+	 *  2.0.0-rc.24's unified mode rejects conditional field omission.
+	 *  Mirrors [`InstallSkillsResult`] and [`crate::steering::InstallSteeringResult`],
+	 *  neither of which use `skip_serializing_if` either.
+	 */
+	installed_native: InstalledNativeAgentOutcome[],
+	/**
+	 *  Per-plugin native companion bundle outcome. `None` for translated
+	 *  plugins or for native plugins with zero companion files. See
+	 *  [`Self::installed_native`] for why `skip_serializing_if` is absent.
+	 */
+	installed_companions: InstalledNativeCompanionsOutcome | null,
+};
+
+/**
  *  What happened during one native install call. Three states are
  *  distinct variants rather than a `(was_idempotent: bool,
  *  forced_overwrite: bool)` pair so that the contradictory
@@ -329,6 +497,69 @@ export type InstallSteeringResult_Serialize = {
 	installed: InstalledSteeringOutcome[],
 	failed: FailedSteeringFile_Serialize[],
 	warnings: SteeringWarning[],
+};
+
+/**
+ *  Non-fatal issue produced during install. Surfaced in install results
+ *  so the CLI / Tauri frontend can render them without blocking the install.
+ * 
+ *  Carries structured reason enums (not pre-rendered strings) so consumers
+ *  can switch on them — the CLI formats for a human, the Tauri frontend
+ *  can localize or map to its own UI states.
+ * 
+ *  Wire format: internally tagged on `kind` (`snake_case` discriminant) to
+ *  match the workspace convention for FFI-crossing enums (`SteeringWarning`,
+ *  `SkippedReason`, `FailedSkillReason`, `ParseFailure`). Enforced by the
+ *  `ffi-enum-serde-tag` plan-lint gate.
+ */
+export type InstallWarning = 
+/**
+ *  A source-declared tool had no Kiro equivalent and was dropped.
+ *  The emitted agent will inherit the full parent toolset for that slot.
+ */
+{ kind: "unmapped_tool"; agent: string; tool: string; reason: UnmappedReason } | 
+// An agent file could not be parsed; it was skipped.
+{ kind: "agent_parse_failed"; path: string; failure: ParseFailure } | 
+/**
+ *  An agent declares MCP servers but the install was not opted in
+ *  to MCP. The agent was skipped — its prompt would otherwise
+ *  install with a `mcpServers` block that runs subprocesses or
+ *  opens network connections without the user's explicit consent.
+ *  Listed transports help the user see the risk surface (e.g.
+ *  `["stdio", "stdio", "http"]`) before they re-run with the
+ *  `--accept-mcp` opt-in.
+ */
+{ kind: "mcp_servers_require_opt_in"; agent: string; transports: string[] };
+
+/**
+ *  In-memory outcome of one [`KiroProject::install_native_agent`] call.
+ * 
+ *  Carries enough detail for the service layer to render an install-summary
+ *  row without re-reading tracking — name, the resolved destination JSON
+ *  path, what kind of install happened, and both content hashes.
+ */
+export type InstalledNativeAgentOutcome = {
+	name: string,
+	json_path: string,
+	kind: InstallOutcomeKind,
+	source_hash: string,
+	installed_hash: string,
+};
+
+/**
+ *  In-memory outcome of one [`KiroProject::install_native_companions`] call.
+ * 
+ *  Plugin-scoped (companion bundles are owned per-plugin, not per-agent),
+ *  so callers see one entry for the whole bundle rather than one per file.
+ *  `files` is the absolute destination paths of every companion file
+ *  installed for this plugin.
+ */
+export type InstalledNativeCompanionsOutcome = {
+	plugin: string,
+	files: string[],
+	kind: InstallOutcomeKind,
+	source_hash: string,
+	installed_hash: string,
 };
 
 // Information about a single installed skill.
@@ -396,6 +627,63 @@ export type MarketplaceStorage =
  *  Edits to the source require re-adding the marketplace.
  */
 "copied";
+
+/**
+ *  Structured reason a source agent file could not be parsed.
+ * 
+ *  Replaces the pre-rendered `reason: String` that earlier versions carried
+ *  on `AgentError` and `InstallWarning`. Callers switch on variants
+ *  (e.g. to demote `MissingFrontmatter` to debug logs for README-style
+ *  files) rather than substring-matching on error text — which would
+ *  silently break the moment a message is reworded.
+ * 
+ *  Wire format: internally tagged on `kind` (`snake_case` discriminant)
+ *  to match the workspace convention for FFI-crossing enums
+ *  (`SteeringWarning`, `SkippedReason`, `FailedSkillReason`, …). All
+ *  payload-bearing variants use struct-style fields rather than tuple
+ *  fields because internal tagging requires named fields. Enforced by
+ *  the `ffi-enum-serde-tag` plan-lint gate.
+ */
+export type ParseFailure = 
+/**
+ *  No opening `---` fence. Usually a README or other prose file
+ *  accidentally scanned from the agents directory. Service layer
+ *  demotes this to a debug log.
+ */
+{ kind: "missing_frontmatter" } | 
+/**
+ *  Opening fence present but no closing fence — a broken file that
+ *  the user probably wants to hear about.
+ */
+{ kind: "unclosed_frontmatter" } | 
+// YAML parser rejected the frontmatter block.
+{ kind: "invalid_yaml"; reason: string } | 
+// Frontmatter parsed but lacks the required `name` key.
+{ kind: "missing_name" } | 
+/**
+ *  Frontmatter `name` failed validation (unsafe for use as a filename).
+ *  `reason` carries the validator's human-readable explanation.
+ */
+{ kind: "invalid_name"; reason: string } | 
+/**
+ *  File read failed (permission denied, not found during racy delete,
+ *  etc.). `reason` carries the rendered I/O error message.
+ */
+{ kind: "io_error"; reason: string } | 
+/**
+ *  The translated parser (`parse_agent_file`) was called with a file
+ *  whose detected dialect belongs on a different install code path.
+ *  Currently fires only for [`AgentDialect::Native`]: native agents are
+ *  installed via validate-and-copy through `parse_native_kiro_agent_file`,
+ *  not through `parse_agent_file`. The service routes by dialect
+ *  upstream, so this branch is a defensive sanity check rather than a
+ *  normal failure mode.
+ * 
+ *  Distinct from [`ParseFailure::IoError`] so callers branching on
+ *  "should I retry the I/O?" don't misclassify a routing bug as a
+ *  transient I/O failure.
+ */
+{ kind: "unsupported_dialect" };
 
 // Basic information about a plugin within a marketplace.
 export type PluginBasicInfo = {
@@ -736,6 +1024,15 @@ export type StructuredSource =
  *  exist in-memory — `RelativePath::new` is the only way in.
  */
 path: RelativePath; ref: string | null; sha: string | null };
+
+export type UnmappedReason = 
+// Claude `PascalCase` name with no Kiro equivalent (e.g. `NotebookEdit`).
+"NoKiroEquivalent" | 
+/**
+ *  Copilot bare name (e.g. `codebase`, `findTestFiles`) — internal Copilot
+ *  concept with no reliable Kiro mapping.
+ */
+"BareCopilotName";
 
 // Result of updating one or more marketplaces.
 export type UpdateResult = {

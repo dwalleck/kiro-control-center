@@ -1,3 +1,4 @@
+pub mod agents;
 pub mod browse;
 pub mod installed;
 pub mod kiro_settings;

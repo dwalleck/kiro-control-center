@@ -400,11 +400,19 @@ pub struct InstallAgentsResult {
     /// Per-native-agent rich outcome (`kind`, hashes). Empty for
     /// translated-only installs. Frontends that want the rich detail
     /// consume this; legacy presenters keep using `installed: Vec<String>`.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    ///
+    /// `serde` `default` is kept for round-trip parsing of legacy JSON
+    /// blobs that omit the field. `skip_serializing_if` was removed so
+    /// the type can flow through Tauri/Specta bindings — `tauri-specta`
+    /// 2.0.0-rc.24's unified mode rejects conditional field omission.
+    /// Mirrors [`InstallSkillsResult`] and [`crate::steering::InstallSteeringResult`],
+    /// neither of which use `skip_serializing_if` either.
+    #[serde(default)]
     pub installed_native: Vec<crate::project::InstalledNativeAgentOutcome>,
     /// Per-plugin native companion bundle outcome. `None` for translated
-    /// plugins or for native plugins with zero companion files.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// plugins or for native plugins with zero companion files. See
+    /// [`Self::installed_native`] for why `skip_serializing_if` is absent.
+    #[serde(default)]
     pub installed_companions: Option<crate::project::InstalledNativeCompanionsOutcome>,
 }
 
