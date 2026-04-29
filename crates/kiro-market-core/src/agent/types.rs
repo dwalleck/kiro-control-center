@@ -142,8 +142,16 @@ pub struct AgentDefinition {
 /// (e.g. to demote `MissingFrontmatter` to debug logs for README-style
 /// files) rather than substring-matching on error text — which would
 /// silently break the moment a message is reworded.
+///
+/// Wire format: internally tagged on `kind` (`snake_case` discriminant)
+/// to match the workspace convention for FFI-crossing enums
+/// (`SteeringWarning`, `SkippedReason`, `FailedSkillReason`, …). All
+/// payload-bearing variants use struct-style fields rather than tuple
+/// fields because internal tagging requires named fields. Enforced by
+/// the `ffi-enum-serde-tag` plan-lint gate.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[cfg_attr(feature = "specta", derive(specta::Type))]
+#[serde(tag = "kind", rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum ParseFailure {
     /// No opening `---` fence. Usually a README or other prose file
@@ -154,15 +162,15 @@ pub enum ParseFailure {
     /// the user probably wants to hear about.
     UnclosedFrontmatter,
     /// YAML parser rejected the frontmatter block.
-    InvalidYaml(String),
+    InvalidYaml { reason: String },
     /// Frontmatter parsed but lacks the required `name` key.
     MissingName,
     /// Frontmatter `name` failed validation (unsafe for use as a filename).
-    /// Carries the validator's human-readable reason.
-    InvalidName(String),
+    /// `reason` carries the validator's human-readable explanation.
+    InvalidName { reason: String },
     /// File read failed (permission denied, not found during racy delete,
-    /// etc.). Carries the rendered I/O error message.
-    IoError(String),
+    /// etc.). `reason` carries the rendered I/O error message.
+    IoError { reason: String },
     /// The translated parser (`parse_agent_file`) was called with a file
     /// whose detected dialect belongs on a different install code path.
     /// Currently fires only for [`AgentDialect::Native`]: native agents are
@@ -186,14 +194,65 @@ impl std::fmt::Display for ParseFailure {
             ParseFailure::UnclosedFrontmatter => {
                 f.write_str("unclosed frontmatter: missing closing `---` fence")
             }
-            ParseFailure::InvalidYaml(msg) => write!(f, "invalid YAML: {msg}"),
+            ParseFailure::InvalidYaml { reason } => write!(f, "invalid YAML: {reason}"),
             ParseFailure::MissingName => f.write_str("missing required `name` field"),
-            ParseFailure::InvalidName(reason) => write!(f, "invalid `name` value: {reason}"),
-            ParseFailure::IoError(msg) => write!(f, "read failed: {msg}"),
+            ParseFailure::InvalidName { reason } => write!(f, "invalid `name` value: {reason}"),
+            ParseFailure::IoError { reason } => write!(f, "read failed: {reason}"),
             ParseFailure::UnsupportedDialect => f.write_str(
                 "translated parser called for a dialect that uses the validate-and-copy path \
                  (native agents go through `parse_native_kiro_agent_file`)",
             ),
         }
+    }
+}
+
+#[cfg(test)]
+mod parse_failure_tests {
+    use super::*;
+    use rstest::rstest;
+
+    /// Wire-format lock for `ParseFailure`. The `ffi-enum-serde-tag`
+    /// plan-lint gate enforces that pub `Serialize + specta::Type` enums
+    /// with payload-bearing variants carry an explicit
+    /// `#[serde(tag = "...")]` directive. These cases pin the resulting
+    /// JSON shape so a future revert (drop the attribute, change the
+    /// discriminant key, switch back to tuple variants) breaks loud
+    /// rather than silently emitting awkward externally-tagged shapes
+    /// to `bindings.ts` — exactly the regression that affected
+    /// `SteeringWarning` pre-PR-83. Frontend code patterns like
+    /// `if (failure.kind === "invalid_yaml")` rely on this wire shape.
+    #[rstest]
+    #[case::missing_frontmatter(
+        ParseFailure::MissingFrontmatter,
+        serde_json::json!({"kind": "missing_frontmatter"}),
+    )]
+    #[case::invalid_yaml(
+        ParseFailure::InvalidYaml { reason: "expected ':' at line 3".into() },
+        serde_json::json!({"kind": "invalid_yaml", "reason": "expected ':' at line 3"}),
+    )]
+    #[case::invalid_name(
+        ParseFailure::InvalidName { reason: "contains `..`".into() },
+        serde_json::json!({"kind": "invalid_name", "reason": "contains `..`"}),
+    )]
+    #[case::io_error(
+        ParseFailure::IoError { reason: "permission denied".into() },
+        serde_json::json!({"kind": "io_error", "reason": "permission denied"}),
+    )]
+    #[case::unsupported_dialect(
+        ParseFailure::UnsupportedDialect,
+        serde_json::json!({"kind": "unsupported_dialect"}),
+    )]
+    fn parse_failure_variants_json_shape(
+        #[case] failure: ParseFailure,
+        #[case] expected: serde_json::Value,
+    ) {
+        let json = serde_json::to_value(&failure).expect("serialize");
+        assert_eq!(
+            json, expected,
+            "wire format must use internally-tagged `kind` + snake_case to match \
+             SteeringWarning / SkippedReason / FailedSkillReason. Frontend code \
+             writes `if (failure.kind === \"...\")` — a revert to default external \
+             tagging or to tuple variants would silently break that pattern."
+        );
     }
 }

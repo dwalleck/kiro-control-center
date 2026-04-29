@@ -52,16 +52,20 @@ struct CopilotFrontmatter {
 pub fn parse_copilot_agent(content: &str) -> Result<AgentDefinition, ParseFailure> {
     let (yaml, body) = split_frontmatter(content)?;
     let fm: CopilotFrontmatter =
-        serde_yaml_ng::from_str(yaml).map_err(|e| ParseFailure::InvalidYaml(e.to_string()))?;
+        serde_yaml_ng::from_str(yaml).map_err(|e| ParseFailure::InvalidYaml {
+            reason: e.to_string(),
+        })?;
 
     let name = fm.name.ok_or(ParseFailure::MissingName)?;
     // Validate the name at parse time so downstream fs operations (and the
     // file:// URI in the emitted JSON) can trust it without re-checking.
     crate::validation::validate_name(&name).map_err(|e| match e {
         crate::error::ValidationError::InvalidName { reason, .. } => {
-            ParseFailure::InvalidName(reason)
+            ParseFailure::InvalidName { reason }
         }
-        other => ParseFailure::InvalidName(other.to_string()),
+        other => ParseFailure::InvalidName {
+            reason: other.to_string(),
+        },
     })?;
 
     Ok(AgentDefinition {
@@ -176,7 +180,7 @@ Body text.
                    body\n";
         let err = parse_copilot_agent(src).expect_err("unknown discriminator must be rejected");
         assert!(
-            matches!(err, ParseFailure::InvalidYaml(_)),
+            matches!(err, ParseFailure::InvalidYaml { .. }),
             "expected InvalidYaml for unknown MCP type, got {err:?}"
         );
     }
@@ -195,7 +199,7 @@ Body text.
                    body\n";
         let err = parse_copilot_agent(src).expect_err("missing command must be rejected");
         assert!(
-            matches!(err, ParseFailure::InvalidYaml(_)),
+            matches!(err, ParseFailure::InvalidYaml { .. }),
             "expected InvalidYaml for missing command, got {err:?}"
         );
     }
@@ -210,6 +214,6 @@ Body text.
                    ---\n\
                    body\n";
         let err = parse_copilot_agent(src).expect_err("missing url must be rejected");
-        assert!(matches!(err, ParseFailure::InvalidYaml(_)));
+        assert!(matches!(err, ParseFailure::InvalidYaml { .. }));
     }
 }

@@ -524,8 +524,14 @@ fn serialize_agent_error<S: serde::Serializer>(
 /// Carries structured reason enums (not pre-rendered strings) so consumers
 /// can switch on them — the CLI formats for a human, the Tauri frontend
 /// can localize or map to its own UI states.
+///
+/// Wire format: internally tagged on `kind` (`snake_case` discriminant) to
+/// match the workspace convention for FFI-crossing enums (`SteeringWarning`,
+/// `SkippedReason`, `FailedSkillReason`, `ParseFailure`). Enforced by the
+/// `ffi-enum-serde-tag` plan-lint gate.
 #[derive(Clone, Debug, Serialize)]
 #[cfg_attr(feature = "specta", derive(specta::Type))]
+#[serde(tag = "kind", rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum InstallWarning {
     /// A source-declared tool had no Kiro equivalent and was dropped.
@@ -1959,7 +1965,9 @@ mod tests {
         use crate::agent::ParseFailure;
         let w = InstallWarning::AgentParseFailed {
             path: PathBuf::from("/tmp/bad.md"),
-            failure: ParseFailure::InvalidYaml("unexpected token".into()),
+            failure: ParseFailure::InvalidYaml {
+                reason: "unexpected token".into(),
+            },
         };
         let s = w.to_string();
         assert!(s.contains("/tmp/bad.md"));
@@ -1976,6 +1984,65 @@ mod tests {
         };
         let s = w.to_string();
         assert!(s.contains("name"));
+    }
+
+    /// Wire-format lock for `InstallWarning`. The `ffi-enum-serde-tag`
+    /// plan-lint gate enforces that pub `Serialize + specta::Type` enums
+    /// with payload-bearing variants carry an explicit
+    /// `#[serde(tag = "...")]` directive. These cases pin the resulting
+    /// JSON shape so a future revert (drop the attribute, change the
+    /// discriminant key) breaks loud rather than silently emitting
+    /// awkward externally-tagged shapes to `bindings.ts`. Frontend code
+    /// patterns like `if (warning.kind === "unmapped_tool")` rely on
+    /// this wire shape.
+    #[rstest::rstest]
+    #[case::unmapped_tool(
+        InstallWarning::UnmappedTool {
+            agent: "reviewer".into(),
+            tool: "NotebookEdit".into(),
+            reason: crate::agent::tools::UnmappedReason::NoKiroEquivalent,
+        },
+        serde_json::json!({
+            "kind": "unmapped_tool",
+            "agent": "reviewer",
+            "tool": "NotebookEdit",
+            "reason": "NoKiroEquivalent",
+        }),
+    )]
+    #[case::agent_parse_failed(
+        InstallWarning::AgentParseFailed {
+            path: PathBuf::from("/tmp/bad.md"),
+            failure: crate::agent::ParseFailure::MissingName,
+        },
+        serde_json::json!({
+            "kind": "agent_parse_failed",
+            "path": "/tmp/bad.md",
+            "failure": {"kind": "missing_name"},
+        }),
+    )]
+    #[case::mcp_servers_require_opt_in(
+        InstallWarning::McpServersRequireOptIn {
+            agent: "tester".into(),
+            transports: vec!["stdio".into(), "http".into()],
+        },
+        serde_json::json!({
+            "kind": "mcp_servers_require_opt_in",
+            "agent": "tester",
+            "transports": ["stdio", "http"],
+        }),
+    )]
+    fn install_warning_variants_json_shape(
+        #[case] warning: InstallWarning,
+        #[case] expected: serde_json::Value,
+    ) {
+        let json = serde_json::to_value(&warning).expect("serialize");
+        assert_eq!(
+            json, expected,
+            "wire format must use internally-tagged `kind` + snake_case to match \
+             SteeringWarning / ParseFailure / SkippedReason. Frontend code writes \
+             `if (warning.kind === \"...\")` — a revert to default external tagging \
+             would silently break that pattern."
+        );
     }
 
     #[test]
@@ -2622,7 +2689,7 @@ mod tests {
             matches!(
                 w,
                 InstallWarning::AgentParseFailed {
-                    failure: ParseFailure::InvalidName(_),
+                    failure: ParseFailure::InvalidName { .. },
                     ..
                 }
             )

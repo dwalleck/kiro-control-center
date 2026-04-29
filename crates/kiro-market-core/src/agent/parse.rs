@@ -37,7 +37,9 @@ pub fn detect_dialect(path: &Path) -> AgentDialect {
 pub fn parse_agent_file(path: &Path) -> Result<AgentDefinition, AgentError> {
     let content = fs::read_to_string(path).map_err(|e| AgentError::ParseFailed {
         path: path.to_path_buf(),
-        failure: ParseFailure::IoError(e.to_string()),
+        failure: ParseFailure::IoError {
+            reason: e.to_string(),
+        },
     })?;
     let dialect = detect_dialect(path);
     let result = match dialect {
@@ -130,7 +132,7 @@ mod tests {
         assert!(matches!(
             err,
             AgentError::ParseFailed {
-                failure: ParseFailure::InvalidYaml(_),
+                failure: ParseFailure::InvalidYaml { .. },
                 ..
             }
         ));
@@ -143,7 +145,7 @@ mod tests {
         assert!(matches!(
             err,
             AgentError::ParseFailed {
-                failure: ParseFailure::IoError(_),
+                failure: ParseFailure::IoError { .. },
                 ..
             }
         ));
