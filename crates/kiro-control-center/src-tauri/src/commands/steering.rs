@@ -9,7 +9,7 @@
 use kiro_market_core::project::KiroProject;
 use kiro_market_core::service::{InstallMode, MarketplaceService};
 use kiro_market_core::steering::{InstallSteeringResult, SteeringInstallContext};
-use kiro_market_core::validation::validate_name;
+use kiro_market_core::validation::{MarketplaceName, PluginName};
 
 use crate::commands::{make_service, validate_kiro_project_path};
 use crate::error::CommandError;
@@ -47,18 +47,18 @@ fn install_plugin_steering_impl(
     mode: InstallMode,
     project_path: &str,
 ) -> Result<InstallSteeringResult, CommandError> {
-    validate_name(marketplace)?;
-    validate_name(plugin)?;
     let project_root = validate_kiro_project_path(project_path)?;
+    let marketplace = MarketplaceName::new(marketplace)?;
+    let plugin = PluginName::new(plugin)?;
     let ctx = svc
-        .resolve_plugin_install_context(marketplace, plugin)
+        .resolve_plugin_install_context(&marketplace, &plugin)
         .map_err(CommandError::from)?;
     let project = KiroProject::new(project_root);
 
     let install_ctx = SteeringInstallContext {
         mode,
-        marketplace,
-        plugin,
+        marketplace: &marketplace,
+        plugin: &plugin,
         version: ctx.version.as_deref(),
     };
 

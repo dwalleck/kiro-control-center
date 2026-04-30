@@ -13,7 +13,7 @@ use kiro_market_core::service::{
     BulkSkillsResult, InstallFilter, InstallMode, InstallSkillsResult, MarketplaceService,
     PluginSkillsResult, SkillCount,
 };
-use kiro_market_core::validation::validate_name;
+use kiro_market_core::validation::{MarketplaceName, PluginName};
 
 use crate::commands::{make_service, validate_kiro_project_path};
 use crate::error::{CommandError, ErrorType};
@@ -109,11 +109,14 @@ pub async fn list_marketplaces() -> Result<Vec<MarketplaceInfo>, CommandError> {
 #[tauri::command]
 #[specta::specta]
 pub async fn list_plugins(marketplace: String) -> Result<Vec<PluginInfo>, CommandError> {
-    validate_name(&marketplace)?;
+    let marketplace = MarketplaceName::new(marketplace)?;
     let svc = make_service()?;
-    let marketplace_path = svc.marketplace_path(&marketplace);
+    // Phase 1.5: `marketplace_path` and `list_plugin_entries` remain
+    // `&str`-typed by design — only the install API migrates to the
+    // newtypes. The `as_str()` bridges below are permanent.
+    let marketplace_path = svc.marketplace_path(marketplace.as_str());
     let plugin_entries = svc
-        .list_plugin_entries(&marketplace)
+        .list_plugin_entries(marketplace.as_str())
         .map_err(CommandError::from)?;
 
     let mut results = Vec::with_capacity(plugin_entries.len());
@@ -212,11 +215,11 @@ fn install_skills_impl(
     mode: InstallMode,
     project_path: &str,
 ) -> Result<InstallSkillsResult, CommandError> {
-    validate_name(marketplace)?;
-    validate_name(plugin)?;
     let project_root = validate_kiro_project_path(project_path)?;
+    let marketplace = MarketplaceName::new(marketplace)?;
+    let plugin = PluginName::new(plugin)?;
     let ctx = svc
-        .resolve_plugin_install_context(marketplace, plugin)
+        .resolve_plugin_install_context(&marketplace, &plugin)
         .map_err(CommandError::from)?;
     let project = KiroProject::new(project_root);
     Ok(svc.install_skills(
@@ -224,8 +227,8 @@ fn install_skills_impl(
         &ctx.skill_dirs,
         &InstallFilter::Names(skills),
         mode,
-        marketplace,
-        plugin,
+        &marketplace,
+        &plugin,
         ctx.version.as_deref(),
     ))
 }
