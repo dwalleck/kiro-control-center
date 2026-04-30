@@ -201,6 +201,73 @@ The plan's note is technically right but reads as if even kiro-market-core might
 
 ---
 
+## P1.5-6 — Implementation finding: Task 3's intra-crate ripple is wider than the plan anticipated
+
+**Surfaced during.** Task 3 implementation (commit `9fbbfd9`). The plan's Task 3 step 7 said only the workspace crates (`kiro-control-center`, `kiro-market`) would fail to compile after Task 3, with `kiro-market-core` itself going green. In practice, three meta-construction sites *inside* `kiro-market-core` also have to be migrated in Task 3 (because the crate must compile end-to-end as a unit):
+
+- `crates/kiro-market-core/src/service/mod.rs::install_skills` (around line 1110) — builds `InstalledSkillMeta` from `marketplace: &str, plugin: &str` parameters that won't be migrated until Task 5 changes `MarketplaceService::install_skills`'s signature.
+- `crates/kiro-market-core/src/service/mod.rs::install_translated_agent` (around line 1519) — builds `InstalledAgentMeta` from `ctx: AgentInstallContext<'_>` whose `marketplace`/`plugin` fields stay `&str` until Task 5 migrates `AgentInstallContext`.
+- `crates/kiro-market-core/src/service/mod.rs::install_one_native_agent` and `install_native_companions_for_plugin` (around lines 1691, 1771) — same shape, take `ctx: AgentInstallContext<'_>` whose fields are still `&str` pre-Task-5.
+
+Plus one inside `project.rs` itself: `install_steering_file_locked` (around line 1878) holds a `SteeringInstallContext<'_>` whose fields stay `&str` until Task 4 migrates that struct.
+
+**Why the plan missed it.** The plan correctly identified the *call sites that change in each task* but didn't trace the *meta-construction sites that consume those parameters*. An `InstalledSkillMeta` construction inside `install_skills` is downstream of `install_skills`'s parameter type — when we change the meta type's field type in Task 3, the construction site has to be updated even if its surrounding fn's signature doesn't change until Task 5.
+
+**Mitigation chosen.** Task 3 added two `pub(crate) fn from_internal_unchecked` constructors on `MarketplaceName` and `PluginName` (mirroring the existing `RelativePath::from_internal_unchecked` precedent at `validation.rs:56` — `debug_assert!` validation, no panic in release, identical recipe). The four shim sites use them with explicit "Phase 1.5 Task 3 transient shim — Task 4/5 strips" comments. Task 4's `SteeringInstallContext` migration strips the `project.rs` shim; Task 5's `AgentInstallContext` + `MarketplaceService::install_skills` migrations strip the three `service/mod.rs` shims.
+
+**Forward-looking rule.** When a plan migrates a struct field type (X), the plan should also enumerate the *construction sites* of that struct, not just the *call sites of the function holding it*. Construction sites and parameter sites are separate axes of ripple.
+
+**Rationale.** Captured as audit trail per "forward motion + amendments" execution rule. The implementer correctly identified the intra-crate ripple, applied the existing `from_internal_unchecked` recipe (not a new pattern), and marked every shim site for Task 4/5 to strip. No design-doc revision needed.
+
+---
+
+## P1.5-7 — Implementation finding: `from_internal_unchecked` constructors added to both newtypes
+
+**Surfaced during.** Task 3 implementation (commit `9fbbfd9`). Coupled to P1.5-6 — these are the constructors that enable the transient shim sites to compile without introducing `unwrap`/`expect` in production code.
+
+**Drift.** The plan's Task 1 spec defined `MarketplaceName::new` and `PluginName::new` as the only public constructors. Task 3's intra-crate ripple (P1.5-6) needed a way to construct the newtypes from strings that *had already been validated upstream* (at the marketplace catalog parse layer) without re-running validation or returning a `Result`.
+
+**Resolved by.** Adding `pub(crate) fn from_internal_unchecked(value: String) -> Self` to both newtypes:
+
+```rust
+/// See [`RelativePath::from_internal_unchecked`].
+pub(crate) fn from_internal_unchecked(value: String) -> Self {
+    debug_assert!(
+        validate_name(&value).is_ok(),
+        "MarketplaceName::from_internal_unchecked called with invalid name: {value:?}"
+    );
+    MarketplaceName(value)
+}
+```
+
+This mirrors the **existing** `RelativePath::from_internal_unchecked` precedent at `crates/kiro-market-core/src/validation.rs:56`. It's not a new pattern — it's the codebase's established recipe for "internal post-validation construction without re-validating." `pub(crate)` keeps it off the public API; `debug_assert!` catches bugs in dev/test builds.
+
+**Forward-looking expectation.** The four `from_internal_unchecked` call sites (3 in `service/mod.rs`, 1 in `project.rs`) are TRANSIENT — Tasks 4 and 5 strip them when the surrounding context structs (`SteeringInstallContext`, `AgentInstallContext`) and `MarketplaceService::install_skills` migrate to take the newtypes directly. The constructors themselves stay (they're general infrastructure matching `RelativePath`'s shape), but the call sites should disappear.
+
+**Verification expectation.** After Task 5 lands, `grep -rn "from_internal_unchecked" crates/kiro-market-core/src/` should return only the `validation.rs` definition lines and the `RelativePath` precedent — no call sites in `service/mod.rs` (or anywhere else). If any survive past Task 5, that's a finding to capture.
+
+**Site-count drift.** Tasks 1-4 deep review (`9a3b297..a80455c`) found that the actual call-site count is 5 (not 4): all in `service/mod.rs` after Task 4 stripped the `project.rs` site. Lines 1117/1120 (`install_skills`), 1523/1526 (`install_translated_agent`), 1696/1698 (`install_one_native_agent`), 1776/1778 (`install_native_companions_for_plugin`), 2005/2006 (`install_plugin`'s `SteeringInstallContext` construction added by Task 4). Task 5 strips all five.
+
+**IMPORTANT — release-build exposure pre-Task-5.** Two of the five shim sites (`install_skills` 1117/1120 and `install_plugin` 2005/2006) are reached via PUBLIC `MarketplaceService` methods that still take `marketplace: &str, plugin: &str`. `from_internal_unchecked`'s `debug_assert!` is stripped in release builds, so a release-build CLI consumer that doesn't pre-validate could plant a malformed name into a tracking file. The Tauri direction is safe (callers do `validate_name(...)?` first); the CLI direction is not (`crates/kiro-market/src/commands/install.rs` parses but doesn't `validate_name`). Closing this is a Task 5 hard requirement — Task 5 must migrate `MarketplaceService::install_skills` and `install_plugin`'s public signatures to `&MarketplaceName, &PluginName` so the shim sites disappear by construction. No interim mitigation needed since Task 5 is the next dispatched task.
+
+**Rationale.** Captured as audit trail. The implementer correctly invoked the existing precedent rather than introducing a new pattern, and the constructors will continue to be useful infrastructure even after the Phase 1.5 shim sites disappear (any future internal post-validation construction can reach for the same recipe).
+
+---
+
+## P1.5-8 — Implementation finding: Task 5 removed `from_internal_unchecked` from `MarketplaceName` / `PluginName` instead of keeping them as infrastructure
+
+**Surfaced during.** Task 5 implementation. P1.5-7 said the `pub(crate) fn from_internal_unchecked` constructors on `MarketplaceName` and `PluginName` would stay as general infrastructure even after their Phase 1.5 shim call sites disappeared. In practice, leaving them as dead code triggered `dead_code` warnings, which `cargo clippy --tests -- -D warnings` (the project's pre-commit gate) treats as errors. CLAUDE.md's zero-tolerance policy on `#[allow(...)]` directives forecloses the warning-suppression escape hatch.
+
+**Resolved by.** Removing both `pub(crate) fn from_internal_unchecked` definitions from `validation.rs` (along with their doc comments). The `RelativePath::from_internal_unchecked` precedent at `validation.rs:56` is unaffected — it has a real call site (`plugin.rs:133` via `DiscoveredPlugin::as_relative_path`) so it stays.
+
+**Forward-looking expectation.** If a future task needs to construct a `MarketplaceName` or `PluginName` from an already-validated string without re-running validation, re-adding the constructor is a 7-line edit and the `RelativePath` precedent is right there. The deletion is reversible. The decision rule going forward: a `pub(crate) fn from_internal_unchecked` on a newtype that has no callers is a code smell, not infrastructure.
+
+**Asymmetry left in place — `AgentError::PathOwnedByOtherPlugin.owner: String`.** Task 4 migrated `SteeringError::PathOwnedByOtherPlugin.owner` to `PluginName`. The sibling variant `AgentError::PathOwnedByOtherPlugin.owner` (at `error.rs:332`) still carries `String`. The construction site at `project.rs:2966` reads from a `&String` HashMap key — the in-design choice was to keep `HashMap<String, _>` keys as `String` rather than `PluginName`. Migrating just the error variant would either (a) require adding a NEW `from_internal_unchecked` shim site (defeating Task 5's purpose) or (b) require migrating the HashMap key (out of scope per the design doc). Task 5 leaves the asymmetry in place. If a follow-up wants to close it, the shape is "migrate the HashMap key first, then the variant." Logged here so the asymmetry is auditable rather than accidental.
+
+**Rationale.** Captured as audit trail per "forward motion + amendments" execution rule. The deletion is the right call given the project's clippy posture; the forward-looking note keeps the door open for re-introduction if a future need actually materializes.
+
+---
+
 ## Gates not flagged
 
 - **Gate 2 (Threat Model)** — pass. The plan migrates existing surface; no new untrusted byte sources. The newtype's `Deserialize` adds defensive validation at parse time, strengthening the existing trust model. PR #94's I9 walkers + the new newtype `Deserialize` gives belt-and-suspenders for tracking-file content.
@@ -215,6 +282,9 @@ The plan's note is technically right but reads as if even kiro-market-core might
 - **P1.5-3**: Add inline rationale comment on `Ord/PartialOrd` derive, plus a regression test asserting cmp matches inner String cmp.
 - **P1.5-4**: One-line note in Task 7 step 1 citing Phase 1 I10's `From<ValidationError> for CommandError`.
 - **P1.5-5**: Tighter wording in Task 3 step 7 separating crate-level vs workspace-level compile boundaries.
+- **P1.5-6** (implementation finding): Task 3's intra-crate ripple wider than plan anticipated; 4 transient shim sites added with `from_internal_unchecked` per P1.5-7.
+- **P1.5-7** (implementation finding): `pub(crate) fn from_internal_unchecked` added to `MarketplaceName` and `PluginName` mirroring the existing `RelativePath::from_internal_unchecked` precedent. Tasks 4-5 strip the call sites; the constructors themselves stay as infrastructure.
+- **P1.5-8** (implementation finding): Task 5 removed the `from_internal_unchecked` constructors (no remaining callers triggered `dead_code`; CLAUDE.md's no-`#[allow]` rule blocked suppression). Reversible if a future task needs them. Also documents the deliberate `AgentError::PathOwnedByOtherPlugin.owner: String` asymmetry that Task 5 chose to leave in place.
 
 No design-doc revisions required. The amendments are execution-time corrections; the architecture in `2026-04-30-phase-1-5-type-safety-design.md` stands as written.
 

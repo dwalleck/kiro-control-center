@@ -57,11 +57,13 @@ impl IntegrationHarness {
     ) -> (PluginFormat, InstallAgentsResult) {
         let ctx = MarketplaceService::resolve_plugin_install_context_from_dir(plugin_dir)
             .expect("resolve plugin install context");
+        let mp_name = mp(marketplace);
+        let pn_name = pn(plugin);
         let install_ctx = AgentInstallContext {
             mode,
             accept_mcp: false, // fixtures never carry MCP servers
-            marketplace,
-            plugin,
+            marketplace: &mp_name,
+            plugin: &pn_name,
             version: None,
         };
         let result = MarketplaceService::install_plugin_agents(
