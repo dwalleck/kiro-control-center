@@ -1107,4 +1107,54 @@ mod tests {
         let json = serde_json::to_string(&name).expect("serialize");
         assert_eq!(json, r#""p""#);
     }
+
+    // The five tests below mirror the corresponding `marketplace_name_*`
+    // tests at lines 991, 1018, 1031, 1039, 1046. PR #95's review
+    // (finding I4) flagged the asymmetry: PluginName lacked parallel
+    // accessor / empty-deserialize / round-trip / Ord coverage, which
+    // would let a regression slip through one type but not the other.
+    // The Ord lock in particular is load-bearing: if `PluginName` ever
+    // becomes a `BTreeMap` key (it isn't today, but `MarketplaceName`
+    // already is), an inconsistent comparator would silently misorder
+    // entries. Locking the contract symmetrically prevents that.
+
+    #[test]
+    fn plugin_name_accessors_round_trip() {
+        let name = PluginName::new("p").expect("valid");
+        let s = name.clone().into_inner();
+        assert_eq!(s, "p");
+        assert_eq!(name.as_str(), "p");
+    }
+
+    #[test]
+    fn deserialize_plugin_name_rejects_empty() {
+        let result: Result<PluginNameWrapper, _> = serde_json::from_str(r#"{"name":""}"#);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn plugin_name_round_trips_through_serde_json() {
+        let name = PluginName::new("kiro-code-reviewer").expect("valid");
+        let json = serde_json::to_string(&name).expect("serialize");
+        let parsed: PluginName = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(parsed, name);
+    }
+
+    #[test]
+    fn plugin_name_ord_is_lexicographic_on_inner() {
+        let a = PluginName::new("alpha").expect("valid");
+        let b = PluginName::new("bravo").expect("valid");
+        assert!(a < b);
+    }
+
+    #[test]
+    fn plugin_name_ord_matches_inner_string_ord() {
+        let a = PluginName::new("alpha").expect("valid");
+        let b = PluginName::new("bravo").expect("valid");
+        assert_eq!(
+            a.cmp(&b),
+            a.as_str().cmp(b.as_str()),
+            "PluginName::cmp must match inner String::cmp byte-for-byte"
+        );
+    }
 }

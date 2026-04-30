@@ -443,4 +443,54 @@ mod tests {
             "rendered error must mention the agent name, got: {rendered}"
         );
     }
+
+    // -----------------------------------------------------------------------
+    // install_plugin_agents_impl — IPC-boundary newtype rejection (I2 from
+    // PR #95 8-reviewer review). Mirrors `install_plugin_impl` tests in
+    // `commands/plugins.rs::tests:368-401` so each install `_impl` carries
+    // symmetric adversarial coverage; otherwise the `MarketplaceName::new`
+    // / `PluginName::new` guard is only exercised on one of four install
+    // paths.
+    // -----------------------------------------------------------------------
+
+    /// FE-supplied `marketplace = "../etc/passwd"` would otherwise reach
+    /// `cache::marketplace_path(marketplace)` via the
+    /// `resolve_plugin_install_context` lookup and force an FS read at
+    /// `<registries_dir>/../etc/passwd`. The IPC-boundary
+    /// `MarketplaceName::new` constructor rejects it before the service
+    /// ever runs.
+    #[test]
+    fn install_plugin_agents_impl_rejects_traversal_in_marketplace() {
+        let (dir, svc) = temp_service();
+        let project_path = make_kiro_project(dir.path());
+        let err = install_plugin_agents_impl(
+            &svc,
+            "../etc/passwd",
+            "myplugin",
+            InstallMode::New,
+            false,
+            &project_path,
+        )
+        .expect_err("traversal in marketplace must error");
+        assert_eq!(err.error_type, ErrorType::Validation);
+    }
+
+    /// NUL bytes truncate C-string conversions in syscalls; the
+    /// IPC-boundary `PluginName::new` constructor must reject them
+    /// before they reach `cache::plugin_registry_path`.
+    #[test]
+    fn install_plugin_agents_impl_rejects_nul_byte_in_plugin() {
+        let (dir, svc) = temp_service();
+        let project_path = make_kiro_project(dir.path());
+        let err = install_plugin_agents_impl(
+            &svc,
+            "mp1",
+            "evil\0plugin",
+            InstallMode::New,
+            false,
+            &project_path,
+        )
+        .expect_err("NUL byte in plugin name must error");
+        assert_eq!(err.error_type, ErrorType::Validation);
+    }
 }
