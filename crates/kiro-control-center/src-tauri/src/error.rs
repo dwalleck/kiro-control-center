@@ -111,10 +111,20 @@ impl From<String> for CommandError {
 }
 
 /// Map `ValidationError` straight to a `CommandError` so IPC-boundary
-/// guards (`validate_name`, `validate_relative_path`, ...) can use `?`
-/// without a manual `CoreError::from(...).into()` hop. Equivalent to
-/// `CommandError::from(CoreError::Validation(err))` but avoids the
-/// indirection at every call site.
+/// guards can use `?` without a manual `CoreError::from(...).into()`
+/// hop. Two families of caller depend on this conversion:
+///
+/// - the freestanding helpers (`validate_name`,
+///   `validate_relative_path`, `validate_kiro_project_path`) used at
+///   the top of `#[tauri::command]` wrappers;
+/// - the validating constructors (`MarketplaceName::new`,
+///   `PluginName::new`, `RelativePath::new`, `AgentName::new`) which
+///   are now the dominant users after Phase 1.5's newtype migration —
+///   every install-side wrapper threads marketplace/plugin strings
+///   through these constructors before calling the service.
+///
+/// Equivalent to `CommandError::from(CoreError::Validation(err))` but
+/// avoids the indirection at every call site.
 impl From<ValidationError> for CommandError {
     fn from(err: ValidationError) -> Self {
         Self::from(CoreError::from(err))

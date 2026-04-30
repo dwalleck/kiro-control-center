@@ -363,8 +363,9 @@ mod tests {
     // FE-supplied `marketplace = "../etc/passwd"` would otherwise reach
     // `cache::marketplace_path(marketplace)` and force an FS access at
     // `<registries_dir>/../etc/passwd` before the registry layer's own
-    // checks fire. The IPC-boundary `validate_name` guard rejects it
-    // before the service ever runs.
+    // checks fire. The IPC-boundary `MarketplaceName::new` constructor
+    // (which routes through `validate_name`) rejects it before the
+    // service ever runs.
     #[test]
     fn install_plugin_impl_rejects_traversal_in_marketplace() {
         let (dir, svc) = temp_service();
@@ -382,8 +383,9 @@ mod tests {
     }
 
     /// NUL bytes truncate C-string conversions in syscalls; the
-    /// IPC-boundary `validate_name` guard must reject them before they
-    /// reach `cache::plugin_registry_path`.
+    /// IPC-boundary `PluginName::new` constructor (which routes through
+    /// `validate_name`) must reject them before they reach
+    /// `cache::plugin_registry_path`.
     #[test]
     fn install_plugin_impl_rejects_nul_byte_in_plugin() {
         let (dir, svc) = temp_service();
