@@ -1,5 +1,6 @@
 use kiro_market_core::error::{
     error_full_chain, Error as CoreError, MarketplaceError, PluginError, SkillError,
+    ValidationError,
 };
 use serde::Serialize;
 use tracing::warn;
@@ -106,6 +107,17 @@ impl From<String> for CommandError {
             message,
             error_type: ErrorType::Unknown,
         }
+    }
+}
+
+/// Map `ValidationError` straight to a `CommandError` so IPC-boundary
+/// guards (`validate_name`, `validate_relative_path`, ...) can use `?`
+/// without a manual `CoreError::from(...).into()` hop. Equivalent to
+/// `CommandError::from(CoreError::Validation(err))` but avoids the
+/// indirection at every call site.
+impl From<ValidationError> for CommandError {
+    fn from(err: ValidationError) -> Self {
+        Self::from(CoreError::from(err))
     }
 }
 

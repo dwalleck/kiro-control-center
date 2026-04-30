@@ -23,9 +23,12 @@ pub struct PluginManifest {
     /// ([`crate::DEFAULT_AGENT_PATHS`]).
     #[serde(default)]
     pub agents: Vec<String>,
-    /// Authoring format for this plugin. See [`PluginFormat`].
+    /// Authoring format for this plugin. See [`PluginFormat`]. Omitted
+    /// fields default to [`PluginFormat::Translated`] via the type's
+    /// `Default` impl, matching the legacy "no `format` field means
+    /// markdown agents that need translation" behavior.
     #[serde(default)]
-    pub format: Option<PluginFormat>,
+    pub format: PluginFormat,
 
     /// Optional list of directories (relative to the plugin root) to scan
     /// for steering markdown files. Empty means "use the default scan
@@ -35,14 +38,29 @@ pub struct PluginManifest {
 }
 
 /// The plugin's native authoring format. Drives dispatch in
-/// `MarketplaceService::install_plugin_agents`: `KiroCli` skips
-/// parse-and-translate and validates-and-copies native JSON agents.
-/// Absent means the plugin uses Claude / Copilot markdown agents that
-/// require translation (the existing default flow).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize)]
+/// `MarketplaceService::install_plugin_agents`: [`PluginFormat::KiroCli`]
+/// skips parse-and-translate and validates-and-copies native JSON
+/// agents; [`PluginFormat::Translated`] (the default for plugins that
+/// don't declare a format) parses Claude / Copilot markdown agents and
+/// translates them.
+///
+/// Encoded as a real `Translated` variant rather than `None` so a
+/// future variant (e.g. `Cursor`) forces a compile-time decision at
+/// every dispatch site instead of silently routing through the
+/// translated path. Adding the explicit variant makes the
+/// `Option<PluginFormat>::None` == translated handshake unrepresentable.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Default)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
 #[serde(rename_all = "kebab-case")]
 #[non_exhaustive]
 pub enum PluginFormat {
+    /// Claude / Copilot-style markdown agents (default for plugins
+    /// that don't declare a `format` field — preserves the legacy
+    /// install path).
+    #[default]
+    Translated,
+    /// Native Kiro CLI format (`agents/<name>.json` with optional
+    /// `agents/prompts/<name>.md` companion files).
     KiroCli,
 }
 
@@ -836,14 +854,25 @@ mod tests {
     fn manifest_parses_format_kiro_cli() {
         let json = br#"{"name": "p", "format": "kiro-cli"}"#;
         let manifest = PluginManifest::from_json(json).expect("should parse");
-        assert_eq!(manifest.format, Some(PluginFormat::KiroCli));
+        assert_eq!(manifest.format, PluginFormat::KiroCli);
     }
 
     #[test]
-    fn manifest_format_absent_is_none() {
+    fn manifest_format_absent_defaults_to_translated() {
+        // I8: omitted `format` field deserializes to
+        // `PluginFormat::Translated` via `#[serde(default)]` +
+        // `#[derive(Default)]`. Encodes "no format = translated" in
+        // the type instead of `Option<...>::None`.
         let json = br#"{"name": "p"}"#;
         let manifest = PluginManifest::from_json(json).expect("should parse");
-        assert!(manifest.format.is_none());
+        assert_eq!(manifest.format, PluginFormat::Translated);
+    }
+
+    #[test]
+    fn manifest_parses_format_translated() {
+        let json = br#"{"name": "p", "format": "translated"}"#;
+        let manifest = PluginManifest::from_json(json).expect("should parse");
+        assert_eq!(manifest.format, PluginFormat::Translated);
     }
 
     #[test]

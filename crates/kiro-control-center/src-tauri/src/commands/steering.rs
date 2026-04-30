@@ -6,11 +6,10 @@
 //! is unit-testable against [`kiro_market_core::service::test_support`]
 //! fixtures without a Tauri runtime.
 
-use std::path::PathBuf;
-
 use kiro_market_core::project::KiroProject;
 use kiro_market_core::service::{InstallMode, MarketplaceService};
 use kiro_market_core::steering::{InstallSteeringResult, SteeringInstallContext};
+use kiro_market_core::validation::validate_name;
 
 use crate::commands::{make_service, validate_kiro_project_path};
 use crate::error::CommandError;
@@ -48,11 +47,13 @@ fn install_plugin_steering_impl(
     mode: InstallMode,
     project_path: &str,
 ) -> Result<InstallSteeringResult, CommandError> {
-    validate_kiro_project_path(project_path)?;
+    validate_name(marketplace)?;
+    validate_name(plugin)?;
+    let project_root = validate_kiro_project_path(project_path)?;
     let ctx = svc
         .resolve_plugin_install_context(marketplace, plugin)
         .map_err(CommandError::from)?;
-    let project = KiroProject::new(PathBuf::from(project_path));
+    let project = KiroProject::new(project_root);
 
     let install_ctx = SteeringInstallContext {
         mode,
@@ -78,18 +79,12 @@ mod tests {
     use std::fs;
 
     use kiro_market_core::service::test_support::{
-        relative_path_entry, seed_marketplace_with_registry, temp_service,
+        make_kiro_project, relative_path_entry, seed_marketplace_with_registry, temp_service,
     };
 
     use crate::error::ErrorType;
 
     use super::*;
-
-    fn make_kiro_project(dir: &std::path::Path) -> String {
-        let project_path = dir.join("kproj");
-        fs::create_dir_all(project_path.join(".kiro")).expect("create .kiro dir");
-        project_path.to_str().expect("utf-8 path").to_owned()
-    }
 
     fn write_steering_file(plugin_dir: &std::path::Path, rel: &str, body: &str) {
         let p = plugin_dir.join(rel);

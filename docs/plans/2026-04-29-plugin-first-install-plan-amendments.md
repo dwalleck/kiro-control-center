@@ -1441,6 +1441,81 @@ lesson so future plan-reviews start with the right tool.
 
 ---
 
+## A-25 — Implementation finding: `tauri-specta` 2.0.0-rc.24 rejects `skip_serializing_if` on FFI types
+
+**Surfaced during.** Task 4 implementation (commit `34c96e0`). Hit when registering `install_plugin_agents` triggered the binding-gen pass.
+
+**Drift.** `InstallAgentsResult` (in `service/mod.rs:387`) had `#[serde(default, skip_serializing_if = "Vec::is_empty")]` on `installed_native` and `#[serde(default, skip_serializing_if = "Option::is_none")]` on `installed_companions`. These pre-dated the type crossing FFI. Registering it as a Tauri command return failed validation:
+
+```
+Specta Serde validation failed for command 'install_plugin_agents' result:
+Invalid phased type usage at 'InstallAgentsResult_Serialize.installed_native':
+`skip_serializing_if` requires `apply_phases` because unified mode cannot
+represent conditional omission
+```
+
+**Why `tauri-specta` rejects this.** Unified mode generates one TypeScript type that has to be valid for both serialization and deserialization. `skip_serializing_if` makes a field's *presence* conditional — meaning the deserialization input may have fewer fields than the serialization output. The unified TS type can't represent that without phase-splitting (`InstallAgentsResult_Serialize` vs `_Deserialize`), which `apply_phases` would enable but the project doesn't currently configure.
+
+**Wire-format peers don't have this issue.** `InstallSkillsResult` and `InstallSteeringResult` — both already exported through `bindings.ts` since PRs 83 and 92 — don't use `skip_serializing_if` on any field. The pattern at this codebase is "always serialize, always deserialize, default values for missing fields." `InstallAgentsResult`'s `skip_serializing_if` was an outlier predating its FFI exposure.
+
+**Amended.** Drop `skip_serializing_if` from both fields. Keep `serde(default)` for legacy-JSON tolerance:
+
+```rust
+#[serde(default)]
+pub installed_native: Vec<crate::project::InstalledNativeAgentOutcome>,
+#[serde(default)]
+pub installed_companions: Option<crate::project::InstalledNativeCompanionsOutcome>,
+```
+
+**Wire format change.** Empty `installed_native` now serializes as `[]` instead of being omitted; `installed_companions: None` now serializes as `null` instead of being omitted. No Rust callers asserted on the omitted shape; no tests asserted on the omitted shape. The runtime contract for Rust consumers is preserved. The TypeScript wire shape becomes consistent with the sibling result types.
+
+**Forward-looking rule.** Validation/result types that flow through Tauri must avoid `skip_serializing_if` — match `InstallSkillsResult`'s shape. This is a sibling rule to CLAUDE.md's existing "validation newtypes flowing through Tauri bindings need `#[cfg_attr(feature = "specta", derive(specta::Type))]`" guidance. Worth adding to CLAUDE.md once Phase 1 ships.
+
+**Rationale.** Captured as audit trail per the "forward motion + amendments" execution rule. The implementer correctly identified the root cause, made the minimal fix, and preserved the legacy-JSON tolerance contract. The amendment names the rule for future reviewers.
+
+---
+
+## A-24 — [CLOSED in PR #94 review fixup] Implementation finding: `remove_skill`'s `NotInstalled` leaves tracking row stale; A-12 cascade counts but doesn't truly drive to absence
+
+**Status.** Closed via PR #94's I3 review-fixup commit. The fix
+is option 1 from the original "two equally valid future fixes" list:
+`remove_skill` now drops the tracking row before any fs op and treats
+`fs::remove_dir_all` `NotFound` as success. The cascade's match arms
+were simultaneously reworked under I5 (per-step failures collected
+into `RemovePluginResult.failed`) so the orphan path is no longer
+even an exceptional case — `remove_skill` returns `Ok(())` and the
+cascade increments `skills_removed` like any other clean removal.
+
+Regression locks:
+- `remove_skill_drops_tracking_on_orphan_dir` — per-method contract.
+- `remove_plugin_recovers_from_orphan_skill_tracking_entry` —
+  expanded to assert tracking is empty post-cascade AND
+  `installed_plugins()` returns `[]` (no resurrection).
+
+The original A-24 narrative is preserved below for audit trail.
+
+**Surfaced during.** Task 3 implementation (commit `7a4718d`). Captured per the "forward motion + audit trail" rule from the Phase 1 execution session — not actioned in Task 3.
+
+**Drift.** A-12's "log + count + continue" recipe assumes that catching `*Error::NotInstalled` from a per-content remove is equivalent to "the entry is now gone." That holds for `remove_steering_file` and `remove_agent` (Tasks 3b/3c — both methods drop the tracking entry as the FIRST step, then unlink, so a missing on-disk file is still success and the tracking row is gone). It does NOT hold for the existing `remove_skill` (`project.rs:562`): when `!skill_dir.exists()`, `remove_skill` returns `Err(SkillError::NotInstalled)` *without* mutating `installed-skills.json`. The orphan tracking row persists.
+
+**User-visible effect.** A user clicks "Remove plugin" on a plugin whose `.kiro/skills/<name>/` was hand-deleted. The cascade reports `skills_removed: 1` and the UI redraws as "removed." But `installed_plugins()` will still surface that orphan tracking row on the next list call — the plugin reappears.
+
+**Why out-of-scope for Task 3.** Fixing `remove_skill` is a behavioral change to a pre-existing public API on `KiroProject` — the asymmetry vs. `remove_steering_file` / `remove_agent` (which Task 3 introduced) is a pre-existing design quirk. Tightening it touches the existing `remove_skill_*` test suite and may surface invariants we'd rather not change mid-implementation.
+
+**Two equally valid future fixes — pick during follow-up:**
+
+1. **Tighten `remove_skill`** to drop the tracking entry on `!dir.exists()` instead of returning `NotInstalled`. Symmetric with the new sibling methods. Risk: a caller relying on the current "tracking unchanged on NotInstalled" contract would break — needs a grep for `SkillError::NotInstalled` consumers to gauge the blast radius.
+
+2. **Tighten the cascade** to manually drop the skill tracking entry when it catches `SkillError::NotInstalled`, via direct `with_file_lock` + `load_installed` + remove + save. The `remove_skill` API stays unchanged; only the cascade's recovery path becomes complete. Risk: the cascade gains intimate knowledge of tracking-file shape that lives elsewhere.
+
+**Recommendation:** option 1, tracked for a Phase 1.5 follow-up PR after Phase 1 ships. The orphan-skill scenario is real but rare (user manually `rm -rf`'d a skill), and the user can recover by clicking "Remove" again after a `Refresh` (which would now show no entry — wait, no, the entry persists; never mind, *the user can hand-edit the tracking JSON*, which is the documented escape hatch per CLAUDE.md "tracking files are user-owned").
+
+The Task 3 orphan-recovery test (`remove_plugin_recovers_from_orphan_skill_tracking_entry`) was written as a regression lock for the cascade's no-abort behavior — NOT as a "drives to absence" test. The test asserts `result.skills_removed == 1` and that the cascade returns `Ok`. It does NOT assert that the tracking is empty afterward, because today it isn't. Future-fix PR should expand that test once `remove_skill` (or the cascade) is tightened.
+
+**Rationale.** Captured for audit trail per the "23 amendments + forward motion" rule. The implementer correctly chose to leave `remove_skill` alone — A-12's recipe didn't mandate "drive to absence," only "log + count + continue." The semantic gap is real but doesn't block Phase 1 from shipping; Phase 1.5 can close it.
+
+---
+
 ## Summary of changes
 
 - A-1: Single line fix in Task 1 step 4 (`self.` → `Self::`).
@@ -1512,6 +1587,18 @@ lesson so future plan-reviews start with the right tool.
   boundary, matching the existing `InstalledSkillInfo.installed_at`
   precedent. `PathBuf` survives — verified `InstalledSteeringOutcome`
   uses it under specta::Type today.
+- A-24: Implementation finding from Task 3. `remove_skill`'s
+  `NotInstalled` doesn't drop the tracking row, so the cascade's
+  A-12 "count as removed" path leaves stale tracking. Out of scope
+  for Phase 1; deferred to Phase 1.5 follow-up. Captured here as
+  audit trail per the "forward motion + amendments" execution rule.
+- A-25: Implementation finding from Task 4. `tauri-specta` 2.0.0-rc.24
+  rejects `skip_serializing_if` on Tauri-exposed result types in
+  unified mode. Drop the directives from `InstallAgentsResult.installed_native`
+  and `InstallAgentsResult.installed_companions`; the wire format
+  becomes `[]`/`null` for empty/None instead of omitted, matching
+  `InstallSkillsResult` and `InstallSteeringResult`. Forward-looking
+  rule worth adding to CLAUDE.md.
 
 No design-doc revisions required. The amendments are all execution-time
 corrections; the architecture in

@@ -400,12 +400,41 @@ pub struct InstallAgentsResult {
     /// Per-native-agent rich outcome (`kind`, hashes). Empty for
     /// translated-only installs. Frontends that want the rich detail
     /// consume this; legacy presenters keep using `installed: Vec<String>`.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    ///
+    /// `serde` `default` is kept for round-trip parsing of legacy JSON
+    /// blobs that omit the field. `skip_serializing_if` was removed so
+    /// the type can flow through Tauri/Specta bindings — `tauri-specta`
+    /// 2.0.0-rc.24's unified mode rejects conditional field omission.
+    /// Mirrors [`InstallSkillsResult`] and [`crate::steering::InstallSteeringResult`],
+    /// neither of which use `skip_serializing_if` either.
+    #[serde(default)]
     pub installed_native: Vec<crate::project::InstalledNativeAgentOutcome>,
     /// Per-plugin native companion bundle outcome. `None` for translated
-    /// plugins or for native plugins with zero companion files.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// plugins or for native plugins with zero companion files. See
+    /// [`Self::installed_native`] for why `skip_serializing_if` is absent.
+    #[serde(default)]
     pub installed_companions: Option<crate::project::InstalledNativeCompanionsOutcome>,
+}
+
+/// Aggregate result of [`MarketplaceService::install_plugin`] — the
+/// outcome of running every install path a plugin declares (skills,
+/// steering, agents) in one coordinated call.
+///
+/// Sub-results are always populated. The underlying scan-path
+/// fallbacks (`agent_scan_paths_for_plugin` /
+/// `steering_scan_paths_for_plugin`) guarantee at least one attempt;
+/// `install_skills` returns a fully-formed default for empty input.
+/// Empty `installed` / `failed` vecs on a sub-result indicate "this
+/// content type was attempted with nothing to do" — distinct from a
+/// missing field.
+#[derive(Debug, Default, Serialize)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
+pub struct InstallPluginResult {
+    pub plugin: String,
+    pub version: Option<String>,
+    pub skills: InstallSkillsResult,
+    pub steering: crate::steering::InstallSteeringResult,
+    pub agents: InstallAgentsResult,
 }
 
 /// An agent that failed to install, with the typed error.
@@ -1300,14 +1329,20 @@ impl MarketplaceService {
         project: &crate::project::KiroProject,
         plugin_dir: &Path,
         scan_paths: &[String],
-        format: Option<crate::plugin::PluginFormat>,
+        format: crate::plugin::PluginFormat,
         ctx: AgentInstallContext<'_>,
     ) -> InstallAgentsResult {
+        // I8: exhaustive match on the explicit `Translated` variant
+        // (vs. `Option<PluginFormat>::None`) so a future variant
+        // (e.g. `Cursor`) forces a compile-time decision here instead
+        // of silently routing through the translated path.
         match format {
-            Some(crate::plugin::PluginFormat::KiroCli) => {
+            crate::plugin::PluginFormat::KiroCli => {
                 Self::install_native_kiro_cli_agents_inner(project, plugin_dir, scan_paths, ctx)
             }
-            None => Self::install_translated_agents_inner(project, plugin_dir, scan_paths, ctx),
+            crate::plugin::PluginFormat::Translated => {
+                Self::install_translated_agents_inner(project, plugin_dir, scan_paths, ctx)
+            }
         }
     }
 
@@ -1885,6 +1920,83 @@ impl MarketplaceService {
             Err(e) => Err(e.into()),
         }
     }
+
+    /// Install every content type a plugin declares — skills, steering,
+    /// and agents — in one coordinated call. Replaces the per-frontend
+    /// "resolve context, then call three install paths in sequence" loop
+    /// that CLI and Tauri previously duplicated.
+    ///
+    /// Sub-results are always populated. `install_skills` returns a
+    /// fully-formed default for empty `skill_dirs`; the agent and steering
+    /// scan-path fallbacks guarantee at least one attempt each. Per-item
+    /// failures live in the relevant sub-result's `failed` field — a
+    /// single broken file never aborts the whole plugin install.
+    ///
+    /// `accept_mcp` plumbs through to [`Self::install_plugin_agents`]'s
+    /// MCP opt-in gate. Default-deny: agents that bring MCP servers are
+    /// skipped with a warning unless the caller explicitly opts in.
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` only for unrecoverable preamble failures — registry
+    /// lookup, plugin-directory resolution, or `plugin.json` parse — as
+    /// surfaced by [`Self::resolve_plugin_install_context`]. Once the
+    /// context resolves, every per-content-type call collects per-item
+    /// failures into its sub-result rather than propagating.
+    pub fn install_plugin(
+        &self,
+        project: &crate::project::KiroProject,
+        marketplace: &str,
+        plugin: &str,
+        mode: InstallMode,
+        accept_mcp: bool,
+    ) -> Result<InstallPluginResult, Error> {
+        let ctx = self.resolve_plugin_install_context(marketplace, plugin)?;
+
+        let skills = self.install_skills(
+            project,
+            &ctx.skill_dirs,
+            &InstallFilter::All,
+            mode,
+            marketplace,
+            plugin,
+            ctx.version.as_deref(),
+        );
+
+        let steering = Self::install_plugin_steering(
+            project,
+            &ctx.plugin_dir,
+            &ctx.steering_scan_paths,
+            crate::steering::SteeringInstallContext {
+                mode,
+                marketplace,
+                plugin,
+                version: ctx.version.as_deref(),
+            },
+        );
+
+        let agents = Self::install_plugin_agents(
+            project,
+            &ctx.plugin_dir,
+            &ctx.agent_scan_paths,
+            ctx.format,
+            AgentInstallContext {
+                mode,
+                accept_mcp,
+                marketplace,
+                plugin,
+                version: ctx.version.as_deref(),
+            },
+        );
+
+        Ok(InstallPluginResult {
+            plugin: plugin.to_string(),
+            version: ctx.version,
+            skills,
+            steering,
+            agents,
+        })
+    }
 }
 
 /// Decide whether a skill name passes the install filter.
@@ -2076,7 +2188,7 @@ mod tests {
             &project,
             plugin_tmp.path(),
             &["./agents/".to_string()],
-            None,
+            crate::plugin::PluginFormat::Translated,
             AgentInstallContext {
                 mode: InstallMode::New,
                 accept_mcp: false, // existing fixtures don't carry MCP servers
@@ -2155,7 +2267,7 @@ mod tests {
             &project,
             plugin_tmp.path(),
             &["./agents/".to_string()],
-            None,
+            crate::plugin::PluginFormat::Translated,
             AgentInstallContext {
                 mode: InstallMode::New,
                 accept_mcp: false,
@@ -2203,7 +2315,7 @@ mod tests {
             &project,
             plugin_tmp.path(),
             &["./agents/".to_string()],
-            None,
+            crate::plugin::PluginFormat::Translated,
             AgentInstallContext {
                 mode: InstallMode::New,
                 accept_mcp: false,
@@ -2258,7 +2370,7 @@ mod tests {
             &project,
             plugin_tmp.path(),
             &["./agents/".to_string()],
-            None,
+            crate::plugin::PluginFormat::Translated,
             AgentInstallContext {
                 mode: InstallMode::New,
                 accept_mcp: false,
@@ -2307,7 +2419,7 @@ mod tests {
             &project,
             plugin_tmp.path(),
             &["./agents/".to_string()],
-            None,
+            crate::plugin::PluginFormat::Translated,
             AgentInstallContext {
                 mode: InstallMode::New,
                 accept_mcp: false, // gate must fire
@@ -2362,7 +2474,7 @@ mod tests {
             &project,
             plugin_tmp.path(),
             &["./agents/".to_string()],
-            None,
+            crate::plugin::PluginFormat::Translated,
             AgentInstallContext {
                 mode: InstallMode::New,
                 accept_mcp: true, // gate is bypassed
@@ -2431,7 +2543,7 @@ mod tests {
             &project,
             plugin_tmp.path(),
             &["./agents/".to_string()],
-            None,
+            crate::plugin::PluginFormat::Translated,
             AgentInstallContext {
                 mode: InstallMode::New,
                 accept_mcp: false,
@@ -2487,7 +2599,7 @@ mod tests {
             &project,
             plugin_tmp.path(),
             &["./agents/".to_string()],
-            None,
+            crate::plugin::PluginFormat::Translated,
             AgentInstallContext {
                 mode: InstallMode::Force, // force, but...
                 accept_mcp: false,        // accept_mcp = false should still gate
@@ -2528,7 +2640,7 @@ mod tests {
             &project,
             plugin_tmp.path(),
             &["./agents/".to_string()],
-            None,
+            crate::plugin::PluginFormat::Translated,
             AgentInstallContext {
                 mode: InstallMode::New,
                 accept_mcp: false,
@@ -2545,7 +2657,7 @@ mod tests {
             &project,
             plugin_tmp.path(),
             &["./agents/".to_string()],
-            None,
+            crate::plugin::PluginFormat::Translated,
             AgentInstallContext {
                 mode: InstallMode::New,
                 accept_mcp: false,
@@ -2584,7 +2696,7 @@ mod tests {
             &project,
             plugin_tmp.path(),
             &["./agents/".to_string()],
-            None,
+            crate::plugin::PluginFormat::Translated,
             AgentInstallContext {
                 mode: InstallMode::New,
                 accept_mcp: false,
@@ -2608,7 +2720,7 @@ mod tests {
             &project,
             plugin_tmp.path(),
             &["./agents/".to_string()],
-            None,
+            crate::plugin::PluginFormat::Translated,
             AgentInstallContext {
                 mode: InstallMode::Force,
                 accept_mcp: false,
@@ -2674,7 +2786,7 @@ mod tests {
             &project,
             plugin_tmp.path(),
             &["./agents/".to_string()],
-            None,
+            crate::plugin::PluginFormat::Translated,
             AgentInstallContext {
                 mode: InstallMode::New,
                 accept_mcp: false,
@@ -2736,7 +2848,7 @@ mod tests {
             &project,
             plugin_tmp.path(),
             &["./agents/".to_string()],
-            Some(crate::plugin::PluginFormat::KiroCli),
+            crate::plugin::PluginFormat::KiroCli,
             AgentInstallContext {
                 mode: InstallMode::New,
                 accept_mcp: false, // fixture has no MCP servers
@@ -2805,7 +2917,7 @@ mod tests {
             &project,
             plugin_tmp.path(),
             &["./agents/".to_string()],
-            Some(crate::plugin::PluginFormat::KiroCli),
+            crate::plugin::PluginFormat::KiroCli,
             AgentInstallContext {
                 mode: InstallMode::New,
                 accept_mcp: false, // gate fires
@@ -2865,7 +2977,7 @@ mod tests {
             &project,
             plugin_tmp.path(),
             &["./agents/".to_string(), "./extras/".to_string()],
-            Some(crate::plugin::PluginFormat::KiroCli),
+            crate::plugin::PluginFormat::KiroCli,
             AgentInstallContext {
                 mode: InstallMode::New,
                 accept_mcp: false,
@@ -4600,6 +4712,127 @@ mod tests {
             matches!(result.failed[0].kind, FailedSkillReason::InstallFailed),
             "expected InstallFailed, got: {:?}",
             result.failed[0].kind
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // install_plugin orchestrator
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn install_plugin_runs_skills_steering_agents_in_one_call() {
+        use crate::project::KiroProject;
+        use crate::service::test_support::{
+            make_plugin_with_skills, relative_path_entry, seed_marketplace_with_registry,
+            temp_service,
+        };
+
+        let (dir, svc) = temp_service();
+        let entries = vec![relative_path_entry("p", "plugins/p")];
+        let mp_path = seed_marketplace_with_registry(dir.path(), &svc, "mp", &entries);
+        let plugin_dir = mp_path.join("plugins/p");
+        fs::create_dir_all(&plugin_dir).expect("plugin dir");
+        make_plugin_with_skills(&mp_path, "p", &["alpha"]);
+        fs::write(
+            plugin_dir.join("plugin.json"),
+            br#"{"name": "p", "version": "1.0.0"}"#,
+        )
+        .expect("write plugin.json");
+        fs::create_dir_all(plugin_dir.join("steering")).expect("steering dir");
+        fs::write(plugin_dir.join("steering/guide.md"), "# guide\n").expect("steering");
+        fs::create_dir_all(plugin_dir.join("agents")).expect("agents dir");
+        fs::write(
+            plugin_dir.join("agents/reviewer.md"),
+            "---\nname: reviewer\ndescription: Reviews\n---\nBody.\n",
+        )
+        .expect("agent");
+
+        let project_dir = tempfile::tempdir().expect("project tempdir");
+        let project = KiroProject::new(project_dir.path().to_path_buf());
+
+        let result = svc
+            .install_plugin(&project, "mp", "p", InstallMode::New, false)
+            .expect("install_plugin happy path");
+
+        assert_eq!(result.plugin, "p");
+        assert_eq!(result.version.as_deref(), Some("1.0.0"));
+        assert_eq!(result.skills.installed, vec!["alpha".to_string()]);
+        assert_eq!(
+            result.steering.installed.len(),
+            1,
+            "steering: {:?}",
+            result.steering
+        );
+        assert_eq!(
+            result.agents.installed.len(),
+            1,
+            "agents: {:?}",
+            result.agents
+        );
+    }
+
+    /// Wire-format lock for `InstallPluginResult`. Sub-result fields are
+    /// non-Optional structs (per Task 1 amendment A-15) — they always
+    /// serialize as nested objects, never as `null` or missing keys.
+    /// Frontend code that branches on `result.skills.installed.length`
+    /// relies on this shape.
+    #[test]
+    fn install_plugin_result_json_shape_locks_default_subresults() {
+        let result = InstallPluginResult {
+            plugin: "p".into(),
+            version: Some("1.0.0".into()),
+            skills: InstallSkillsResult::default(),
+            steering: crate::steering::InstallSteeringResult::default(),
+            agents: InstallAgentsResult::default(),
+        };
+        let json = serde_json::to_value(&result).expect("serialize");
+        assert_eq!(json["plugin"], "p");
+        assert_eq!(json["version"], "1.0.0");
+        assert!(
+            json["skills"].is_object(),
+            "skills must serialize as nested object, got: {}",
+            json["skills"]
+        );
+        assert!(
+            json["steering"].is_object(),
+            "steering must serialize as nested object, got: {}",
+            json["steering"]
+        );
+        assert!(
+            json["agents"].is_object(),
+            "agents must serialize as nested object, got: {}",
+            json["agents"]
+        );
+    }
+
+    /// Companion to the default-shape lock: a populated sub-result must
+    /// keep nesting under its key (no accidental `#[serde(flatten)]`
+    /// on `InstallPluginResult`). Pin one populated field so a future
+    /// flatten regression breaks the assertion immediately.
+    #[test]
+    fn install_plugin_result_json_shape_with_populated_subresult() {
+        let result = InstallPluginResult {
+            plugin: "p".into(),
+            version: Some("1.0.0".into()),
+            skills: InstallSkillsResult {
+                installed: vec!["alpha".into()],
+                ..InstallSkillsResult::default()
+            },
+            steering: crate::steering::InstallSteeringResult::default(),
+            agents: InstallAgentsResult::default(),
+        };
+        let json = serde_json::to_value(&result).expect("serialize");
+        let skills = json.pointer("/skills").expect("skills field exists");
+        assert!(
+            skills.is_object(),
+            "must serialize as nested object, not flatten: {skills}"
+        );
+        assert_eq!(
+            skills
+                .pointer("/installed")
+                .and_then(|v| v.as_array())
+                .map(Vec::len),
+            Some(1),
         );
     }
 }
