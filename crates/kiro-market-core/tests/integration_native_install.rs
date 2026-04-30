@@ -17,7 +17,7 @@ use std::path::{Path, PathBuf};
 use kiro_market_core::agent::AgentDialect;
 use kiro_market_core::plugin::PluginFormat;
 use kiro_market_core::project::{InstallOutcomeKind, KiroProject};
-use kiro_market_core::service::test_support::temp_service;
+use kiro_market_core::service::test_support::{mp, pn, temp_service};
 use kiro_market_core::service::{
     AgentInstallContext, InstallAgentsResult, InstallMode, MarketplaceService,
 };
@@ -86,10 +86,12 @@ impl IntegrationHarness {
     ) -> InstallSteeringResult {
         let ctx = MarketplaceService::resolve_plugin_install_context_from_dir(plugin_dir)
             .expect("resolve plugin install context");
+        let mp_name = mp(marketplace);
+        let pn_name = pn(plugin);
         let steering_ctx = SteeringInstallContext {
             mode,
-            marketplace,
-            plugin,
+            marketplace: &mp_name,
+            plugin: &pn_name,
             version: None,
         };
         MarketplaceService::install_plugin_steering(

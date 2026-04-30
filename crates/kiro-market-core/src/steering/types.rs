@@ -16,6 +16,7 @@ use thiserror::Error;
 
 use crate::project::InstallOutcomeKind;
 use crate::service::InstallMode;
+use crate::validation::{MarketplaceName, PluginName};
 
 /// Bundled non-source-specific install identity threaded through the
 /// per-file steering install chain. Mirrors
@@ -26,8 +27,8 @@ use crate::service::InstallMode;
 #[derive(Debug, Clone, Copy)]
 pub struct SteeringInstallContext<'a> {
     pub mode: InstallMode,
-    pub marketplace: &'a str,
-    pub plugin: &'a str,
+    pub marketplace: &'a MarketplaceName,
+    pub plugin: &'a PluginName,
     pub version: Option<&'a str>,
 }
 
@@ -57,7 +58,7 @@ pub enum SteeringError {
         "steering file `{rel}` would clobber a file owned by plugin `{owner}`; \
          pass --force to transfer ownership"
     )]
-    PathOwnedByOtherPlugin { rel: PathBuf, owner: String },
+    PathOwnedByOtherPlugin { rel: PathBuf, owner: PluginName },
 
     #[non_exhaustive]
     #[error(

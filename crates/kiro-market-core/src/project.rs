@@ -1751,9 +1751,7 @@ impl KiroProject {
                 if !mode.is_force() {
                     return Err(crate::steering::SteeringError::PathOwnedByOtherPlugin {
                         rel: rel_path.to_path_buf(),
-                        // `owner` is the wire-format `String` field; project
-                        // the newtype to its string view via `Display`.
-                        owner: existing.plugin.to_string(),
+                        owner: existing.plugin.clone(),
                     });
                 }
                 Ok(CollisionDecision::Proceed {
@@ -1875,14 +1873,6 @@ impl KiroProject {
         source_hash: &str,
         ctx: crate::steering::SteeringInstallContext<'_>,
     ) -> crate::error::Result<crate::steering::InstalledSteeringOutcome> {
-        // Wrap the still-`&str` ctx fields once (Task 3 transient shim).
-        // Task 4 migrates `SteeringInstallContext` to carry the newtypes
-        // directly; until then the strings come in pre-validated from
-        // the marketplace catalog, so `from_internal_unchecked` is sound
-        // — same precedent as `RelativePath::from_internal_unchecked`.
-        let plugin_name = PluginName::from_internal_unchecked(ctx.plugin.to_owned());
-        let marketplace_name = MarketplaceName::from_internal_unchecked(ctx.marketplace.to_owned());
-
         let tracking_path = self.steering_tracking_path();
         let mut installed = self.load_installed_steering().map_err(|e| match e {
             // A malformed installed-steering.json is a distinct condition
@@ -1900,7 +1890,7 @@ impl KiroProject {
         let forced_overwrite = match Self::classify_steering_collision(
             &installed,
             rel_path,
-            &plugin_name,
+            ctx.plugin,
             source_hash,
             dest,
             ctx.mode,
@@ -1933,7 +1923,7 @@ impl KiroProject {
         // If we're transferring ownership from another plugin, scrub the
         // prior owner's entry so the same path isn't tracked twice.
         if let Some(existing) = installed.files.get(rel_path)
-            && existing.plugin != plugin_name
+            && existing.plugin != *ctx.plugin
         {
             installed.files.remove(rel_path);
         }
@@ -1941,8 +1931,8 @@ impl KiroProject {
         installed.files.insert(
             rel_path.to_path_buf(),
             InstalledSteeringMeta {
-                marketplace: marketplace_name,
-                plugin: plugin_name,
+                marketplace: ctx.marketplace.clone(),
+                plugin: ctx.plugin.clone(),
                 version: ctx.version.map(str::to_owned),
                 installed_at: chrono::Utc::now(),
                 source_hash: source_hash.to_owned(),
@@ -4158,13 +4148,15 @@ mod tests {
             source: f.source_path(),
             scan_root: f.scan_root.clone(),
         };
+        let mp_name = mp("m");
+        let pn_name = pn(plugin);
         f.project.install_steering_file(
             &discovered,
             &f.source_hash,
             crate::steering::SteeringInstallContext {
                 mode,
-                marketplace: "m",
-                plugin,
+                marketplace: &mp_name,
+                plugin: &pn_name,
                 version: None,
             },
         )
@@ -4265,6 +4257,8 @@ mod tests {
             scan_root: scan_b.clone(),
         };
 
+        let mp_name = mp("m");
+        let pn_name = pn("plugin-b");
         let err = steering_file
             .project
             .install_steering_file(
@@ -4272,8 +4266,8 @@ mod tests {
                 &source_hash_b,
                 crate::steering::SteeringInstallContext {
                     mode: crate::service::InstallMode::New,
-                    marketplace: "m",
-                    plugin: "plugin-b",
+                    marketplace: &mp_name,
+                    plugin: &pn_name,
                     version: None,
                 },
             )
@@ -4294,8 +4288,8 @@ mod tests {
                 &source_hash_b,
                 crate::steering::SteeringInstallContext {
                     mode: crate::service::InstallMode::Force,
-                    marketplace: "m",
-                    plugin: "plugin-b",
+                    marketplace: &mp_name,
+                    plugin: &pn_name,
                     version: None,
                 },
             )
@@ -4335,6 +4329,8 @@ mod tests {
             scan_root: steering_file.scan_root.clone(),
         };
 
+        let mp_name = mp("m");
+        let pn_name = pn("p");
         let err = steering_file
             .project
             .install_steering_file(
@@ -4342,8 +4338,8 @@ mod tests {
                 &source_hash,
                 crate::steering::SteeringInstallContext {
                     mode: crate::service::InstallMode::New,
-                    marketplace: "m",
-                    plugin: "p",
+                    marketplace: &mp_name,
+                    plugin: &pn_name,
                     version: None,
                 },
             )
@@ -4410,14 +4406,16 @@ mod tests {
             scan_root: scan_root.clone(),
         };
 
+        let mp_name = mp("marketplace-x");
+        let pn_name = pn("plugin-y");
         let outcome = project
             .install_steering_file(
                 &discovered,
                 &source_hash,
                 crate::steering::SteeringInstallContext {
                     mode: crate::service::InstallMode::New,
-                    marketplace: "marketplace-x",
-                    plugin: "plugin-y",
+                    marketplace: &mp_name,
+                    plugin: &pn_name,
                     version: Some("0.1.0"),
                 },
             )
@@ -7090,14 +7088,16 @@ mod tests {
             source: scan_root.join("guide.md"),
             scan_root: scan_root.clone(),
         };
+        let mp_name = mp("m");
+        let pn_name = pn("p");
         project
             .install_steering_file(
                 &discovered,
                 &h_v1,
                 crate::steering::SteeringInstallContext {
                     mode: crate::service::InstallMode::New,
-                    marketplace: "m",
-                    plugin: "p",
+                    marketplace: &mp_name,
+                    plugin: &pn_name,
                     version: None,
                 },
             )
@@ -7122,8 +7122,8 @@ mod tests {
                 &h_v2,
                 crate::steering::SteeringInstallContext {
                     mode: crate::service::InstallMode::Force,
-                    marketplace: "m",
-                    plugin: "p",
+                    marketplace: &mp_name,
+                    plugin: &pn_name,
                     version: None,
                 },
             )

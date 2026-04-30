@@ -1995,14 +1995,24 @@ impl MarketplaceService {
             ctx.version.as_deref(),
         );
 
+        // Phase 1.5 Task 4 transient shim — Task 5 strips this when
+        // MarketplaceService::install_plugin migrates to take
+        // &MarketplaceName / &PluginName. The strings reach here
+        // pre-validated at the marketplace catalog parse layer, so
+        // from_internal_unchecked is sound — same precedent as
+        // RelativePath::from_internal_unchecked.
+        let marketplace_name =
+            crate::validation::MarketplaceName::from_internal_unchecked(marketplace.to_owned());
+        let plugin_name = crate::validation::PluginName::from_internal_unchecked(plugin.to_owned());
+
         let steering = Self::install_plugin_steering(
             project,
             &ctx.plugin_dir,
             &ctx.steering_scan_paths,
             crate::steering::SteeringInstallContext {
                 mode,
-                marketplace,
-                plugin,
+                marketplace: &marketplace_name,
+                plugin: &plugin_name,
                 version: ctx.version.as_deref(),
             },
         );
@@ -3151,10 +3161,12 @@ mod tests {
         let project = crate::project::KiroProject::new(project_tmp.path().to_path_buf());
 
         let scan_paths = vec!["./steering/".to_string()];
+        let mp_name = crate::service::test_support::mp("marketplace-x");
+        let pn_name = crate::service::test_support::pn("p");
         let ctx = crate::steering::SteeringInstallContext {
             mode: InstallMode::New,
-            marketplace: "marketplace-x",
-            plugin: "p",
+            marketplace: &mp_name,
+            plugin: &pn_name,
             version: None,
         };
 
@@ -3211,10 +3223,12 @@ mod tests {
         // the legitimate one still installs, the traversal surfaces as
         // a warning without aborting the batch.
         let scan_paths = vec!["./steering/".to_string(), "../escape/".to_string()];
+        let mp_name = crate::service::test_support::mp("m");
+        let pn_name = crate::service::test_support::pn("p");
         let ctx = crate::steering::SteeringInstallContext {
             mode: InstallMode::New,
-            marketplace: "m",
-            plugin: "p",
+            marketplace: &mp_name,
+            plugin: &pn_name,
             version: None,
         };
 
@@ -3281,10 +3295,12 @@ mod tests {
         let project = crate::project::KiroProject::new(project_tmp.path().to_path_buf());
 
         let scan_paths = vec!["./a/".to_string(), "./b/".to_string()];
+        let mp_name = crate::service::test_support::mp("m");
+        let pn_name = crate::service::test_support::pn("p");
         let ctx = crate::steering::SteeringInstallContext {
             mode: InstallMode::New,
-            marketplace: "m",
-            plugin: "p",
+            marketplace: &mp_name,
+            plugin: &pn_name,
             version: None,
         };
 
