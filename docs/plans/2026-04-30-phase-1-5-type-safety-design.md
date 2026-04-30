@@ -49,7 +49,7 @@ These came out of the `2026-04-30` brainstorming conversation. Documented here s
 
 4. **Naming: `*Name`, not `*Id`.** Matches the existing `AgentName` precedent in `validation.rs`. The strings ARE names (used in path joining, log output, tracking-file keys); `MarketplaceId` / `PluginId` would imply opaque identifiers which they aren't.
 
-5. **Default impl: degenerate empty-string.** `MarketplaceName::default()` returns `MarketplaceName(String::new())`. The struct derives `Default` for test ergonomics — `InstallPluginResult` derives `Default` for two JSON-shape rstests (`install_plugin_result_json_shape_locks_default_subresults` and the populated-subresult companion), and `InstallPluginResult::default()` requires the field types to be `Default`-constructible. **This is a NEW pattern for `kiro-market-core`** — existing newtypes (`RelativePath`, `AgentName`, `GitRef`) deliberately don't derive `Default`. The trade-off: degenerate values bypass `new`'s validator, but they can't escape because (a) production paths always route through `MarketplaceName::new(...)?`, and (b) downstream uses of an empty name fail predictably (path joins produce no-op paths, tracking-file lookups find nothing). Alternative: drop `Default` from `InstallPluginResult` and update the two test sites to construct manually — preserves the existing-newtypes precedent at the cost of slightly more verbose tests. **See "Open question" below for the call-out.**
+5. **No `Default` derive on the newtypes.** Verified by `grep`: `InstallPluginResult::default()` is never called anywhere — the two JSON-shape rstests construct the struct field-by-field, and `MarketplaceService::install_plugin` at `service/mod.rs:1992` does the same. Phase 1's implementer added `Default` to `InstallPluginResult`'s derive list but no consumer uses it. Phase 1.5 drops `Default` from `InstallPluginResult` and does NOT derive `Default` on the newtypes. Matches existing precedent (`RelativePath`, `AgentName`, `GitRef` deliberately don't derive `Default`); avoids the degenerate-state hazard (`MarketplaceName(String::new())` would be a value the type's own validator rejects); zero test churn. A future reader who tries `InstallPluginResult::default()` will see a compile error rather than silently construct a degenerate value.
 
 ## Phase 1.5 architecture
 
@@ -61,7 +61,11 @@ Two newtypes added to `crates/kiro-market-core/src/validation.rs` next to the ex
 /// Marketplace name as it appears in `marketplace.json` and tracking files.
 /// Validated against the existing `validate_name` rules at construction:
 /// non-empty, no NUL/control bytes, no path-traversal, no Windows-reserved names.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Hash, Serialize)]
+///
+/// Deliberately does NOT derive `Default` — `MarketplaceName::default()` would
+/// have to return `MarketplaceName(String::new())`, which `validate_name` rejects.
+/// Matches the existing `RelativePath` / `AgentName` / `GitRef` precedent.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
 #[serde(transparent)]
 #[cfg_attr(feature = "specta", derive(specta::Type))]
 pub struct MarketplaceName(String);
@@ -110,7 +114,8 @@ impl PartialEq<&str> for MarketplaceName { /* same */ }
 ### A4: `marketplace` field on `InstallPluginResult`
 
 ```rust
-#[derive(Debug, Default, Serialize)]
+// `Default` derive dropped — never called; A1 newtypes don't derive Default.
+#[derive(Debug, Serialize)]
 #[cfg_attr(feature = "specta", derive(specta::Type))]
 pub struct InstallPluginResult {
     pub marketplace: MarketplaceName,   // NEW (A4)
@@ -225,16 +230,7 @@ Documented here so they don't drift into the plan:
 
 **This phase IS the Gate 5 work.** It encodes the "this is a validated marketplace/plugin name, not a raw string" invariant in the type system — making argument-order swap-safe at compile time, eliminating the swap-arg bug class entirely. The newtypes use a private inner field (per CLAUDE.md template) so degenerate values can't be constructed without going through `new`.
 
-The `Default` impl returning empty-string is the one caveat. It exists for test ergonomics — `InstallPluginResult::default()` is called by JSON-shape rstests. Production code never constructs `MarketplaceName::default()`; every real-world instance flows through `MarketplaceName::new(...)?`. **Note:** this is a new pattern for `kiro-market-core` — the existing newtypes (`RelativePath`, `AgentName`, `GitRef`) don't derive `Default`. Mitigation: empty-string would fail downstream uses anyway (path joining with `""` produces a deterministic-but-meaningless path; tracking-file lookups for `""` find nothing). The alternative — drop `Default` from `InstallPluginResult` — preserves the existing precedent at the cost of slightly more verbose test construction. See open question below.
-
-## Open question
-
-**Should `MarketplaceName` / `PluginName` derive `Default`?**
-
-- **Yes (current design):** `InstallPluginResult` keeps its `Default` derive; the two JSON-shape rstests stay terse via `InstallPluginResult::default()`. New pattern for kiro-market-core.
-- **No (alternative):** Drop `Default` from both newtypes AND from `InstallPluginResult`. Two test sites construct manually with `mp("...")` / `pn("...")` helpers. Matches existing `RelativePath` / `AgentName` / `GitRef` precedent (none derive Default).
-
-The first review pass picked "Yes" before discovering the precedent mismatch. Re-confirm before the implementation plan is written, since the choice ripples to ~3 sites: the two newtypes' `derive(...)` lists, `InstallPluginResult`'s `derive(...)` line, and two rstest call sites.
+**No `Default` derive** on the newtypes — verified by grep that `InstallPluginResult::default()` is never called anywhere. Phase 1.5 drops `Default` from `InstallPluginResult` and does NOT derive `Default` on the newtypes. The newtypes can only be constructed via `new` (which validates) or `Deserialize` (which routes through `new`). Degenerate empty-string values are unrepresentable. Matches existing precedent for the validation newtypes in this crate.
 
 ## Module map
 
