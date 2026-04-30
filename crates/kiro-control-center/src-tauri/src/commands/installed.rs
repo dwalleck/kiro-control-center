@@ -1,12 +1,12 @@
 //! Commands for managing installed skills.
 
-use std::path::PathBuf;
-
 use serde::Serialize;
 use tracing::debug;
 
 use kiro_market_core::project::KiroProject;
+use kiro_market_core::validation::validate_name;
 
+use crate::commands::validate_kiro_project_path;
 use crate::error::CommandError;
 
 // ---------------------------------------------------------------------------
@@ -34,7 +34,8 @@ pub struct InstalledSkillInfo {
 pub async fn list_installed_skills(
     project_path: String,
 ) -> Result<Vec<InstalledSkillInfo>, CommandError> {
-    let project = KiroProject::new(PathBuf::from(&project_path));
+    let project_root = validate_kiro_project_path(&project_path)?;
+    let project = KiroProject::new(project_root);
     let installed = project.load_installed().map_err(CommandError::from)?;
 
     let mut results: Vec<InstalledSkillInfo> = installed
@@ -59,7 +60,9 @@ pub async fn list_installed_skills(
 #[tauri::command]
 #[specta::specta]
 pub async fn remove_skill(name: String, project_path: String) -> Result<(), CommandError> {
-    let project = KiroProject::new(PathBuf::from(&project_path));
+    validate_name(&name)?;
+    let project_root = validate_kiro_project_path(&project_path)?;
+    let project = KiroProject::new(project_root);
     project.remove_skill(&name).map_err(CommandError::from)?;
     debug!(skill = %name, "skill removed via control center");
 
@@ -134,6 +137,10 @@ mod tests {
     #[tokio::test]
     async fn list_installed_skills_empty_project_returns_empty_vec() {
         let dir = tempfile::tempdir().expect("tempdir");
+        // The IPC-boundary `validate_kiro_project_path` requires `.kiro/`
+        // to exist; without it, an empty-tempdir call now returns
+        // `ErrorType::Validation` rather than an empty list.
+        std::fs::create_dir_all(dir.path().join(".kiro")).expect("create .kiro");
         let path = dir.path().to_str().expect("valid utf-8").to_owned();
 
         let result = list_installed_skills(path).await.expect("should succeed");
@@ -156,6 +163,11 @@ mod tests {
     #[tokio::test]
     async fn remove_skill_nonexistent_returns_error() {
         let dir = tempfile::tempdir().expect("tempdir");
+        // `validate_kiro_project_path` requires `.kiro/`, so create it
+        // even though the inner `remove_skill` is what we're stressing —
+        // otherwise the validation guard fires first and we'd assert on
+        // the wrong error.
+        std::fs::create_dir_all(dir.path().join(".kiro")).expect("create .kiro");
         let path = dir.path().to_str().expect("valid utf-8").to_owned();
 
         let err = remove_skill("nonexistent".into(), path)

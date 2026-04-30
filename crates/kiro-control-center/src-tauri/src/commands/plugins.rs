@@ -16,10 +16,9 @@
 //!   [`KiroProject::remove_plugin`] (Task 3). No `_impl` per A-19; same
 //!   project-only-read shape as `list_installed_plugins`.
 
-use std::path::PathBuf;
-
 use kiro_market_core::project::{InstalledPluginsView, KiroProject, RemovePluginResult};
 use kiro_market_core::service::{InstallMode, InstallPluginResult, MarketplaceService};
+use kiro_market_core::validation::validate_name;
 
 use crate::commands::{make_service, validate_kiro_project_path};
 use crate::error::CommandError;
@@ -64,8 +63,10 @@ fn install_plugin_impl(
     accept_mcp: bool,
     project_path: &str,
 ) -> Result<InstallPluginResult, CommandError> {
-    validate_kiro_project_path(project_path)?;
-    let project = KiroProject::new(PathBuf::from(project_path));
+    validate_name(marketplace)?;
+    validate_name(plugin)?;
+    let project_root = validate_kiro_project_path(project_path)?;
+    let project = KiroProject::new(project_root);
     svc.install_plugin(&project, marketplace, plugin, mode, accept_mcp)
         .map_err(CommandError::from)
 }
@@ -83,8 +84,8 @@ fn install_plugin_impl(
 pub async fn list_installed_plugins(
     project_path: String,
 ) -> Result<InstalledPluginsView, CommandError> {
-    validate_kiro_project_path(&project_path)?;
-    let project = KiroProject::new(PathBuf::from(&project_path));
+    let project_root = validate_kiro_project_path(&project_path)?;
+    let project = KiroProject::new(project_root);
     project.installed_plugins().map_err(CommandError::from)
 }
 
@@ -102,8 +103,10 @@ pub async fn remove_plugin(
     plugin: String,
     project_path: String,
 ) -> Result<RemovePluginResult, CommandError> {
-    validate_kiro_project_path(&project_path)?;
-    let project = KiroProject::new(PathBuf::from(&project_path));
+    validate_name(&marketplace)?;
+    validate_name(&plugin)?;
+    let project_root = validate_kiro_project_path(&project_path)?;
+    let project = KiroProject::new(project_root);
     project
         .remove_plugin(&marketplace, &plugin)
         .map_err(CommandError::from)
@@ -355,6 +358,46 @@ mod tests {
             "error message must name the offending field, got: {}",
             err.message
         );
+    }
+
+    // FE-supplied `marketplace = "../etc/passwd"` would otherwise reach
+    // `cache::marketplace_path(marketplace)` and force an FS access at
+    // `<registries_dir>/../etc/passwd` before the registry layer's own
+    // checks fire. The IPC-boundary `validate_name` guard rejects it
+    // before the service ever runs.
+    #[test]
+    fn install_plugin_impl_rejects_traversal_in_marketplace() {
+        let (dir, svc) = temp_service();
+        let project_path = make_kiro_project(dir.path());
+        let err = install_plugin_impl(
+            &svc,
+            "../etc/passwd",
+            "myplugin",
+            InstallMode::New,
+            false,
+            &project_path,
+        )
+        .expect_err("traversal in marketplace must error");
+        assert_eq!(err.error_type, ErrorType::Validation);
+    }
+
+    /// NUL bytes truncate C-string conversions in syscalls; the
+    /// IPC-boundary `validate_name` guard must reject them before they
+    /// reach `cache::plugin_registry_path`.
+    #[test]
+    fn install_plugin_impl_rejects_nul_byte_in_plugin() {
+        let (dir, svc) = temp_service();
+        let project_path = make_kiro_project(dir.path());
+        let err = install_plugin_impl(
+            &svc,
+            "mp1",
+            "evil\0plugin",
+            InstallMode::New,
+            false,
+            &project_path,
+        )
+        .expect_err("NUL byte in plugin name must error");
+        assert_eq!(err.error_type, ErrorType::Validation);
     }
 
     // -----------------------------------------------------------------------

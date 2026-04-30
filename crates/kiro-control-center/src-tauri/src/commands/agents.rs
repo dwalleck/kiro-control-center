@@ -13,12 +13,11 @@
 //! `None` for translated). Otherwise the wrapper / `_impl` split is
 //! identical.
 
-use std::path::PathBuf;
-
 use kiro_market_core::project::KiroProject;
 use kiro_market_core::service::{
     AgentInstallContext, InstallAgentsResult, InstallMode, MarketplaceService,
 };
+use kiro_market_core::validation::validate_name;
 
 use crate::commands::{make_service, validate_kiro_project_path};
 use crate::error::CommandError;
@@ -59,18 +58,14 @@ fn install_plugin_agents_impl(
     accept_mcp: bool,
     project_path: &str,
 ) -> Result<InstallAgentsResult, CommandError> {
-    validate_kiro_project_path(project_path)?;
+    validate_name(marketplace)?;
+    validate_name(plugin)?;
+    let project_root = validate_kiro_project_path(project_path)?;
     let ctx = svc
         .resolve_plugin_install_context(marketplace, plugin)
         .map_err(CommandError::from)?;
-    let project = KiroProject::new(PathBuf::from(project_path));
+    let project = KiroProject::new(project_root);
 
-    // A-14: `install_plugin_agents` is an associated function (no `&self`),
-    // mirroring `install_plugin_steering`. Calling it as `svc.install_...`
-    // would not compile. The `svc` parameter on this `_impl` is kept for
-    // symmetry with `install_plugin_steering_impl` and is intentionally
-    // unused below.
-    let _ = svc;
     Ok(MarketplaceService::install_plugin_agents(
         &project,
         &ctx.plugin_dir,

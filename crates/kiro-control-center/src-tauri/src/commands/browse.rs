@@ -13,8 +13,9 @@ use kiro_market_core::service::{
     BulkSkillsResult, InstallFilter, InstallMode, InstallSkillsResult, MarketplaceService,
     PluginSkillsResult, SkillCount,
 };
+use kiro_market_core::validation::validate_name;
 
-use crate::commands::make_service;
+use crate::commands::{make_service, validate_kiro_project_path};
 use crate::error::{CommandError, ErrorType};
 
 // ---------------------------------------------------------------------------
@@ -108,6 +109,7 @@ pub async fn list_marketplaces() -> Result<Vec<MarketplaceInfo>, CommandError> {
 #[tauri::command]
 #[specta::specta]
 pub async fn list_plugins(marketplace: String) -> Result<Vec<PluginInfo>, CommandError> {
+    validate_name(&marketplace)?;
     let svc = make_service()?;
     let marketplace_path = svc.marketplace_path(&marketplace);
     let plugin_entries = svc
@@ -210,10 +212,13 @@ fn install_skills_impl(
     mode: InstallMode,
     project_path: &str,
 ) -> Result<InstallSkillsResult, CommandError> {
+    validate_name(marketplace)?;
+    validate_name(plugin)?;
+    let project_root = validate_kiro_project_path(project_path)?;
     let ctx = svc
         .resolve_plugin_install_context(marketplace, plugin)
         .map_err(CommandError::from)?;
-    let project = KiroProject::new(PathBuf::from(project_path));
+    let project = KiroProject::new(project_root);
     Ok(svc.install_skills(
         &project,
         &ctx.skill_dirs,
