@@ -16,6 +16,7 @@ use crate::agent::tools::MappedTool;
 use crate::agent::{AgentDefinition, AgentDialect};
 use crate::error::{AgentError, SkillError};
 use crate::validation;
+use crate::validation::{MarketplaceName, PluginName};
 
 // ---------------------------------------------------------------------------
 // Types
@@ -24,10 +25,14 @@ use crate::validation;
 /// Metadata recorded for each installed skill.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InstalledSkillMeta {
-    /// Name of the marketplace the skill came from.
-    pub marketplace: String,
-    /// Name of the plugin that owns the skill.
-    pub plugin: String,
+    /// Name of the marketplace the skill came from. Routed through
+    /// [`MarketplaceName::Deserialize`] so a tampered tracking file with
+    /// a malformed marketplace value is rejected at `serde_json::from_slice`
+    /// time, not later via a follow-up walker.
+    pub marketplace: MarketplaceName,
+    /// Name of the plugin that owns the skill. Same parse-time validation
+    /// as [`Self::marketplace`].
+    pub plugin: PluginName,
     /// Optional version string from the plugin manifest.
     pub version: Option<String>,
     /// Timestamp when the skill was installed.
@@ -55,10 +60,11 @@ pub struct InstalledSkills {
 /// Metadata recorded for each installed agent.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InstalledAgentMeta {
-    /// Name of the marketplace the agent came from.
-    pub marketplace: String,
+    /// Name of the marketplace the agent came from. See
+    /// [`InstalledSkillMeta::marketplace`] for the parse-time validation contract.
+    pub marketplace: MarketplaceName,
     /// Name of the plugin that owns the agent.
-    pub plugin: String,
+    pub plugin: PluginName,
     /// Optional version string from the plugin manifest.
     pub version: Option<String>,
     /// Timestamp when the agent was installed.
@@ -94,8 +100,14 @@ pub struct InstalledAgentMeta {
 /// tracks the union of files installed for one plugin.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InstalledNativeCompanionsMeta {
-    pub marketplace: String,
-    pub plugin: String,
+    /// Marketplace the bundle was installed from. See
+    /// [`InstalledSkillMeta::marketplace`] for the parse-time validation
+    /// contract. Disambiguates same-named plugins across marketplaces — the
+    /// outer `HashMap<String, _>` is keyed by plugin name alone, so the
+    /// `marketplace` field is what makes A-16's "only-removes-matching-
+    /// marketplace" comparison correct.
+    pub marketplace: MarketplaceName,
+    pub plugin: PluginName,
     pub version: Option<String>,
     pub installed_at: DateTime<Utc>,
     /// Relative paths under `.kiro/agents/` of every companion file owned
@@ -129,8 +141,11 @@ pub struct InstalledAgents {
 /// always equal because there is no parse-and-translate step.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InstalledSteeringMeta {
-    pub marketplace: String,
-    pub plugin: String,
+    /// Marketplace the file was installed from. See
+    /// [`InstalledSkillMeta::marketplace`] for the parse-time validation
+    /// contract.
+    pub marketplace: MarketplaceName,
+    pub plugin: PluginName,
     pub version: Option<String>,
     pub installed_at: DateTime<Utc>,
     pub source_hash: String,
@@ -232,8 +247,8 @@ pub struct NativeCompanionsInput<'a> {
     /// `prompts/reviewer.md`). Also the relative paths under
     /// `.kiro/agents/` they install to.
     pub rel_paths: &'a [PathBuf],
-    pub marketplace: &'a str,
-    pub plugin: &'a str,
+    pub marketplace: &'a MarketplaceName,
+    pub plugin: &'a PluginName,
     pub version: Option<&'a str>,
     pub source_hash: &'a str,
     pub mode: crate::service::InstallMode,
@@ -281,8 +296,8 @@ pub struct InstalledNativeCompanionsOutcome {
 #[derive(Debug, Clone, Serialize)]
 #[cfg_attr(feature = "specta", derive(specta::Type))]
 pub struct InstalledPluginInfo {
-    pub marketplace: String,
-    pub plugin: String,
+    pub marketplace: MarketplaceName,
+    pub plugin: PluginName,
     pub installed_version: Option<String>,
     pub skill_count: u32,
     pub steering_count: u32,
@@ -562,8 +577,8 @@ pub struct KiroProject {
 /// caller — which still holds the `(json_target, prompt_target, backups)`
 /// from the promote phase — is the right place to restore on error.
 struct CompanionInput<'a> {
-    marketplace: &'a str,
-    plugin: &'a str,
+    marketplace: &'a MarketplaceName,
+    plugin: &'a PluginName,
     version: Option<&'a str>,
     agents_root: &'a Path,
     prompt_rel: &'a Path,
@@ -1039,7 +1054,11 @@ impl KiroProject {
     pub fn installed_plugins(&self) -> crate::error::Result<InstalledPluginsView> {
         use std::collections::BTreeMap;
 
-        let mut by_pair: BTreeMap<(String, String), Acc> = BTreeMap::new();
+        // Newtype keys: both `MarketplaceName` and `PluginName` derive `Ord`
+        // (added in Phase 1.5 Task 1) so the lexicographic ordering is
+        // identical to a `(String, String)` key — wire-format ordering is
+        // preserved across the migration.
+        let mut by_pair: BTreeMap<(MarketplaceName, PluginName), Acc> = BTreeMap::new();
         let mut warnings: Vec<TrackingLoadWarning> = Vec::new();
 
         // I13: each tracking-file load failure is recorded as a
@@ -1330,23 +1349,28 @@ impl KiroProject {
     /// does not propagate per-file failures.
     pub fn remove_native_companions_for_plugin(
         &self,
-        plugin: &str,
-        marketplace: &str,
+        plugin: &PluginName,
+        marketplace: &MarketplaceName,
     ) -> crate::error::Result<()> {
         let tracking_path = self.agent_tracking_path();
         crate::file_lock::with_file_lock(&tracking_path, || -> crate::error::Result<()> {
             let mut installed = self.load_installed_agents()?;
+            // The companions map is keyed by plugin NAME (a `String` —
+            // out of scope per Phase 1.5 design — HashMap key migration
+            // would require a follow-up). Look up by `plugin.as_str()`.
+            // The marketplace check below uses newtype `PartialEq` to
+            // stay A-16-correct.
             let should_remove = installed
                 .native_companions
-                .get(plugin)
-                .is_some_and(|meta| meta.marketplace == marketplace);
+                .get(plugin.as_str())
+                .is_some_and(|meta| meta.marketplace == *marketplace);
             if !should_remove {
                 return Ok(());
             }
 
             // Take the entry so we can unlink the companion files
             // referenced by it after the tracking write succeeds.
-            let Some(removed) = installed.native_companions.remove(plugin) else {
+            let Some(removed) = installed.native_companions.remove(plugin.as_str()) else {
                 return Ok(());
             };
 
@@ -1359,8 +1383,8 @@ impl KiroProject {
             Self::remove_companion_files_best_effort(&removed.files, &self.agents_dir(), plugin);
 
             debug!(
-                plugin,
-                marketplace,
+                plugin = plugin.as_str(),
+                marketplace = marketplace.as_str(),
                 files = removed.files.len(),
                 "native companions tracking entry removed"
             );
@@ -1404,17 +1428,19 @@ impl KiroProject {
     /// validation errors (A-4).
     pub fn remove_plugin(
         &self,
-        marketplace: &str,
-        plugin: &str,
+        marketplace: &MarketplaceName,
+        plugin: &PluginName,
     ) -> crate::error::Result<RemovePluginResult> {
         let mut result = RemovePluginResult::default();
 
-        // Skills.
+        // Skills. The A-16 marketplace check is preserved by the newtype
+        // `PartialEq` impl (see also the `native_companions` cleanup at
+        // the bottom of this method).
         let skills = self.load_installed()?;
         let skills_to_remove: Vec<String> = skills
             .skills
             .iter()
-            .filter(|(_, meta)| meta.marketplace == marketplace && meta.plugin == plugin)
+            .filter(|(_, meta)| meta.marketplace == *marketplace && meta.plugin == *plugin)
             .map(|(name, _)| name.clone())
             .collect();
         for name in &skills_to_remove {
@@ -1430,8 +1456,8 @@ impl KiroProject {
                     // arm is for genuine fs / serialisation failures.
                     warn!(
                         skill = %name,
-                        plugin,
-                        marketplace,
+                        plugin = plugin.as_str(),
+                        marketplace = marketplace.as_str(),
                         error = %e,
                         "remove_plugin: skill removal failed; recording in `failed`"
                     );
@@ -1449,7 +1475,7 @@ impl KiroProject {
         let steering_to_remove: Vec<PathBuf> = steering
             .files
             .iter()
-            .filter(|(_, meta)| meta.marketplace == marketplace && meta.plugin == plugin)
+            .filter(|(_, meta)| meta.marketplace == *marketplace && meta.plugin == *plugin)
             .map(|(rel, _)| rel.clone())
             .collect();
         for rel in &steering_to_remove {
@@ -1460,8 +1486,8 @@ impl KiroProject {
                 Err(e) => {
                     warn!(
                         rel = %rel.display(),
-                        plugin,
-                        marketplace,
+                        plugin = plugin.as_str(),
+                        marketplace = marketplace.as_str(),
                         error = %e,
                         "remove_plugin: steering removal failed; recording in `failed`"
                     );
@@ -1479,7 +1505,7 @@ impl KiroProject {
         let agents_to_remove: Vec<String> = agents
             .agents
             .iter()
-            .filter(|(_, meta)| meta.marketplace == marketplace && meta.plugin == plugin)
+            .filter(|(_, meta)| meta.marketplace == *marketplace && meta.plugin == *plugin)
             .map(|(name, _)| name.clone())
             .collect();
         for name in &agents_to_remove {
@@ -1490,8 +1516,8 @@ impl KiroProject {
                 Err(e) => {
                     warn!(
                         agent = %name,
-                        plugin,
-                        marketplace,
+                        plugin = plugin.as_str(),
+                        marketplace = marketplace.as_str(),
                         error = %e,
                         "remove_plugin: agent removal failed; recording in `failed`"
                     );
@@ -1510,8 +1536,8 @@ impl KiroProject {
         // also lands in `result.failed` rather than aborting.
         if let Err(e) = self.remove_native_companions_for_plugin(plugin, marketplace) {
             warn!(
-                plugin,
-                marketplace,
+                plugin = plugin.as_str(),
+                marketplace = marketplace.as_str(),
                 error = %e,
                 "remove_plugin: native_companions cleanup failed; recording in `failed`"
             );
@@ -1696,13 +1722,13 @@ impl KiroProject {
     fn classify_steering_collision(
         installed: &InstalledSteering,
         rel_path: &Path,
-        plugin: &str,
+        plugin: &PluginName,
         source_hash: &str,
         dest: &Path,
         mode: crate::service::InstallMode,
     ) -> Result<CollisionDecision<SteeringIdempotentEcho>, crate::steering::SteeringError> {
         match installed.files.get(rel_path) {
-            Some(existing) if existing.plugin == plugin => {
+            Some(existing) if existing.plugin == *plugin => {
                 if existing.source_hash == source_hash {
                     return Ok(CollisionDecision::Idempotent(Box::new(
                         SteeringIdempotentEcho {
@@ -1725,7 +1751,9 @@ impl KiroProject {
                 if !mode.is_force() {
                     return Err(crate::steering::SteeringError::PathOwnedByOtherPlugin {
                         rel: rel_path.to_path_buf(),
-                        owner: existing.plugin.clone(),
+                        // `owner` is the wire-format `String` field; project
+                        // the newtype to its string view via `Display`.
+                        owner: existing.plugin.to_string(),
                     });
                 }
                 Ok(CollisionDecision::Proceed {
@@ -1847,6 +1875,14 @@ impl KiroProject {
         source_hash: &str,
         ctx: crate::steering::SteeringInstallContext<'_>,
     ) -> crate::error::Result<crate::steering::InstalledSteeringOutcome> {
+        // Wrap the still-`&str` ctx fields once (Task 3 transient shim).
+        // Task 4 migrates `SteeringInstallContext` to carry the newtypes
+        // directly; until then the strings come in pre-validated from
+        // the marketplace catalog, so `from_internal_unchecked` is sound
+        // — same precedent as `RelativePath::from_internal_unchecked`.
+        let plugin_name = PluginName::from_internal_unchecked(ctx.plugin.to_owned());
+        let marketplace_name = MarketplaceName::from_internal_unchecked(ctx.marketplace.to_owned());
+
         let tracking_path = self.steering_tracking_path();
         let mut installed = self.load_installed_steering().map_err(|e| match e {
             // A malformed installed-steering.json is a distinct condition
@@ -1864,7 +1900,7 @@ impl KiroProject {
         let forced_overwrite = match Self::classify_steering_collision(
             &installed,
             rel_path,
-            ctx.plugin,
+            &plugin_name,
             source_hash,
             dest,
             ctx.mode,
@@ -1897,7 +1933,7 @@ impl KiroProject {
         // If we're transferring ownership from another plugin, scrub the
         // prior owner's entry so the same path isn't tracked twice.
         if let Some(existing) = installed.files.get(rel_path)
-            && existing.plugin != ctx.plugin
+            && existing.plugin != plugin_name
         {
             installed.files.remove(rel_path);
         }
@@ -1905,8 +1941,8 @@ impl KiroProject {
         installed.files.insert(
             rel_path.to_path_buf(),
             InstalledSteeringMeta {
-                marketplace: ctx.marketplace.to_owned(),
-                plugin: ctx.plugin.to_owned(),
+                marketplace: marketplace_name,
+                plugin: plugin_name,
                 version: ctx.version.map(str::to_owned),
                 installed_at: chrono::Utc::now(),
                 source_hash: source_hash.to_owned(),
@@ -2345,12 +2381,16 @@ impl KiroProject {
         // Hash semantics: source_hash == installed_hash because the
         // translated path does not separately track original .md source
         // files; both equal the hash over the prompt-bundle bytes.
+        //
+        // The HashMap key is still `String` (out of scope per Phase 1.5
+        // design); only the meta-value's `marketplace`/`plugin` fields
+        // adopt the newtypes.
         let companion_entry = installed
             .native_companions
-            .entry(input.plugin.to_owned())
+            .entry(input.plugin.as_str().to_owned())
             .or_insert_with(|| InstalledNativeCompanionsMeta {
-                marketplace: input.marketplace.to_owned(),
-                plugin: input.plugin.to_owned(),
+                marketplace: input.marketplace.clone(),
+                plugin: input.plugin.clone(),
                 version: input.version.map(str::to_owned),
                 installed_at: chrono::Utc::now(),
                 files: Vec::new(),
@@ -2358,9 +2398,7 @@ impl KiroProject {
                 installed_hash: String::new(),
             });
         // Refresh marketplace/version/timestamp on every install.
-        input
-            .marketplace
-            .clone_into(&mut companion_entry.marketplace);
+        companion_entry.marketplace = input.marketplace.clone();
         companion_entry.version = input.version.map(str::to_owned);
         companion_entry.installed_at = chrono::Utc::now();
         if !companion_entry
@@ -2394,13 +2432,13 @@ impl KiroProject {
     fn classify_native_collision(
         installed: &InstalledAgents,
         agent_name: &str,
-        plugin: &str,
+        plugin: &PluginName,
         source_hash: &str,
         json_target: &Path,
         mode: crate::service::InstallMode,
     ) -> crate::error::Result<CollisionDecision<InstalledNativeAgentOutcome>> {
         match installed.agents.get(agent_name) {
-            Some(existing) if existing.plugin == plugin => {
+            Some(existing) if existing.plugin == *plugin => {
                 if existing.source_hash.as_deref() == Some(source_hash) {
                     return Ok(CollisionDecision::Idempotent(Box::new(
                         InstalledNativeAgentOutcome {
@@ -2426,7 +2464,11 @@ impl KiroProject {
                 if !mode.is_force() {
                     return Err(AgentError::NameClashWithOtherPlugin {
                         name: agent_name.to_owned(),
-                        owner: existing.plugin.clone(),
+                        // `owner` is the wire-format `String` field on
+                        // `AgentError`. We project the newtype to its
+                        // string view via `Display` so consumers see the
+                        // same value they did before the migration.
+                        owner: existing.plugin.to_string(),
                     }
                     .into());
                 }
@@ -2501,8 +2543,8 @@ impl KiroProject {
     pub fn install_native_agent(
         &self,
         bundle: &crate::agent::NativeAgentBundle,
-        marketplace: &str,
-        plugin: &str,
+        marketplace: &MarketplaceName,
+        plugin: &PluginName,
         version: Option<&str>,
         source_hash: &str,
         mode: crate::service::InstallMode,
@@ -2543,8 +2585,8 @@ impl KiroProject {
                 installed.agents.insert(
                     agent_name.clone(),
                     InstalledAgentMeta {
-                        marketplace: marketplace.to_string(),
-                        plugin: plugin.to_string(),
+                        marketplace: marketplace.clone(),
+                        plugin: plugin.clone(),
                         version: version.map(String::from),
                         installed_at: chrono::Utc::now(),
                         dialect: AgentDialect::Native,
@@ -2824,10 +2866,13 @@ impl KiroProject {
             Self::diff_prior_companion_files(&installed, input.plugin, input.rel_paths);
 
         installed.native_companions.insert(
-            input.plugin.to_string(),
+            // HashMap key remains `String` (out of scope per Phase 1.5
+            // design — only the meta-value's `plugin: PluginName` field
+            // gets the newtype).
+            input.plugin.as_str().to_owned(),
             InstalledNativeCompanionsMeta {
-                marketplace: input.marketplace.to_string(),
-                plugin: input.plugin.to_string(),
+                marketplace: input.marketplace.clone(),
+                plugin: input.plugin.clone(),
                 version: input.version.map(String::from),
                 installed_at: chrono::Utc::now(),
                 files: input.rel_paths.to_vec(),
@@ -2897,7 +2942,9 @@ impl KiroProject {
         let mut forced_overwrite = false;
 
         // Same-plugin check first — idempotent or content-changed.
-        if let Some(existing) = installed.native_companions.get(input.plugin) {
+        // The HashMap key is still `String` (out of scope), so look up
+        // by string view; equality below uses the same shape.
+        if let Some(existing) = installed.native_companions.get(input.plugin.as_str()) {
             if existing.source_hash == input.source_hash {
                 return Ok(CollisionDecision::Idempotent(Box::new(
                     InstalledNativeCompanionsOutcome {
@@ -2921,7 +2968,7 @@ impl KiroProject {
         // Cross-plugin path conflict + orphan-on-disk checks.
         for rel in input.rel_paths {
             for (other_plugin, other_meta) in &installed.native_companions {
-                if other_plugin == input.plugin {
+                if other_plugin.as_str() == input.plugin.as_str() {
                     continue;
                 }
                 if other_meta.files.contains(rel) {
@@ -2962,12 +3009,12 @@ impl KiroProject {
     /// Returns `(staging_dir, installed_hash)` on success.
     fn stage_native_companion_files(
         &self,
-        plugin: &str,
+        plugin: &PluginName,
         scan_root: &Path,
         rel_paths: &[PathBuf],
     ) -> crate::error::Result<(tempfile::TempDir, String)> {
         let staging = tempfile::Builder::new()
-            .prefix(&format!("_installing-companions-{plugin}-"))
+            .prefix(&format!("_installing-companions-{}-", plugin.as_str()))
             .tempdir_in(self.kiro_dir())?;
 
         for rel in rel_paths {
@@ -3011,7 +3058,7 @@ impl KiroProject {
             Ok(h) => h,
             Err(e) => {
                 warn!(
-                    plugin,
+                    plugin = plugin.as_str(),
                     error = %e,
                     "installed_hash computation failed on staging; removing staging dir"
                 );
@@ -3143,16 +3190,18 @@ impl KiroProject {
     /// promotion since this happens AFTER promote.
     fn strip_transferred_paths_from_other_plugins(
         installed: &mut InstalledAgents,
-        plugin: &str,
+        plugin: &PluginName,
         rel_paths: &[PathBuf],
         agents_dir: &Path,
     ) -> crate::error::Result<()> {
         let new_set: std::collections::HashSet<&Path> =
             rel_paths.iter().map(PathBuf::as_path).collect();
+        // HashMap key on `installed.native_companions` is still `String`,
+        // so the filter compares plugin-name string-views.
         let other_plugins: Vec<String> = installed
             .native_companions
             .keys()
-            .filter(|p| p.as_str() != plugin)
+            .filter(|p| p.as_str() != plugin.as_str())
             .cloned()
             .collect();
         let mut modified: Vec<String> = Vec::new();
@@ -3193,10 +3242,10 @@ impl KiroProject {
     /// half.
     fn diff_prior_companion_files(
         installed: &InstalledAgents,
-        plugin: &str,
+        plugin: &PluginName,
         rel_paths: &[PathBuf],
     ) -> Vec<PathBuf> {
-        let Some(prior) = installed.native_companions.get(plugin) else {
+        let Some(prior) = installed.native_companions.get(plugin.as_str()) else {
             return Vec::new();
         };
         let new_set: std::collections::HashSet<&Path> =
@@ -3227,13 +3276,17 @@ impl KiroProject {
     /// `fs::remove_file` would remove the symlink itself, not the
     /// target — operationally fine but the audit trail is murkier.
     /// Skipping with a warn! makes the unusual state visible.
-    fn remove_companion_files_best_effort(rel_paths: &[PathBuf], agents_dir: &Path, plugin: &str) {
+    fn remove_companion_files_best_effort(
+        rel_paths: &[PathBuf],
+        agents_dir: &Path,
+        plugin: &PluginName,
+    ) {
         for rel in rel_paths {
             let abs = agents_dir.join(rel);
             match fs::symlink_metadata(&abs) {
                 Ok(md) if crate::platform::is_reparse_or_symlink(&md) => {
                     warn!(
-                        plugin,
+                        plugin = plugin.as_str(),
                         path = %abs.display(),
                         "tracked companion is a symlink/reparse point; skipping orphan-removal"
                     );
@@ -3246,7 +3299,7 @@ impl KiroProject {
                 }
                 Err(e) => {
                     warn!(
-                        plugin,
+                        plugin = plugin.as_str(),
                         path = %abs.display(),
                         error = %e,
                         "failed to stat orphaned prior companion file; skipping"
@@ -3258,7 +3311,7 @@ impl KiroProject {
                 && e.kind() != std::io::ErrorKind::NotFound
             {
                 warn!(
-                    plugin,
+                    plugin = plugin.as_str(),
                     path = %abs.display(),
                     error = %e,
                     "failed to remove orphaned prior companion file post-success"
@@ -3394,6 +3447,7 @@ impl KiroProject {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::service::test_support::{mp, pn};
 
     fn temp_project() -> (tempfile::TempDir, KiroProject) {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -3403,8 +3457,8 @@ mod tests {
 
     fn sample_meta() -> InstalledSkillMeta {
         InstalledSkillMeta {
-            marketplace: "test-market".into(),
-            plugin: "test-plugin".into(),
+            marketplace: mp("test-market"),
+            plugin: pn("test-plugin"),
             version: Some("1.0.0".into()),
             installed_at: Utc::now(),
             source_hash: None,
@@ -3415,8 +3469,8 @@ mod tests {
     #[test]
     fn installed_agent_meta_roundtrips_json() {
         let meta = InstalledAgentMeta {
-            marketplace: "mp".into(),
-            plugin: "pr-review-toolkit".into(),
+            marketplace: mp("mp"),
+            plugin: pn("pr-review-toolkit"),
             version: Some("1.2.3".into()),
             installed_at: Utc::now(),
             dialect: AgentDialect::Claude,
@@ -3437,8 +3491,8 @@ mod tests {
     #[test]
     fn installed_agent_meta_roundtrips_copilot_dialect() {
         let meta = InstalledAgentMeta {
-            marketplace: "mp".into(),
-            plugin: "p".into(),
+            marketplace: mp("mp"),
+            plugin: pn("p"),
             version: None,
             installed_at: Utc::now(),
             dialect: AgentDialect::Copilot,
@@ -3471,8 +3525,8 @@ mod tests {
         steering.files.insert(
             std::path::PathBuf::from("review-process.md"),
             InstalledSteeringMeta {
-                marketplace: "m".into(),
-                plugin: "p".into(),
+                marketplace: mp("m"),
+                plugin: pn("p"),
                 version: Some("0.1.0".into()),
                 installed_at: chrono::Utc::now(),
                 source_hash: "blake3:abc".into(),
@@ -3728,8 +3782,8 @@ mod tests {
         to_save.files.insert(
             PathBuf::from("guide.md"),
             InstalledSteeringMeta {
-                marketplace: "m".into(),
-                plugin: "p".into(),
+                marketplace: mp("m"),
+                plugin: pn("p"),
                 version: None,
                 installed_at: chrono::Utc::now(),
                 source_hash: "blake3:abc".into(),
@@ -4406,8 +4460,8 @@ mod tests {
 
     fn sample_agent_meta() -> InstalledAgentMeta {
         InstalledAgentMeta {
-            marketplace: "mp".into(),
-            plugin: "p".into(),
+            marketplace: mp("mp"),
+            plugin: pn("p"),
             version: None,
             installed_at: Utc::now(),
             dialect: AgentDialect::Claude,
@@ -4894,7 +4948,7 @@ mod tests {
         let src_a = write_agent(src_tmp.path(), "shared", "---\nname: shared\n---\nfrom A\n");
         let (def_a, mapped_a) = parse_and_map(&src_a);
         let mut meta_a = sample_agent_meta();
-        "plugin-a".clone_into(&mut meta_a.plugin);
+        meta_a.plugin = pn("plugin-a");
         project
             .install_agent(&def_a, &mapped_a, meta_a, None)
             .expect("plugin-a install");
@@ -4915,7 +4969,7 @@ mod tests {
         fs::write(&src_b, "---\nname: shared\n---\nfrom B\n").unwrap();
         let (def_b, mapped_b) = parse_and_map(&src_b);
         let mut meta_b = sample_agent_meta();
-        "plugin-b".clone_into(&mut meta_b.plugin);
+        meta_b.plugin = pn("plugin-b");
         project
             .install_agent_force(&def_b, &mapped_b, meta_b, None)
             .expect("plugin-b force install");
@@ -4975,12 +5029,14 @@ mod tests {
             PathBuf::from("prompts/transfer.md"),
         ];
         let h_a = crate::hash::hash_artifact(&scan_a, &rel_paths_a).unwrap();
+        let mp_m = mp("m");
+        let pn_a = pn("plugin-a");
         project
             .install_native_companions(&NativeCompanionsInput {
                 scan_root: &scan_a,
                 rel_paths: &rel_paths_a,
-                marketplace: "m",
-                plugin: "plugin-a",
+                marketplace: &mp_m,
+                plugin: &pn_a,
                 version: None,
                 source_hash: &h_a,
                 mode: crate::service::InstallMode::New,
@@ -5003,12 +5059,13 @@ mod tests {
         fs::write(scan_b.join("prompts/transfer.md"), b"b-transfer").unwrap();
         let rel_paths_b = vec![PathBuf::from("prompts/transfer.md")];
         let h_b = crate::hash::hash_artifact(&scan_b, &rel_paths_b).unwrap();
+        let pn_b = pn("plugin-b");
         project
             .install_native_companions(&NativeCompanionsInput {
                 scan_root: &scan_b,
                 rel_paths: &rel_paths_b,
-                marketplace: "m",
-                plugin: "plugin-b",
+                marketplace: &mp_m,
+                plugin: &pn_b,
                 version: None,
                 source_hash: &h_b,
                 mode: crate::service::InstallMode::Force,
@@ -5540,7 +5597,7 @@ mod tests {
 
         // mp-b's "code-reviewer" entry doesn't exist — no-op.
         project
-            .remove_native_companions_for_plugin("code-reviewer", "mp-b")
+            .remove_native_companions_for_plugin(&pn("code-reviewer"), &mp("mp-b"))
             .expect("remove ok (no-op)");
 
         let tracking = project.load_installed_agents().expect("load");
@@ -5551,7 +5608,7 @@ mod tests {
 
         // mp-a's removal takes the entry out.
         project
-            .remove_native_companions_for_plugin("code-reviewer", "mp-a")
+            .remove_native_companions_for_plugin(&pn("code-reviewer"), &mp("mp-a"))
             .expect("remove ok");
         let tracking = project.load_installed_agents().expect("load");
         assert!(
@@ -5590,7 +5647,7 @@ mod tests {
         std::fs::write(&companion, b"# helper\n").expect("write companion file");
 
         project
-            .remove_native_companions_for_plugin("p", "mp")
+            .remove_native_companions_for_plugin(&pn("p"), &mp("mp"))
             .expect("remove ok");
 
         assert!(
@@ -5606,7 +5663,7 @@ mod tests {
 
         // No tracking file at all → load returns default → no entry.
         project
-            .remove_native_companions_for_plugin("p", "mp")
+            .remove_native_companions_for_plugin(&pn("p"), &mp("mp"))
             .expect("must be a no-op when no tracking exists");
     }
 
@@ -5657,7 +5714,9 @@ mod tests {
         std::fs::write(project.kiro_dir().join("steering/guide.md"), "# guide\n")
             .expect("steering file");
 
-        let result = project.remove_plugin("mp", "p").expect("remove_plugin");
+        let result = project
+            .remove_plugin(&mp("mp"), &pn("p"))
+            .expect("remove_plugin");
         assert_eq!(result.skills_removed, 1);
         assert_eq!(result.steering_removed, 1);
         assert_eq!(result.agents_removed, 0);
@@ -5710,7 +5769,9 @@ mod tests {
         std::fs::write(project.kiro_dir().join("steering/a.md"), "# a\n").expect("a");
         std::fs::write(project.kiro_dir().join("steering/b.md"), "# b\n").expect("b");
 
-        let result = project.remove_plugin("mp-a", "p").expect("remove mp-a/p");
+        let result = project
+            .remove_plugin(&mp("mp-a"), &pn("p"))
+            .expect("remove mp-a/p");
         assert_eq!(result.steering_removed, 1, "only mp-a/p's entry");
 
         let tracking = project.load_installed_steering().expect("load");
@@ -5756,7 +5817,7 @@ mod tests {
         // Note: NO skills/orphan dir on disk.
 
         let result = project
-            .remove_plugin("mp", "p")
+            .remove_plugin(&mp("mp"), &pn("p"))
             .expect("orphan recovery: must NOT abort");
         assert_eq!(
             result.skills_removed, 1,
@@ -5809,8 +5870,8 @@ mod tests {
                 "removable",
                 src.path(),
                 InstalledSkillMeta {
-                    marketplace: "mp".into(),
-                    plugin: "p".into(),
+                    marketplace: mp("mp"),
+                    plugin: pn("p"),
                     version: Some("1.0.0".into()),
                     installed_at: Utc::now(),
                     source_hash: Some("deadbeef".into()),
@@ -5843,7 +5904,7 @@ mod tests {
         .expect("write steering tracking");
 
         let result = project
-            .remove_plugin("mp", "p")
+            .remove_plugin(&mp("mp"), &pn("p"))
             .expect("I5: cascade returns Ok even with per-step failures");
 
         assert_eq!(
@@ -5901,7 +5962,7 @@ mod tests {
         .expect("steering tracking");
 
         let err = project
-            .remove_plugin("mp", "p")
+            .remove_plugin(&mp("mp"), &pn("p"))
             .expect_err("traversal entry must surface as Err");
         match err {
             crate::error::Error::Io(io_err) => {
@@ -5943,7 +6004,9 @@ mod tests {
         )
         .expect("agents tracking");
 
-        project.remove_plugin("mp", "p").expect("remove_plugin");
+        project
+            .remove_plugin(&mp("mp"), &pn("p"))
+            .expect("remove_plugin");
 
         let tracking = project.load_installed_agents().expect("load");
         assert!(
@@ -6454,8 +6517,8 @@ mod tests {
     #[test]
     fn installed_native_companions_meta_round_trips_through_serde() {
         let meta = InstalledNativeCompanionsMeta {
-            marketplace: "m".into(),
-            plugin: "p".into(),
+            marketplace: mp("m"),
+            plugin: pn("p"),
             version: Some("0.1.0".into()),
             installed_at: chrono::Utc::now(),
             files: vec![
@@ -6498,8 +6561,8 @@ mod tests {
         fs::write(skill_src.join("SKILL.md"), b"# test skill\n\nbody").unwrap();
 
         let meta = InstalledSkillMeta {
-            marketplace: "m".into(),
-            plugin: "p".into(),
+            marketplace: mp("m"),
+            plugin: pn("p"),
             version: Some("1.0.0".into()),
             installed_at: chrono::Utc::now(),
             source_hash: None,
@@ -6575,7 +6638,7 @@ mod tests {
         // `prompts/rev.md` in the native_companions map.
         let companion = installed
             .native_companions
-            .get(&plugin_name)
+            .get(plugin_name.as_str())
             .expect("native_companions entry synthesized");
         assert!(
             companion
@@ -6618,7 +6681,7 @@ mod tests {
         let installed = project.load_installed_agents().unwrap();
         let companion = installed
             .native_companions
-            .get(&plugin_name)
+            .get(plugin_name.as_str())
             .expect("entry exists");
         assert_eq!(companion.files.len(), 2);
         assert!(
@@ -6718,8 +6781,12 @@ mod tests {
         plugin: &str,
         mode: crate::service::InstallMode,
     ) -> Result<InstalledNativeAgentOutcome, AgentError> {
+        // Wrap once at the helper boundary so the test bodies stay
+        // string-literal-friendly (they pass `"m"`, `"plugin-a"` etc.).
+        let marketplace = mp(marketplace);
+        let plugin = pn(plugin);
         f.project
-            .install_native_agent(&f.bundle, marketplace, plugin, None, &f.source_hash, mode)
+            .install_native_agent(&f.bundle, &marketplace, &plugin, None, &f.source_hash, mode)
     }
 
     #[test]
@@ -6741,8 +6808,8 @@ mod tests {
         let outcome = project
             .install_native_agent(
                 &bundle,
-                "marketplace-x",
-                "plugin-y",
+                &mp("marketplace-x"),
+                &pn("plugin-y"),
                 Some("0.1.0"),
                 &source_hash,
                 crate::service::InstallMode::New,
@@ -6921,8 +6988,8 @@ mod tests {
         let outcome = project
             .install_native_agent(
                 &bundle,
-                "m",
-                "p",
+                &mp("m"),
+                &pn("p"),
                 None,
                 &source_hash,
                 crate::service::InstallMode::New,
@@ -6954,8 +7021,8 @@ mod tests {
         project
             .install_native_agent(
                 &bundle_v1,
-                "m",
-                "p",
+                &mp("m"),
+                &pn("p"),
                 None,
                 &h_v1,
                 crate::service::InstallMode::New,
@@ -6987,8 +7054,8 @@ mod tests {
         let err = project
             .install_native_agent(
                 &bundle_v2,
-                "m",
-                "p",
+                &mp("m"),
+                &pn("p"),
                 None,
                 &h_v2,
                 crate::service::InstallMode::Force,
@@ -7111,12 +7178,14 @@ mod tests {
         let (scan_root, rel_paths, source_hash) =
             stage_companion_source(dir.path(), &[("a.md", b"prompt a"), ("b.md", b"prompt b")]);
 
+        let mp_x = mp("marketplace-x");
+        let pn_y = pn("plugin-y");
         let outcome = project
             .install_native_companions(&NativeCompanionsInput {
                 scan_root: &scan_root,
                 rel_paths: &rel_paths,
-                marketplace: "marketplace-x",
-                plugin: "plugin-y",
+                marketplace: &mp_x,
+                plugin: &pn_y,
                 version: Some("0.1.0"),
                 source_hash: &source_hash,
                 mode: crate::service::InstallMode::New,
@@ -7163,8 +7232,8 @@ mod tests {
             .install_native_companions(&NativeCompanionsInput {
                 scan_root: &scan_root,
                 rel_paths: &[],
-                marketplace: "m",
-                plugin: "p",
+                marketplace: &mp("m"),
+                plugin: &pn("p"),
                 version: None,
                 source_hash: "blake3:empty",
                 mode: crate::service::InstallMode::New,
@@ -7207,8 +7276,8 @@ mod tests {
             .install_native_companions(&NativeCompanionsInput {
                 scan_root: &scan_root,
                 rel_paths: &rel_paths,
-                marketplace: "m",
-                plugin: "p",
+                marketplace: &mp("m"),
+                plugin: &pn("p"),
                 version: None,
                 source_hash: &h,
                 mode: crate::service::InstallMode::New,
@@ -7251,8 +7320,8 @@ mod tests {
             .install_native_companions(&NativeCompanionsInput {
                 scan_root: &scan_root,
                 rel_paths: &rel_paths_v1,
-                marketplace: "m",
-                plugin: "p",
+                marketplace: &mp("m"),
+                plugin: &pn("p"),
                 version: None,
                 source_hash: &h_v1,
                 mode: crate::service::InstallMode::New,
@@ -7284,8 +7353,8 @@ mod tests {
             .install_native_companions(&NativeCompanionsInput {
                 scan_root: &scan_root,
                 rel_paths: &rel_paths_v2,
-                marketplace: "m",
-                plugin: "p",
+                marketplace: &mp("m"),
+                plugin: &pn("p"),
                 version: None,
                 source_hash: &h_v2,
                 mode: crate::service::InstallMode::Force,
@@ -7341,8 +7410,8 @@ mod tests {
             .install_native_companions(&NativeCompanionsInput {
                 scan_root: &scan_root,
                 rel_paths: &rel_paths,
-                marketplace: "m",
-                plugin: "p",
+                marketplace: &mp("m"),
+                plugin: &pn("p"),
                 version: None,
                 source_hash: &source_hash,
                 mode: crate::service::InstallMode::New,
@@ -7413,11 +7482,15 @@ mod tests {
         plugin: &str,
         mode: crate::service::InstallMode,
     ) -> Result<InstalledNativeCompanionsOutcome, AgentError> {
+        // Wrap once at the helper boundary; tests pass `"m"`, `"plugin-a"`
+        // etc. and the wrap stays internal.
+        let marketplace = mp(marketplace);
+        let plugin = pn(plugin);
         f.project.install_native_companions(&NativeCompanionsInput {
             scan_root: &f.scan_root,
             rel_paths: &f.rel_paths,
-            marketplace,
-            plugin,
+            marketplace: &marketplace,
+            plugin: &plugin,
             version: None,
             source_hash: &f.source_hash,
             mode,
@@ -7585,8 +7658,8 @@ mod tests {
             .install_native_companions(&NativeCompanionsInput {
                 scan_root: &scratch_b,
                 rel_paths: &rel_paths_b,
-                marketplace: "m",
-                plugin: "plugin-b",
+                marketplace: &mp("m"),
+                plugin: &pn("plugin-b"),
                 version: None,
                 source_hash: &h_b,
                 mode: crate::service::InstallMode::New,
@@ -7608,8 +7681,8 @@ mod tests {
             .install_native_companions(&NativeCompanionsInput {
                 scan_root: &scratch_b,
                 rel_paths: &rel_paths_b,
-                marketplace: "m",
-                plugin: "plugin-b",
+                marketplace: &mp("m"),
+                plugin: &pn("plugin-b"),
                 version: None,
                 source_hash: &h_b,
                 mode: crate::service::InstallMode::Force,

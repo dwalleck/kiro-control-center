@@ -247,6 +247,23 @@ impl MarketplaceName {
         Ok(MarketplaceName(value))
     }
 
+    /// Construct from a value the caller has already validated upstream.
+    /// `pub(crate)` so external callers cannot bypass [`validate_name`].
+    ///
+    /// **Caller contract:** `value` must already satisfy [`validate_name`].
+    /// Used inside `kiro-market-core` as a transient shim while the surrounding
+    /// function signatures are still `&str` (the names came in via the validated
+    /// marketplace catalog and would otherwise need re-validation here). The
+    /// `debug_assert!` below catches a contract violation in tests. Mirrors
+    /// [`RelativePath::from_internal_unchecked`].
+    pub(crate) fn from_internal_unchecked(value: String) -> Self {
+        debug_assert!(
+            validate_name(&value).is_ok(),
+            "MarketplaceName::from_internal_unchecked called with invalid name: {value:?}"
+        );
+        MarketplaceName(value)
+    }
+
     /// View the validated name as a `&str`.
     #[must_use]
     pub fn as_str(&self) -> &str {
@@ -328,6 +345,17 @@ impl PluginName {
         let value = value.into();
         validate_name(&value)?;
         Ok(PluginName(value))
+    }
+
+    /// Construct from a value the caller has already validated upstream.
+    /// `pub(crate)` so external callers cannot bypass [`validate_name`].
+    /// See [`MarketplaceName::from_internal_unchecked`] for the contract.
+    pub(crate) fn from_internal_unchecked(value: String) -> Self {
+        debug_assert!(
+            validate_name(&value).is_ok(),
+            "PluginName::from_internal_unchecked called with invalid name: {value:?}"
+        );
+        PluginName(value)
     }
 
     /// View the validated name as a `&str`.

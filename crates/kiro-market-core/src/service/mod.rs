@@ -1108,8 +1108,16 @@ impl MarketplaceService {
             processed.insert(frontmatter.name.clone());
 
             let meta = crate::project::InstalledSkillMeta {
-                marketplace: marketplace.to_owned(),
-                plugin: plugin.to_owned(),
+                // Phase 1.5 Task 3 transient shim: the surrounding fn
+                // still takes `marketplace: &str, plugin: &str`. Names
+                // came in via the validated marketplace catalog, so
+                // `from_internal_unchecked` is sound (RelativePath
+                // precedent). Task 5 strips the shim by migrating the
+                // surrounding fn signatures to take the newtypes directly.
+                marketplace: crate::validation::MarketplaceName::from_internal_unchecked(
+                    marketplace.to_owned(),
+                ),
+                plugin: crate::validation::PluginName::from_internal_unchecked(plugin.to_owned()),
                 version: version.map(str::to_owned),
                 installed_at: chrono::Utc::now(),
                 source_hash: None,
@@ -1508,8 +1516,16 @@ impl MarketplaceService {
             }
 
             let meta = crate::project::InstalledAgentMeta {
-                marketplace: ctx.marketplace.to_string(),
-                plugin: ctx.plugin.to_string(),
+                // Phase 1.5 Task 3 transient shim — see equivalent
+                // construction in `install_skills` for rationale. Task 5
+                // migrates `AgentInstallContext` so this collapses to
+                // `ctx.marketplace.clone()` / `ctx.plugin.clone()`.
+                marketplace: crate::validation::MarketplaceName::from_internal_unchecked(
+                    ctx.marketplace.to_string(),
+                ),
+                plugin: crate::validation::PluginName::from_internal_unchecked(
+                    ctx.plugin.to_string(),
+                ),
                 version: ctx.version.map(String::from),
                 installed_at: chrono::Utc::now(),
                 dialect: def.dialect,
@@ -1672,10 +1688,18 @@ impl MarketplaceService {
             }
         };
 
+        // Phase 1.5 Task 3 transient shims: project.install_native_agent
+        // now takes `&MarketplaceName`/`&PluginName`. ctx still carries
+        // `&str` (Task 5 migrates `AgentInstallContext`). The strings are
+        // pre-validated at the marketplace catalog layer.
+        let marketplace_name =
+            crate::validation::MarketplaceName::from_internal_unchecked(ctx.marketplace.to_owned());
+        let plugin_name =
+            crate::validation::PluginName::from_internal_unchecked(ctx.plugin.to_owned());
         match project.install_native_agent(
             &bundle,
-            ctx.marketplace,
-            ctx.plugin,
+            &marketplace_name,
+            &plugin_name,
             ctx.version,
             &source_hash,
             ctx.mode,
@@ -1744,11 +1768,19 @@ impl MarketplaceService {
             }
         };
 
+        // Phase 1.5 Task 3 transient shims — see equivalent in
+        // `install_native_kiro_cli_one_agent`. Task 5 migrates
+        // `AgentInstallContext` so this collapses back to passing
+        // `ctx.marketplace` / `ctx.plugin` directly.
+        let marketplace_name =
+            crate::validation::MarketplaceName::from_internal_unchecked(ctx.marketplace.to_owned());
+        let plugin_name =
+            crate::validation::PluginName::from_internal_unchecked(ctx.plugin.to_owned());
         match project.install_native_companions(&crate::project::NativeCompanionsInput {
             scan_root: &scan_root,
             rel_paths: &rel_paths,
-            marketplace: ctx.marketplace,
-            plugin: ctx.plugin,
+            marketplace: &marketplace_name,
+            plugin: &plugin_name,
             version: ctx.version,
             source_hash: &source_hash,
             mode: ctx.mode,

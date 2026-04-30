@@ -1790,13 +1790,14 @@ mod tests {
         use chrono::Utc;
 
         use crate::project::InstalledSkillMeta;
+        use crate::service::test_support::{mp, pn};
 
         let mut skills = HashMap::new();
         skills.insert(
             skill_name.to_owned(),
             InstalledSkillMeta {
-                marketplace: marketplace.to_owned(),
-                plugin: plugin.to_owned(),
+                marketplace: mp(marketplace),
+                plugin: pn(plugin),
                 version: None,
                 installed_at: Utc::now(),
                 source_hash: None,
