@@ -745,18 +745,21 @@ impl MarketplaceService {
     /// failures, not skips.
     pub fn resolve_plugin_install_context(
         &self,
-        marketplace: &str,
-        plugin: &str,
+        marketplace: &crate::validation::MarketplaceName,
+        plugin: &crate::validation::PluginName,
     ) -> Result<PluginInstallContext, Error> {
-        let marketplace_path = self.marketplace_path(marketplace);
-        let plugin_entries = self.list_plugin_entries(marketplace)?;
+        // Phase 1.5: `marketplace_path` and `list_plugin_entries` remain
+        // `&str`-typed by design — only the install API migrates to the
+        // newtypes. The `as_str()` bridges below are permanent.
+        let marketplace_path = self.marketplace_path(marketplace.as_str());
+        let plugin_entries = self.list_plugin_entries(marketplace.as_str())?;
         let plugin_entry = plugin_entries
             .iter()
-            .find(|p| p.name == plugin)
+            .find(|p| p.name == plugin.as_str())
             .ok_or_else(|| {
                 Error::Plugin(PluginError::NotFound {
-                    plugin: plugin.to_owned(),
-                    marketplace: marketplace.to_owned(),
+                    plugin: plugin.as_str().to_owned(),
+                    marketplace: marketplace.as_str().to_owned(),
                 })
             })?;
         let plugin_dir = self.resolve_local_plugin_dir(plugin_entry, &marketplace_path)?;
@@ -1144,7 +1147,8 @@ mod tests {
     use super::*;
     use crate::marketplace::{PluginSource, StructuredSource};
     use crate::service::test_support::{
-        make_plugin_with_skills, relative_path_entry, seed_marketplace_with_registry, temp_service,
+        make_plugin_with_skills, mp, pn, relative_path_entry, seed_marketplace_with_registry,
+        temp_service,
     };
 
     /// Build an `io::Error` whose Custom repr wraps a two-link error chain.
@@ -2638,7 +2642,7 @@ mod tests {
         .expect("write plugin.json");
 
         let ctx = svc
-            .resolve_plugin_install_context("mp1", "myplugin")
+            .resolve_plugin_install_context(&mp("mp1"), &pn("myplugin"))
             .expect("happy path");
         assert_eq!(
             ctx.plugin_dir,
@@ -2685,7 +2689,7 @@ mod tests {
         .expect("write plugin.json");
 
         let ctx = svc
-            .resolve_plugin_install_context("mp1", "lonely")
+            .resolve_plugin_install_context(&mp("mp1"), &pn("lonely"))
             .expect("happy path");
         assert_eq!(ctx.version.as_deref(), Some("0.1.0"));
         assert!(ctx.skill_dirs.is_empty());
@@ -2707,7 +2711,7 @@ mod tests {
         .expect("write plugin.json");
 
         let ctx = svc
-            .resolve_plugin_install_context("mp1", "nover")
+            .resolve_plugin_install_context(&mp("mp1"), &pn("nover"))
             .expect("happy path");
         assert!(
             ctx.version.is_none(),
@@ -2740,7 +2744,7 @@ mod tests {
         .expect("write plugin.json");
 
         let ctx = svc
-            .resolve_plugin_install_context("mp1", "withcustom")
+            .resolve_plugin_install_context(&mp("mp1"), &pn("withcustom"))
             .expect("happy path");
         assert_eq!(ctx.version.as_deref(), Some("0.1.0"));
         assert_eq!(
@@ -2782,7 +2786,7 @@ mod tests {
     fn resolve_plugin_install_context_errors_on_unknown_marketplace() {
         let (_dir, svc) = temp_service();
         let err = svc
-            .resolve_plugin_install_context("does-not-exist", "anyplugin")
+            .resolve_plugin_install_context(&mp("does-not-exist"), &pn("anyplugin"))
             .expect_err("unknown marketplace must error");
         // The inner MarketplaceError variant is an implementation detail
         // of list_plugin_entries; pin only the top-level Error::Marketplace
@@ -2801,7 +2805,7 @@ mod tests {
         let _ = seed_marketplace_with_registry(dir.path(), &svc, "mp1", &entries);
 
         let err = svc
-            .resolve_plugin_install_context("mp1", "does-not-exist")
+            .resolve_plugin_install_context(&mp("mp1"), &pn("does-not-exist"))
             .expect_err("unknown plugin must error");
         assert!(
             matches!(
@@ -2823,7 +2827,7 @@ mod tests {
         let _ = seed_marketplace_with_registry(dir.path(), &svc, "mp1", &entries);
 
         let err = svc
-            .resolve_plugin_install_context("mp1", "ghost")
+            .resolve_plugin_install_context(&mp("mp1"), &pn("ghost"))
             .expect_err("missing plugin_dir must error");
         assert!(
             matches!(err, Error::Plugin(PluginError::DirectoryMissing { .. })),
@@ -2841,7 +2845,7 @@ mod tests {
         fs::write(plugin_dir.join("plugin.json"), b"{not json").expect("write plugin.json");
 
         let err = svc
-            .resolve_plugin_install_context("mp1", "broken")
+            .resolve_plugin_install_context(&mp("mp1"), &pn("broken"))
             .expect_err("malformed plugin.json must error");
         assert!(
             matches!(err, Error::Plugin(PluginError::InvalidManifest { .. })),
@@ -2864,7 +2868,7 @@ mod tests {
         let _ = seed_marketplace_with_registry(dir.path(), &svc, "mp1", &entries);
 
         let err = svc
-            .resolve_plugin_install_context("mp1", "remote-plugin")
+            .resolve_plugin_install_context(&mp("mp1"), &pn("remote-plugin"))
             .expect_err("remote source must refuse local resolution");
         assert!(
             matches!(err, Error::Plugin(PluginError::RemoteSourceNotLocal { .. })),

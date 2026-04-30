@@ -1960,11 +1960,7 @@ impl MarketplaceService {
         mode: InstallMode,
         accept_mcp: bool,
     ) -> Result<InstallPluginResult, Error> {
-        // Phase 1.5 Task 5 bridge: `resolve_plugin_install_context` still
-        // accepts `&str`; Task 6 migrates it to take the newtypes and
-        // strips the `.as_str()` calls below. Once that lands, this hop
-        // becomes `self.resolve_plugin_install_context(marketplace, plugin)`.
-        let ctx = self.resolve_plugin_install_context(marketplace.as_str(), plugin.as_str())?;
+        let ctx = self.resolve_plugin_install_context(marketplace, plugin)?;
 
         let skills = self.install_skills(
             project,
