@@ -11,6 +11,7 @@ use kiro_market_core::service::{
     InstallAgentsResult, InstallFilter, InstallMode, InstallSkillsResult, MarketplaceService,
 };
 use kiro_market_core::steering::InstallSteeringResult;
+use kiro_market_core::validation::{MarketplaceName, PluginName};
 use tracing::{debug, warn};
 
 use crate::cli;
@@ -30,24 +31,33 @@ pub fn run(
     accept_mcp: bool,
 ) -> Result<()> {
     let mode = InstallMode::from(force);
-    let (plugin_name, marketplace_name) = cli::parse_plugin_ref(plugin_ref).with_context(|| {
+    let (plugin_str, marketplace_str) = cli::parse_plugin_ref(plugin_ref).with_context(|| {
         format!("invalid plugin reference '{plugin_ref}': expected plugin@marketplace")
     })?;
 
+    // Construct validated newtypes once at the IPC boundary; downstream
+    // service APIs accept `&MarketplaceName` / `&PluginName` and can no
+    // longer be called with the args swapped (the convergent Critical
+    // finding from PR #94's 8-reviewer aggregated review).
+    let marketplace = MarketplaceName::new(marketplace_str)
+        .with_context(|| format!("invalid marketplace name: {marketplace_str}"))?;
+    let plugin = PluginName::new(plugin_str)
+        .with_context(|| format!("invalid plugin name: {plugin_str}"))?;
+
     let cache = CacheDir::default_location()
         .context("could not determine data directory; is $HOME set?")?;
-    let marketplace_path = cache.marketplace_path(marketplace_name);
+    let marketplace_path = cache.marketplace_path(marketplace.as_str());
     if !marketplace_path.exists() {
         bail!(
             "marketplace '{}' not found. Run {} first.",
-            marketplace_name,
+            marketplace,
             "kiro-market marketplace add".bold()
         );
     }
 
-    let protocol = load_protocol(&cache, marketplace_name);
+    let protocol = load_protocol(&cache, marketplace.as_str());
     let plugin_entry =
-        super::common::find_plugin_entry(&marketplace_path, plugin_name, marketplace_name)?;
+        super::common::find_plugin_entry(&marketplace_path, plugin.as_str(), marketplace.as_str())?;
 
     // One service instance drives plugin-dir resolution plus the install
     // loops; no second `GixCliBackend` needed.
@@ -56,13 +66,13 @@ pub fn run(
         &svc,
         &plugin_entry,
         &marketplace_path,
-        marketplace_name,
-        plugin_name,
+        marketplace.as_str(),
+        plugin.as_str(),
         protocol,
     )?;
 
     let ctx = MarketplaceService::resolve_plugin_install_context_from_dir(&plugin_dir)
-        .with_context(|| format!("failed to resolve install context for '{plugin_name}'"))?;
+        .with_context(|| format!("failed to resolve install context for '{plugin}'"))?;
 
     let cwd = std::env::current_dir().context("failed to determine current directory")?;
     let project = KiroProject::new(cwd);
@@ -73,8 +83,8 @@ pub fn run(
         &ctx.skill_dirs,
         skill_filter,
         mode,
-        marketplace_name,
-        plugin_name,
+        &marketplace,
+        &plugin,
         ctx.version.as_deref(),
     );
     print_install_outcome(plugin_ref, &skill_result);
@@ -82,8 +92,8 @@ pub fn run(
     let install_ctx = kiro_market_core::service::AgentInstallContext {
         mode,
         accept_mcp,
-        marketplace: marketplace_name,
-        plugin: plugin_name,
+        marketplace: &marketplace,
+        plugin: &plugin,
         version: ctx.version.as_deref(),
     };
     let agent_result = run_agent_install(
@@ -98,8 +108,8 @@ pub fn run(
 
     let steering_ctx = kiro_market_core::steering::SteeringInstallContext {
         mode,
-        marketplace: marketplace_name,
-        plugin: plugin_name,
+        marketplace: &marketplace,
+        plugin: &plugin,
         version: ctx.version.as_deref(),
     };
     let steering_result = run_steering_install(
@@ -169,8 +179,8 @@ fn run_skill_install(
     skill_dirs: &[PathBuf],
     skill_filter: Option<&str>,
     mode: InstallMode,
-    marketplace_name: &str,
-    plugin_name: &str,
+    marketplace: &MarketplaceName,
+    plugin: &PluginName,
     version: Option<&str>,
 ) -> InstallSkillsResult {
     if skill_dirs.is_empty() {
@@ -185,8 +195,8 @@ fn run_skill_install(
         skill_dirs,
         &filter,
         mode,
-        marketplace_name,
-        plugin_name,
+        marketplace,
+        plugin,
         version,
     )
 }

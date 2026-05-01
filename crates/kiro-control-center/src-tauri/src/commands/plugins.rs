@@ -18,7 +18,7 @@
 
 use kiro_market_core::project::{InstalledPluginsView, KiroProject, RemovePluginResult};
 use kiro_market_core::service::{InstallMode, InstallPluginResult, MarketplaceService};
-use kiro_market_core::validation::validate_name;
+use kiro_market_core::validation::{MarketplaceName, PluginName};
 
 use crate::commands::{make_service, validate_kiro_project_path};
 use crate::error::CommandError;
@@ -63,11 +63,11 @@ fn install_plugin_impl(
     accept_mcp: bool,
     project_path: &str,
 ) -> Result<InstallPluginResult, CommandError> {
-    validate_name(marketplace)?;
-    validate_name(plugin)?;
     let project_root = validate_kiro_project_path(project_path)?;
+    let marketplace = MarketplaceName::new(marketplace)?;
+    let plugin = PluginName::new(plugin)?;
     let project = KiroProject::new(project_root);
-    svc.install_plugin(&project, marketplace, plugin, mode, accept_mcp)
+    svc.install_plugin(&project, &marketplace, &plugin, mode, accept_mcp)
         .map_err(CommandError::from)
 }
 
@@ -103,9 +103,9 @@ pub async fn remove_plugin(
     plugin: String,
     project_path: String,
 ) -> Result<RemovePluginResult, CommandError> {
-    validate_name(&marketplace)?;
-    validate_name(&plugin)?;
     let project_root = validate_kiro_project_path(&project_path)?;
+    let marketplace = MarketplaceName::new(marketplace)?;
+    let plugin = PluginName::new(plugin)?;
     let project = KiroProject::new(project_root);
     project
         .remove_plugin(&marketplace, &plugin)
@@ -363,8 +363,9 @@ mod tests {
     // FE-supplied `marketplace = "../etc/passwd"` would otherwise reach
     // `cache::marketplace_path(marketplace)` and force an FS access at
     // `<registries_dir>/../etc/passwd` before the registry layer's own
-    // checks fire. The IPC-boundary `validate_name` guard rejects it
-    // before the service ever runs.
+    // checks fire. The IPC-boundary `MarketplaceName::new` constructor
+    // (which routes through `validate_name`) rejects it before the
+    // service ever runs.
     #[test]
     fn install_plugin_impl_rejects_traversal_in_marketplace() {
         let (dir, svc) = temp_service();
@@ -382,8 +383,9 @@ mod tests {
     }
 
     /// NUL bytes truncate C-string conversions in syscalls; the
-    /// IPC-boundary `validate_name` guard must reject them before they
-    /// reach `cache::plugin_registry_path`.
+    /// IPC-boundary `PluginName::new` constructor (which routes through
+    /// `validate_name`) must reject them before they reach
+    /// `cache::plugin_registry_path`.
     #[test]
     fn install_plugin_impl_rejects_nul_byte_in_plugin() {
         let (dir, svc) = temp_service();

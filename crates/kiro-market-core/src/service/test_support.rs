@@ -163,3 +163,33 @@ pub fn seed_marketplace_with_registry(
         .expect("write plugin registry");
     marketplace_path
 }
+
+/// Test helper: construct a [`MarketplaceName`](crate::validation::MarketplaceName)
+/// from a string literal, panicking on validation failure. Test fixtures pass
+/// `"mp"`, `"plug-a"`, etc. — values controlled by the test author, not user
+/// input. A fixture failure is a bug, not an error to handle.
+///
+/// # Panics
+///
+/// Panics if `s` is not a valid marketplace name. Test infrastructure only —
+/// callers pass known-good literals.
+#[cfg(any(test, feature = "test-support"))]
+#[must_use]
+pub fn mp(s: &str) -> crate::validation::MarketplaceName {
+    crate::validation::MarketplaceName::new(s)
+        .unwrap_or_else(|e| panic!("test fixture: invalid marketplace name {s:?}: {e}"))
+}
+
+/// Test helper: construct a [`PluginName`](crate::validation::PluginName) from
+/// a string literal. See [`mp`] for the contract.
+///
+/// # Panics
+///
+/// Panics if `s` is not a valid plugin name. Test infrastructure only —
+/// callers pass known-good literals.
+#[cfg(any(test, feature = "test-support"))]
+#[must_use]
+pub fn pn(s: &str) -> crate::validation::PluginName {
+    crate::validation::PluginName::new(s)
+        .unwrap_or_else(|e| panic!("test fixture: invalid plugin name {s:?}: {e}"))
+}

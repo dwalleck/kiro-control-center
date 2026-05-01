@@ -213,6 +213,186 @@ impl<'de> Deserialize<'de> for AgentName {
     }
 }
 
+/// Validated marketplace name. Routes through [`validate_name`] at construction
+/// — non-empty, no NUL/control bytes, no path-traversal, no Windows-reserved
+/// names. The `serde(transparent)` representation keeps the JSON wire format
+/// byte-identical to a plain string; `Deserialize` is routed through `new` so
+/// `serde_json::from_slice` rejects malformed names at parse time.
+///
+/// Deliberately does NOT derive `Default` — `MarketplaceName::default()` would
+/// return `MarketplaceName(String::new())` which `validate_name` rejects.
+/// Matches the existing `RelativePath` / `AgentName` / `GitRef` precedent.
+///
+/// `Ord`/`PartialOrd` are derived for use as `BTreeMap` keys in
+/// `installed_plugins`'s aggregator (see `project.rs`). Lexicographic ordering
+/// on the inner string is well-defined and semantically equivalent to
+/// `String`'s ordering. Deviates from `RelativePath` / `AgentName` / `GitRef`
+/// (which don't derive `Ord`) because none of those types are used as map keys
+/// today.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
+#[serde(transparent)]
+pub struct MarketplaceName(String);
+
+impl MarketplaceName {
+    /// Construct after validation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ValidationError::InvalidName`] if the input fails
+    /// [`validate_name`].
+    pub fn new(value: impl Into<String>) -> Result<Self, ValidationError> {
+        let value = value.into();
+        validate_name(&value)?;
+        Ok(MarketplaceName(value))
+    }
+
+    /// View the validated name as a `&str`.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Consume the newtype and return the inner `String`.
+    #[must_use]
+    pub fn into_inner(self) -> String {
+        self.0
+    }
+}
+
+impl TryFrom<&str> for MarketplaceName {
+    type Error = ValidationError;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+
+impl TryFrom<String> for MarketplaceName {
+    type Error = ValidationError;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+
+impl AsRef<str> for MarketplaceName {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for MarketplaceName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.0, f)
+    }
+}
+
+impl PartialEq<str> for MarketplaceName {
+    fn eq(&self, other: &str) -> bool {
+        self.0 == other
+    }
+}
+
+impl PartialEq<&str> for MarketplaceName {
+    fn eq(&self, other: &&str) -> bool {
+        self.0 == *other
+    }
+}
+
+impl<'de> Deserialize<'de> for MarketplaceName {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::new(value).map_err(serde::de::Error::custom)
+    }
+}
+
+/// Validated plugin name. Same shape as [`MarketplaceName`]; see that type's
+/// documentation for the construction, serde, and Ord-derive contracts.
+#[derive(Clone, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
+#[serde(transparent)]
+pub struct PluginName(String);
+
+impl PluginName {
+    /// Construct after validation.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ValidationError::InvalidName`] if the input fails
+    /// [`validate_name`].
+    pub fn new(value: impl Into<String>) -> Result<Self, ValidationError> {
+        let value = value.into();
+        validate_name(&value)?;
+        Ok(PluginName(value))
+    }
+
+    /// View the validated name as a `&str`.
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    /// Consume the newtype and return the inner `String`.
+    #[must_use]
+    pub fn into_inner(self) -> String {
+        self.0
+    }
+}
+
+impl TryFrom<&str> for PluginName {
+    type Error = ValidationError;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+
+impl TryFrom<String> for PluginName {
+    type Error = ValidationError;
+
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        Self::new(value)
+    }
+}
+
+impl AsRef<str> for PluginName {
+    fn as_ref(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for PluginName {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.0, f)
+    }
+}
+
+impl PartialEq<str> for PluginName {
+    fn eq(&self, other: &str) -> bool {
+        self.0 == other
+    }
+}
+
+impl PartialEq<&str> for PluginName {
+    fn eq(&self, other: &&str) -> bool {
+        self.0 == *other
+    }
+}
+
+impl<'de> Deserialize<'de> for PluginName {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        let value = String::deserialize(deserializer)?;
+        Self::new(value).map_err(serde::de::Error::custom)
+    }
+}
+
 /// Names reserved by Windows for legacy device handles. Trying to create
 /// a file or directory with one of these names (with or without extension)
 /// fails on Windows in interesting ways: the OS short-circuits the path to
@@ -774,5 +954,207 @@ mod tests {
         let wire = serde_json::to_string(&original).expect("ser");
         let parsed: AgentName = serde_json::from_str(&wire).expect("de");
         assert_eq!(parsed, original);
+    }
+
+    // ──── MarketplaceName ────────────────────────────────────────────────
+
+    #[test]
+    fn marketplace_name_new_accepts_valid() {
+        let name = MarketplaceName::new("kiro-starter-kit").expect("valid");
+        assert_eq!(name.as_str(), "kiro-starter-kit");
+    }
+
+    #[test]
+    fn marketplace_name_new_rejects_empty() {
+        assert!(MarketplaceName::new("").is_err());
+    }
+
+    #[test]
+    fn marketplace_name_new_rejects_traversal() {
+        assert!(MarketplaceName::new("../etc").is_err());
+        assert!(MarketplaceName::new("..").is_err());
+    }
+
+    #[test]
+    fn marketplace_name_new_rejects_nul_byte() {
+        assert!(MarketplaceName::new("foo\0bar").is_err());
+    }
+
+    #[test]
+    fn marketplace_name_partial_eq_against_str_and_ref_str() {
+        let name = MarketplaceName::new("mp").expect("valid");
+        assert_eq!(name, *"mp");
+        assert_eq!(name, "mp");
+    }
+
+    #[test]
+    fn marketplace_name_accessors_round_trip() {
+        let name = MarketplaceName::new("mp").expect("valid");
+        let s = name.clone().into_inner();
+        assert_eq!(s, "mp");
+        assert_eq!(name.as_str(), "mp");
+    }
+
+    #[derive(Debug, serde::Deserialize)]
+    struct MarketplaceNameWrapper {
+        name: MarketplaceName,
+    }
+
+    #[test]
+    fn deserialize_marketplace_name_accepts_valid() {
+        let w: MarketplaceNameWrapper =
+            serde_json::from_str(r#"{"name":"kiro-starter-kit"}"#).expect("valid");
+        assert_eq!(w.name.as_str(), "kiro-starter-kit");
+    }
+
+    #[test]
+    fn deserialize_marketplace_name_rejects_traversal() {
+        let result: Result<MarketplaceNameWrapper, _> =
+            serde_json::from_str(r#"{"name":"../etc"}"#);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn deserialize_marketplace_name_rejects_empty() {
+        let result: Result<MarketplaceNameWrapper, _> = serde_json::from_str(r#"{"name":""}"#);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn serialize_marketplace_name_is_transparent_string() {
+        let name = MarketplaceName::new("mp").expect("valid");
+        let json = serde_json::to_string(&name).expect("serialize");
+        assert_eq!(json, r#""mp""#);
+    }
+
+    #[test]
+    fn marketplace_name_round_trips_through_serde_json() {
+        let name = MarketplaceName::new("kiro-starter-kit").expect("valid");
+        let json = serde_json::to_string(&name).expect("serialize");
+        let parsed: MarketplaceName = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(parsed, name);
+    }
+
+    #[test]
+    fn marketplace_name_ord_is_lexicographic_on_inner() {
+        let a = MarketplaceName::new("alpha").expect("valid");
+        let b = MarketplaceName::new("bravo").expect("valid");
+        assert!(a < b);
+    }
+
+    #[test]
+    fn marketplace_name_ord_matches_inner_string_ord() {
+        let a = MarketplaceName::new("alpha").expect("valid");
+        let b = MarketplaceName::new("bravo").expect("valid");
+        assert_eq!(
+            a.cmp(&b),
+            a.as_str().cmp(b.as_str()),
+            "MarketplaceName::cmp must match inner String::cmp byte-for-byte"
+        );
+    }
+
+    // ──── PluginName ────────────────────────────────────────────────────
+
+    #[test]
+    fn plugin_name_new_accepts_valid() {
+        let name = PluginName::new("kiro-code-reviewer").expect("valid");
+        assert_eq!(name.as_str(), "kiro-code-reviewer");
+    }
+
+    #[test]
+    fn plugin_name_new_rejects_empty() {
+        assert!(PluginName::new("").is_err());
+    }
+
+    #[test]
+    fn plugin_name_new_rejects_traversal() {
+        assert!(PluginName::new("../etc").is_err());
+    }
+
+    #[test]
+    fn plugin_name_new_rejects_nul_byte() {
+        assert!(PluginName::new("foo\0bar").is_err());
+    }
+
+    #[test]
+    fn plugin_name_partial_eq_against_str_and_ref_str() {
+        let name = PluginName::new("p").expect("valid");
+        assert_eq!(name, *"p");
+        assert_eq!(name, "p");
+    }
+
+    #[derive(Debug, serde::Deserialize)]
+    struct PluginNameWrapper {
+        name: PluginName,
+    }
+
+    #[test]
+    fn deserialize_plugin_name_accepts_valid() {
+        let w: PluginNameWrapper =
+            serde_json::from_str(r#"{"name":"kiro-code-reviewer"}"#).expect("valid");
+        assert_eq!(w.name.as_str(), "kiro-code-reviewer");
+    }
+
+    #[test]
+    fn deserialize_plugin_name_rejects_traversal() {
+        let result: Result<PluginNameWrapper, _> = serde_json::from_str(r#"{"name":"../etc"}"#);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn serialize_plugin_name_is_transparent_string() {
+        let name = PluginName::new("p").expect("valid");
+        let json = serde_json::to_string(&name).expect("serialize");
+        assert_eq!(json, r#""p""#);
+    }
+
+    // The five tests below mirror the corresponding `marketplace_name_*`
+    // tests at lines 991, 1018, 1031, 1039, 1046. PR #95's review
+    // (finding I4) flagged the asymmetry: PluginName lacked parallel
+    // accessor / empty-deserialize / round-trip / Ord coverage, which
+    // would let a regression slip through one type but not the other.
+    // The Ord lock in particular is load-bearing: if `PluginName` ever
+    // becomes a `BTreeMap` key (it isn't today, but `MarketplaceName`
+    // already is), an inconsistent comparator would silently misorder
+    // entries. Locking the contract symmetrically prevents that.
+
+    #[test]
+    fn plugin_name_accessors_round_trip() {
+        let name = PluginName::new("p").expect("valid");
+        let s = name.clone().into_inner();
+        assert_eq!(s, "p");
+        assert_eq!(name.as_str(), "p");
+    }
+
+    #[test]
+    fn deserialize_plugin_name_rejects_empty() {
+        let result: Result<PluginNameWrapper, _> = serde_json::from_str(r#"{"name":""}"#);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn plugin_name_round_trips_through_serde_json() {
+        let name = PluginName::new("kiro-code-reviewer").expect("valid");
+        let json = serde_json::to_string(&name).expect("serialize");
+        let parsed: PluginName = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(parsed, name);
+    }
+
+    #[test]
+    fn plugin_name_ord_is_lexicographic_on_inner() {
+        let a = PluginName::new("alpha").expect("valid");
+        let b = PluginName::new("bravo").expect("valid");
+        assert!(a < b);
+    }
+
+    #[test]
+    fn plugin_name_ord_matches_inner_string_ord() {
+        let a = PluginName::new("alpha").expect("valid");
+        let b = PluginName::new("bravo").expect("valid");
+        assert_eq!(
+            a.cmp(&b),
+            a.as_str().cmp(b.as_str()),
+            "PluginName::cmp must match inner String::cmp byte-for-byte"
+        );
     }
 }

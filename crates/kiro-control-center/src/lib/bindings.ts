@@ -508,6 +508,14 @@ export type InstallOutcomeKind =
  *  Empty `installed` / `failed` vecs on a sub-result indicate "this
  *  content type was attempted with nothing to do" — distinct from a
  *  missing field.
+ * 
+ *  Phase 1.5 (A1+A4): the `marketplace` and `plugin` fields are typed
+ *  newtypes (`MarketplaceName` / `PluginName`) — `serde(transparent)`
+ *  in the wire format, so the JSON shape stays plain strings while the
+ *  in-memory contract is parse-don't-validate. `Default` is intentionally
+ *  not derived: the newtypes don't derive `Default`, and no consumer
+ *  constructs an `InstallPluginResult::default()` — `install_plugin` is
+ *  the only origin and always populates every field.
  */
 export type InstallPluginResult = InstallPluginResult_Serialize | InstallPluginResult_Deserialize;
 
@@ -523,9 +531,18 @@ export type InstallPluginResult = InstallPluginResult_Serialize | InstallPluginR
  *  Empty `installed` / `failed` vecs on a sub-result indicate "this
  *  content type was attempted with nothing to do" — distinct from a
  *  missing field.
+ * 
+ *  Phase 1.5 (A1+A4): the `marketplace` and `plugin` fields are typed
+ *  newtypes (`MarketplaceName` / `PluginName`) — `serde(transparent)`
+ *  in the wire format, so the JSON shape stays plain strings while the
+ *  in-memory contract is parse-don't-validate. `Default` is intentionally
+ *  not derived: the newtypes don't derive `Default`, and no consumer
+ *  constructs an `InstallPluginResult::default()` — `install_plugin` is
+ *  the only origin and always populates every field.
  */
 export type InstallPluginResult_Deserialize = {
-	plugin: string,
+	marketplace: MarketplaceName,
+	plugin: PluginName,
 	version: string | null,
 	skills: InstallSkillsResult,
 	steering: InstallSteeringResult_Deserialize,
@@ -544,9 +561,18 @@ export type InstallPluginResult_Deserialize = {
  *  Empty `installed` / `failed` vecs on a sub-result indicate "this
  *  content type was attempted with nothing to do" — distinct from a
  *  missing field.
+ * 
+ *  Phase 1.5 (A1+A4): the `marketplace` and `plugin` fields are typed
+ *  newtypes (`MarketplaceName` / `PluginName`) — `serde(transparent)`
+ *  in the wire format, so the JSON shape stays plain strings while the
+ *  in-memory contract is parse-don't-validate. `Default` is intentionally
+ *  not derived: the newtypes don't derive `Default`, and no consumer
+ *  constructs an `InstallPluginResult::default()` — `install_plugin` is
+ *  the only origin and always populates every field.
  */
 export type InstallPluginResult_Serialize = {
-	plugin: string,
+	marketplace: MarketplaceName,
+	plugin: PluginName,
 	version: string | null,
 	skills: InstallSkillsResult,
 	steering: InstallSteeringResult_Serialize,
@@ -673,8 +699,8 @@ export type InstalledNativeCompanionsOutcome = {
  *  (specta's chrono feature isn't enabled in this crate).
  */
 export type InstalledPluginInfo = {
-	marketplace: string,
-	plugin: string,
+	marketplace: MarketplaceName,
+	plugin: PluginName,
 	installed_version: string | null,
 	skill_count: number,
 	steering_count: number,
@@ -774,6 +800,26 @@ export type MarketplaceInfo = {
 	load_error: string | null,
 };
 
+/**
+ *  Validated marketplace name. Routes through [`validate_name`] at construction
+ *  — non-empty, no NUL/control bytes, no path-traversal, no Windows-reserved
+ *  names. The `serde(transparent)` representation keeps the JSON wire format
+ *  byte-identical to a plain string; `Deserialize` is routed through `new` so
+ *  `serde_json::from_slice` rejects malformed names at parse time.
+ * 
+ *  Deliberately does NOT derive `Default` — `MarketplaceName::default()` would
+ *  return `MarketplaceName(String::new())` which `validate_name` rejects.
+ *  Matches the existing `RelativePath` / `AgentName` / `GitRef` precedent.
+ * 
+ *  `Ord`/`PartialOrd` are derived for use as `BTreeMap` keys in
+ *  `installed_plugins`'s aggregator (see `project.rs`). Lexicographic ordering
+ *  on the inner string is well-defined and semantically equivalent to
+ *  `String`'s ordering. Deviates from `RelativePath` / `AgentName` / `GitRef`
+ *  (which don't derive `Ord`) because none of those types are used as map keys
+ *  today.
+ */
+export type MarketplaceName = string;
+
 // How a registered marketplace's contents are stored on disk.
 export type MarketplaceStorage = 
 // Cloned from a remote git repository.
@@ -859,6 +905,12 @@ export type PluginInfo = {
 	skill_count: SkillCount,
 	source_type: SourceType,
 };
+
+/**
+ *  Validated plugin name. Same shape as [`MarketplaceName`]; see that type's
+ *  documentation for the construction, serde, and Ord-derive contracts.
+ */
+export type PluginName = string;
 
 /**
  *  Result of [`MarketplaceService::list_skills_for_plugin`]. Mirrors

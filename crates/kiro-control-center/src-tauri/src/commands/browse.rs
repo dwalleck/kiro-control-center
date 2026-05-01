@@ -13,7 +13,7 @@ use kiro_market_core::service::{
     BulkSkillsResult, InstallFilter, InstallMode, InstallSkillsResult, MarketplaceService,
     PluginSkillsResult, SkillCount,
 };
-use kiro_market_core::validation::validate_name;
+use kiro_market_core::validation::{MarketplaceName, PluginName};
 
 use crate::commands::{make_service, validate_kiro_project_path};
 use crate::error::{CommandError, ErrorType};
@@ -109,11 +109,14 @@ pub async fn list_marketplaces() -> Result<Vec<MarketplaceInfo>, CommandError> {
 #[tauri::command]
 #[specta::specta]
 pub async fn list_plugins(marketplace: String) -> Result<Vec<PluginInfo>, CommandError> {
-    validate_name(&marketplace)?;
+    let marketplace = MarketplaceName::new(marketplace)?;
     let svc = make_service()?;
-    let marketplace_path = svc.marketplace_path(&marketplace);
+    // Phase 1.5: `marketplace_path` and `list_plugin_entries` remain
+    // `&str`-typed by design — only the install API migrates to the
+    // newtypes. The `as_str()` bridges below are permanent.
+    let marketplace_path = svc.marketplace_path(marketplace.as_str());
     let plugin_entries = svc
-        .list_plugin_entries(&marketplace)
+        .list_plugin_entries(marketplace.as_str())
         .map_err(CommandError::from)?;
 
     let mut results = Vec::with_capacity(plugin_entries.len());
@@ -138,6 +141,17 @@ pub async fn list_plugins(marketplace: String) -> Result<Vec<PluginInfo>, Comman
 /// per-skill failures vanished into `warn!` logs, leaving the frontend to
 /// wonder why the count shrank; surfacing them structurally lets the UI
 /// show "N skills failed to load" with a drill-down.
+///
+/// The IPC-boundary [`MarketplaceName::new`] / [`PluginName::new`]
+/// constructors plus [`validate_kiro_project_path`] gate the wrapper
+/// before any service or filesystem access. Without these guards a
+/// frontend-supplied `marketplace = "../etc/passwd"` would reach
+/// [`MarketplaceService::marketplace_path`] (`cache::marketplace_path`)
+/// via a bare path join and force an FS read at
+/// `<registries_dir>/../etc/passwd` — the read-side analogue of the
+/// install-side hardening from PR #94's I10. Validation runs *before*
+/// [`make_service`] so rejection paths never touch `$HOME` / the cache
+/// directory.
 #[tauri::command]
 #[specta::specta]
 pub async fn list_available_skills(
@@ -145,10 +159,16 @@ pub async fn list_available_skills(
     plugin: String,
     project_path: String,
 ) -> Result<PluginSkillsResult, CommandError> {
+    let project_root = validate_kiro_project_path(&project_path)?;
+    let marketplace = MarketplaceName::new(marketplace)?;
+    let plugin = PluginName::new(plugin)?;
     let svc = make_service()?;
-    let project = KiroProject::new(PathBuf::from(&project_path));
+    // Phase 1.5: `list_skills_for_plugin` keeps its `&str` signature by
+    // design (only the install API migrates to newtypes). The `as_str()`
+    // bridges below are permanent.
+    let project = KiroProject::new(project_root);
     let installed = load_installed_or_error(&project, &project_path)?;
-    svc.list_skills_for_plugin(&marketplace, &plugin, &installed)
+    svc.list_skills_for_plugin(marketplace.as_str(), plugin.as_str(), &installed)
         .map_err(CommandError::from)
 }
 
@@ -159,16 +179,23 @@ pub async fn list_available_skills(
 /// plugin filter is active. The returned [`BulkSkillsResult::skipped`]
 /// carries plugin-level errors (missing directory, malformed manifest,
 /// remote source) so the frontend can surface a partial-listing warning.
+///
+/// The IPC-boundary [`MarketplaceName::new`] plus
+/// [`validate_kiro_project_path`] gate the wrapper before any service or
+/// filesystem access — same defense-in-depth contract as
+/// [`list_available_skills`].
 #[tauri::command]
 #[specta::specta]
 pub async fn list_all_skills_for_marketplace(
     marketplace: String,
     project_path: String,
 ) -> Result<BulkSkillsResult, CommandError> {
+    let project_root = validate_kiro_project_path(&project_path)?;
+    let marketplace = MarketplaceName::new(marketplace)?;
     let svc = make_service()?;
-    let project = KiroProject::new(PathBuf::from(&project_path));
+    let project = KiroProject::new(project_root);
     let installed = load_installed_or_error(&project, &project_path)?;
-    svc.list_all_skills(&marketplace, &installed)
+    svc.list_all_skills(marketplace.as_str(), &installed)
         .map_err(CommandError::from)
 }
 
@@ -212,11 +239,11 @@ fn install_skills_impl(
     mode: InstallMode,
     project_path: &str,
 ) -> Result<InstallSkillsResult, CommandError> {
-    validate_name(marketplace)?;
-    validate_name(plugin)?;
     let project_root = validate_kiro_project_path(project_path)?;
+    let marketplace = MarketplaceName::new(marketplace)?;
+    let plugin = PluginName::new(plugin)?;
     let ctx = svc
-        .resolve_plugin_install_context(marketplace, plugin)
+        .resolve_plugin_install_context(&marketplace, &plugin)
         .map_err(CommandError::from)?;
     let project = KiroProject::new(project_root);
     Ok(svc.install_skills(
@@ -224,8 +251,8 @@ fn install_skills_impl(
         &ctx.skill_dirs,
         &InstallFilter::Names(skills),
         mode,
-        marketplace,
-        plugin,
+        &marketplace,
+        &plugin,
         ctx.version.as_deref(),
     ))
 }
@@ -631,6 +658,114 @@ mod tests {
         )
         .expect_err("remote source must refuse local install");
 
+        assert_eq!(err.error_type, ErrorType::Validation);
+    }
+
+    // -----------------------------------------------------------------------
+    // install_skills_impl — IPC-boundary newtype rejection (I2 from PR #95
+    // 8-reviewer review). Mirrors the `install_plugin_impl` rejection tests
+    // in `commands/plugins.rs::tests` so each `_impl` siblings the same
+    // adversarial coverage; without this every newtype constructor we add
+    // would only be exercised on one of the four install paths.
+    // -----------------------------------------------------------------------
+
+    /// FE-supplied `marketplace = "../etc/passwd"` would otherwise reach
+    /// `cache::marketplace_path(marketplace)` and force an FS read at
+    /// `<registries_dir>/../etc/passwd`. The IPC-boundary
+    /// `MarketplaceName::new` constructor rejects it before the service
+    /// ever runs.
+    #[test]
+    fn install_skills_impl_rejects_traversal_in_marketplace() {
+        let (dir, svc) = temp_service();
+        let project_path = make_kiro_project(dir.path());
+        let err = install_skills_impl(
+            &svc,
+            "../etc/passwd",
+            "myplugin",
+            &[],
+            InstallMode::New,
+            &project_path,
+        )
+        .expect_err("traversal in marketplace must error");
+        assert_eq!(err.error_type, ErrorType::Validation);
+    }
+
+    /// NUL bytes truncate C-string conversions in syscalls; the
+    /// IPC-boundary `PluginName::new` constructor must reject them
+    /// before they reach `cache::plugin_registry_path`.
+    #[test]
+    fn install_skills_impl_rejects_nul_byte_in_plugin() {
+        let (dir, svc) = temp_service();
+        let project_path = make_kiro_project(dir.path());
+        let err = install_skills_impl(
+            &svc,
+            "mp1",
+            "evil\0plugin",
+            &[],
+            InstallMode::New,
+            &project_path,
+        )
+        .expect_err("NUL byte in plugin name must error");
+        assert_eq!(err.error_type, ErrorType::Validation);
+    }
+
+    // -----------------------------------------------------------------------
+    // list_available_skills / list_all_skills_for_marketplace — IPC-boundary
+    // newtype rejection (I1 follow-on from PR #95 review). The Phase 1.5
+    // wrappers were the only `String`-typed marketplace/plugin entry points
+    // that bypassed validation; these tests pin the rejection behaviour now
+    // that `MarketplaceName::new` / `PluginName::new` gate the wrapper.
+    // -----------------------------------------------------------------------
+
+    /// `list_available_skills` reaches `MarketplaceService::marketplace_path`
+    /// (cache::marketplace_path) via a bare path join. Without the
+    /// IPC-boundary `MarketplaceName::new` guard, `marketplace = "../etc"`
+    /// would force an FS read outside the cache root.
+    #[tokio::test]
+    async fn list_available_skills_rejects_traversal_in_marketplace() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let project_path = make_kiro_project(dir.path());
+        let err = list_available_skills("../etc".to_string(), "myplugin".to_string(), project_path)
+            .await
+            .expect_err("traversal in marketplace must error");
+        assert_eq!(err.error_type, ErrorType::Validation);
+    }
+
+    /// NUL bytes truncate C-string conversions in syscalls; the IPC-boundary
+    /// `PluginName::new` guard must reject them before they reach
+    /// `list_skills_for_plugin`.
+    #[tokio::test]
+    async fn list_available_skills_rejects_nul_byte_in_plugin() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let project_path = make_kiro_project(dir.path());
+        let err =
+            list_available_skills("mp1".to_string(), "evil\0plugin".to_string(), project_path)
+                .await
+                .expect_err("NUL byte in plugin must error");
+        assert_eq!(err.error_type, ErrorType::Validation);
+    }
+
+    /// Bulk listing must reject a traversal marketplace name before the
+    /// service iterates plugin entries; mirrors the per-plugin variant.
+    #[tokio::test]
+    async fn list_all_skills_for_marketplace_rejects_traversal_in_marketplace() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let project_path = make_kiro_project(dir.path());
+        let err = list_all_skills_for_marketplace("../etc".to_string(), project_path)
+            .await
+            .expect_err("traversal in marketplace must error");
+        assert_eq!(err.error_type, ErrorType::Validation);
+    }
+
+    /// Bulk listing only takes a marketplace name (no per-plugin arg);
+    /// the NUL-byte adversarial case targets that single string field.
+    #[tokio::test]
+    async fn list_all_skills_for_marketplace_rejects_nul_byte_in_marketplace() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let project_path = make_kiro_project(dir.path());
+        let err = list_all_skills_for_marketplace("evil\0mp".to_string(), project_path)
+            .await
+            .expect_err("NUL byte in marketplace must error");
         assert_eq!(err.error_type, ErrorType::Validation);
     }
 }

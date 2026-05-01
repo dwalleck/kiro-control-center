@@ -371,8 +371,8 @@ pub struct AgentInstallContext<'a> {
     /// servers (subprocess / network capability). Default-deny; flip via
     /// `--accept-mcp` or its frontend equivalent.
     pub accept_mcp: bool,
-    pub marketplace: &'a str,
-    pub plugin: &'a str,
+    pub marketplace: &'a crate::validation::MarketplaceName,
+    pub plugin: &'a crate::validation::PluginName,
     pub version: Option<&'a str>,
 }
 
@@ -427,10 +427,19 @@ pub struct InstallAgentsResult {
 /// Empty `installed` / `failed` vecs on a sub-result indicate "this
 /// content type was attempted with nothing to do" — distinct from a
 /// missing field.
-#[derive(Debug, Default, Serialize)]
+///
+/// Phase 1.5 (A1+A4): the `marketplace` and `plugin` fields are typed
+/// newtypes (`MarketplaceName` / `PluginName`) — `serde(transparent)`
+/// in the wire format, so the JSON shape stays plain strings while the
+/// in-memory contract is parse-don't-validate. `Default` is intentionally
+/// not derived: the newtypes don't derive `Default`, and no consumer
+/// constructs an `InstallPluginResult::default()` — `install_plugin` is
+/// the only origin and always populates every field.
+#[derive(Debug, Serialize)]
 #[cfg_attr(feature = "specta", derive(specta::Type))]
 pub struct InstallPluginResult {
-    pub plugin: String,
+    pub marketplace: crate::validation::MarketplaceName,
+    pub plugin: crate::validation::PluginName,
     pub version: Option<String>,
     pub skills: InstallSkillsResult,
     pub steering: crate::steering::InstallSteeringResult,
@@ -1053,8 +1062,8 @@ impl MarketplaceService {
         skill_dirs: &[PathBuf],
         filter: &InstallFilter<'_>,
         mode: InstallMode,
-        marketplace: &str,
-        plugin: &str,
+        marketplace: &crate::validation::MarketplaceName,
+        plugin: &crate::validation::PluginName,
         version: Option<&str>,
     ) -> InstallSkillsResult {
         let mut result = InstallSkillsResult::default();
@@ -1071,7 +1080,7 @@ impl MarketplaceService {
                         "failed to read SKILL.md, skipping"
                     );
                     result.skipped_skills.push(browse::SkippedSkill {
-                        plugin: plugin.to_owned(),
+                        plugin: plugin.as_str().to_owned(),
                         name_hint: browse::name_hint_from_skill_dir(skill_dir),
                         path: skill_md_path,
                         reason: browse::SkippedSkillReason::ReadFailed {
@@ -1091,7 +1100,7 @@ impl MarketplaceService {
                         "failed to parse SKILL.md frontmatter, skipping"
                     );
                     result.skipped_skills.push(browse::SkippedSkill {
-                        plugin: plugin.to_owned(),
+                        plugin: plugin.as_str().to_owned(),
                         name_hint: browse::name_hint_from_skill_dir(skill_dir),
                         path: skill_md_path,
                         reason: browse::SkippedSkillReason::FrontmatterInvalid {
@@ -1108,8 +1117,8 @@ impl MarketplaceService {
             processed.insert(frontmatter.name.clone());
 
             let meta = crate::project::InstalledSkillMeta {
-                marketplace: marketplace.to_owned(),
-                plugin: plugin.to_owned(),
+                marketplace: marketplace.clone(),
+                plugin: plugin.clone(),
                 version: version.map(str::to_owned),
                 installed_at: chrono::Utc::now(),
                 source_hash: None,
@@ -1149,10 +1158,10 @@ impl MarketplaceService {
         if let InstallFilter::Names(requested) = *filter {
             for name in requested {
                 if !processed.contains(name) {
-                    warn!(skill = %name, plugin = %plugin, "requested skill not found in plugin");
+                    warn!(skill = %name, plugin = %plugin.as_str(), "requested skill not found in plugin");
                     result.failed.push(FailedSkill::requested_but_not_found(
                         name.clone(),
-                        plugin.to_owned(),
+                        plugin.as_str().to_owned(),
                     ));
                 }
             }
@@ -1508,8 +1517,8 @@ impl MarketplaceService {
             }
 
             let meta = crate::project::InstalledAgentMeta {
-                marketplace: ctx.marketplace.to_string(),
-                plugin: ctx.plugin.to_string(),
+                marketplace: ctx.marketplace.clone(),
+                plugin: ctx.plugin.clone(),
                 version: ctx.version.map(String::from),
                 installed_at: chrono::Utc::now(),
                 dialect: def.dialect,
@@ -1946,8 +1955,8 @@ impl MarketplaceService {
     pub fn install_plugin(
         &self,
         project: &crate::project::KiroProject,
-        marketplace: &str,
-        plugin: &str,
+        marketplace: &crate::validation::MarketplaceName,
+        plugin: &crate::validation::PluginName,
         mode: InstallMode,
         accept_mcp: bool,
     ) -> Result<InstallPluginResult, Error> {
@@ -1990,7 +1999,8 @@ impl MarketplaceService {
         );
 
         Ok(InstallPluginResult {
-            plugin: plugin.to_string(),
+            marketplace: marketplace.clone(),
+            plugin: plugin.clone(),
             version: ctx.version,
             skills,
             steering,
@@ -2045,6 +2055,7 @@ mod tests {
     use crate::cache::CacheDir;
     use crate::error::GitError;
     use crate::git::CloneOptions;
+    use crate::service::test_support::{mp, pn};
 
     #[test]
     fn install_warning_unmapped_tool_renders_with_reason() {
@@ -2192,8 +2203,8 @@ mod tests {
             AgentInstallContext {
                 mode: InstallMode::New,
                 accept_mcp: false, // existing fixtures don't carry MCP servers
-                marketplace: "mp",
-                plugin: "plugin-x",
+                marketplace: &mp("mp"),
+                plugin: &pn("plugin-x"),
                 version: None,
             },
         );
@@ -2271,8 +2282,8 @@ mod tests {
             AgentInstallContext {
                 mode: InstallMode::New,
                 accept_mcp: false,
-                marketplace: "mp",
-                plugin: "p",
+                marketplace: &mp("mp"),
+                plugin: &pn("p"),
                 version: None,
             },
         );
@@ -2319,8 +2330,8 @@ mod tests {
             AgentInstallContext {
                 mode: InstallMode::New,
                 accept_mcp: false,
-                marketplace: "mp",
-                plugin: "p",
+                marketplace: &mp("mp"),
+                plugin: &pn("p"),
                 version: None,
             },
         );
@@ -2374,8 +2385,8 @@ mod tests {
             AgentInstallContext {
                 mode: InstallMode::New,
                 accept_mcp: false,
-                marketplace: "mp",
-                plugin: "p",
+                marketplace: &mp("mp"),
+                plugin: &pn("p"),
                 version: None,
             },
         );
@@ -2423,8 +2434,8 @@ mod tests {
             AgentInstallContext {
                 mode: InstallMode::New,
                 accept_mcp: false, // gate must fire
-                marketplace: "mp",
-                plugin: "p",
+                marketplace: &mp("mp"),
+                plugin: &pn("p"),
                 version: None,
             },
         );
@@ -2478,8 +2489,8 @@ mod tests {
             AgentInstallContext {
                 mode: InstallMode::New,
                 accept_mcp: true, // gate is bypassed
-                marketplace: "mp",
-                plugin: "p",
+                marketplace: &mp("mp"),
+                plugin: &pn("p"),
                 version: None,
             },
         );
@@ -2547,8 +2558,8 @@ mod tests {
             AgentInstallContext {
                 mode: InstallMode::New,
                 accept_mcp: false,
-                marketplace: "mp",
-                plugin: "p",
+                marketplace: &mp("mp"),
+                plugin: &pn("p"),
                 version: None,
             },
         );
@@ -2603,8 +2614,8 @@ mod tests {
             AgentInstallContext {
                 mode: InstallMode::Force, // force, but...
                 accept_mcp: false,        // accept_mcp = false should still gate
-                marketplace: "mp",
-                plugin: "p",
+                marketplace: &mp("mp"),
+                plugin: &pn("p"),
                 version: None,
             },
         );
@@ -2644,8 +2655,8 @@ mod tests {
             AgentInstallContext {
                 mode: InstallMode::New,
                 accept_mcp: false,
-                marketplace: "mp",
-                plugin: "p",
+                marketplace: &mp("mp"),
+                plugin: &pn("p"),
                 version: None,
             },
         );
@@ -2661,8 +2672,8 @@ mod tests {
             AgentInstallContext {
                 mode: InstallMode::New,
                 accept_mcp: false,
-                marketplace: "mp",
-                plugin: "p",
+                marketplace: &mp("mp"),
+                plugin: &pn("p"),
                 version: None,
             },
         );
@@ -2700,8 +2711,8 @@ mod tests {
             AgentInstallContext {
                 mode: InstallMode::New,
                 accept_mcp: false,
-                marketplace: "mp",
-                plugin: "p",
+                marketplace: &mp("mp"),
+                plugin: &pn("p"),
                 version: Some("1.0.0"),
             },
         );
@@ -2724,8 +2735,8 @@ mod tests {
             AgentInstallContext {
                 mode: InstallMode::Force,
                 accept_mcp: false,
-                marketplace: "mp",
-                plugin: "p",
+                marketplace: &mp("mp"),
+                plugin: &pn("p"),
                 version: Some("2.0.0"),
             },
         );
@@ -2790,8 +2801,8 @@ mod tests {
             AgentInstallContext {
                 mode: InstallMode::New,
                 accept_mcp: false,
-                marketplace: "mp",
-                plugin: "p",
+                marketplace: &mp("mp"),
+                plugin: &pn("p"),
                 version: None,
             },
         );
@@ -2852,8 +2863,8 @@ mod tests {
             AgentInstallContext {
                 mode: InstallMode::New,
                 accept_mcp: false, // fixture has no MCP servers
-                marketplace: "marketplace-x",
-                plugin: "p",
+                marketplace: &mp("marketplace-x"),
+                plugin: &pn("p"),
                 version: None,
             },
         );
@@ -2921,8 +2932,8 @@ mod tests {
             AgentInstallContext {
                 mode: InstallMode::New,
                 accept_mcp: false, // gate fires
-                marketplace: "m",
-                plugin: "p",
+                marketplace: &mp("m"),
+                plugin: &pn("p"),
                 version: None,
             },
         );
@@ -2981,8 +2992,8 @@ mod tests {
             AgentInstallContext {
                 mode: InstallMode::New,
                 accept_mcp: false,
-                marketplace: "m",
-                plugin: "p",
+                marketplace: &mp("m"),
+                plugin: &pn("p"),
                 version: None,
             },
         );
@@ -3119,10 +3130,12 @@ mod tests {
         let project = crate::project::KiroProject::new(project_tmp.path().to_path_buf());
 
         let scan_paths = vec!["./steering/".to_string()];
+        let mp_name = crate::service::test_support::mp("marketplace-x");
+        let pn_name = crate::service::test_support::pn("p");
         let ctx = crate::steering::SteeringInstallContext {
             mode: InstallMode::New,
-            marketplace: "marketplace-x",
-            plugin: "p",
+            marketplace: &mp_name,
+            plugin: &pn_name,
             version: None,
         };
 
@@ -3179,10 +3192,12 @@ mod tests {
         // the legitimate one still installs, the traversal surfaces as
         // a warning without aborting the batch.
         let scan_paths = vec!["./steering/".to_string(), "../escape/".to_string()];
+        let mp_name = crate::service::test_support::mp("m");
+        let pn_name = crate::service::test_support::pn("p");
         let ctx = crate::steering::SteeringInstallContext {
             mode: InstallMode::New,
-            marketplace: "m",
-            plugin: "p",
+            marketplace: &mp_name,
+            plugin: &pn_name,
             version: None,
         };
 
@@ -3249,10 +3264,12 @@ mod tests {
         let project = crate::project::KiroProject::new(project_tmp.path().to_path_buf());
 
         let scan_paths = vec!["./a/".to_string(), "./b/".to_string()];
+        let mp_name = crate::service::test_support::mp("m");
+        let pn_name = crate::service::test_support::pn("p");
         let ctx = crate::steering::SteeringInstallContext {
             mode: InstallMode::New,
-            marketplace: "m",
-            plugin: "p",
+            marketplace: &mp_name,
+            plugin: &pn_name,
             version: None,
         };
 
@@ -4481,8 +4498,8 @@ mod tests {
             &skill_dirs,
             &InstallFilter::All,
             InstallMode::New,
-            "mp1",
-            "plug1",
+            &mp("mp1"),
+            &pn("plug1"),
             None,
         );
 
@@ -4530,8 +4547,8 @@ mod tests {
             &[only_dir],
             &InstallFilter::Names(&requested),
             InstallMode::New,
-            "mp1",
-            "plug1",
+            &mp("mp1"),
+            &pn("plug1"),
             None,
         );
 
@@ -4622,8 +4639,8 @@ mod tests {
             std::slice::from_ref(&skill_dir),
             &InstallFilter::All,
             InstallMode::New,
-            "mp1",
-            "plug1",
+            &mp("mp1"),
+            &pn("plug1"),
             None,
         );
         // Restore permissions BEFORE assertions so tempdir cleanup can
@@ -4685,8 +4702,8 @@ mod tests {
             &[skill_dir],
             &InstallFilter::All,
             InstallMode::New,
-            "mp1",
-            "plug1",
+            &mp("mp1"),
+            &pn("plug1"),
             None,
         );
 
@@ -4751,9 +4768,10 @@ mod tests {
         let project = KiroProject::new(project_dir.path().to_path_buf());
 
         let result = svc
-            .install_plugin(&project, "mp", "p", InstallMode::New, false)
+            .install_plugin(&project, &mp("mp"), &pn("p"), InstallMode::New, false)
             .expect("install_plugin happy path");
 
+        assert_eq!(result.marketplace, "mp");
         assert_eq!(result.plugin, "p");
         assert_eq!(result.version.as_deref(), Some("1.0.0"));
         assert_eq!(result.skills.installed, vec!["alpha".to_string()]);
@@ -4776,17 +4794,30 @@ mod tests {
     /// serialize as nested objects, never as `null` or missing keys.
     /// Frontend code that branches on `result.skills.installed.length`
     /// relies on this shape.
+    ///
+    /// Phase 1.5 (A4): also pins that the new `marketplace` field
+    /// serializes as a plain string via `serde(transparent)` on
+    /// `MarketplaceName`, and that `plugin` likewise stays a plain
+    /// string after the `String` -> `PluginName` swap.
     #[test]
     fn install_plugin_result_json_shape_locks_default_subresults() {
         let result = InstallPluginResult {
-            plugin: "p".into(),
+            marketplace: mp("mp"),
+            plugin: pn("p"),
             version: Some("1.0.0".into()),
             skills: InstallSkillsResult::default(),
             steering: crate::steering::InstallSteeringResult::default(),
             agents: InstallAgentsResult::default(),
         };
         let json = serde_json::to_value(&result).expect("serialize");
-        assert_eq!(json["plugin"], "p");
+        assert_eq!(
+            json["marketplace"], "mp",
+            "MarketplaceName is serde(transparent); wire format must be a plain string"
+        );
+        assert_eq!(
+            json["plugin"], "p",
+            "PluginName is serde(transparent); wire format must be a plain string"
+        );
         assert_eq!(json["version"], "1.0.0");
         assert!(
             json["skills"].is_object(),
@@ -4812,7 +4843,8 @@ mod tests {
     #[test]
     fn install_plugin_result_json_shape_with_populated_subresult() {
         let result = InstallPluginResult {
-            plugin: "p".into(),
+            marketplace: mp("mp"),
+            plugin: pn("p"),
             version: Some("1.0.0".into()),
             skills: InstallSkillsResult {
                 installed: vec!["alpha".into()],
@@ -4834,5 +4866,11 @@ mod tests {
                 .map(Vec::len),
             Some(1),
         );
+        // A4: marketplace field serializes as a plain string via
+        // serde(transparent) — pin alongside a populated sub-result so
+        // a future regression that breaks ordering or transparency
+        // surfaces in this test, not just the default-shape lock.
+        assert_eq!(json["marketplace"], "mp");
+        assert_eq!(json["plugin"], "p");
     }
 }

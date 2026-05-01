@@ -43,8 +43,8 @@ pub async fn list_installed_skills(
         .into_iter()
         .map(|(name, meta)| InstalledSkillInfo {
             name,
-            marketplace: meta.marketplace,
-            plugin: meta.plugin,
+            marketplace: meta.marketplace.into_inner(),
+            plugin: meta.plugin.into_inner(),
             version: meta.version,
             installed_at: meta.installed_at.to_rfc3339(),
         })
@@ -73,6 +73,7 @@ pub async fn remove_skill(name: String, project_path: String) -> Result<(), Comm
 mod tests {
     use chrono::Utc;
     use kiro_market_core::project::{InstalledSkillMeta, KiroProject};
+    use kiro_market_core::validation::{MarketplaceName, PluginName};
 
     use super::*;
 
@@ -80,8 +81,8 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let project = KiroProject::new(dir.path().to_path_buf());
         let meta = InstalledSkillMeta {
-            marketplace: "test-market".into(),
-            plugin: "test-plugin".into(),
+            marketplace: MarketplaceName::new("test-market").expect("valid marketplace"),
+            plugin: PluginName::new("test-plugin").expect("valid plugin"),
             version: Some("1.0.0".into()),
             installed_at: Utc::now(),
             source_hash: None,
@@ -108,8 +109,8 @@ mod tests {
 
         for name in &["zulu-skill", "alpha-skill", "mike-skill"] {
             let meta = InstalledSkillMeta {
-                marketplace: "test-market".into(),
-                plugin: "test-plugin".into(),
+                marketplace: MarketplaceName::new("test-market").expect("valid marketplace"),
+                plugin: PluginName::new("test-plugin").expect("valid plugin"),
                 version: Some("1.0.0".into()),
                 installed_at: Utc::now(),
                 source_hash: None,

@@ -142,6 +142,60 @@ fn install_missing_marketplace_fails() {
     );
 }
 
+/// CLI-side defense-in-depth: a `plugin@../etc/passwd` reference must
+/// surface as `invalid marketplace name` from the IPC-boundary
+/// `MarketplaceName::new(...).with_context(...)` guard at
+/// `commands/install.rs:42-43` *before* the cache directory is touched.
+/// Without this test, a regression that dropped the `with_context` would
+/// only surface as a downstream `marketplace not found` error — masking
+/// the validation gate.
+#[test]
+fn install_rejects_traversal_in_marketplace() {
+    let dir = TempDir::new().expect("temp dir");
+    let output = run_in_dir(dir.path(), &["install", "myplugin@../etc/passwd"]);
+
+    assert!(
+        !output.status.success(),
+        "traversal in marketplace must fail"
+    );
+    let err = stderr(&output);
+    assert!(
+        err.contains("invalid marketplace name"),
+        "stderr must surface the IPC-boundary validation message, got:\n{err}"
+    );
+}
+
+/// CLI-side defense-in-depth: a path separator in the plugin name must
+/// surface as `invalid plugin name` from the IPC-boundary
+/// `PluginName::new(...).with_context(...)` guard at
+/// `commands/install.rs:44-45`. Path separators in plugin names would
+/// otherwise let the install code build paths like
+/// `<plugin_registry>/foo/bar` and target a directory the user never
+/// intended.
+///
+/// The other adversarial cases (`..`, NUL byte, control characters) can't
+/// reach the CLI: `..` collides with shell globbing, NUL bytes are
+/// rejected by `Command::args` at the OS level (`InvalidInput: nul byte
+/// found in provided data`), and control characters get filtered by the
+/// shell. The path-separator branch is the right CLI-layer adversarial
+/// case to lock; the other branches are covered by the
+/// `PluginName::new` unit tests in `validation.rs`.
+#[test]
+fn install_rejects_invalid_plugin_name() {
+    let dir = TempDir::new().expect("temp dir");
+    let output = run_in_dir(dir.path(), &["install", "evil/plugin@mp"]);
+
+    assert!(
+        !output.status.success(),
+        "path separator in plugin must fail"
+    );
+    let err = stderr(&output);
+    assert!(
+        err.contains("invalid plugin name"),
+        "stderr must surface the IPC-boundary validation message, got:\n{err}"
+    );
+}
+
 #[test]
 fn marketplace_add_rejects_http_url_by_default() {
     // End-to-end coverage of the http:// gate: the CLI must surface the
