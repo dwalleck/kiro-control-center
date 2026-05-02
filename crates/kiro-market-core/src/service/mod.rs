@@ -1588,10 +1588,7 @@ impl MarketplaceService {
                 version: ctx.version.map(String::from),
                 installed_at: chrono::Utc::now(),
                 dialect: def.dialect,
-                source_path: path
-                    .strip_prefix(plugin_dir)
-                    .ok()
-                    .map(std::path::Path::to_path_buf),
+                source_path: relative_source_path_for_tracking(&path, plugin_dir),
                 source_hash: None,
                 installed_hash: None,
             };
@@ -2151,7 +2148,30 @@ impl MarketplaceService {
         let marketplace_path = self.marketplace_path(marketplace_name);
         let plugin_dir = self.resolve_local_plugin_dir(entry, &marketplace_path)?;
 
-        let available_version = Self::load_plugin_manifest_version(&plugin_dir)?;
+        // NC1 (PR #96 re-review): when `load_plugin_manifest_version`
+        // collapsed `Ok(None)` for "manifest legitimately lacks
+        // version" and "manifest unreadable", the latter case combined
+        // with `installed_version: Some(_)` below to emit a phantom
+        // `PluginUpdateInfo { available_version: None, change_signal:
+        // VersionBumped }`. After the `ManifestVersion` 3-state split,
+        // unreadable surfaces as a per-plugin failure that lands in
+        // `DetectUpdatesResult::failures` — never as "update available
+        // to nothing".
+        let available_version = match Self::load_plugin_manifest_version(&plugin_dir)? {
+            ManifestVersion::Found(v) => v,
+            ManifestVersion::Unreadable { reason } => {
+                let manifest_path = plugin_dir.join("plugin.json");
+                // ManifestNotFound's Display embeds the path; we wrap
+                // the symlink/missing distinction into the carried
+                // io::Error so error_full_chain renders both pieces in
+                // the wire-format `PluginUpdateFailure.reason`.
+                return Err(PluginError::ManifestReadFailed {
+                    path: manifest_path,
+                    source: std::io::Error::new(std::io::ErrorKind::NotFound, reason),
+                }
+                .into());
+            }
+        };
 
         let (content_drift, legacy_fallback) =
             Self::scan_plugin_for_content_drift(project, plugin_info, &plugin_dir)?;
@@ -2187,8 +2207,38 @@ impl MarketplaceService {
         Ok(None)
     }
 
-    /// Load `plugin.json` from `plugin_dir` and return its `version` field.
-    fn load_plugin_manifest_version(plugin_dir: &Path) -> Result<Option<String>, Error> {
+    // (See `ManifestVersion` enum and `read_capped` helper at module scope below.)
+
+    /// Load `plugin.json` from `plugin_dir` and report the manifest's
+    /// `version` field — distinguishing between three semantically
+    /// distinct outcomes per NC1 (PR #96 re-review):
+    ///
+    /// - [`ManifestVersion::Found(Some(v))`] — manifest read; `version`
+    ///   field present.
+    /// - [`ManifestVersion::Found(None)`] — manifest read; `version`
+    ///   field legitimately absent.
+    /// - [`ManifestVersion::Unreadable`] — manifest could not be read for
+    ///   a non-fatal reason (symlink-refused or `NotFound`). The
+    ///   caller must surface this as a per-plugin failure rather than
+    ///   collapse it with the `Found(None)` arm — otherwise the
+    ///   version-comparison logic produces a phantom
+    ///   `PluginUpdateInfo { available_version: None, change_signal:
+    ///   VersionBumped }` whenever an installed plugin happens to carry
+    ///   a `version` string.
+    ///
+    /// The symlink defense embedded here exists because the
+    /// `InvalidManifest` error path's `reason` field includes the
+    /// rendered serde error, which on a symlinked manifest would
+    /// surface bytes from the symlink target (a host file outside the
+    /// untrusted cloned-marketplace tree). Refusing to follow symlinks
+    /// at stat time keeps that exfiltration channel closed. Mirrors
+    /// `service::browse::load_plugin_manifest`'s defense.
+    ///
+    /// Resource cap (Commit 9 / pre-existing security observation):
+    /// reads are bounded at [`MAX_PLUGIN_MANIFEST_BYTES`] so a malicious
+    /// marketplace shipping a multi-GB `plugin.json` cannot OOM the
+    /// process before serde sees a byte.
+    fn load_plugin_manifest_version(plugin_dir: &Path) -> Result<ManifestVersion, Error> {
         let manifest_path = plugin_dir.join("plugin.json");
 
         // Symlink defense: refuse to follow symlinks (C5 security fix).
@@ -2196,13 +2246,17 @@ impl MarketplaceService {
             Ok(m) if m.file_type().is_symlink() => {
                 warn!(
                     path = %manifest_path.display(),
-                    "plugin.json is a symlink, refusing to follow; treating as missing"
+                    "plugin.json is a symlink, refusing to follow; treating as unreadable"
                 );
-                return Ok(None);
+                return Ok(ManifestVersion::Unreadable {
+                    reason: "plugin.json is a symlink — refused".to_owned(),
+                });
             }
             Ok(_) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(None);
+                return Ok(ManifestVersion::Unreadable {
+                    reason: "plugin.json missing in marketplace cache".to_owned(),
+                });
             }
             Err(e) => {
                 return Err(PluginError::ManifestReadFailed {
@@ -2213,18 +2267,22 @@ impl MarketplaceService {
             }
         }
 
-        match fs::read(&manifest_path) {
-            Ok(bytes) => match crate::plugin::PluginManifest::from_json(&bytes) {
-                Ok(manifest) => Ok(manifest.version),
-                Err(e) => Err(PluginError::InvalidManifest {
+        let bytes = match read_capped(&manifest_path, MAX_PLUGIN_MANIFEST_BYTES) {
+            Ok(b) => b,
+            Err(e) => {
+                return Err(PluginError::ManifestReadFailed {
                     path: manifest_path,
-                    reason: error_full_chain(&e),
+                    source: e,
                 }
-                .into()),
-            },
-            Err(e) => Err(PluginError::ManifestReadFailed {
+                .into());
+            }
+        };
+
+        match crate::plugin::PluginManifest::from_json(&bytes) {
+            Ok(manifest) => Ok(ManifestVersion::Found(manifest.version)),
+            Err(e) => Err(PluginError::InvalidManifest {
                 path: manifest_path,
-                source: e,
+                reason: error_full_chain(&e),
             }
             .into()),
         }
@@ -2285,20 +2343,30 @@ impl MarketplaceService {
                 match &meta.source_hash {
                     Some(stored) => {
                         let agents_dir = plugin_dir.join("agents");
-                        let rel_path =
-                            meta.source_path
-                                .clone()
-                                .unwrap_or_else(|| match meta.dialect {
-                                    crate::agent::AgentDialect::Native => {
-                                        PathBuf::from(format!("{name}.json"))
-                                    }
-                                    crate::agent::AgentDialect::Claude => {
-                                        PathBuf::from(format!("{name}.md"))
-                                    }
-                                    crate::agent::AgentDialect::Copilot => {
-                                        PathBuf::from(format!("{name}.agent.md"))
-                                    }
-                                });
+                        // Two notes on this fallback (C6 area):
+                        // (a) the dialect-default branch only fires for
+                        //     tracking entries written before the
+                        //     `source_path` field existed (legacy
+                        //     installs); post-NC2 entries always carry a
+                        //     validated `RelativePath`.
+                        // (b) Copilot's `.agent.md` (vs `.md`) extension
+                        //     must mirror the install-time naming
+                        //     convention or a content-hash diff will be
+                        //     misreported as drift.
+                        let rel_path: PathBuf = match &meta.source_path {
+                            Some(rp) => PathBuf::from(rp.as_str()),
+                            None => match meta.dialect {
+                                crate::agent::AgentDialect::Native => {
+                                    PathBuf::from(format!("{name}.json"))
+                                }
+                                crate::agent::AgentDialect::Claude => {
+                                    PathBuf::from(format!("{name}.md"))
+                                }
+                                crate::agent::AgentDialect::Copilot => {
+                                    PathBuf::from(format!("{name}.agent.md"))
+                                }
+                            },
+                        };
                         let computed = crate::hash::hash_artifact(&agents_dir, &[rel_path])?;
                         if computed != *stored {
                             content_drift = true;
@@ -2323,6 +2391,116 @@ impl MarketplaceService {
         }
 
         Ok((content_drift, legacy_fallback))
+    }
+}
+
+/// 3-state outcome of [`MarketplaceService::load_plugin_manifest_version`].
+///
+/// Distinguishing "manifest exists, version field absent" from "manifest
+/// could not be read" closes NC1 (PR #96 re-review): collapsing both
+/// into `Option<String>::None` causes `check_plugin_for_update` to emit
+/// a phantom `VersionBumped` entry whenever an installed plugin happens
+/// to carry a `version` and the cache's `plugin.json` is symlinked or
+/// missing.
+///
+/// `Found(Some(v))` and `Found(None)` are both "scan succeeded";
+/// `Unreadable { reason }` is "do not compare versions — surface a
+/// per-plugin failure instead". Module-private — the public surface
+/// remains [`PluginUpdateInfo`] / [`PluginUpdateFailure`].
+enum ManifestVersion {
+    /// Manifest read; carries the (possibly absent) `version` field.
+    Found(Option<String>),
+    /// Manifest could not be read for a non-fatal reason
+    /// (symlink-refused or `NotFound` on the cache copy). Caller must
+    /// treat this as a per-plugin failure rather than collapse it with
+    /// `Found(None)` — see NC1 above.
+    Unreadable {
+        /// Human-readable reason; embedded into the wire-format
+        /// `PluginUpdateFailure.reason` via `error_full_chain`. Kept
+        /// out of the typed public API so callers cannot substring-match.
+        reason: String,
+    },
+}
+
+/// Maximum bytes a `plugin.json` is allowed to occupy before
+/// [`read_capped`] returns an error. 1 MiB is well above any plausible
+/// manifest (the largest in this workspace's fixtures is < 4 KiB) and
+/// well below process-OOM territory. Mitigates the resource-exhaustion
+/// vector flagged by marketplace-security-reviewer in PR #96 re-review:
+/// a malicious marketplace could otherwise ship a multi-GB
+/// `plugin.json` and OOM the host before serde sees a byte.
+const MAX_PLUGIN_MANIFEST_BYTES: u64 = 1024 * 1024;
+
+/// Read a file with a hard byte cap. Returns
+/// [`std::io::ErrorKind::InvalidData`] if the file exceeds `cap` bytes
+/// (so callers can distinguish from genuine I/O failure). The cap is
+/// enforced via `Read::take`, so the process never allocates more than
+/// `cap` bytes for the buffer.
+fn read_capped(path: &Path, cap: u64) -> std::io::Result<Vec<u8>> {
+    use std::io::Read;
+    let file = fs::File::open(path)?;
+    let mut buf = Vec::with_capacity(usize::try_from(cap.min(64 * 1024)).unwrap_or(64 * 1024));
+    let read = (&file).take(cap + 1).read_to_end(&mut buf)?;
+    if u64::try_from(read).unwrap_or(u64::MAX) > cap {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("file at {} exceeds the {cap}-byte cap", path.display()),
+        ));
+    }
+    Ok(buf)
+}
+
+/// Build the tracking-file `source_path` for a translated agent install
+/// as a [`crate::validation::RelativePath`] so the on-disk JSON
+/// survives the post-load validation pass (NC2).
+///
+/// Today [`crate::agent::discover::discover_agents_in_dirs`] always
+/// yields paths under `plugin_dir`, but a silent `.ok()` would mask any
+/// future invariant break (Rule 35) — explicit `warn!` plus the
+/// dialect-fallback in
+/// [`MarketplaceService::scan_plugin_for_content_drift`] keep detection
+/// working even if `source_path` lands as `None`.
+///
+/// The forward-slash conversion is required because
+/// `RelativePath::new` rejects backslashes for cross-platform
+/// portability of the wire format.
+fn relative_source_path_for_tracking(
+    path: &Path,
+    plugin_dir: &Path,
+) -> Option<crate::validation::RelativePath> {
+    let rel = match path.strip_prefix(plugin_dir) {
+        Ok(r) => r,
+        Err(e) => {
+            warn!(
+                path = %path.display(),
+                plugin_dir = %plugin_dir.display(),
+                error = %e,
+                "agent path is not under plugin_dir; source_path will fall back \
+                 to dialect default during update detection"
+            );
+            return None;
+        }
+    };
+    let rel_str = rel
+        .components()
+        .filter_map(|c| match c {
+            std::path::Component::Normal(s) => Some(s.to_string_lossy()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("/");
+    match crate::validation::RelativePath::new(rel_str) {
+        Ok(rp) => Some(rp),
+        Err(e) => {
+            warn!(
+                path = %path.display(),
+                plugin_dir = %plugin_dir.display(),
+                error = %e,
+                "agent path could not be expressed as RelativePath; source_path \
+                 will fall back to dialect default during update detection"
+            );
+            None
+        }
     }
 }
 
@@ -5912,5 +6090,84 @@ mod tests {
             UpdateChangeSignal::VersionBumped
         ));
         assert!(result.failures.is_empty());
+    }
+
+    /// NC1 (PR #96 re-review): the C5 symlink defense returned
+    /// `Ok(None)` from `load_plugin_manifest_version` when the
+    /// `plugin.json` symlink was refused. That `None` then collapsed
+    /// with `installed_version: Some("1.0")` in the version-comparison
+    /// path to emit a phantom `PluginUpdateInfo { available_version:
+    /// None, change_signal: VersionBumped }` — telling the user "an
+    /// update is available to nothing" whenever an installed plugin's
+    /// cache `plugin.json` had been swapped for a symlink.
+    ///
+    /// Post-fix: the 3-state `ManifestVersion` enum routes
+    /// "unreadable" through the per-plugin failure arm. This test
+    /// pins the no-phantom-update contract by deleting the cache
+    /// `plugin.json` after install and asserting the scan produces
+    /// zero updates and exactly one failure (not an update with
+    /// `available_version: None`).
+    #[test]
+    fn detect_plugin_updates_unreadable_manifest_does_not_phantom_version_bump() {
+        use crate::project::KiroProject;
+        use crate::service::test_support::{
+            make_plugin_with_skills, relative_path_entry, seed_marketplace_with_registry,
+            temp_service,
+        };
+
+        let (dir, svc) = temp_service();
+        let entries = vec![relative_path_entry("p", "plugins/p")];
+        let mp_path = seed_marketplace_with_registry(dir.path(), &svc, "mp", &entries);
+        make_plugin_with_skills(&mp_path, "p", &["alpha"]);
+        let plugin_dir = mp_path.join("plugins/p");
+        // Install with a manifest carrying version "1.0" so the
+        // tracking file records `installed_version: Some("1.0")` —
+        // the precondition for the phantom-version-bump regression.
+        fs::write(
+            plugin_dir.join("plugin.json"),
+            br#"{"name":"p","version":"1.0"}"#,
+        )
+        .unwrap();
+
+        let project_tmp = tempfile::tempdir().unwrap();
+        let project = KiroProject::new(project_tmp.path().to_path_buf());
+        svc.install_plugin(&project, &mp("mp"), &pn("p"), InstallMode::New, false)
+            .expect("install");
+
+        // Tracking should now carry version="1.0".
+        let tracking = project.load_installed().expect("load tracking");
+        assert_eq!(
+            tracking
+                .skills
+                .get("alpha")
+                .and_then(|m| m.version.as_deref()),
+            Some("1.0"),
+            "precondition: tracking carries installed_version Some(\"1.0\")"
+        );
+
+        // Now make the cache plugin.json unreadable: delete it.
+        // Pre-NC1 fix: load_plugin_manifest_version returns Ok(None),
+        // version_differs becomes true (Some("1.0") != None), and the
+        // result has a phantom `VersionBumped` update with
+        // available_version: None.
+        fs::remove_file(plugin_dir.join("plugin.json")).unwrap();
+
+        let result = svc.detect_plugin_updates(&project).expect("detect");
+
+        // Post-fix: zero updates, one failure.
+        assert!(
+            result.updates.is_empty(),
+            "unreadable cache plugin.json must NOT phantom-bump to a \
+             VersionBumped update with available_version: None; got: {:?}",
+            result.updates
+        );
+        assert_eq!(
+            result.failures.len(),
+            1,
+            "unreadable cache manifest must surface as exactly one \
+             per-plugin failure, got: {:?}",
+            result.failures
+        );
+        assert_eq!(result.failures[0].plugin.as_str(), "p");
     }
 }

@@ -16,7 +16,7 @@ use crate::agent::tools::MappedTool;
 use crate::agent::{AgentDefinition, AgentDialect};
 use crate::error::{AgentError, SkillError};
 use crate::validation;
-use crate::validation::{MarketplaceName, PluginName};
+use crate::validation::{MarketplaceName, PluginName, RelativePath};
 
 // ---------------------------------------------------------------------------
 // Types
@@ -75,8 +75,25 @@ pub struct InstalledAgentMeta {
     /// Relative path under the plugin's `agents/` directory of the
     /// source file that was installed. `None` for legacy entries
     /// installed before this field was added.
+    ///
+    /// Wrapped in [`RelativePath`] so `serde_json::from_slice` rejects
+    /// path-traversal attempts (`"../../etc/passwd"`) at tracking-file
+    /// load time per CLAUDE.md's "Parse, don't validate" rule. The
+    /// `RelativePath::Deserialize` impl routes through `RelativePath::new`,
+    /// which forbids `..`, absolute paths, NUL bytes, and embedded
+    /// backslashes — closing NC2 from PR #96 review (the original
+    /// `Option<PathBuf>` type let a tampered tracking file's
+    /// `source_path` escape the install boundary at hash recompute time
+    /// in [`crate::service::MarketplaceService::scan_plugin_for_content_drift`]).
+    ///
+    /// Cross-file invariant: install-time filename conventions in
+    /// [`crate::service::MarketplaceService::install_translated_agents_inner`]
+    /// must stay in sync with the dialect-classifier fallback in
+    /// `scan_plugin_for_content_drift`. If the install side starts
+    /// emitting paths that disagree with the fallback (e.g. Copilot's
+    /// `.agent.md` vs `.md`), drift detection misreports legacy entries.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub source_path: Option<PathBuf>,
+    pub source_path: Option<RelativePath>,
 
     /// Tree-hash of the agent source as it existed in the marketplace at
     /// install time. `None` for entries written before Stage 1 of the
@@ -3776,6 +3793,70 @@ mod tests {
             }
             other => panic!("expected Error::Io(InvalidData), got {other:?}"),
         }
+    }
+
+    /// NC2 (PR #96 re-review): a tampered `installed-agents.json`
+    /// whose per-agent `source_path` contains a traversal entry would,
+    /// without the `RelativePath` newtype on `InstalledAgentMeta`,
+    /// reach `hash_artifact(agents_dir, &[rel])` at update-detection
+    /// time and read arbitrary host files. The newtype's `Deserialize`
+    /// impl routes through `RelativePath::new` which rejects `..`,
+    /// absolute paths, NUL, and embedded backslashes — failing at
+    /// `serde_json::from_slice` time, before any path joins happen.
+    #[test]
+    fn load_installed_agents_rejects_path_traversal_in_source_path() {
+        let (_dir, project) = temp_project();
+        let tracking_path = project.root.join(".kiro/installed-agents.json");
+        fs::create_dir_all(tracking_path.parent().unwrap()).unwrap();
+        let tampered = serde_json::json!({
+            "agents": {
+                "victim": {
+                    "marketplace": "m",
+                    "plugin": "p",
+                    "version": null,
+                    "installed_at": chrono::Utc::now(),
+                    "dialect": "claude",
+                    "source_path": "../../etc/passwd",
+                }
+            }
+        });
+        fs::write(&tracking_path, tampered.to_string()).unwrap();
+
+        let err = project
+            .load_installed_agents()
+            .expect_err("traversal in source_path must be refused at load time");
+        // serde_json deserialize errors land in Error::Json
+        // (mapped via #[error(transparent)] on Error::Json).
+        match err {
+            crate::error::Error::Json(_) => {}
+            other => panic!("expected Error::Json (RelativePath rejection), got {other:?}"),
+        }
+    }
+
+    /// NC2 + parse-don't-validate sanity: a well-formed `source_path`
+    /// (forward-slash relative path under `agents/`) must round-trip
+    /// through serde and end up as `Some(RelativePath)`.
+    #[test]
+    fn installed_agent_meta_round_trips_valid_source_path() {
+        use crate::validation::RelativePath;
+        let meta = InstalledAgentMeta {
+            marketplace: mp("m"),
+            plugin: pn("p"),
+            version: None,
+            installed_at: Utc::now(),
+            dialect: AgentDialect::Claude,
+            source_path: Some(RelativePath::new("subdir/agent.md").expect("valid rel path")),
+            source_hash: None,
+            installed_hash: None,
+        };
+        let json = serde_json::to_string(&meta).unwrap();
+        assert!(
+            json.contains("\"source_path\":\"subdir/agent.md\""),
+            "wire format must remain a flat string, got: {json}"
+        );
+        let back: InstalledAgentMeta = serde_json::from_str(&json).unwrap();
+        let rp = back.source_path.expect("source_path should be Some");
+        assert_eq!(rp.as_str(), "subdir/agent.md");
     }
 
     #[test]
