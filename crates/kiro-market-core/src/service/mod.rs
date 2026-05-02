@@ -496,16 +496,94 @@ pub struct PluginUpdateInfo {
     pub change_signal: UpdateChangeSignal,
 }
 
-/// A plugin the update scan couldn't check. `reason` is the rendered
-/// error chain via [`crate::error::error_full_chain`] per CLAUDE.md FFI
-/// rule (any wire-format `reason`/`error: String` field uses
-/// `error_full_chain(&err)`, not `err.to_string()`).
+/// A plugin the update scan couldn't check.
+///
+/// `kind` is the stable programmatic discriminant frontends should
+/// `match` on (per CLAUDE.md Rule 42: match error types, not error
+/// strings). `reason` is the rendered error chain via
+/// [`crate::error::error_full_chain`] per the FFI rule — suitable for
+/// log lines or fallback UI rendering, but never for branching logic.
 #[derive(Clone, Debug, Serialize)]
 #[cfg_attr(feature = "specta", derive(specta::Type))]
 pub struct PluginUpdateFailure {
     pub marketplace: crate::validation::MarketplaceName,
     pub plugin: crate::validation::PluginName,
+    pub kind: PluginUpdateFailureKind,
     pub reason: String,
+}
+
+/// Why an update-detection scan couldn't check a plugin. Tagged enum
+/// for FFI per the `ffi-enum-serde-tag` plan-lint gate (PR #91):
+/// `#[serde(tag = "kind", rename_all = "snake_case")]` produces
+/// `{ "kind": "manifest_unreadable" }` in JSON, which `tauri-specta`
+/// emits as a discriminated TS union.
+///
+/// Closes original-review I4: `PluginUpdateFailure` was opaque
+/// (substring matching `reason` to differentiate failure types
+/// violated CLAUDE.md Rule 42). The classifier
+/// [`PluginUpdateFailureKind::from_error`] is exhaustive per the
+/// CLAUDE.md classifier rule — a new error variant either matches
+/// here explicitly or routes through `Other` after a written-down
+/// rationale.
+#[derive(Clone, Debug, Serialize)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
+#[serde(tag = "kind", rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum PluginUpdateFailureKind {
+    /// Marketplace cache directory missing or plugin removed from
+    /// the marketplace's manifest.
+    MarketplaceUnavailable,
+    /// `plugin.json` missing in the marketplace cache (typically the
+    /// plugin was deleted from upstream and the cache hasn't been
+    /// refreshed). Also covers symlink-refused per the C5 defense.
+    ManifestUnreadable,
+    /// `plugin.json` exists but failed to parse (malformed JSON,
+    /// missing required fields, etc.).
+    ManifestInvalid,
+    /// Hash recomputation against an installed file failed (file
+    /// missing in the cache, permission denied, etc.).
+    HashFailed,
+    /// Catch-all for unanticipated failure shapes. Surfacing this
+    /// rather than panicking lets the FE render a generic "scan
+    /// failed" badge while the typed variants drive specific
+    /// remediation. Each new error class deliberately routed here
+    /// should also be considered for promotion to a typed variant.
+    Other,
+}
+
+impl PluginUpdateFailureKind {
+    /// Project an [`Error`] into the right
+    /// [`PluginUpdateFailureKind`] variant. Exhaustive per the
+    /// CLAUDE.md classifier rule — every entry-point error class
+    /// `check_plugin_for_update` can produce is enumerated; the
+    /// final `Other` arm is reserved for genuinely unanticipated
+    /// errors and is intentional rather than a `_` catch-all.
+    #[must_use]
+    pub fn from_error(err: &Error) -> Self {
+        match err {
+            Error::Plugin(PluginError::NotFound { .. }) => Self::MarketplaceUnavailable,
+            Error::Plugin(
+                PluginError::ManifestNotFound { .. } | PluginError::ManifestReadFailed { .. },
+            ) => Self::ManifestUnreadable,
+            Error::Plugin(PluginError::InvalidManifest { .. }) => Self::ManifestInvalid,
+            Error::Hash(_) => Self::HashFailed,
+            Error::Marketplace(crate::error::MarketplaceError::NotFound { .. }) => {
+                Self::MarketplaceUnavailable
+            }
+            // All other Plugin variants and all other top-level
+            // Error categories route to Other. Written down so a new
+            // variant lands here intentionally rather than silently.
+            Error::Plugin(_)
+            | Error::Marketplace(_)
+            | Error::Skill(_)
+            | Error::Agent(_)
+            | Error::Steering(_)
+            | Error::Git(_)
+            | Error::Validation(_)
+            | Error::Io(_)
+            | Error::Json(_) => Self::Other,
+        }
+    }
 }
 
 /// Why an update is being surfaced. Tagged enum for FFI per the
@@ -2129,6 +2207,7 @@ impl MarketplaceService {
                 Err(err) => failures.push(PluginUpdateFailure {
                     marketplace: plugin_info.marketplace.clone(),
                     plugin: plugin_info.plugin.clone(),
+                    kind: PluginUpdateFailureKind::from_error(&err),
                     reason: error_full_chain(&err),
                 }),
             }
@@ -5442,6 +5521,7 @@ mod tests {
             failures: vec![PluginUpdateFailure {
                 marketplace: mp("mp2"),
                 plugin: pn("p2"),
+                kind: PluginUpdateFailureKind::ManifestUnreadable,
                 reason: "marketplace not in cache".into(),
             }],
             partial_load_warnings: vec![crate::project::TrackingLoadWarning {
@@ -5460,6 +5540,7 @@ mod tests {
         );
         assert_eq!(json["failures"][0]["marketplace"], "mp2");
         assert_eq!(json["failures"][0]["plugin"], "p2");
+        assert_eq!(json["failures"][0]["kind"]["kind"], "manifest_unreadable");
         assert_eq!(json["failures"][0]["reason"], "marketplace not in cache");
         assert_eq!(
             json["partial_load_warnings"][0]["tracking_file"],
@@ -5494,6 +5575,75 @@ mod tests {
         };
         let json = serde_json::to_value(&info).expect("serialize");
         assert_eq!(json["change_signal"]["kind"], "content_changed");
+    }
+
+    /// JSON-shape lock for every [`PluginUpdateFailureKind`] variant
+    /// — pins the wire-format discriminator strings so a future
+    /// rename or `serde(rename)` typo lights up tests, not the
+    /// frontend's `match` arms. The frontend must branch on `kind`
+    /// (Rule 42), so each tag string is part of the FFI contract.
+    #[rstest::rstest]
+    #[case(
+        PluginUpdateFailureKind::MarketplaceUnavailable,
+        "marketplace_unavailable"
+    )]
+    #[case(PluginUpdateFailureKind::ManifestUnreadable, "manifest_unreadable")]
+    #[case(PluginUpdateFailureKind::ManifestInvalid, "manifest_invalid")]
+    #[case(PluginUpdateFailureKind::HashFailed, "hash_failed")]
+    #[case(PluginUpdateFailureKind::Other, "other")]
+    fn plugin_update_failure_kind_json_shape(
+        #[case] kind: PluginUpdateFailureKind,
+        #[case] expected_tag: &str,
+    ) {
+        let json = serde_json::to_value(&kind).expect("serialize");
+        assert_eq!(
+            json["kind"], expected_tag,
+            "wire-format discriminator must stay stable for FE branching"
+        );
+    }
+
+    /// Classifier-exhaustiveness witness: every entry-point error
+    /// the scan can produce projects to a known
+    /// [`PluginUpdateFailureKind`]. If the classifier ever silently
+    /// returns `Other` for a variant that should have a typed
+    /// kind, this test surfaces the regression.
+    #[test]
+    fn plugin_update_failure_kind_from_error_classifies_known_variants() {
+        use crate::error::{MarketplaceError, PluginError};
+        use std::path::PathBuf;
+        let cases: &[(Error, PluginUpdateFailureKind)] = &[
+            (
+                Error::Plugin(PluginError::NotFound {
+                    plugin: "p".into(),
+                    marketplace: "m".into(),
+                }),
+                PluginUpdateFailureKind::MarketplaceUnavailable,
+            ),
+            (
+                Error::Plugin(PluginError::ManifestNotFound {
+                    path: PathBuf::from("/x"),
+                }),
+                PluginUpdateFailureKind::ManifestUnreadable,
+            ),
+            (
+                Error::Plugin(PluginError::InvalidManifest {
+                    path: PathBuf::from("/x"),
+                    reason: "bad".into(),
+                }),
+                PluginUpdateFailureKind::ManifestInvalid,
+            ),
+            (
+                Error::Marketplace(MarketplaceError::NotFound { name: "m".into() }),
+                PluginUpdateFailureKind::MarketplaceUnavailable,
+            ),
+        ];
+        for (err, expected) in cases {
+            let got = PluginUpdateFailureKind::from_error(err);
+            assert!(
+                std::mem::discriminant(&got) == std::mem::discriminant(expected),
+                "from_error({err:?}) -> {got:?}, expected {expected:?}"
+            );
+        }
     }
 
     // -------------------------------------------------------------------
