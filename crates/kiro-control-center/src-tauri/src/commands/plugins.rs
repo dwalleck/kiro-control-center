@@ -530,9 +530,12 @@ mod tests {
         .await
         .expect("remove on empty project must succeed");
 
-        assert_eq!(counts.skills_removed, 0);
-        assert_eq!(counts.steering_removed, 0);
-        assert_eq!(counts.agents_removed, 0);
+        assert!(counts.skills.removed.is_empty());
+        assert!(counts.steering.removed.is_empty());
+        assert!(counts.agents.removed.is_empty());
+        assert!(counts.skills.failures.is_empty());
+        assert!(counts.steering.failures.is_empty());
+        assert!(counts.agents.failures.is_empty());
     }
 
     /// After [`install_plugin_impl`] seeds all three content types,
@@ -567,9 +570,12 @@ mod tests {
         .await
         .expect("cascade remove");
 
-        assert_eq!(counts.skills_removed, 1);
-        assert_eq!(counts.steering_removed, 1);
-        assert_eq!(counts.agents_removed, 1);
+        assert_eq!(counts.skills.removed, vec!["alpha"]);
+        assert_eq!(counts.steering.removed, vec!["guide.md"]);
+        assert_eq!(counts.agents.removed, vec!["reviewer"]);
+        assert!(counts.skills.failures.is_empty());
+        assert!(counts.steering.failures.is_empty());
+        assert!(counts.agents.failures.is_empty());
 
         let view_after = list_installed_plugins(project_path)
             .await
