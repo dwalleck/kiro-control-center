@@ -469,17 +469,29 @@ pub struct DetectUpdatesResult {
     pub partial_load_warnings: Vec<crate::project::TrackingLoadWarning>,
 }
 
-/// A single plugin with an update available. `installed_version` is
-/// `None` for legacy installs whose tracking file lacked the version
-/// field; `available_version` is `None` when the marketplace plugin
-/// manifest itself lacks a version. The `change_signal` discriminates
-/// between manifest-version change and content-drift-without-version-bump.
+/// A single plugin with an update available.
+///
+/// The `change_signal` discriminates between manifest-version change
+/// and content-drift-without-version-bump.
 #[derive(Clone, Debug, Serialize)]
 #[cfg_attr(feature = "specta", derive(specta::Type))]
 pub struct PluginUpdateInfo {
     pub marketplace: crate::validation::MarketplaceName,
     pub plugin: crate::validation::PluginName,
+    /// `None` means the project's tracking file lacked a `version`
+    /// field at install time (a legacy install pre-Stage-1, before
+    /// the version field was added to the tracking schema). Cases
+    /// where the tracking file itself failed to load are surfaced via
+    /// [`DetectUpdatesResult::partial_load_warnings`], NOT via
+    /// `Some(None)` here.
     pub installed_version: Option<String>,
+    /// `None` means the marketplace plugin manifest exists but lacks
+    /// a `version` field. After NC1's `ManifestVersion` 3-state
+    /// split, cases where the manifest is missing or unreadable
+    /// (symlinked, `NotFound`) surface as a [`PluginUpdateFailure`] —
+    /// they no longer collapse into `Some(None)` here. So
+    /// `available_version: None` is now an unambiguous "marketplace
+    /// says no version" signal.
     pub available_version: Option<String>,
     pub change_signal: UpdateChangeSignal,
 }
