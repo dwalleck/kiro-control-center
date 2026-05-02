@@ -72,6 +72,11 @@ pub struct InstalledAgentMeta {
     /// Which source dialect the agent was parsed from. Persisted via the
     /// enum's serde rename so the wire format stays `"claude"` / `"copilot"`.
     pub dialect: AgentDialect,
+    /// Relative path under the plugin's `agents/` directory of the
+    /// source file that was installed. `None` for legacy entries
+    /// installed before this field was added.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_path: Option<PathBuf>,
 
     /// Tree-hash of the agent source as it existed in the marketplace at
     /// install time. `None` for entries written before Stage 1 of the
@@ -384,9 +389,10 @@ pub struct RemoveSteeringResult {
 /// Per-content-type sub-result for [`RemovePluginResult`]. Mirrors
 /// the install-side [`crate::service::InstallAgentsResult`] shape.
 /// `removed` is a flat vec of translated agent names + native agent
-/// names + native companion file paths (rendered) — matches the
-/// install-side asymmetry where native companions are agent-side
-/// artifacts.
+/// names. Native companion file paths are NOT itemized (P2a-3
+/// decision α) — the `native_companions` cascade step succeeds with
+/// no per-file entries. If the FE later wants per-companion
+/// granularity, that's an additive field change.
 #[derive(Clone, Debug, Default, Serialize)]
 #[cfg_attr(feature = "specta", derive(specta::Type))]
 pub struct RemoveAgentsResult {
@@ -1412,7 +1418,7 @@ impl KiroProject {
     /// Cascade-remove every tracked entry from `(marketplace, plugin)`
     /// across all three `installed-*.json` tracking files. Unlinks
     /// the on-disk files, updates the tracking JSON files atomically,
-    /// and returns aggregated counts.
+    /// and returns per-content-type sub-results.
     ///
     /// **Orphan-tracking recovery (A-12 + I3).** If a tracking entry
     /// references a path that no longer exists on disk (state
@@ -1423,26 +1429,28 @@ impl KiroProject {
     /// resurrects the plugin in `installed_plugins()`.
     ///
     /// **Per-step failures (I5).** A per-content removal that fails
-    /// mid-cascade does NOT abort. The failure is recorded in
-    /// `result.failed`; the cascade keeps going on the remaining
-    /// content types so partial progress isn't lost. Same policy as
-    /// `InstallPluginResult`'s sub-result `failed` vecs (A-15).
+    /// mid-cascade does NOT abort. The failure is recorded in the
+    /// appropriate sub-result's `failures` vec (e.g.
+    /// `result.skills.failures`); the cascade keeps going on the
+    /// remaining content types so partial progress isn't lost. Same
+    /// policy as `InstallPluginResult`'s sub-result `failed` vecs
+    /// (A-15).
     ///
     /// **`native_companions` cleanup (A-3 + A-16).** After per-agent
     /// removals, the plugin-level `native_companions` entry is
     /// dropped if its `marketplace` field matches `marketplace` (the
     /// map is keyed by plugin name alone, so the marketplace check
     /// disambiguates same-named plugins across marketplaces). A
-    /// failure here also lands in `result.failed` rather than
+    /// failure here lands in `result.agents.failures` rather than
     /// short-circuiting the cascade.
     ///
     /// # Errors
     ///
     /// Reserved for "failed to even read the initial tracking files"
     /// (the three `load_installed*()` calls). Per-step errors during
-    /// the loop go into `result.failed`. Tracking-file loads can fail
-    /// with I/O errors, JSON parse errors, or path-traversal
-    /// validation errors (A-4).
+    /// the loop go into the sub-results' `failures` vecs.
+    /// Tracking-file loads can fail with I/O errors, JSON parse
+    /// errors, or path-traversal validation errors (A-4).
     pub fn remove_plugin(
         &self,
         marketplace: &MarketplaceName,
@@ -2583,6 +2591,7 @@ impl KiroProject {
                         version: version.map(String::from),
                         installed_at: chrono::Utc::now(),
                         dialect: AgentDialect::Native,
+                        source_path: None,
                         source_hash: Some(source_hash.to_string()),
                         installed_hash: Some(installed_hash.clone()),
                     },
@@ -3467,6 +3476,7 @@ mod tests {
             version: Some("1.2.3".into()),
             installed_at: Utc::now(),
             dialect: AgentDialect::Claude,
+            source_path: None,
             source_hash: None,
             installed_hash: None,
         };
@@ -3489,6 +3499,7 @@ mod tests {
             version: None,
             installed_at: Utc::now(),
             dialect: AgentDialect::Copilot,
+            source_path: None,
             source_hash: None,
             installed_hash: None,
         };
@@ -4570,6 +4581,7 @@ mod tests {
             version: None,
             installed_at: Utc::now(),
             dialect: AgentDialect::Claude,
+            source_path: None,
             source_hash: None,
             installed_hash: None,
         }
@@ -6155,9 +6167,20 @@ mod tests {
         )
         .expect("agents tracking");
 
-        project
+        let result = project
             .remove_plugin(&mp("mp"), &pn("p"))
             .expect("remove_plugin");
+
+        // P2a-3 sub-decision α: agents.removed does NOT itemize companion
+        // files; the step succeeds with an empty removed vec.
+        assert!(
+            result.agents.removed.is_empty(),
+            "native_companions success yields no per-file entries in agents.removed"
+        );
+        assert!(
+            result.agents.failures.is_empty(),
+            "native_companions cleanup must not fail for matching marketplace"
+        );
 
         let tracking = project.load_installed_agents().expect("load");
         assert!(

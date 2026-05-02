@@ -452,6 +452,12 @@ pub struct InstallPluginResult {
 /// from cache, manifest malformed, hash computation failure). Plugins
 /// with no update available are absent from both vecs (the implicit
 /// "everything's fine" set).
+///
+/// `partial_load_warnings` carries tracking-file load failures that
+/// happened before `installed_plugins()` returned — e.g. a corrupt
+/// `installed-skills.json` means the corresponding skills are missing
+/// from `plugins` and the warning is surfaced here so the caller can
+/// render a "partial state" banner.
 #[derive(Clone, Debug, Default, Serialize)]
 #[cfg_attr(feature = "specta", derive(specta::Type))]
 pub struct DetectUpdatesResult {
@@ -459,6 +465,8 @@ pub struct DetectUpdatesResult {
     pub updates: Vec<PluginUpdateInfo>,
     #[serde(default)]
     pub failures: Vec<PluginUpdateFailure>,
+    #[serde(default)]
+    pub partial_load_warnings: Vec<crate::project::TrackingLoadWarning>,
 }
 
 /// A single plugin with an update available. `installed_version` is
@@ -1580,6 +1588,10 @@ impl MarketplaceService {
                 version: ctx.version.map(String::from),
                 installed_at: chrono::Utc::now(),
                 dialect: def.dialect,
+                source_path: path
+                    .strip_prefix(plugin_dir)
+                    .ok()
+                    .map(std::path::Path::to_path_buf),
                 source_hash: None,
                 installed_hash: None,
             };
@@ -2112,7 +2124,11 @@ impl MarketplaceService {
                 }),
             }
         }
-        Ok(DetectUpdatesResult { updates, failures })
+        Ok(DetectUpdatesResult {
+            updates,
+            failures,
+            partial_load_warnings: view.partial_load_warnings,
+        })
     }
 
     fn check_plugin_for_update(
@@ -2133,12 +2149,7 @@ impl MarketplaceService {
             })?;
 
         let marketplace_path = self.marketplace_path(marketplace_name);
-        let plugin_dir = self.resolve_plugin_dir(
-            entry,
-            &marketplace_path,
-            marketplace_name,
-            GitProtocol::Https,
-        )?;
+        let plugin_dir = self.resolve_local_plugin_dir(entry, &marketplace_path)?;
 
         let available_version = Self::load_plugin_manifest_version(&plugin_dir)?;
 
@@ -2179,6 +2190,29 @@ impl MarketplaceService {
     /// Load `plugin.json` from `plugin_dir` and return its `version` field.
     fn load_plugin_manifest_version(plugin_dir: &Path) -> Result<Option<String>, Error> {
         let manifest_path = plugin_dir.join("plugin.json");
+
+        // Symlink defense: refuse to follow symlinks (C5 security fix).
+        match fs::symlink_metadata(&manifest_path) {
+            Ok(m) if m.file_type().is_symlink() => {
+                warn!(
+                    path = %manifest_path.display(),
+                    "plugin.json is a symlink, refusing to follow; treating as missing"
+                );
+                return Ok(None);
+            }
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(None);
+            }
+            Err(e) => {
+                return Err(PluginError::ManifestReadFailed {
+                    path: manifest_path,
+                    source: e,
+                }
+                .into());
+            }
+        }
+
         match fs::read(&manifest_path) {
             Ok(bytes) => match crate::plugin::PluginManifest::from_json(&bytes) {
                 Ok(manifest) => Ok(manifest.version),
@@ -2188,7 +2222,6 @@ impl MarketplaceService {
                 }
                 .into()),
             },
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
             Err(e) => Err(PluginError::ManifestReadFailed {
                 path: manifest_path,
                 source: e,
@@ -2252,12 +2285,20 @@ impl MarketplaceService {
                 match &meta.source_hash {
                     Some(stored) => {
                         let agents_dir = plugin_dir.join("agents");
-                        let rel_path = match meta.dialect {
-                            crate::agent::AgentDialect::Native => {
-                                PathBuf::from(format!("{name}.json"))
-                            }
-                            _ => PathBuf::from(format!("{name}.md")),
-                        };
+                        let rel_path =
+                            meta.source_path
+                                .clone()
+                                .unwrap_or_else(|| match meta.dialect {
+                                    crate::agent::AgentDialect::Native => {
+                                        PathBuf::from(format!("{name}.json"))
+                                    }
+                                    crate::agent::AgentDialect::Claude => {
+                                        PathBuf::from(format!("{name}.md"))
+                                    }
+                                    crate::agent::AgentDialect::Copilot => {
+                                        PathBuf::from(format!("{name}.agent.md"))
+                                    }
+                                });
                         let computed = crate::hash::hash_artifact(&agents_dir, &[rel_path])?;
                         if computed != *stored {
                             content_drift = true;
@@ -5156,6 +5197,7 @@ mod tests {
         let json = serde_json::to_value(&result).expect("serialize");
         assert_eq!(json["updates"], serde_json::json!([]));
         assert_eq!(json["failures"], serde_json::json!([]));
+        assert_eq!(json["partial_load_warnings"], serde_json::json!([]));
     }
 
     #[test]
@@ -5174,6 +5216,10 @@ mod tests {
                 plugin: pn("p2"),
                 reason: "marketplace not in cache".into(),
             }],
+            partial_load_warnings: vec![crate::project::TrackingLoadWarning {
+                tracking_file: "installed-skills.json".into(),
+                error: "simulated".into(),
+            }],
         };
         let json = serde_json::to_value(&result).expect("serialize");
         assert_eq!(json["updates"][0]["marketplace"], "mp1");
@@ -5187,6 +5233,11 @@ mod tests {
         assert_eq!(json["failures"][0]["marketplace"], "mp2");
         assert_eq!(json["failures"][0]["plugin"], "p2");
         assert_eq!(json["failures"][0]["reason"], "marketplace not in cache");
+        assert_eq!(
+            json["partial_load_warnings"][0]["tracking_file"],
+            "installed-skills.json"
+        );
+        assert_eq!(json["partial_load_warnings"][0]["error"], "simulated");
     }
 
     #[test]
@@ -5373,6 +5424,66 @@ mod tests {
         assert_eq!(result.failures.len(), 1);
         assert_eq!(result.failures[0].plugin.as_str(), "p");
         assert_eq!(result.failures[0].marketplace.as_str(), "mp");
+    }
+
+    #[test]
+    fn detect_plugin_updates_structured_source_returns_failure() {
+        use crate::marketplace::{PluginEntry, PluginSource, StructuredSource};
+        use crate::project::KiroProject;
+        use crate::service::test_support::{mp, pn, seed_marketplace_with_registry, temp_service};
+
+        let (dir, svc) = temp_service();
+
+        // Seed marketplace with a structured-source plugin.
+        let entries = vec![PluginEntry {
+            name: "structured-p".into(),
+            description: None,
+            source: PluginSource::Structured(StructuredSource::GitHub {
+                repo: "foo/bar".into(),
+                git_ref: Some("main".into()),
+                sha: None,
+            }),
+        }];
+        let _mp_path = seed_marketplace_with_registry(dir.path(), &svc, "mp", &entries);
+
+        // Manually create a project with a tracking entry for this plugin.
+        let project_tmp = tempfile::tempdir().unwrap();
+        let project = KiroProject::new(project_tmp.path().to_path_buf());
+
+        let tracking = crate::project::InstalledSkills {
+            skills: [(
+                "dummy-skill".into(),
+                crate::project::InstalledSkillMeta {
+                    marketplace: mp("mp"),
+                    plugin: pn("structured-p"),
+                    version: Some("1.0".into()),
+                    installed_at: chrono::Utc::now(),
+                    source_hash: None,
+                    installed_hash: None,
+                },
+            )]
+            .into_iter()
+            .collect(),
+        };
+        let tracking_path = project_tmp.path().join(".kiro/installed-skills.json");
+        std::fs::create_dir_all(tracking_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &tracking_path,
+            serde_json::to_vec_pretty(&tracking).unwrap(),
+        )
+        .unwrap();
+
+        // Detection must NOT clone; it should return a per-plugin failure.
+        let result = svc.detect_plugin_updates(&project).expect("detect");
+        assert!(result.updates.is_empty());
+        assert_eq!(result.failures.len(), 1);
+        assert_eq!(result.failures[0].plugin.as_str(), "structured-p");
+        assert_eq!(result.failures[0].marketplace.as_str(), "mp");
+        assert!(
+            result.failures[0].reason.contains("remote source"),
+            "expected remote-source failure, got: {}",
+            result.failures[0].reason
+        );
     }
 
     #[test]
@@ -5619,6 +5730,186 @@ mod tests {
         assert!(matches!(
             result.updates[0].change_signal,
             UpdateChangeSignal::ContentChanged
+        ));
+        assert!(result.failures.is_empty());
+    }
+
+    /// P2a-1 finding: malformed plugin.json must surface as a per-plugin
+    /// failure, not as a toplevel Err.
+    #[test]
+    fn detect_plugin_updates_malformed_plugin_json_surfaces_as_failure() {
+        use crate::project::KiroProject;
+        use crate::service::test_support::{
+            make_plugin_with_skills, relative_path_entry, seed_marketplace_with_registry,
+            temp_service,
+        };
+
+        let (dir, svc) = temp_service();
+        let entries = vec![relative_path_entry("p", "plugins/p")];
+        let mp_path = seed_marketplace_with_registry(dir.path(), &svc, "mp", &entries);
+        make_plugin_with_skills(&mp_path, "p", &["alpha"]);
+        let plugin_dir = mp_path.join("plugins/p");
+        // Write a VALID manifest for install, then corrupt it after.
+        fs::write(
+            plugin_dir.join("plugin.json"),
+            br#"{"name":"p","version":"1.0"}"#,
+        )
+        .unwrap();
+
+        let project_tmp = tempfile::tempdir().unwrap();
+        let project = KiroProject::new(project_tmp.path().to_path_buf());
+
+        svc.install_plugin(&project, &mp("mp"), &pn("p"), InstallMode::New, false)
+            .expect("install");
+
+        // Now corrupt the manifest so the detection scan hits InvalidManifest.
+        fs::write(
+            plugin_dir.join("plugin.json"),
+            br#"{"name":"p","version":1.0}"#, // 1.0 is a number, not a string — malformed
+        )
+        .unwrap();
+
+        let result = svc.detect_plugin_updates(&project).expect("detect");
+        assert!(
+            result.updates.is_empty(),
+            "malformed manifest must not produce an update entry"
+        );
+        assert_eq!(
+            result.failures.len(),
+            1,
+            "malformed manifest must produce exactly one failure, got: {:?}",
+            result.failures
+        );
+        assert_eq!(result.failures[0].plugin.as_str(), "p");
+        assert!(
+            result.failures[0].reason.contains("manifest"),
+            "failure reason must mention the manifest, got: {}",
+            result.failures[0].reason
+        );
+    }
+
+    /// P2a-1 finding: an unreadable plugin.json (directory instead of file)
+    /// must surface as a per-plugin failure via `ManifestReadFailed`.
+    #[test]
+    fn detect_plugin_updates_unreadable_plugin_json_surfaces_as_failure() {
+        use crate::project::KiroProject;
+        use crate::service::test_support::{
+            make_plugin_with_skills, relative_path_entry, seed_marketplace_with_registry,
+            temp_service,
+        };
+
+        let (dir, svc) = temp_service();
+        let entries = vec![relative_path_entry("p", "plugins/p")];
+        let mp_path = seed_marketplace_with_registry(dir.path(), &svc, "mp", &entries);
+        make_plugin_with_skills(&mp_path, "p", &["alpha"]);
+        let plugin_dir = mp_path.join("plugins/p");
+        fs::write(
+            plugin_dir.join("plugin.json"),
+            br#"{"name":"p","version":"1.0"}"#,
+        )
+        .unwrap();
+
+        let project_tmp = tempfile::tempdir().unwrap();
+        let project = KiroProject::new(project_tmp.path().to_path_buf());
+
+        svc.install_plugin(&project, &mp("mp"), &pn("p"), InstallMode::New, false)
+            .expect("install");
+
+        // Replace plugin.json with a directory so fs::read fails
+        fs::remove_file(plugin_dir.join("plugin.json")).unwrap();
+        fs::create_dir(plugin_dir.join("plugin.json")).unwrap();
+
+        let result = svc.detect_plugin_updates(&project).expect("detect");
+        assert!(
+            result.updates.is_empty(),
+            "unreadable manifest must not produce an update entry"
+        );
+        assert_eq!(
+            result.failures.len(),
+            1,
+            "unreadable manifest must produce exactly one failure, got: {:?}",
+            result.failures
+        );
+        assert_eq!(result.failures[0].plugin.as_str(), "p");
+        assert!(
+            result.failures[0].reason.contains("manifest"),
+            "failure reason must mention the manifest, got: {}",
+            result.failures[0].reason
+        );
+    }
+
+    /// P2a-4 finding: agents have the same `Option<String>` `source_hash` shape
+    /// as skills and must follow the same legacy fallback path. Uses a
+    /// native-format agent to avoid the translated-agent companion-files
+    /// path-reconstruction complexity (C7).
+    #[test]
+    fn detect_plugin_updates_agent_legacy_fallback_source_hash_none() {
+        use crate::project::KiroProject;
+        use crate::service::test_support::{
+            make_plugin_with_skills, relative_path_entry, seed_marketplace_with_registry,
+            temp_service,
+        };
+
+        let (dir, svc) = temp_service();
+        let entries = vec![relative_path_entry("p", "plugins/p")];
+        let mp_path = seed_marketplace_with_registry(dir.path(), &svc, "mp", &entries);
+        make_plugin_with_skills(&mp_path, "p", &["alpha"]);
+        let plugin_dir = mp_path.join("plugins/p");
+        let agents_dir = plugin_dir.join("agents");
+        fs::create_dir_all(&agents_dir).unwrap();
+        fs::write(
+            agents_dir.join("reviewer.json"),
+            br#"{"name":"reviewer","description":"Reviews"}"#,
+        )
+        .unwrap();
+        fs::write(
+            plugin_dir.join("plugin.json"),
+            br#"{"name":"p","version":"1.0","format":"kiro-cli"}"#,
+        )
+        .unwrap();
+
+        let project_tmp = tempfile::tempdir().unwrap();
+        let project = KiroProject::new(project_tmp.path().to_path_buf());
+
+        svc.install_plugin(&project, &mp("mp"), &pn("p"), InstallMode::New, false)
+            .expect("install");
+
+        // Verify the agent was actually installed before mutating.
+        let tracking_pre = project.load_installed_agents().unwrap();
+        assert!(
+            tracking_pre.agents.contains_key("reviewer"),
+            "agent must be installed before test mutation"
+        );
+
+        // Set agent source_hash: None in tracking file
+        let mut tracking = project.load_installed_agents().unwrap();
+        for meta in tracking.agents.values_mut() {
+            meta.source_hash = None;
+        }
+        let tracking_path = project_tmp.path().join(".kiro/installed-agents.json");
+        fs::write(
+            &tracking_path,
+            serde_json::to_vec_pretty(&tracking).unwrap(),
+        )
+        .unwrap();
+
+        // Bump version
+        fs::write(
+            plugin_dir.join("plugin.json"),
+            br#"{"name":"p","version":"1.1","format":"kiro-cli"}"#,
+        )
+        .unwrap();
+
+        let result = svc.detect_plugin_updates(&project).expect("detect");
+        assert_eq!(
+            result.updates.len(),
+            1,
+            "agent with source_hash: None and version bump must surface as update, got: {result:?}"
+        );
+        assert_eq!(result.updates[0].plugin.as_str(), "p");
+        assert!(matches!(
+            result.updates[0].change_signal,
+            UpdateChangeSignal::VersionBumped
         ));
         assert!(result.failures.is_empty());
     }

@@ -195,10 +195,17 @@ export type CommandError = {
  *  from cache, manifest malformed, hash computation failure). Plugins
  *  with no update available are absent from both vecs (the implicit
  *  "everything's fine" set).
+ * 
+ *  `partial_load_warnings` carries tracking-file load failures that
+ *  happened before `installed_plugins()` returned — e.g. a corrupt
+ *  `installed-skills.json` means the corresponding skills are missing
+ *  from `plugins` and the warning is surfaced here so the caller can
+ *  render a "partial state" banner.
  */
 export type DetectUpdatesResult = {
 	updates?: PluginUpdateInfo[],
 	failures?: PluginUpdateFailure[],
+	partial_load_warnings?: TrackingLoadWarning[],
 };
 
 // A discovered Kiro project found during directory scanning.
@@ -1006,9 +1013,10 @@ export type RelativePath = string;
  *  Per-content-type sub-result for [`RemovePluginResult`]. Mirrors
  *  the install-side [`crate::service::InstallAgentsResult`] shape.
  *  `removed` is a flat vec of translated agent names + native agent
- *  names + native companion file paths (rendered) — matches the
- *  install-side asymmetry where native companions are agent-side
- *  artifacts.
+ *  names. Native companion file paths are NOT itemized (P2a-3
+ *  decision α) — the `native_companions` cascade step succeeds with
+ *  no per-file entries. If the FE later wants per-companion
+ *  granularity, that's an additive field change.
  */
 export type RemoveAgentsResult = {
 	removed?: string[],
