@@ -562,10 +562,20 @@ impl PluginUpdateFailureKind {
     pub fn from_error(err: &Error) -> Self {
         match err {
             Error::Plugin(PluginError::NotFound { .. }) => Self::MarketplaceUnavailable,
+            // Cache-side variants are the canonical detection path
+            // (Phase 2a). Project-side variants
+            // (`ManifestReadFailed` / `InvalidManifest`) map here too
+            // because `check_plugin_for_update` may surface them
+            // transitively via `resolve_local_plugin_dir` which
+            // shares the install-time error vocabulary.
             Error::Plugin(
-                PluginError::ManifestNotFound { .. } | PluginError::ManifestReadFailed { .. },
+                PluginError::ManifestNotFound { .. }
+                | PluginError::ManifestReadFailed { .. }
+                | PluginError::CacheManifestReadFailed { .. },
             ) => Self::ManifestUnreadable,
-            Error::Plugin(PluginError::InvalidManifest { .. }) => Self::ManifestInvalid,
+            Error::Plugin(
+                PluginError::InvalidManifest { .. } | PluginError::CacheManifestInvalid { .. },
+            ) => Self::ManifestInvalid,
             Error::Hash(_) => Self::HashFailed,
             Error::Marketplace(crate::error::MarketplaceError::NotFound { .. }) => {
                 Self::MarketplaceUnavailable
@@ -2252,11 +2262,14 @@ impl MarketplaceService {
             ManifestVersion::Found(v) => v,
             ManifestVersion::Unreadable { reason } => {
                 let manifest_path = plugin_dir.join("plugin.json");
-                // ManifestNotFound's Display embeds the path; we wrap
-                // the symlink/missing distinction into the carried
-                // io::Error so error_full_chain renders both pieces in
-                // the wire-format `PluginUpdateFailure.reason`.
-                return Err(PluginError::ManifestReadFailed {
+                // CacheManifestReadFailed's Display embeds the path;
+                // we wrap the symlink/missing distinction into the
+                // carried io::Error so error_full_chain renders both
+                // pieces in the wire-format `PluginUpdateFailure.reason`.
+                // The cache-side variant routes through
+                // PluginUpdateFailureKind::ManifestUnreadable in the
+                // outer detect_plugin_updates loop (see Commit 5).
+                return Err(PluginError::CacheManifestReadFailed {
                     path: manifest_path,
                     source: std::io::Error::new(std::io::ErrorKind::NotFound, reason),
                 }
@@ -2350,7 +2363,7 @@ impl MarketplaceService {
                 });
             }
             Err(e) => {
-                return Err(PluginError::ManifestReadFailed {
+                return Err(PluginError::CacheManifestReadFailed {
                     path: manifest_path,
                     source: e,
                 }
@@ -2361,7 +2374,7 @@ impl MarketplaceService {
         let bytes = match read_capped(&manifest_path, MAX_PLUGIN_MANIFEST_BYTES) {
             Ok(b) => b,
             Err(e) => {
-                return Err(PluginError::ManifestReadFailed {
+                return Err(PluginError::CacheManifestReadFailed {
                     path: manifest_path,
                     source: e,
                 }
@@ -2371,7 +2384,7 @@ impl MarketplaceService {
 
         match crate::plugin::PluginManifest::from_json(&bytes) {
             Ok(manifest) => Ok(ManifestVersion::Found(manifest.version)),
-            Err(e) => Err(PluginError::InvalidManifest {
+            Err(e) => Err(PluginError::CacheManifestInvalid {
                 path: manifest_path,
                 reason: error_full_chain(&e),
             }

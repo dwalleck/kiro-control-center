@@ -138,6 +138,29 @@ pub enum PluginError {
         source: io::Error,
     },
 
+    /// Marketplace-cache `plugin.json` could not be read. Distinct from
+    /// [`Self::ManifestReadFailed`] (project-side / install-time) so a
+    /// future classifier can render "your project is broken" vs "the
+    /// local marketplace cache is broken — run `kiro-market update`"
+    /// without substring-matching paths. Carries the underlying
+    /// [`io::Error`] via `#[source]`.
+    #[error("could not read marketplace cache manifest at {path}")]
+    CacheManifestReadFailed {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+
+    /// Marketplace-cache `plugin.json` exists but failed to parse.
+    /// Distinct from [`Self::InvalidManifest`] (project-side /
+    /// install-time) for the same reason as
+    /// [`Self::CacheManifestReadFailed`]. `reason` carries the rendered
+    /// `serde_json` error chain — the type does NOT leak through this
+    /// public API per CLAUDE.md gate-4 (`#[non_exhaustive]` enum +
+    /// `reason: String`).
+    #[error("invalid marketplace cache manifest at {path}: {reason}")]
+    CacheManifestInvalid { path: PathBuf, reason: String },
+
     /// A caller asked for a local filesystem path to a plugin whose source
     /// is remote (GitHub / Git URL / Git subdir). Resolving it would
     /// require a clone, which the caller explicitly did not request.
@@ -233,7 +256,9 @@ impl PluginError {
             | Self::NotADirectory { .. }
             | Self::SymlinkRefused { .. }
             | Self::DirectoryUnreadable { .. }
-            | Self::ManifestReadFailed { .. } => None,
+            | Self::ManifestReadFailed { .. }
+            | Self::CacheManifestReadFailed { .. }
+            | Self::CacheManifestInvalid { .. } => None,
         }
     }
 }
@@ -692,6 +717,20 @@ mod tests {
         },
         "plugin `acme` uses a remote source and is not available locally"
     )]
+    #[case::plugin_cache_manifest_read_failed(
+        PluginError::CacheManifestReadFailed {
+            path: PathBuf::from("/tmp/cache/p/plugin.json"),
+            source: io::Error::from(io::ErrorKind::NotFound),
+        },
+        "could not read marketplace cache manifest at /tmp/cache/p/plugin.json"
+    )]
+    #[case::plugin_cache_manifest_invalid(
+        PluginError::CacheManifestInvalid {
+            path: PathBuf::from("/tmp/cache/p/plugin.json"),
+            reason: "missing field `name`".into(),
+        },
+        "invalid marketplace cache manifest at /tmp/cache/p/plugin.json: missing field `name`"
+    )]
     fn plugin_error_display(#[case] err: PluginError, #[case] expected: &str) {
         assert_eq!(err.to_string(), expected);
     }
@@ -796,6 +835,14 @@ mod tests {
     #[case::no_skills(PluginError::NoSkills {
         name: "empty".into(),
         path: PathBuf::from("/tmp/plugins/empty"),
+    })]
+    #[case::cache_manifest_read_failed(PluginError::CacheManifestReadFailed {
+        path: PathBuf::from("/tmp/cache/p/plugin.json"),
+        source: io::Error::from(io::ErrorKind::NotFound),
+    })]
+    #[case::cache_manifest_invalid(PluginError::CacheManifestInvalid {
+        path: PathBuf::from("/tmp/cache/p/plugin.json"),
+        reason: "expected `,` got `}`".into(),
     })]
     fn remediation_hint_returns_none_for_variants_without_actionable_step(
         #[case] err: PluginError,

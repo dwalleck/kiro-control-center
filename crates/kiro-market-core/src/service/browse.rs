@@ -184,7 +184,17 @@ impl SkippedReason {
             // `NotFound` and `ManifestNotFound` stay here because they
             // represent "caller asked for the wrong thing" — a user-input
             // bug, not a damaged plugin to fold into `skipped`.
-            PluginError::NotFound { .. } | PluginError::ManifestNotFound { .. } => None,
+            //
+            // The cache-side variants (CacheManifestReadFailed /
+            // CacheManifestInvalid) belong to the update-detection
+            // path (`detect_plugin_updates`), not the bulk-listing
+            // path that produces `SkippedPlugin`. They route through
+            // PluginUpdateFailureKind instead, so they correctly
+            // return None here.
+            PluginError::NotFound { .. }
+            | PluginError::ManifestNotFound { .. }
+            | PluginError::CacheManifestReadFailed { .. }
+            | PluginError::CacheManifestInvalid { .. } => None,
         }
     }
 }
