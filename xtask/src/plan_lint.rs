@@ -352,13 +352,13 @@ const ALLOWED_SITES: &[AllowedSite] = &[
     AllowedSite {
         gate: "no-unwrap-in-production",
         path: "crates/kiro-control-center/src-tauri/src/lib.rs",
-        line: 54,
+        line: 55,
         reason: "Tauri scaffolding pattern — debug-only `specta_typescript::Typescript::default().export(...)` failure at app startup. Refactoring to `?` propagation would only move the panic into `fn main()`. Idiomatic Rust at the binary entry point.",
     },
     AllowedSite {
         gate: "no-unwrap-in-production",
         path: "crates/kiro-control-center/src-tauri/src/lib.rs",
-        line: 65,
+        line: 66,
         reason: "Tauri scaffolding pattern — `tauri::Builder::run` failure at app startup. Replacing with Result propagation would only move the panic into `fn main()`. Idiomatic Rust at the binary entry point.",
     },
 ];
@@ -1306,7 +1306,7 @@ mod tests {
     fn is_allowed_matches_gate_path_and_line_exactly() {
         let f = Finding {
             path: "crates/kiro-control-center/src-tauri/src/lib.rs".to_string(),
-            line: 54,
+            line: 55,
             qualified_name: "run".to_string(),
             signature: Some("expect".to_string()),
         };
