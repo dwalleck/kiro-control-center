@@ -83,6 +83,33 @@ fn detect_plugin_updates_impl(
         .map_err(CommandError::from)
 }
 
+/// Scan installed plugins for available updates by comparing each
+/// project tracking entry's recorded `version` and `source_hash`
+/// against the corresponding plugin in the marketplace cache. Reads
+/// from local cache only — callers that want fresh data run
+/// `update_marketplaces` first.
+///
+/// Returns a [`DetectUpdatesResult`] split into three vecs:
+/// - `updates`: plugins with an available update (typed
+///   `change_signal` distinguishes manifest version bump from
+///   content drift without version bump).
+/// - `failures`: plugins the scan couldn't check, with a typed
+///   `kind: PluginUpdateFailureKind` for FE branching (Rule 42).
+/// - `partial_load_warnings`: tracking files that failed to load
+///   (corrupt JSON etc.) — the other tracking files still
+///   contribute and the scan continues.
+///
+/// Splits into [`detect_plugin_updates_impl`] per the
+/// service-consuming-command convention so the body is testable
+/// without a Tauri runtime.
+///
+/// # Errors
+///
+/// Returns `CommandError::Validation` on an invalid `project_path`.
+/// Per-plugin scan failures land in
+/// [`DetectUpdatesResult::failures`] (a typed entry, not an
+/// `Err(CommandError)`) so a single bad plugin doesn't abort the
+/// whole scan.
 #[tauri::command]
 #[specta::specta]
 pub async fn detect_plugin_updates(

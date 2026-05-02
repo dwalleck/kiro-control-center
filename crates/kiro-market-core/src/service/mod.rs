@@ -2503,7 +2503,43 @@ impl MarketplaceService {
                             meta.dialect,
                             meta.source_path.as_ref(),
                         );
-                        let computed = crate::hash::hash_artifact(&base, &[filename])?;
+                        let computed = match crate::hash::hash_artifact(
+                            &base,
+                            std::slice::from_ref(&filename),
+                        ) {
+                            Ok(h) => h,
+                            Err(crate::hash::HashError::ReadFailed { path, source })
+                                if source.kind() == std::io::ErrorKind::NotFound
+                                    && meta.source_path.is_none() =>
+                            {
+                                // I-N7 (PR #96 re-review): the dialect
+                                // fallback resolved a path that doesn't
+                                // exist in the cache — typical cause is
+                                // a pre-C7 install (no source_path
+                                // tracked) where the install-time
+                                // filename convention disagrees with
+                                // detection's dialect-fallback (e.g. a
+                                // Copilot agent installed under a
+                                // non-`{name}.agent.md` filename).
+                                // Surface an actionable message instead
+                                // of "file not found".
+                                return Err(std::io::Error::new(
+                                    std::io::ErrorKind::NotFound,
+                                    format!(
+                                        "agent `{name}` was installed before \
+                                         `source_path` tracking landed (legacy \
+                                         entry); the dialect-fallback path `{}` is \
+                                         not present in the marketplace cache. \
+                                         Reinstall the plugin to populate \
+                                         `source_path` so update detection can \
+                                         locate the source file unambiguously.",
+                                        path.display(),
+                                    ),
+                                )
+                                .into());
+                            }
+                            Err(e) => return Err(e.into()),
+                        };
                         if computed != *stored {
                             content_drift = true;
                             return Ok((content_drift, legacy_fallback));
