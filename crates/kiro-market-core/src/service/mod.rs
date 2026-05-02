@@ -446,6 +446,64 @@ pub struct InstallPluginResult {
     pub agents: InstallAgentsResult,
 }
 
+/// Result of [`MarketplaceService::detect_plugin_updates`] — a scan over
+/// installed plugins. `updates` lists plugins with available updates;
+/// `failures` lists plugins the scan couldn't check (marketplace gone
+/// from cache, manifest malformed, hash computation failure). Plugins
+/// with no update available are absent from both vecs (the implicit
+/// "everything's fine" set).
+#[derive(Clone, Debug, Default, Serialize)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
+pub struct DetectUpdatesResult {
+    #[serde(default)]
+    pub updates: Vec<PluginUpdateInfo>,
+    #[serde(default)]
+    pub failures: Vec<PluginUpdateFailure>,
+}
+
+/// A single plugin with an update available. `installed_version` is
+/// `None` for legacy installs whose tracking file lacked the version
+/// field; `available_version` is `None` when the marketplace plugin
+/// manifest itself lacks a version. The `change_signal` discriminates
+/// between manifest-version change and content-drift-without-version-bump.
+#[derive(Clone, Debug, Serialize)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
+pub struct PluginUpdateInfo {
+    pub marketplace: crate::validation::MarketplaceName,
+    pub plugin: crate::validation::PluginName,
+    pub installed_version: Option<String>,
+    pub available_version: Option<String>,
+    pub change_signal: UpdateChangeSignal,
+}
+
+/// A plugin the update scan couldn't check. `reason` is the rendered
+/// error chain via [`crate::error::error_full_chain`] per CLAUDE.md FFI
+/// rule (any wire-format `reason`/`error: String` field uses
+/// `error_full_chain(&err)`, not `err.to_string()`).
+#[derive(Clone, Debug, Serialize)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
+pub struct PluginUpdateFailure {
+    pub marketplace: crate::validation::MarketplaceName,
+    pub plugin: crate::validation::PluginName,
+    pub reason: String,
+}
+
+/// Why an update is being surfaced. Tagged enum for FFI per the
+/// `ffi-enum-serde-tag` plan-lint gate (PR #91): `#[serde(tag = "kind",
+/// rename_all = "snake_case")]` produces `{ "kind": "version_bumped" }`
+/// in JSON, which `tauri-specta` emits as a discriminated TS union.
+#[derive(Clone, Debug, Serialize)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum UpdateChangeSignal {
+    /// Manifest version string differs (with or without content hash diff).
+    /// FE renders "Update v1.0 → v1.1".
+    VersionBumped,
+    /// Manifest version unchanged but at least one source-hash diff
+    /// detected. FE renders "Content updated since install".
+    ContentChanged,
+}
+
 /// An agent that failed to install, with the typed error.
 ///
 /// `name` is `Some` once parsing has identified the agent; pre-parse
@@ -4872,5 +4930,72 @@ mod tests {
         // surfaces in this test, not just the default-shape lock.
         assert_eq!(json["marketplace"], "mp");
         assert_eq!(json["plugin"], "p");
+    }
+
+    #[test]
+    fn detect_updates_result_json_shape_default_empty() {
+        let result = DetectUpdatesResult::default();
+        let json = serde_json::to_value(&result).expect("serialize");
+        assert_eq!(json["updates"], serde_json::json!([]));
+        assert_eq!(json["failures"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn detect_updates_result_json_shape_with_one_update_and_one_failure() {
+        use crate::service::test_support::{mp, pn};
+        let result = DetectUpdatesResult {
+            updates: vec![PluginUpdateInfo {
+                marketplace: mp("mp1"),
+                plugin: pn("p1"),
+                installed_version: Some("1.0".into()),
+                available_version: Some("1.1".into()),
+                change_signal: UpdateChangeSignal::VersionBumped,
+            }],
+            failures: vec![PluginUpdateFailure {
+                marketplace: mp("mp2"),
+                plugin: pn("p2"),
+                reason: "marketplace not in cache".into(),
+            }],
+        };
+        let json = serde_json::to_value(&result).expect("serialize");
+        assert_eq!(json["updates"][0]["marketplace"], "mp1");
+        assert_eq!(json["updates"][0]["plugin"], "p1");
+        assert_eq!(json["updates"][0]["installed_version"], "1.0");
+        assert_eq!(json["updates"][0]["available_version"], "1.1");
+        assert_eq!(
+            json["updates"][0]["change_signal"]["kind"],
+            "version_bumped"
+        );
+        assert_eq!(json["failures"][0]["marketplace"], "mp2");
+        assert_eq!(json["failures"][0]["plugin"], "p2");
+        assert_eq!(json["failures"][0]["reason"], "marketplace not in cache");
+    }
+
+    #[test]
+    fn plugin_update_info_json_shape_version_bumped() {
+        use crate::service::test_support::{mp, pn};
+        let info = PluginUpdateInfo {
+            marketplace: mp("mp"),
+            plugin: pn("p"),
+            installed_version: Some("1.0".into()),
+            available_version: Some("1.1".into()),
+            change_signal: UpdateChangeSignal::VersionBumped,
+        };
+        let json = serde_json::to_value(&info).expect("serialize");
+        assert_eq!(json["change_signal"]["kind"], "version_bumped");
+    }
+
+    #[test]
+    fn plugin_update_info_json_shape_content_changed() {
+        use crate::service::test_support::{mp, pn};
+        let info = PluginUpdateInfo {
+            marketplace: mp("mp"),
+            plugin: pn("p"),
+            installed_version: Some("1.0".into()),
+            available_version: Some("1.0".into()),
+            change_signal: UpdateChangeSignal::ContentChanged,
+        };
+        let json = serde_json::to_value(&info).expect("serialize");
+        assert_eq!(json["change_signal"]["kind"], "content_changed");
     }
 }
