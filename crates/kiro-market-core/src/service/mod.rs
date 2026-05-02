@@ -2208,10 +2208,37 @@ impl MarketplaceService {
         project: &crate::project::KiroProject,
     ) -> Result<DetectUpdatesResult, Error> {
         let view = project.installed_plugins()?;
+        // Hoist the three tracking-file loads above the per-plugin
+        // loop (originally-deferred IMPORTANT in PR #96 review). Pre-fix:
+        // `scan_plugin_for_content_drift` called
+        // load_installed{,_steering,_agents}() once per plugin, so a
+        // project with N installed plugins did 3N reads + JSON
+        // deserializations where 3 are sufficient. Side-benefit:
+        // tracking-file load failures no longer get misattributed to
+        // whichever plugin happens to be first in the iteration
+        // order — they're folded into `partial_load_warnings` (the
+        // view already did that walk; here we follow the same
+        // defaulting pattern so a corrupt tracking file doesn't
+        // double-surface as both a warning AND a top-level Err).
+        let installed_skills = project
+            .load_installed()
+            .unwrap_or_else(|_| crate::project::InstalledSkills::default());
+        let installed_steering = project
+            .load_installed_steering()
+            .unwrap_or_else(|_| crate::project::InstalledSteering::default());
+        let installed_agents = project
+            .load_installed_agents()
+            .unwrap_or_else(|_| crate::project::InstalledAgents::default());
+
         let mut updates = Vec::new();
         let mut failures = Vec::new();
         for plugin_info in view.plugins {
-            match self.check_plugin_for_update(project, &plugin_info) {
+            match self.check_plugin_for_update(
+                &plugin_info,
+                &installed_skills,
+                &installed_steering,
+                &installed_agents,
+            ) {
                 Ok(Some(update)) => updates.push(update),
                 Ok(None) => {}
                 Err(err) => failures.push(PluginUpdateFailure {
@@ -2231,8 +2258,10 @@ impl MarketplaceService {
 
     fn check_plugin_for_update(
         &self,
-        project: &crate::project::KiroProject,
         plugin_info: &crate::project::InstalledPluginInfo,
+        installed_skills: &crate::project::InstalledSkills,
+        installed_steering: &crate::project::InstalledSteering,
+        installed_agents: &crate::project::InstalledAgents,
     ) -> Result<Option<PluginUpdateInfo>, Error> {
         let marketplace_name = plugin_info.marketplace.as_str();
         let plugin_name = plugin_info.plugin.as_str();
@@ -2277,8 +2306,13 @@ impl MarketplaceService {
             }
         };
 
-        let (content_drift, legacy_fallback) =
-            Self::scan_plugin_for_content_drift(project, plugin_info, &plugin_dir)?;
+        let (content_drift, legacy_fallback) = Self::scan_plugin_for_content_drift(
+            plugin_info,
+            &plugin_dir,
+            installed_skills,
+            installed_steering,
+            installed_agents,
+        )?;
 
         let installed_version = plugin_info.installed_version.clone();
         let version_differs = installed_version != available_version;
@@ -2401,15 +2435,16 @@ impl MarketplaceService {
     /// so a clean miss is possible." Callers should treat `legacy_fallback`
     /// as "drift undetectable" rather than "drift absent."
     fn scan_plugin_for_content_drift(
-        project: &crate::project::KiroProject,
         plugin_info: &crate::project::InstalledPluginInfo,
         plugin_dir: &Path,
+        installed_skills: &crate::project::InstalledSkills,
+        installed_steering: &crate::project::InstalledSteering,
+        installed_agents: &crate::project::InstalledAgents,
     ) -> Result<(bool, bool), Error> {
         let mut content_drift = false;
         let mut legacy_fallback = false;
 
         // Skills
-        let installed_skills = project.load_installed()?;
         for (name, meta) in &installed_skills.skills {
             if meta.marketplace == plugin_info.marketplace && meta.plugin == plugin_info.plugin {
                 match &meta.source_hash {
@@ -2427,7 +2462,6 @@ impl MarketplaceService {
         }
 
         // Steering
-        let installed_steering = project.load_installed_steering()?;
         for (rel_path, meta) in &installed_steering.files {
             if meta.marketplace == plugin_info.marketplace && meta.plugin == plugin_info.plugin {
                 let steering_dir = plugin_dir.join("steering");
@@ -2441,7 +2475,6 @@ impl MarketplaceService {
         }
 
         // Agents
-        let installed_agents = project.load_installed_agents()?;
         for (name, meta) in &installed_agents.agents {
             if meta.marketplace == plugin_info.marketplace && meta.plugin == plugin_info.plugin {
                 match &meta.source_hash {
