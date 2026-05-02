@@ -2065,6 +2065,224 @@ impl MarketplaceService {
             agents,
         })
     }
+
+    /// Scan installed plugins, comparing each tracking-file `version` and
+    /// `source_hash` against the corresponding marketplace plugin manifest +
+    /// source files in the local cache. Reads from local cache only;
+    /// callers run `update_marketplaces` first if they want fresh data.
+    ///
+    /// "Update available" = at least one source-hash differs from the
+    /// tracking entry's `source_hash`, OR the marketplace plugin manifest's
+    /// `version` is not byte-equal to the most-recently-installed version
+    /// across the three tracking files. Strict string inequality on
+    /// versions, no semver — downgrades pushed by marketplace owners are
+    /// surfaced.
+    ///
+    /// Per-plugin failures (marketplace gone from cache, plugin removed
+    /// from manifest, manifest malformed, hash recomputation failed) land
+    /// in `failures`, not in `Result::Err`. Plugins with no update available
+    /// are absent from both vecs.
+    ///
+    /// Legacy fallback: if any tracked file's `source_hash` is `None`
+    /// (pre-Stage-1 install), drop back to version-only comparison for that
+    /// plugin. Same versions in legacy mode -> no entry in updates (content
+    /// drift undetectable until next install).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` only if `project.installed_plugins()` fails to load
+    /// the aggregate view (e.g. a tracking file is unreadable at the
+    /// `installed_plugins()` layer). Per-plugin scan failures are collected
+    /// in `DetectUpdatesResult::failures`, not in `Result::Err`.
+    pub fn detect_plugin_updates(
+        &self,
+        project: &crate::project::KiroProject,
+    ) -> Result<DetectUpdatesResult, Error> {
+        let view = project.installed_plugins()?;
+        let mut updates = Vec::new();
+        let mut failures = Vec::new();
+        for plugin_info in view.plugins {
+            match self.check_plugin_for_update(project, &plugin_info) {
+                Ok(Some(update)) => updates.push(update),
+                Ok(None) => {}
+                Err(err) => failures.push(PluginUpdateFailure {
+                    marketplace: plugin_info.marketplace.clone(),
+                    plugin: plugin_info.plugin.clone(),
+                    reason: error_full_chain(&err),
+                }),
+            }
+        }
+        Ok(DetectUpdatesResult { updates, failures })
+    }
+
+    fn check_plugin_for_update(
+        &self,
+        project: &crate::project::KiroProject,
+        plugin_info: &crate::project::InstalledPluginInfo,
+    ) -> Result<Option<PluginUpdateInfo>, Error> {
+        let marketplace_name = plugin_info.marketplace.as_str();
+        let plugin_name = plugin_info.plugin.as_str();
+
+        let entries = self.list_plugin_entries(marketplace_name)?;
+        let entry = entries
+            .iter()
+            .find(|e| e.name == plugin_name)
+            .ok_or_else(|| PluginError::NotFound {
+                plugin: plugin_name.to_owned(),
+                marketplace: marketplace_name.to_owned(),
+            })?;
+
+        let marketplace_path = self.marketplace_path(marketplace_name);
+        let plugin_dir = self.resolve_plugin_dir(
+            entry,
+            &marketplace_path,
+            marketplace_name,
+            GitProtocol::Https,
+        )?;
+
+        let available_version = Self::load_plugin_manifest_version(&plugin_dir)?;
+
+        let (content_drift, legacy_fallback) =
+            Self::scan_plugin_for_content_drift(project, plugin_info, &plugin_dir)?;
+
+        let installed_version = plugin_info.installed_version.clone();
+        let version_differs = installed_version != available_version;
+
+        if version_differs {
+            return Ok(Some(PluginUpdateInfo {
+                marketplace: plugin_info.marketplace.clone(),
+                plugin: plugin_info.plugin.clone(),
+                installed_version,
+                available_version,
+                change_signal: UpdateChangeSignal::VersionBumped,
+            }));
+        }
+
+        if content_drift {
+            return Ok(Some(PluginUpdateInfo {
+                marketplace: plugin_info.marketplace.clone(),
+                plugin: plugin_info.plugin.clone(),
+                installed_version,
+                available_version,
+                change_signal: UpdateChangeSignal::ContentChanged,
+            }));
+        }
+
+        if legacy_fallback {
+            // Drift undetectable — same versions means no entry.
+            return Ok(None);
+        }
+
+        Ok(None)
+    }
+
+    /// Load `plugin.json` from `plugin_dir` and return its `version` field.
+    fn load_plugin_manifest_version(plugin_dir: &Path) -> Result<Option<String>, Error> {
+        let manifest_path = plugin_dir.join("plugin.json");
+        match fs::read(&manifest_path) {
+            Ok(bytes) => match crate::plugin::PluginManifest::from_json(&bytes) {
+                Ok(manifest) => Ok(manifest.version),
+                Err(e) => Err(PluginError::InvalidManifest {
+                    path: manifest_path,
+                    reason: error_full_chain(&e),
+                }
+                .into()),
+            },
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(PluginError::ManifestReadFailed {
+                path: manifest_path,
+                source: e,
+            }
+            .into()),
+        }
+    }
+
+    /// Scan all tracking entries for `(marketplace, plugin)` and compare
+    /// their stored `source_hash` against freshly-computed hashes from
+    /// `plugin_dir`.
+    ///
+    /// `content_drift = false && legacy_fallback = true` means "no drift
+    /// detected among hashable entries; some entries had no `source_hash`
+    /// so a clean miss is possible." Callers should treat `legacy_fallback`
+    /// as "drift undetectable" rather than "drift absent."
+    fn scan_plugin_for_content_drift(
+        project: &crate::project::KiroProject,
+        plugin_info: &crate::project::InstalledPluginInfo,
+        plugin_dir: &Path,
+    ) -> Result<(bool, bool), Error> {
+        let mut content_drift = false;
+        let mut legacy_fallback = false;
+
+        // Skills
+        let installed_skills = project.load_installed()?;
+        for (name, meta) in &installed_skills.skills {
+            if meta.marketplace == plugin_info.marketplace && meta.plugin == plugin_info.plugin {
+                match &meta.source_hash {
+                    Some(stored) => {
+                        let skill_dir = plugin_dir.join("skills").join(name);
+                        let computed = crate::hash::hash_dir_tree(&skill_dir)?;
+                        if computed != *stored {
+                            content_drift = true;
+                            return Ok((content_drift, legacy_fallback));
+                        }
+                    }
+                    None => legacy_fallback = true,
+                }
+            }
+        }
+
+        // Steering
+        let installed_steering = project.load_installed_steering()?;
+        for (rel_path, meta) in &installed_steering.files {
+            if meta.marketplace == plugin_info.marketplace && meta.plugin == plugin_info.plugin {
+                let steering_dir = plugin_dir.join("steering");
+                let computed =
+                    crate::hash::hash_artifact(&steering_dir, std::slice::from_ref(rel_path))?;
+                if computed != meta.source_hash {
+                    content_drift = true;
+                    return Ok((content_drift, legacy_fallback));
+                }
+            }
+        }
+
+        // Agents
+        let installed_agents = project.load_installed_agents()?;
+        for (name, meta) in &installed_agents.agents {
+            if meta.marketplace == plugin_info.marketplace && meta.plugin == plugin_info.plugin {
+                match &meta.source_hash {
+                    Some(stored) => {
+                        let agents_dir = plugin_dir.join("agents");
+                        let rel_path = match meta.dialect {
+                            crate::agent::AgentDialect::Native => {
+                                PathBuf::from(format!("{name}.json"))
+                            }
+                            _ => PathBuf::from(format!("{name}.md")),
+                        };
+                        let computed = crate::hash::hash_artifact(&agents_dir, &[rel_path])?;
+                        if computed != *stored {
+                            content_drift = true;
+                            return Ok((content_drift, legacy_fallback));
+                        }
+                    }
+                    None => legacy_fallback = true,
+                }
+            }
+        }
+
+        // Native companions
+        for meta in installed_agents.native_companions.values() {
+            if meta.marketplace == plugin_info.marketplace && meta.plugin == plugin_info.plugin {
+                let agents_dir = plugin_dir.join("agents");
+                let computed = crate::hash::hash_artifact(&agents_dir, &meta.files)?;
+                if computed != meta.source_hash {
+                    content_drift = true;
+                    return Ok((content_drift, legacy_fallback));
+                }
+            }
+        }
+
+        Ok((content_drift, legacy_fallback))
+    }
 }
 
 /// Decide whether a skill name passes the install filter.
@@ -4997,5 +5215,411 @@ mod tests {
         };
         let json = serde_json::to_value(&info).expect("serialize");
         assert_eq!(json["change_signal"]["kind"], "content_changed");
+    }
+
+    // -------------------------------------------------------------------
+    // detect_plugin_updates behavioral tests
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn detect_plugin_updates_happy_path_no_updates() {
+        use crate::project::KiroProject;
+        use crate::service::test_support::{
+            make_plugin_with_skills, relative_path_entry, seed_marketplace_with_registry,
+            temp_service,
+        };
+
+        let (dir, svc) = temp_service();
+        let entries = vec![relative_path_entry("p", "plugins/p")];
+        let mp_path = seed_marketplace_with_registry(dir.path(), &svc, "mp", &entries);
+        make_plugin_with_skills(&mp_path, "p", &["alpha"]);
+        let plugin_dir = mp_path.join("plugins/p");
+        fs::write(
+            plugin_dir.join("plugin.json"),
+            br#"{"name":"p","version":"1.0"}"#,
+        )
+        .unwrap();
+
+        let project_tmp = tempfile::tempdir().unwrap();
+        let project = KiroProject::new(project_tmp.path().to_path_buf());
+
+        svc.install_plugin(&project, &mp("mp"), &pn("p"), InstallMode::New, false)
+            .expect("install");
+
+        let result = svc.detect_plugin_updates(&project).expect("detect");
+        assert!(
+            result.updates.is_empty(),
+            "expected no updates: {:?}",
+            result.updates
+        );
+        assert!(
+            result.failures.is_empty(),
+            "expected no failures: {:?}",
+            result.failures
+        );
+    }
+
+    #[test]
+    fn detect_plugin_updates_version_bump() {
+        use crate::project::KiroProject;
+        use crate::service::test_support::{
+            make_plugin_with_skills, relative_path_entry, seed_marketplace_with_registry,
+            temp_service,
+        };
+
+        let (dir, svc) = temp_service();
+        let entries = vec![relative_path_entry("p", "plugins/p")];
+        let mp_path = seed_marketplace_with_registry(dir.path(), &svc, "mp", &entries);
+        make_plugin_with_skills(&mp_path, "p", &["alpha"]);
+        let plugin_dir = mp_path.join("plugins/p");
+        fs::write(
+            plugin_dir.join("plugin.json"),
+            br#"{"name":"p","version":"1.0"}"#,
+        )
+        .unwrap();
+
+        let project_tmp = tempfile::tempdir().unwrap();
+        let project = KiroProject::new(project_tmp.path().to_path_buf());
+
+        svc.install_plugin(&project, &mp("mp"), &pn("p"), InstallMode::New, false)
+            .expect("install");
+
+        // Bump manifest version
+        fs::write(
+            plugin_dir.join("plugin.json"),
+            br#"{"name":"p","version":"1.1"}"#,
+        )
+        .unwrap();
+
+        let result = svc.detect_plugin_updates(&project).expect("detect");
+        assert_eq!(result.updates.len(), 1);
+        assert_eq!(result.updates[0].plugin.as_str(), "p");
+        assert!(matches!(
+            result.updates[0].change_signal,
+            UpdateChangeSignal::VersionBumped
+        ));
+        assert!(result.failures.is_empty());
+    }
+
+    #[test]
+    fn detect_plugin_updates_content_drift_without_version_bump() {
+        use crate::project::KiroProject;
+        use crate::service::test_support::{
+            make_plugin_with_skills, relative_path_entry, seed_marketplace_with_registry,
+            temp_service,
+        };
+
+        let (dir, svc) = temp_service();
+        let entries = vec![relative_path_entry("p", "plugins/p")];
+        let mp_path = seed_marketplace_with_registry(dir.path(), &svc, "mp", &entries);
+        make_plugin_with_skills(&mp_path, "p", &["alpha"]);
+        let plugin_dir = mp_path.join("plugins/p");
+        fs::write(
+            plugin_dir.join("plugin.json"),
+            br#"{"name":"p","version":"1.0"}"#,
+        )
+        .unwrap();
+
+        let project_tmp = tempfile::tempdir().unwrap();
+        let project = KiroProject::new(project_tmp.path().to_path_buf());
+
+        svc.install_plugin(&project, &mp("mp"), &pn("p"), InstallMode::New, false)
+            .expect("install");
+
+        // Mutate a skill file in the cache
+        let skill_dir = plugin_dir.join("skills/alpha");
+        fs::write(skill_dir.join("SKILL.md"), "mutated content").unwrap();
+
+        let result = svc.detect_plugin_updates(&project).expect("detect");
+        assert_eq!(result.updates.len(), 1);
+        assert_eq!(result.updates[0].plugin.as_str(), "p");
+        assert!(matches!(
+            result.updates[0].change_signal,
+            UpdateChangeSignal::ContentChanged
+        ));
+        assert!(result.failures.is_empty());
+    }
+
+    #[test]
+    fn detect_plugin_updates_per_plugin_failure_surfacing() {
+        use crate::project::KiroProject;
+        use crate::service::test_support::{
+            make_plugin_with_skills, relative_path_entry, seed_marketplace_with_registry,
+            temp_service,
+        };
+
+        let (dir, svc) = temp_service();
+        let entries = vec![relative_path_entry("p", "plugins/p")];
+        let mp_path = seed_marketplace_with_registry(dir.path(), &svc, "mp", &entries);
+        make_plugin_with_skills(&mp_path, "p", &["alpha"]);
+        let plugin_dir = mp_path.join("plugins/p");
+        fs::write(
+            plugin_dir.join("plugin.json"),
+            br#"{"name":"p","version":"1.0"}"#,
+        )
+        .unwrap();
+
+        let project_tmp = tempfile::tempdir().unwrap();
+        let project = KiroProject::new(project_tmp.path().to_path_buf());
+
+        svc.install_plugin(&project, &mp("mp"), &pn("p"), InstallMode::New, false)
+            .expect("install");
+
+        // Remove marketplace from cache
+        fs::remove_dir_all(&mp_path).unwrap();
+
+        let result = svc.detect_plugin_updates(&project).expect("detect");
+        assert!(result.updates.is_empty());
+        assert_eq!(result.failures.len(), 1);
+        assert_eq!(result.failures[0].plugin.as_str(), "p");
+        assert_eq!(result.failures[0].marketplace.as_str(), "mp");
+    }
+
+    #[test]
+    fn detect_plugin_updates_legacy_fallback_source_hash_none() {
+        use crate::project::KiroProject;
+        use crate::service::test_support::{
+            make_plugin_with_skills, relative_path_entry, seed_marketplace_with_registry,
+            temp_service,
+        };
+
+        let (dir, svc) = temp_service();
+        let entries = vec![relative_path_entry("p", "plugins/p")];
+        let mp_path = seed_marketplace_with_registry(dir.path(), &svc, "mp", &entries);
+        make_plugin_with_skills(&mp_path, "p", &["alpha"]);
+        let plugin_dir = mp_path.join("plugins/p");
+        fs::write(
+            plugin_dir.join("plugin.json"),
+            br#"{"name":"p","version":"1.0"}"#,
+        )
+        .unwrap();
+
+        let project_tmp = tempfile::tempdir().unwrap();
+        let project = KiroProject::new(project_tmp.path().to_path_buf());
+
+        svc.install_plugin(&project, &mp("mp"), &pn("p"), InstallMode::New, false)
+            .expect("install");
+
+        // Set source_hash: None in tracking file
+        let mut tracking = project.load_installed().unwrap();
+        for meta in tracking.skills.values_mut() {
+            meta.source_hash = None;
+        }
+        let tracking_path = project_tmp.path().join(".kiro/installed-skills.json");
+        fs::write(
+            &tracking_path,
+            serde_json::to_vec_pretty(&tracking).unwrap(),
+        )
+        .unwrap();
+
+        // Bump version
+        fs::write(
+            plugin_dir.join("plugin.json"),
+            br#"{"name":"p","version":"1.1"}"#,
+        )
+        .unwrap();
+
+        let result = svc.detect_plugin_updates(&project).expect("detect");
+        assert_eq!(result.updates.len(), 1);
+        assert_eq!(result.updates[0].plugin.as_str(), "p");
+        assert!(matches!(
+            result.updates[0].change_signal,
+            UpdateChangeSignal::VersionBumped
+        ));
+        assert!(result.failures.is_empty());
+    }
+
+    #[test]
+    fn detect_plugin_updates_legacy_fallback_no_version_bump_returns_no_update() {
+        use crate::project::KiroProject;
+        use crate::service::test_support::{
+            make_plugin_with_skills, relative_path_entry, seed_marketplace_with_registry,
+            temp_service,
+        };
+
+        let (dir, svc) = temp_service();
+        let entries = vec![relative_path_entry("p", "plugins/p")];
+        let mp_path = seed_marketplace_with_registry(dir.path(), &svc, "mp", &entries);
+        make_plugin_with_skills(&mp_path, "p", &["alpha"]);
+        let plugin_dir = mp_path.join("plugins/p");
+        fs::write(
+            plugin_dir.join("plugin.json"),
+            br#"{"name":"p","version":"1.0"}"#,
+        )
+        .unwrap();
+
+        let project_tmp = tempfile::tempdir().unwrap();
+        let project = KiroProject::new(project_tmp.path().to_path_buf());
+
+        svc.install_plugin(&project, &mp("mp"), &pn("p"), InstallMode::New, false)
+            .expect("install");
+
+        // Set source_hash: None in tracking file
+        let mut tracking = project.load_installed().unwrap();
+        for meta in tracking.skills.values_mut() {
+            meta.source_hash = None;
+        }
+        let tracking_path = project_tmp.path().join(".kiro/installed-skills.json");
+        fs::write(
+            &tracking_path,
+            serde_json::to_vec_pretty(&tracking).unwrap(),
+        )
+        .unwrap();
+
+        // Same version, no mutation
+        let result = svc.detect_plugin_updates(&project).expect("detect");
+        assert!(result.updates.is_empty());
+        assert!(result.failures.is_empty());
+    }
+
+    #[test]
+    fn detect_plugin_updates_mixed_scenario() {
+        use crate::project::KiroProject;
+        use crate::service::test_support::{
+            make_plugin_with_skills, relative_path_entry, seed_marketplace_with_registry,
+            temp_service,
+        };
+
+        let (dir, svc) = temp_service();
+
+        // Marketplace mp with 3 plugins
+        let primary_entries = vec![
+            relative_path_entry("no_update", "plugins/no_update"),
+            relative_path_entry("version_bumped", "plugins/version_bumped"),
+            relative_path_entry("content_drift", "plugins/content_drift"),
+        ];
+        let mp_path = seed_marketplace_with_registry(dir.path(), &svc, "mp", &primary_entries);
+        for name in ["no_update", "version_bumped", "content_drift"] {
+            // Use plugin-specific skill names so they don't collide across plugins.
+            let skill_name = format!("{name}_skill");
+            make_plugin_with_skills(&mp_path, name, &[&skill_name]);
+            let pdir = mp_path.join(format!("plugins/{name}"));
+            fs::write(
+                pdir.join("plugin.json"),
+                format!(r#"{{"name":"{name}","version":"1.0"}}"#),
+            )
+            .unwrap();
+        }
+
+        // Marketplace mp2 with 1 plugin
+        let secondary_entries = vec![relative_path_entry("missing", "plugins/missing")];
+        let mp2_path = seed_marketplace_with_registry(dir.path(), &svc, "mp2", &secondary_entries);
+        make_plugin_with_skills(&mp2_path, "missing", &["missing_skill"]);
+        fs::write(
+            mp2_path.join("plugins/missing/plugin.json"),
+            br#"{"name":"missing","version":"1.0"}"#,
+        )
+        .unwrap();
+
+        let project_tmp = tempfile::tempdir().unwrap();
+        let project = KiroProject::new(project_tmp.path().to_path_buf());
+
+        for name in ["no_update", "version_bumped", "content_drift"] {
+            svc.install_plugin(&project, &mp("mp"), &pn(name), InstallMode::New, false)
+                .unwrap_or_else(|_| panic!("install {name}"));
+        }
+        svc.install_plugin(
+            &project,
+            &mp("mp2"),
+            &pn("missing"),
+            InstallMode::New,
+            false,
+        )
+        .expect("install missing");
+
+        // version_bumped: bump version
+        fs::write(
+            mp_path.join("plugins/version_bumped/plugin.json"),
+            br#"{"name":"version_bumped","version":"1.1"}"#,
+        )
+        .unwrap();
+
+        // content_drift: mutate skill file
+        fs::write(
+            mp_path.join("plugins/content_drift/skills/content_drift_skill/SKILL.md"),
+            "mutated content",
+        )
+        .unwrap();
+
+        // missing: remove mp2 marketplace directory and registry
+        fs::remove_dir_all(&mp2_path).unwrap();
+        let reg_path = dir.path().join("registries/mp2.json");
+        if reg_path.exists() {
+            fs::remove_file(&reg_path).unwrap();
+        }
+
+        let result = svc.detect_plugin_updates(&project).expect("detect");
+        assert_eq!(
+            result.updates.len(),
+            2,
+            "expected 2 updates: {:?}",
+            result.updates
+        );
+        assert_eq!(
+            result.failures.len(),
+            1,
+            "expected 1 failure: {:?}",
+            result.failures
+        );
+
+        let update_names: Vec<&str> = result.updates.iter().map(|u| u.plugin.as_str()).collect();
+        assert!(update_names.contains(&"version_bumped"));
+        assert!(update_names.contains(&"content_drift"));
+
+        assert_eq!(result.failures[0].plugin.as_str(), "missing");
+        assert_eq!(result.failures[0].marketplace.as_str(), "mp2");
+    }
+
+    #[test]
+    fn detect_plugin_updates_per_plugin_granularity() {
+        use crate::project::KiroProject;
+        use crate::service::test_support::{
+            make_plugin_with_skills, relative_path_entry, seed_marketplace_with_registry,
+            temp_service,
+        };
+
+        let (dir, svc) = temp_service();
+        let entries = vec![relative_path_entry("p", "plugins/p")];
+        let mp_path = seed_marketplace_with_registry(dir.path(), &svc, "mp", &entries);
+        make_plugin_with_skills(&mp_path, "p", &["s1", "s2", "s3"]);
+
+        let plugin_dir = mp_path.join("plugins/p");
+        fs::write(
+            plugin_dir.join("plugin.json"),
+            br#"{"name":"p","version":"1.0"}"#,
+        )
+        .unwrap();
+
+        let steering_dir = plugin_dir.join("steering");
+        fs::create_dir_all(&steering_dir).unwrap();
+        fs::write(steering_dir.join("guide1.md"), "guide1").unwrap();
+        fs::write(steering_dir.join("guide2.md"), "guide2").unwrap();
+
+        let agents_dir = plugin_dir.join("agents");
+        fs::create_dir_all(&agents_dir).unwrap();
+        fs::write(agents_dir.join("a.md"), "---\nname: a\n---\n").unwrap();
+
+        let project_tmp = tempfile::tempdir().unwrap();
+        let project = KiroProject::new(project_tmp.path().to_path_buf());
+
+        svc.install_plugin(&project, &mp("mp"), &pn("p"), InstallMode::New, false)
+            .expect("install");
+
+        // Mutate exactly one steering file
+        fs::write(steering_dir.join("guide1.md"), "mutated guide1").unwrap();
+
+        let result = svc.detect_plugin_updates(&project).expect("detect");
+        assert_eq!(
+            result.updates.len(),
+            1,
+            "expected 1 update: {:?}",
+            result.updates
+        );
+        assert_eq!(result.updates[0].plugin.as_str(), "p");
+        assert!(matches!(
+            result.updates[0].change_signal,
+            UpdateChangeSignal::ContentChanged
+        ));
+        assert!(result.failures.is_empty());
     }
 }
