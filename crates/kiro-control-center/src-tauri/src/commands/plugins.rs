@@ -17,7 +17,9 @@
 //!   project-only-read shape as `list_installed_plugins`.
 
 use kiro_market_core::project::{InstalledPluginsView, KiroProject, RemovePluginResult};
-use kiro_market_core::service::{InstallMode, InstallPluginResult, MarketplaceService};
+use kiro_market_core::service::{
+    DetectUpdatesResult, InstallMode, InstallPluginResult, MarketplaceService,
+};
 use kiro_market_core::validation::{MarketplaceName, PluginName};
 
 use crate::commands::{make_service, validate_kiro_project_path};
@@ -69,6 +71,25 @@ fn install_plugin_impl(
     let project = KiroProject::new(project_root);
     svc.install_plugin(&project, &marketplace, &plugin, mode, accept_mcp)
         .map_err(CommandError::from)
+}
+
+fn detect_plugin_updates_impl(
+    svc: &MarketplaceService,
+    project_path: &str,
+) -> Result<DetectUpdatesResult, CommandError> {
+    let project_root = validate_kiro_project_path(project_path)?;
+    let project = KiroProject::new(project_root);
+    svc.detect_plugin_updates(&project)
+        .map_err(CommandError::from)
+}
+
+#[tauri::command]
+#[specta::specta]
+pub async fn detect_plugin_updates(
+    project_path: String,
+) -> Result<DetectUpdatesResult, CommandError> {
+    let svc = make_service()?;
+    detect_plugin_updates_impl(&svc, &project_path)
 }
 
 /// List every installed plugin in the project, aggregated by
@@ -566,6 +587,28 @@ mod tests {
         let err = remove_plugin("mp1".to_string(), "myplugin".to_string(), String::new())
             .await
             .expect_err("empty project_path must error");
+        assert_eq!(err.error_type, ErrorType::Validation);
+    }
+
+    // -----------------------------------------------------------------------
+    // detect_plugin_updates_impl
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn detect_plugin_updates_impl_happy_path() {
+        let (dir, svc) = temp_service();
+        let project_path = make_kiro_project(dir.path());
+        let result = detect_plugin_updates_impl(&svc, &project_path)
+            .expect("scan succeeds with empty project");
+        assert!(result.updates.is_empty());
+        assert!(result.failures.is_empty());
+    }
+
+    #[test]
+    fn detect_plugin_updates_impl_rejects_invalid_project_path() {
+        let (_dir, svc) = temp_service();
+        let result = detect_plugin_updates_impl(&svc, "/nonexistent/path/to/project");
+        let err = result.expect_err("invalid project path must be rejected");
         assert_eq!(err.error_type, ErrorType::Validation);
     }
 }
