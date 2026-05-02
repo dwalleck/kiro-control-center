@@ -2585,6 +2585,7 @@ impl MarketplaceService {
 /// `Unreadable { reason }` is "do not compare versions — surface a
 /// per-plugin failure instead". Module-private — the public surface
 /// remains [`PluginUpdateInfo`] / [`PluginUpdateFailure`].
+#[derive(Debug)]
 enum ManifestVersion {
     /// Manifest read; carries the (possibly absent) `version` field.
     Found(Option<String>),
@@ -6457,6 +6458,33 @@ mod tests {
             result.failures
         );
         assert_eq!(result.failures[0].plugin.as_str(), "p");
+    }
+
+    /// Commit 9 / Phase 2a sibling of
+    /// `service::browse::tests::load_plugin_manifest_rejects_oversized_file`:
+    /// the detection-side `load_plugin_manifest_version` shares the
+    /// same `read_capped` defense; verify it fires here too.
+    #[test]
+    fn load_plugin_manifest_version_rejects_oversized_file() {
+        use std::io::Write;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let plugin_dir = tmp.path().join("plugin");
+        fs::create_dir_all(&plugin_dir).expect("create plugin dir");
+        let manifest_path = plugin_dir.join("plugin.json");
+        let mut f = fs::File::create(&manifest_path).expect("create manifest");
+        f.write_all(&vec![b'A'; 2 * 1024 * 1024])
+            .expect("write 2 MiB");
+        f.sync_all().expect("sync");
+
+        let err = MarketplaceService::load_plugin_manifest_version(&plugin_dir)
+            .expect_err("oversized plugin.json must be refused at the cap");
+        assert!(
+            matches!(
+                err,
+                Error::Plugin(PluginError::CacheManifestReadFailed { .. })
+            ),
+            "expected CacheManifestReadFailed for cap-exceeded, got: {err:?}"
+        );
     }
 
     /// I-N2 (PR #96 re-review): mirrors `service::browse::tests::

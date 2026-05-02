@@ -1107,7 +1107,13 @@ fn load_plugin_manifest(plugin_dir: &Path) -> Result<Option<PluginManifest>, Err
         }
     }
 
-    let bytes = match fs::read(&manifest_path) {
+    // Resource cap: bound the read at MAX_PLUGIN_MANIFEST_BYTES so a
+    // malicious marketplace shipping a multi-GB plugin.json cannot OOM
+    // the process before serde sees a byte. Mirrors the cap applied to
+    // service::mod::load_plugin_manifest_version in the Phase 2a
+    // detection path. Pre-existing crate-wide gap flagged by
+    // marketplace-security-reviewer in PR #96 review.
+    let bytes = match super::read_capped(&manifest_path, super::MAX_PLUGIN_MANIFEST_BYTES) {
         Ok(b) => b,
         Err(e) => {
             warn!(
@@ -1554,6 +1560,38 @@ mod tests {
         assert!(
             result.is_none(),
             "symlinked plugin.json must be treated as absent, got: {result:?}"
+        );
+    }
+
+    /// Resource cap regression: a `plugin.json` larger than
+    /// `MAX_PLUGIN_MANIFEST_BYTES` (1 MiB) must be rejected before
+    /// serde sees the bytes. Mitigates the OOM vector flagged by
+    /// marketplace-security-reviewer in PR #96 review (a malicious
+    /// marketplace could otherwise ship a multi-GB manifest and OOM
+    /// the host). The cap fires at `super::read_capped`, which
+    /// returns `io::ErrorKind::InvalidData` — surfaced here as
+    /// [`PluginError::ManifestReadFailed`].
+    #[test]
+    fn load_plugin_manifest_rejects_oversized_file() {
+        use std::io::Write;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let plugin_dir = tmp.path().join("plugin");
+        fs::create_dir_all(&plugin_dir).expect("create plugin dir");
+        let manifest_path = plugin_dir.join("plugin.json");
+        // Write 2 MiB of valid JSON-ish bytes — well over the 1 MiB cap.
+        // The cap fires before parse, so the content shape doesn't
+        // matter. We open with sync_data() to make sure the file is
+        // committed before the read.
+        let mut f = fs::File::create(&manifest_path).expect("create manifest");
+        f.write_all(&vec![b'A'; 2 * 1024 * 1024])
+            .expect("write 2 MiB");
+        f.sync_all().expect("sync");
+
+        let err = load_plugin_manifest(&plugin_dir)
+            .expect_err("oversized plugin.json must be refused at the cap");
+        assert!(
+            matches!(err, Error::Plugin(PluginError::ManifestReadFailed { .. })),
+            "expected ManifestReadFailed for cap-exceeded, got: {err:?}"
         );
     }
 
