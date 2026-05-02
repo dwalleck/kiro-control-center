@@ -359,6 +359,58 @@ pub struct TrackingLoadWarning {
     pub error: String,
 }
 
+/// Per-content-type sub-result for [`RemovePluginResult`]. Mirrors
+/// the install-side [`InstallSkillsResult`] shape.
+#[derive(Clone, Debug, Default, Serialize)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
+pub struct RemoveSkillsResult {
+    #[serde(default)]
+    pub removed: Vec<String>, // skill names
+    #[serde(default)]
+    pub failures: Vec<RemoveItemFailure>,
+}
+
+/// Per-content-type sub-result for [`RemovePluginResult`]. Mirrors
+/// the install-side `InstallSteeringResult` shape.
+#[derive(Clone, Debug, Default, Serialize)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
+pub struct RemoveSteeringResult {
+    #[serde(default)]
+    pub removed: Vec<String>, // rendered via Path::display()
+    #[serde(default)]
+    pub failures: Vec<RemoveItemFailure>,
+}
+
+/// Per-content-type sub-result for [`RemovePluginResult`]. Mirrors
+/// the install-side [`crate::service::InstallAgentsResult`] shape.
+/// `removed` is a flat vec of translated agent names + native agent
+/// names + native companion file paths (rendered) — matches the
+/// install-side asymmetry where native companions are agent-side
+/// artifacts.
+#[derive(Clone, Debug, Default, Serialize)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
+pub struct RemoveAgentsResult {
+    #[serde(default)]
+    pub removed: Vec<String>, // agent names + native companion paths, flat
+    #[serde(default)]
+    pub failures: Vec<RemoveItemFailure>,
+}
+
+/// One failure during a per-content-type removal step. The discriminator
+/// (which content type) is the parent type — no `content_type: String`
+/// field needed (it's expressed structurally via the parent's field
+/// name in [`RemovePluginResult`]).
+#[derive(Clone, Debug, Serialize)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
+pub struct RemoveItemFailure {
+    /// The skill/agent name or steering rel-path rendered via
+    /// [`std::path::Path::display`].
+    pub item: String,
+    /// Rendered error chain via [`crate::error::error_full_chain`] —
+    /// wire format per CLAUDE.md FFI rule.
+    pub error: String,
+}
+
 /// Aggregated counts returned by
 /// [`KiroProject::remove_plugin`] — one tally per content type so the
 /// caller (CLI / Tauri) can render a one-line "removed N skills,
@@ -3762,6 +3814,110 @@ mod tests {
             }
             other => panic!("expected Error::Io(InvalidData), got {other:?}"),
         }
+    }
+
+    #[test]
+    fn remove_skills_result_json_shape_default_empty() {
+        let result = RemoveSkillsResult::default();
+        let json = serde_json::to_value(&result).expect("serialize");
+        assert_eq!(json["removed"], serde_json::json!([]));
+        assert_eq!(json["failures"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn remove_skills_result_json_shape_with_populated_removed() {
+        let result = RemoveSkillsResult {
+            removed: vec!["alpha".into(), "beta".into()],
+            failures: vec![],
+        };
+        let json = serde_json::to_value(&result).expect("serialize");
+        assert_eq!(json["removed"], serde_json::json!(["alpha", "beta"]));
+        assert_eq!(json["failures"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn remove_skills_result_json_shape_with_populated_failure() {
+        let result = RemoveSkillsResult {
+            removed: vec![],
+            failures: vec![RemoveItemFailure {
+                item: "broken".into(),
+                error: "io: permission denied".into(),
+            }],
+        };
+        let json = serde_json::to_value(&result).expect("serialize");
+        assert_eq!(json["failures"][0]["item"], "broken");
+        assert_eq!(json["failures"][0]["error"], "io: permission denied");
+    }
+
+    // Symmetric tests for RemoveSteeringResult
+    #[test]
+    fn remove_steering_result_json_shape_default_empty() {
+        let result = RemoveSteeringResult::default();
+        let json = serde_json::to_value(&result).expect("serialize");
+        assert_eq!(json["removed"], serde_json::json!([]));
+        assert_eq!(json["failures"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn remove_steering_result_json_shape_with_populated_removed() {
+        let result = RemoveSteeringResult {
+            removed: vec!["guide.md".into()],
+            failures: vec![],
+        };
+        let json = serde_json::to_value(&result).expect("serialize");
+        assert_eq!(json["removed"], serde_json::json!(["guide.md"]));
+        assert_eq!(json["failures"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn remove_steering_result_json_shape_with_populated_failure() {
+        let result = RemoveSteeringResult {
+            removed: vec![],
+            failures: vec![RemoveItemFailure {
+                item: "broken.md".into(),
+                error: "io: permission denied".into(),
+            }],
+        };
+        let json = serde_json::to_value(&result).expect("serialize");
+        assert_eq!(json["failures"][0]["item"], "broken.md");
+        assert_eq!(json["failures"][0]["error"], "io: permission denied");
+    }
+
+    // Symmetric tests for RemoveAgentsResult
+    #[test]
+    fn remove_agents_result_json_shape_default_empty() {
+        let result = RemoveAgentsResult::default();
+        let json = serde_json::to_value(&result).expect("serialize");
+        assert_eq!(json["removed"], serde_json::json!([]));
+        assert_eq!(json["failures"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn remove_agents_result_json_shape_with_populated_removed() {
+        let result = RemoveAgentsResult {
+            removed: vec!["reviewer".into(), "companions/prompt.md".into()],
+            failures: vec![],
+        };
+        let json = serde_json::to_value(&result).expect("serialize");
+        assert_eq!(
+            json["removed"],
+            serde_json::json!(["reviewer", "companions/prompt.md"])
+        );
+        assert_eq!(json["failures"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn remove_agents_result_json_shape_with_populated_failure() {
+        let result = RemoveAgentsResult {
+            removed: vec![],
+            failures: vec![RemoveItemFailure {
+                item: "broken-agent".into(),
+                error: "io: permission denied".into(),
+            }],
+        };
+        let json = serde_json::to_value(&result).expect("serialize");
+        assert_eq!(json["failures"][0]["item"], "broken-agent");
+        assert_eq!(json["failures"][0]["error"], "io: permission denied");
     }
 
     #[test]
