@@ -605,10 +605,10 @@ impl PluginUpdateFailureKind {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum UpdateChangeSignal {
     /// Manifest version string differs (with or without content hash diff).
-    /// FE renders "Update v1.0 → v1.1".
+    /// Designed for FE rendering as "Update v1.0 → v1.1".
     VersionBumped,
     /// Manifest version unchanged but at least one source-hash diff
-    /// detected. FE renders "Content updated since install".
+    /// detected. Designed for FE rendering as "Content updated since install".
     ContentChanged,
 }
 
@@ -2338,14 +2338,20 @@ impl MarketplaceService {
         }
 
         if legacy_fallback {
-            // Drift undetectable — same versions means no entry.
-            return Ok(None);
+            // Drift undetectable for legacy entries (no source_hash) —
+            // same versions means no entry. Logging at debug so the
+            // legacy-fallback case is observable in traces without
+            // surfacing in normal operation.
+            tracing::debug!(
+                marketplace = %plugin_info.marketplace,
+                plugin = %plugin_info.plugin,
+                "scan saw a legacy (pre-Stage-1) tracking entry with no \
+                 source_hash; falling back to version-only comparison and \
+                 returning no update entry"
+            );
         }
-
         Ok(None)
     }
-
-    // (See `ManifestVersion` enum and `read_capped` helper at module scope below.)
 
     /// Load `plugin.json` from `plugin_dir` and report the manifest's
     /// `version` field — distinguishing between three semantically

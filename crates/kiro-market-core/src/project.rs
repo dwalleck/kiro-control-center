@@ -414,7 +414,7 @@ pub struct RemoveSteeringResult {
 #[cfg_attr(feature = "specta", derive(specta::Type))]
 pub struct RemoveAgentsResult {
     #[serde(default)]
-    pub removed: Vec<String>, // agent names + native companion paths, flat
+    pub removed: Vec<String>,
     #[serde(default)]
     pub failures: Vec<RemoveItemFailure>,
 }
@@ -6061,8 +6061,8 @@ mod tests {
         // whose unlink fails (directory at destination). The cascade
         // must:
         //   - count the skill as removed
-        //   - record the steering failure in `result.failed` (NOT
-        //     short-circuit)
+        //   - record the steering failure in `result.steering.failures`
+        //     (NOT short-circuit)
         //   - still return Ok(result)
         use chrono::Utc;
         let (_dir, project) = temp_project();

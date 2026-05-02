@@ -1,6 +1,6 @@
 //! Plugin-level commands for the Tauri frontend.
 //!
-//! Three commands live here:
+//! Four commands live here:
 //!
 //! - [`install_plugin`] — orchestrator wrapper around
 //!   [`MarketplaceService::install_plugin`] (Task 1's core method). Carries
@@ -15,6 +15,10 @@
 //! - [`remove_plugin`] — cascade wrapper around
 //!   [`KiroProject::remove_plugin`] (Task 3). No `_impl` per A-19; same
 //!   project-only-read shape as `list_installed_plugins`.
+//! - [`detect_plugin_updates`] — update-detection wrapper around
+//!   [`MarketplaceService::detect_plugin_updates`] (Phase 2a). Splits
+//!   into [`detect_plugin_updates_impl`] per the service-consuming
+//!   convention so the body is testable without a Tauri runtime.
 
 use kiro_market_core::project::{InstalledPluginsView, KiroProject, RemovePluginResult};
 use kiro_market_core::service::{
@@ -139,7 +143,7 @@ pub async fn list_installed_plugins(
 
 /// Remove every skill, steering file, and agent for a given
 /// `(marketplace, plugin)` pair from the project, returning per-content
-/// removal counts.
+/// `removed: Vec<String>` lists plus per-content `failures` vecs.
 ///
 /// No `_impl` split (A-19): same rationale as
 /// [`list_installed_plugins`] above — `KiroProject`-only read/write,
@@ -162,12 +166,14 @@ pub async fn remove_plugin(
 
 #[cfg(test)]
 mod tests {
-    //! `_impl`-level tests for [`install_plugin_impl`] plus wrapper-level
-    //! tests for [`list_installed_plugins`] and [`remove_plugin`] (A-19:
-    //! the latter two have no `_impl`, so the wrapper IS the unit). The
-    //! `#[tauri::command]` attribute on `install_plugin` is a thin serde
-    //! shim and is not re-exercised here; see `commands/browse.rs::tests`
-    //! for the canonical pattern.
+    //! `_impl`-level tests for [`install_plugin_impl`] and
+    //! [`detect_plugin_updates_impl`] plus wrapper-level tests for
+    //! [`list_installed_plugins`] and [`remove_plugin`] (A-19: the
+    //! latter two have no `_impl`, so the wrapper IS the unit). The
+    //! `#[tauri::command]` attribute on `install_plugin` /
+    //! `detect_plugin_updates` is a thin serde shim and is not
+    //! re-exercised here; see `commands/browse.rs::tests` for the
+    //! canonical pattern.
 
     use std::fs;
 
@@ -541,15 +547,15 @@ mod tests {
     // -----------------------------------------------------------------------
 
     /// Removing a `(marketplace, plugin)` pair that was never installed
-    /// returns zeroed counts (not an error). The cascade's
-    /// "filter-then-remove" shape naturally produces zeros when no
-    /// tracking entries match.
+    /// returns empty per-content `removed` lists (not an error). The
+    /// cascade's "filter-then-remove" shape naturally produces empty
+    /// vecs when no tracking entries match.
     #[tokio::test]
     async fn remove_plugin_returns_zeros_for_nonexistent_pair() {
         let dir = tempfile::tempdir().expect("tempdir");
         let project_path = make_kiro_project(dir.path());
 
-        let counts = remove_plugin(
+        let result = remove_plugin(
             "mp-absent".to_string(),
             "plugin-absent".to_string(),
             project_path,
@@ -557,17 +563,18 @@ mod tests {
         .await
         .expect("remove on empty project must succeed");
 
-        assert!(counts.skills.removed.is_empty());
-        assert!(counts.steering.removed.is_empty());
-        assert!(counts.agents.removed.is_empty());
-        assert!(counts.skills.failures.is_empty());
-        assert!(counts.steering.failures.is_empty());
-        assert!(counts.agents.failures.is_empty());
+        assert!(result.skills.removed.is_empty());
+        assert!(result.steering.removed.is_empty());
+        assert!(result.agents.removed.is_empty());
+        assert!(result.skills.failures.is_empty());
+        assert!(result.steering.failures.is_empty());
+        assert!(result.agents.failures.is_empty());
     }
 
     /// After [`install_plugin_impl`] seeds all three content types,
-    /// `remove_plugin` must report counts matching what was installed
-    /// AND the tracking files must reflect the removal.
+    /// `remove_plugin` must report per-content removed lists matching
+    /// what was installed AND the tracking files must reflect the
+    /// removal.
     #[tokio::test]
     async fn remove_plugin_returns_expected_counts_after_install() {
         let (dir, svc) = temp_service();
@@ -589,7 +596,7 @@ mod tests {
         )
         .expect("seed via install_plugin_impl");
 
-        let counts = remove_plugin(
+        let result = remove_plugin(
             "mp1".to_string(),
             "myplugin".to_string(),
             project_path.clone(),
@@ -597,12 +604,12 @@ mod tests {
         .await
         .expect("cascade remove");
 
-        assert_eq!(counts.skills.removed, vec!["alpha"]);
-        assert_eq!(counts.steering.removed, vec!["guide.md"]);
-        assert_eq!(counts.agents.removed, vec!["reviewer"]);
-        assert!(counts.skills.failures.is_empty());
-        assert!(counts.steering.failures.is_empty());
-        assert!(counts.agents.failures.is_empty());
+        assert_eq!(result.skills.removed, vec!["alpha"]);
+        assert_eq!(result.steering.removed, vec!["guide.md"]);
+        assert_eq!(result.agents.removed, vec!["reviewer"]);
+        assert!(result.skills.failures.is_empty());
+        assert!(result.steering.failures.is_empty());
+        assert!(result.agents.failures.is_empty());
 
         let view_after = list_installed_plugins(project_path)
             .await
