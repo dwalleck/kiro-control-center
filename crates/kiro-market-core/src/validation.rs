@@ -61,6 +61,55 @@ impl RelativePath {
         Self(value)
     }
 
+    /// Convert a `Path` to a [`RelativePath`] by stripping `base` and
+    /// normalising path separators to forward-slash. Returns `Err` if
+    /// `path` is not under `base` or the resulting relative path fails
+    /// [`validate_relative_path`].
+    ///
+    /// Forward-slash conversion is required because [`RelativePath::new`]
+    /// rejects backslashes for cross-platform portability of the wire
+    /// format. On Windows, `Path::strip_prefix(...).to_string_lossy()`
+    /// returns backslashes; without normalisation, `RelativePath::new`
+    /// fails. The recipe (`Components::Normal` + `join("/")`) drops any
+    /// platform-specific prefix or root components, producing a
+    /// purely-forward-slash representation regardless of the host OS.
+    ///
+    /// Used by install-side code to record where in the plugin tree an
+    /// artifact came from, so detection can look it up directly without
+    /// probing each configured manifest scan path.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ValidationError::InvalidRelativePath`] if `path` is
+    /// not under `base`, or whatever [`validate_relative_path`] returns
+    /// if the normalised string fails its checks.
+    pub fn from_path_under(path: &Path, base: &Path) -> Result<Self, ValidationError> {
+        let rel = path
+            .strip_prefix(base)
+            .map_err(|_| ValidationError::InvalidRelativePath {
+                path: path.display().to_string(),
+                reason: format!("path is not under base directory `{}`", base.display()),
+            })?;
+        // Two-pass normalisation. On Windows-native paths, `Components`
+        // already splits on `\` and `Normal` strings have no embedded
+        // backslashes — `join("/")` is enough. On Unix interpreting a
+        // Windows-shaped path (or any synthetic input), `\` is NOT a
+        // path separator, so a string like `"agents\reviewer.md"` lands
+        // as ONE `Normal` component and we'd hand `RelativePath::new` a
+        // backslash it rejects. The explicit `.replace('\\', '/')`
+        // closes that gap; harmless when components already split.
+        let rel_str = rel
+            .components()
+            .filter_map(|c| match c {
+                std::path::Component::Normal(s) => Some(s.to_string_lossy().into_owned()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("/")
+            .replace('\\', "/");
+        Self::new(rel_str)
+    }
+
     /// View the validated path as a `&str`.
     #[must_use]
     pub fn as_str(&self) -> &str {
@@ -1156,5 +1205,42 @@ mod tests {
             a.as_str().cmp(b.as_str()),
             "PluginName::cmp must match inner String::cmp byte-for-byte"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // RelativePath::from_path_under (install↔detect symmetry foundation)
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn from_path_under_normalizes_backslashes() {
+        use std::path::PathBuf;
+        // Synthesise a path with backslash components. PathBuf is just
+        // bytes underneath, so this works on any platform — tests the
+        // Windows-native input shape without requiring Windows CI.
+        let plugin_dir = PathBuf::from("/tmp/plugin");
+        let source = PathBuf::from("/tmp/plugin/agents\\reviewer.md");
+        let rel = RelativePath::from_path_under(&source, &plugin_dir)
+            .expect("backslash path under plugin_dir should normalize");
+        assert_eq!(rel.as_str(), "agents/reviewer.md");
+    }
+
+    #[test]
+    fn from_path_under_rejects_path_outside_base() {
+        use std::path::PathBuf;
+        let plugin_dir = PathBuf::from("/tmp/plugin");
+        let outside = PathBuf::from("/etc/passwd");
+        assert!(
+            RelativePath::from_path_under(&outside, &plugin_dir).is_err(),
+            "path not under plugin_dir must error, not silently produce a bogus rel"
+        );
+    }
+
+    #[test]
+    fn from_path_under_round_trips_simple_unix_path() {
+        use std::path::PathBuf;
+        let plugin_dir = PathBuf::from("/tmp/plugin");
+        let source = PathBuf::from("/tmp/plugin/agents/reviewer.md");
+        let rel = RelativePath::from_path_under(&source, &plugin_dir).expect("valid input");
+        assert_eq!(rel.as_str(), "agents/reviewer.md");
     }
 }

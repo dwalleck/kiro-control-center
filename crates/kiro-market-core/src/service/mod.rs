@@ -2831,28 +2831,7 @@ fn relative_source_path_for_tracking(
     path: &Path,
     plugin_dir: &Path,
 ) -> Option<crate::validation::RelativePath> {
-    let rel = match path.strip_prefix(plugin_dir) {
-        Ok(r) => r,
-        Err(e) => {
-            warn!(
-                path = %path.display(),
-                plugin_dir = %plugin_dir.display(),
-                error = %e,
-                "agent path is not under plugin_dir; source_path will fall back \
-                 to dialect default during update detection"
-            );
-            return None;
-        }
-    };
-    let rel_str = rel
-        .components()
-        .filter_map(|c| match c {
-            std::path::Component::Normal(s) => Some(s.to_string_lossy()),
-            _ => None,
-        })
-        .collect::<Vec<_>>()
-        .join("/");
-    match crate::validation::RelativePath::new(rel_str) {
+    match crate::validation::RelativePath::from_path_under(path, plugin_dir) {
         Ok(rp) => Some(rp),
         Err(e) => {
             warn!(
