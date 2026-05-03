@@ -112,6 +112,7 @@ pub fn run(
         marketplace: &marketplace,
         plugin: &plugin,
         version: ctx.version.as_deref(),
+        plugin_dir: &plugin_dir,
     };
     let steering_result = run_steering_install(
         &project,

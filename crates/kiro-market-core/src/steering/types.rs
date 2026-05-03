@@ -30,6 +30,13 @@ pub struct SteeringInstallContext<'a> {
     pub marketplace: &'a MarketplaceName,
     pub plugin: &'a PluginName,
     pub version: Option<&'a str>,
+    /// Plugin root directory; used to compute the per-file
+    /// `source_scan_root` populated on
+    /// [`crate::project::InstalledSteeringMeta`] at install time.
+    /// Required after the install↔detect symmetry pass — drift
+    /// detection consults the recorded scan root directly instead of
+    /// probing manifest paths.
+    pub plugin_dir: &'a std::path::Path,
 }
 
 /// Errors that can occur during steering install.

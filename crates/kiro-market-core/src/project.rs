@@ -183,6 +183,39 @@ pub struct InstalledSteeringMeta {
     pub installed_at: DateTime<Utc>,
     pub source_hash: String,
     pub installed_hash: String,
+    /// Scan root (relative to `plugin_dir`) that this steering file
+    /// was installed from. Required at install time; populated from
+    /// `DiscoveredNativeFile.scan_root` (which steering shares with
+    /// the agent discover sites). Drift detection at
+    /// [`crate::service::MarketplaceService::scan_plugin_for_content_drift`]
+    /// uses this directly to locate the source file for hash
+    /// recomputation, replacing PR #96's `hash_artifact_in_scan_paths`
+    /// probe helper.
+    pub source_scan_root: RelativePath,
+}
+
+/// Compute the install-time `source_scan_root` for a discovered
+/// steering file, mapping the path-not-under-plugin-dir error to a
+/// `SteeringError::SourceReadFailed`. Extracted from
+/// `install_steering_file_locked` to keep that function under
+/// clippy's 100-line cap after the install↔detect symmetry pass.
+pub(crate) fn required_steering_scan_root(
+    scan_root: &std::path::Path,
+    plugin_dir: &std::path::Path,
+) -> Result<RelativePath, crate::steering::SteeringError> {
+    RelativePath::from_path_under(scan_root, plugin_dir).map_err(|e| {
+        crate::steering::SteeringError::SourceReadFailed {
+            path: scan_root.to_path_buf(),
+            source: std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "steering scan_root `{}` not under plugin_dir `{}`: {e}",
+                    scan_root.display(),
+                    plugin_dir.display(),
+                ),
+            ),
+        }
+    })
 }
 
 /// On-disk structure of `installed-steering.json`. Map key is the
@@ -1984,6 +2017,8 @@ impl KiroProject {
             installed.files.remove(rel_path);
         }
 
+        let source_scan_root = required_steering_scan_root(&source.scan_root, ctx.plugin_dir)?;
+
         installed.files.insert(
             rel_path.to_path_buf(),
             InstalledSteeringMeta {
@@ -1993,6 +2028,7 @@ impl KiroProject {
                 installed_at: chrono::Utc::now(),
                 source_hash: source_hash.to_owned(),
                 installed_hash: installed_hash.clone(),
+                source_scan_root,
             },
         );
 
@@ -3578,6 +3614,7 @@ mod tests {
                 installed_at: chrono::Utc::now(),
                 source_hash: "blake3:abc".into(),
                 installed_hash: "blake3:abc".into(),
+                source_scan_root: RelativePath::new("steering").expect("valid"),
             },
         );
         let bytes = serde_json::to_vec(&steering).unwrap();
@@ -3631,6 +3668,7 @@ mod tests {
                     "installed_at": chrono::Utc::now(),
                     "source_hash": "blake3:abc",
                     "installed_hash": "blake3:abc",
+                    "source_scan_root": "steering",
                 }
             }
         });
@@ -4003,6 +4041,7 @@ mod tests {
                 installed_at: chrono::Utc::now(),
                 source_hash: "blake3:abc".into(),
                 installed_hash: "blake3:abc".into(),
+                source_scan_root: RelativePath::new("steering").expect("valid"),
             },
         );
         project.write_steering_tracking(&to_save).unwrap();
@@ -4046,7 +4085,8 @@ mod tests {
                     "version": "1.0.0",
                     "installed_at": now,
                     "source_hash": "cafebabe",
-                    "installed_hash": "cafebabe"
+                    "installed_hash": "cafebabe",
+                    "source_scan_root": "steering"
                 },
                 "review.md": {
                     "marketplace": "mp",
@@ -4054,7 +4094,8 @@ mod tests {
                     "version": "0.5.0",
                     "installed_at": now,
                     "source_hash": "feedface",
-                    "installed_hash": "feedface"
+                    "installed_hash": "feedface",
+                    "source_scan_root": "steering"
                 }
             }
         });
@@ -4124,7 +4165,8 @@ mod tests {
                 "guide.md": {
                     "marketplace": "mp", "plugin": "p",
                     "version": "2.0.0", "installed_at": same_time,
-                    "source_hash": "cafebabe", "installed_hash": "cafebabe"
+                    "source_hash": "cafebabe", "installed_hash": "cafebabe",
+                    "source_scan_root": "steering"
                 }
             }
         });
@@ -4186,7 +4228,8 @@ mod tests {
             serde_json::json!({
                 "marketplace": "mp", "plugin": "p",
                 "version": "1.0.0", "installed_at": now,
-                "source_hash": "x", "installed_hash": "x"
+                "source_hash": "x", "installed_hash": "x",
+                "source_scan_root": "steering"
             })
         };
         let agent_meta = || {
@@ -4292,6 +4335,7 @@ mod tests {
                         "marketplace": "mp", "plugin": "p",
                         "version": "1.0.0", "installed_at": now,
                         "source_hash": "x", "installed_hash": "x",
+                        "source_scan_root": "steering",
                     }
                 }
             }))
@@ -4387,6 +4431,7 @@ mod tests {
                 marketplace: &mp_name,
                 plugin: &pn_name,
                 version: None,
+                plugin_dir: f.scratch.path(),
             },
         )
     }
@@ -4498,6 +4543,7 @@ mod tests {
                     marketplace: &mp_name,
                     plugin: &pn_name,
                     version: None,
+                    plugin_dir: steering_file.scratch.path(),
                 },
             )
             .expect_err("cross-plugin clash must fail");
@@ -4520,6 +4566,7 @@ mod tests {
                     marketplace: &mp_name,
                     plugin: &pn_name,
                     version: None,
+                    plugin_dir: steering_file.scratch.path(),
                 },
             )
             .expect("force-mode transfer");
@@ -4570,6 +4617,7 @@ mod tests {
                     marketplace: &mp_name,
                     plugin: &pn_name,
                     version: None,
+                    plugin_dir: steering_file.scratch.path(),
                 },
             )
             .expect_err("hardlinked source must be refused");
@@ -4646,6 +4694,7 @@ mod tests {
                     marketplace: &mp_name,
                     plugin: &pn_name,
                     version: Some("0.1.0"),
+                    plugin_dir: &project.root,
                 },
             )
             .expect("install_steering_file");
@@ -5472,6 +5521,7 @@ mod tests {
                         "installed_at": now,
                         "source_hash": "feedface",
                         "installed_hash": "feedface",
+                        "source_scan_root": "steering",
                     }
                 }
             }))
@@ -5535,6 +5585,7 @@ mod tests {
                         "installed_at": now,
                         "source_hash": "x",
                         "installed_hash": "x",
+                        "source_scan_root": "steering",
                     }
                 }
             }))
@@ -5579,6 +5630,7 @@ mod tests {
                         "installed_at": now,
                         "source_hash": "x",
                         "installed_hash": "x",
+                        "source_scan_root": "steering",
                     }
                 }
             }))
@@ -5938,6 +5990,7 @@ mod tests {
                         "marketplace": "mp", "plugin": "p",
                         "version": "1.0.0", "installed_at": now,
                         "source_hash": "feedface", "installed_hash": "feedface",
+                        "source_scan_root": "steering",
                     }
                 }
             }))
@@ -5991,11 +6044,13 @@ mod tests {
                         "marketplace": "mp-a", "plugin": "p",
                         "version": "1.0.0", "installed_at": now,
                         "source_hash": "1", "installed_hash": "1",
+                        "source_scan_root": "steering",
                     },
                     "b.md": {
                         "marketplace": "mp-b", "plugin": "p",
                         "version": "1.0.0", "installed_at": now,
                         "source_hash": "2", "installed_hash": "2",
+                        "source_scan_root": "steering",
                     }
                 }
             }))
@@ -6144,6 +6199,7 @@ mod tests {
                         "installed_at": now,
                         "source_hash": "x",
                         "installed_hash": "x",
+                        "source_scan_root": "steering",
                     }
                 }
             }))
@@ -6235,6 +6291,7 @@ mod tests {
                         "marketplace": "mp", "plugin": "p",
                         "version": "1.0.0", "installed_at": now,
                         "source_hash": "x", "installed_hash": "x",
+                        "source_scan_root": "steering",
                     }
                 }
             }))
@@ -7371,6 +7428,7 @@ mod tests {
                     marketplace: &mp_name,
                     plugin: &pn_name,
                     version: None,
+                    plugin_dir: scratch.path(),
                 },
             )
             .expect("v1 install");
@@ -7397,6 +7455,7 @@ mod tests {
                     marketplace: &mp_name,
                     plugin: &pn_name,
                     version: None,
+                    plugin_dir: scratch.path(),
                 },
             )
             .expect_err("tracking write must fail");

@@ -2171,6 +2171,7 @@ impl MarketplaceService {
                 marketplace,
                 plugin,
                 version: ctx.version.as_deref(),
+                plugin_dir: &ctx.plugin_dir,
             },
         );
 
@@ -2521,21 +2522,16 @@ impl MarketplaceService {
             }
         }
 
-        // Steering — probe each configured scan path. Install hashes
-        // via `hash_artifact(&f.scan_root, &[rel])` per
-        // `install_plugin_steering`, so detection MUST iterate the
-        // declared scan paths and use the first one where the file
-        // exists. A single hardcoded `plugin_dir/steering` would
-        // false-positive every plugin declaring `steering: ["./guides/"]`
-        // — see PR #96 review comment #6.
-        let steering_paths = crate::service::browse::steering_scan_paths_for_plugin(manifest);
+        // Steering — direct lookup against the install-recorded scan
+        // root. Install records source_scan_root via
+        // RelativePath::from_path_under in install_steering_file_locked,
+        // so detection hashes against the same directory the install
+        // copied from.
         for (rel_path, meta) in &installed_steering.files {
             if meta.marketplace == plugin_info.marketplace && meta.plugin == plugin_info.plugin {
-                let computed = hash_artifact_in_scan_paths(
-                    plugin_dir,
-                    &steering_paths,
-                    std::slice::from_ref(rel_path),
-                )?;
+                let scan_root = plugin_dir.join(meta.source_scan_root.as_str());
+                let computed =
+                    crate::hash::hash_artifact(&scan_root, std::slice::from_ref(rel_path))?;
                 if computed != meta.source_hash {
                     content_drift = true;
                     return Ok((content_drift, legacy_fallback));
@@ -4002,6 +3998,7 @@ mod tests {
             marketplace: &mp_name,
             plugin: &pn_name,
             version: None,
+            plugin_dir: plugin_tmp.path(),
         };
 
         let result = MarketplaceService::install_plugin_steering(
@@ -4064,6 +4061,7 @@ mod tests {
             marketplace: &mp_name,
             plugin: &pn_name,
             version: None,
+            plugin_dir: plugin_tmp.path(),
         };
 
         let result = MarketplaceService::install_plugin_steering(
@@ -4136,6 +4134,7 @@ mod tests {
             marketplace: &mp_name,
             plugin: &pn_name,
             version: None,
+            plugin_dir: plugin_tmp.path(),
         };
 
         let result = MarketplaceService::install_plugin_steering(

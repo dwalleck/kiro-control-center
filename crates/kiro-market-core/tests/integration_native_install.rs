@@ -95,6 +95,7 @@ impl IntegrationHarness {
             marketplace: &mp_name,
             plugin: &pn_name,
             version: None,
+            plugin_dir,
         };
         MarketplaceService::install_plugin_steering(
             &self.project,
