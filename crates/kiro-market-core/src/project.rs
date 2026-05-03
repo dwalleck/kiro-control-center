@@ -6911,6 +6911,138 @@ mod tests {
         assert_eq!(back.files.len(), 2);
     }
 
+    // ---------------------------------------------------------------------
+    // Deserialize-rejection tests for the install↔detect symmetry pass.
+    //
+    // After the no-users assumption let us tighten source_path /
+    // source_scan_root from Option<...> to required, legacy tracking
+    // files written before this PR landed must fail to deserialize. The
+    // contract is "intentionally invalid by design" — these tests pin
+    // it so a future refactor that re-adds Option (re-introducing the
+    // probe-fallback machinery) breaks here, not silently in production.
+    // ---------------------------------------------------------------------
+
+    #[test]
+    fn load_installed_skills_rejects_legacy_entry_without_source_scan_root() {
+        let (_dir, project) = temp_project();
+        let kiro_dir = project.kiro_dir();
+        std::fs::create_dir_all(&kiro_dir).expect("create .kiro");
+
+        let legacy_json = br#"{
+            "skills": {
+                "alpha": {
+                    "marketplace": "mp",
+                    "plugin": "p",
+                    "version": "1.0",
+                    "installed_at": "2026-01-01T00:00:00Z"
+                }
+            }
+        }"#;
+        std::fs::write(kiro_dir.join("installed-skills.json"), legacy_json)
+            .expect("write legacy tracking");
+
+        let err = project
+            .load_installed()
+            .expect_err("legacy entry must fail to deserialize");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("source_scan_root") || msg.contains("missing field"),
+            "error must mention the missing required field; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn load_installed_steering_rejects_legacy_entry_without_source_scan_root() {
+        let (_dir, project) = temp_project();
+        let kiro_dir = project.kiro_dir();
+        std::fs::create_dir_all(&kiro_dir).expect("create .kiro");
+
+        let legacy_json = br#"{
+            "files": {
+                "guide.md": {
+                    "marketplace": "mp",
+                    "plugin": "p",
+                    "version": "1.0",
+                    "installed_at": "2026-01-01T00:00:00Z",
+                    "source_hash": "blake3:0000",
+                    "installed_hash": "blake3:0000"
+                }
+            }
+        }"#;
+        std::fs::write(kiro_dir.join("installed-steering.json"), legacy_json)
+            .expect("write legacy tracking");
+
+        let err = project
+            .load_installed_steering()
+            .expect_err("legacy entry must fail to deserialize");
+        assert!(
+            err.to_string().contains("source_scan_root"),
+            "error must mention source_scan_root; got: {err}"
+        );
+    }
+
+    #[test]
+    fn load_installed_agents_rejects_legacy_entry_without_source_path() {
+        let (_dir, project) = temp_project();
+        let kiro_dir = project.kiro_dir();
+        std::fs::create_dir_all(&kiro_dir).expect("create .kiro");
+
+        let legacy_json = br#"{
+            "agents": {
+                "reviewer": {
+                    "marketplace": "mp",
+                    "plugin": "p",
+                    "version": "1.0",
+                    "installed_at": "2026-01-01T00:00:00Z",
+                    "dialect": "native"
+                }
+            }
+        }"#;
+        std::fs::write(kiro_dir.join("installed-agents.json"), legacy_json)
+            .expect("write legacy tracking");
+
+        let err = project
+            .load_installed_agents()
+            .expect_err("legacy entry must fail to deserialize");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("source_path") || msg.contains("missing field"),
+            "error must mention a missing required field; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn load_installed_native_companions_rejects_legacy_entry_without_source_scan_root() {
+        let (_dir, project) = temp_project();
+        let kiro_dir = project.kiro_dir();
+        std::fs::create_dir_all(&kiro_dir).expect("create .kiro");
+
+        let legacy_json = br#"{
+            "agents": {},
+            "native_companions": {
+                "p": {
+                    "marketplace": "mp",
+                    "plugin": "p",
+                    "version": "1.0",
+                    "installed_at": "2026-01-01T00:00:00Z",
+                    "files": ["prompts/reviewer.md"],
+                    "source_hash": "blake3:0000",
+                    "installed_hash": "blake3:0000"
+                }
+            }
+        }"#;
+        std::fs::write(kiro_dir.join("installed-agents.json"), legacy_json)
+            .expect("write legacy tracking");
+
+        let err = project
+            .load_installed_agents()
+            .expect_err("legacy companions entry must fail");
+        assert!(
+            err.to_string().contains("source_scan_root"),
+            "error must mention source_scan_root; got: {err}"
+        );
+    }
+
     #[test]
     fn installed_agents_with_empty_native_companions_does_not_serialize_the_field() {
         // Regression guard: a legacy tracking file (no native_companions key)

@@ -6806,10 +6806,10 @@ mod tests {
         fs::write(prompts_dir.join("reviewer.md"), b"prompt body\n")
             .expect("write companion source");
 
-        // Manifest declares the custom scan path. The Phase 2a fix
-        // makes `scan_plugin_for_content_drift`'s native-companions
-        // loop consult `agent_scan_paths_for_plugin(manifest)` instead
-        // of `plugin_dir.join("agents")`.
+        // Manifest declares the custom scan path. After install↔detect
+        // symmetry, install records source_scan_root="companions" on
+        // the tracking entry and detection consults it directly instead
+        // of probing or hardcoding plugin_dir.join("agents").
         fs::write(
             plugin_dir.join("plugin.json"),
             br#"{"name":"p","version":"1.0","agents":["./companions/"]}"#,
