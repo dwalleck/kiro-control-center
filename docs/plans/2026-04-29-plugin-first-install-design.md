@@ -1,6 +1,6 @@
 # Plugin-First Install — Design
 
-> **Status:** design draft. Phase 1 plan in `2026-04-29-plugin-first-install-plan.md`. Phase 2 plan deferred until Phase 1 ships.
+> **Status:** Phase 1 shipped (PR #94, main merge `9ff4e7b`). Phase 1.5 type-safety hardening shipped (PR #95, main merge `a9f7b97`) — `MarketplaceName` / `PluginName` newtypes + A4 marketplace field on `InstallPluginResult`. Phase 2 plan deferred; sketch refreshed 2026-04-30 to reflect newtypes and bundle A2 (`RemovePluginResult` shape symmetry).
 
 ## Problem
 
@@ -184,6 +184,8 @@ The banner-collision concern (code-reviewer finding from PR 92's review) is addr
 
 ## Phase 2 architecture (sketch)
 
+> **Post-Phase-1.5 type-refresh (2026-04-30):** The signatures below were updated after PR #95 merged the `MarketplaceName` / `PluginName` newtypes. `PluginUpdateInfo`'s name fields use the newtypes (parse-don't-validate at deserialization, compile-enforced argument order across the install/update API surface). The update action uses `InstallMode::Force`, not the pre-1.5 `force: bool` shape. **A2** (`RemovePluginResult` shape symmetry — drop `_count: u32`, return `Vec<String>` per content type) was deferred from Phase 1.5 for bundling here, since the wire-format change needs frontend updates landing alongside.
+
 ### Update detection
 
 ```rust
@@ -208,18 +210,43 @@ impl MarketplaceService {
 }
 
 pub struct PluginUpdateInfo {
-    pub marketplace: String,
-    pub plugin: String,
+    pub marketplace: MarketplaceName,
+    pub plugin: PluginName,
     pub installed_version: Option<String>,
     pub available_version: Option<String>,
 }
 ```
 
-Tauri command `detect_plugin_updates(project_path)` returns the same shape.
+Tauri command `detect_plugin_updates(project_path)` returns the same shape. Per Phase 1.5's lesson (PR #95 I1), the wrapper does not need to construct newtypes from FE input — `detect_plugin_updates` reads from already-validated tracking files, and `PluginUpdateInfo`'s newtype-typed fields enforce parse-don't-validate at the deserialization boundary.
 
 ### Update action
 
-No new Tauri command. The update action is `install_plugin(..., force=true)`. The frontend renders an "Update" button in place of "Install" when `detect_plugin_updates` shows the plugin needs one.
+No new Tauri command. The update action is `install_plugin(project, &marketplace, &plugin, InstallMode::Force, accept_mcp)` — the existing `MarketplaceService::install_plugin` signature (post-Phase-1.5) already takes the newtypes and `InstallMode::Force`. The frontend renders an "Update" button in place of "Install" when `detect_plugin_updates` shows the plugin needs one.
+
+### A2 — `RemovePluginResult` shape symmetry (bundled here per Phase 1.5 design)
+
+Phase 1's `RemovePluginResult { skills_removed: u32, steering_removed: u32, agents_removed: u32 }` is asymmetric with `InstallPluginResult` (which carries `Vec`-typed sub-results, not just counts). Phase 1.5 deferred this reshape so the wire-format change could land alongside the InstalledTab UI work that consumes it.
+
+> **Superseded by Phase 2a.** The sketch below was the design-time
+> shape; the implementation that landed in PR #96 uses nested
+> per-content-type sub-results (`skills`, `steering`, `agents` each
+> carrying `removed` + `failures`) and drops the `marketplace` /
+> `plugin` echo fields (caller already passed them to `remove_plugin`).
+> See `docs/plans/2026-04-30-phase-2a-update-detection-design.md` for
+> the canonical shape and `crates/kiro-market-core/src/project.rs`'s
+> `RemovePluginResult` for the implementation.
+
+```rust
+pub struct RemovePluginResult {
+    pub marketplace: MarketplaceName,
+    pub plugin: PluginName,
+    pub skills_removed: Vec<String>,        // skill names
+    pub steering_removed: Vec<PathBuf>,     // relative paths under .kiro/steering/
+    pub agents_removed: Vec<String>,        // agent names
+}
+```
+
+The frontend's "Removed N items" toast becomes "Removed: alpha, beta, gamma" — actionable detail without a follow-up navigation. Counts are recoverable via `.len()` on each Vec.
 
 ### Phase 2 alternatives (rejected for v1, documented for future)
 

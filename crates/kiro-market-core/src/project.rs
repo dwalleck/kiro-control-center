@@ -16,7 +16,7 @@ use crate::agent::tools::MappedTool;
 use crate::agent::{AgentDefinition, AgentDialect};
 use crate::error::{AgentError, SkillError};
 use crate::validation;
-use crate::validation::{MarketplaceName, PluginName};
+use crate::validation::{MarketplaceName, PluginName, RelativePath};
 
 // ---------------------------------------------------------------------------
 // Types
@@ -72,6 +72,28 @@ pub struct InstalledAgentMeta {
     /// Which source dialect the agent was parsed from. Persisted via the
     /// enum's serde rename so the wire format stays `"claude"` / `"copilot"`.
     pub dialect: AgentDialect,
+    /// Relative path under the plugin's `agents/` directory of the
+    /// source file that was installed. `None` for legacy entries
+    /// installed before this field was added.
+    ///
+    /// Wrapped in [`RelativePath`] so `serde_json::from_slice` rejects
+    /// path-traversal attempts (`"../../etc/passwd"`) at tracking-file
+    /// load time per CLAUDE.md's "Parse, don't validate" rule. The
+    /// `RelativePath::Deserialize` impl routes through `RelativePath::new`,
+    /// which forbids `..`, absolute paths, NUL bytes, and embedded
+    /// backslashes — closing NC2 from PR #96 review (the original
+    /// `Option<PathBuf>` type let a tampered tracking file's
+    /// `source_path` escape the install boundary at hash recompute time
+    /// in [`crate::service::MarketplaceService::scan_plugin_for_content_drift`]).
+    ///
+    /// Cross-file invariant: install-time filename conventions in
+    /// [`crate::service::MarketplaceService::install_translated_agents_inner`]
+    /// must stay in sync with the dialect-classifier fallback in
+    /// `scan_plugin_for_content_drift`. If the install side starts
+    /// emitting paths that disagree with the fallback (e.g. Copilot's
+    /// `.agent.md` vs `.md`), drift detection misreports legacy entries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_path: Option<RelativePath>,
 
     /// Tree-hash of the agent source as it existed in the marketplace at
     /// install time. `None` for entries written before Stage 1 of the
@@ -359,58 +381,76 @@ pub struct TrackingLoadWarning {
     pub error: String,
 }
 
-/// Aggregated counts returned by
-/// [`KiroProject::remove_plugin`] — one tally per content type so the
-/// caller (CLI / Tauri) can render a one-line "removed N skills,
-/// M steering files, K agents" summary without re-reading the tracking
-/// files.
-///
-/// Counts are post-cascade across every per-content removal that
-/// completed successfully. A per-step error during the cascade does
-/// **not** abort the work — the cascade keeps going on the remaining
-/// content types and records the failure in `failed`. Only "failed
-/// to even read the initial tracking files" is surfaced as the
-/// cascade's outer `Err` (I5). Orphan-tracking recoveries (A-12) still
-/// count as "removed" because the per-content remove drops the
-/// tracking row and treats the missing on-disk entry as success.
-#[derive(Debug, Clone, Default, Serialize)]
+/// Per-content-type sub-result for [`RemovePluginResult`]. Mirrors
+/// the install-side [`InstallSkillsResult`] shape.
+#[derive(Clone, Debug, Default, Serialize)]
 #[cfg_attr(feature = "specta", derive(specta::Type))]
-pub struct RemovePluginResult {
-    pub skills_removed: u32,
-    pub steering_removed: u32,
-    pub agents_removed: u32,
-    /// Per-step errors encountered during the cascade. The cascade
-    /// keeps making progress on remaining content types when one
-    /// step fails — same policy as `InstallPluginResult`'s sub-result
-    /// `failed` vecs (A-15). Empty on a clean cascade.
-    ///
-    /// `serde(default)` is kept for legacy-JSON tolerance.
-    /// `skip_serializing_if` is intentionally absent — `tauri-specta`
-    /// 2.0.0-rc.24 unified mode rejects it (A-25). Empty Vec serializes
-    /// as `[]` rather than being omitted.
+pub struct RemoveSkillsResult {
     #[serde(default)]
-    pub failed: Vec<RemovePluginFailure>,
+    pub removed: Vec<String>, // skill names
+    #[serde(default)]
+    pub failures: Vec<RemoveItemFailure>,
 }
 
-/// One per-step failure recorded by [`KiroProject::remove_plugin`] when
-/// a per-content removal fails mid-cascade. The cascade keeps going on
-/// remaining content types; the caller surfaces these to the user as a
-/// partial-failure summary.
-#[derive(Debug, Clone, Serialize)]
+/// Per-content-type sub-result for [`RemovePluginResult`]. Mirrors
+/// the install-side `InstallSteeringResult` shape.
+#[derive(Clone, Debug, Default, Serialize)]
 #[cfg_attr(feature = "specta", derive(specta::Type))]
-pub struct RemovePluginFailure {
-    /// Which content type errored: `"skill"` / `"steering"` / `"agent"`
-    /// / `"native_companions"`.
-    pub content_type: String,
-    /// The item identifier — skill or agent name, or steering rel-path
-    /// rendered via `Path::display()`. Empty string for the
-    /// `"native_companions"` row, which is plugin-scoped rather than
-    /// per-item.
+pub struct RemoveSteeringResult {
+    #[serde(default)]
+    pub removed: Vec<String>, // rendered via Path::display()
+    #[serde(default)]
+    pub failures: Vec<RemoveItemFailure>,
+}
+
+/// Per-content-type sub-result for [`RemovePluginResult`]. Mirrors
+/// the install-side [`crate::service::InstallAgentsResult`] shape.
+/// `removed` is a flat vec of translated agent names + native agent
+/// names. Native companion file paths are NOT itemized (P2a-3
+/// decision α) — the `native_companions` cascade step succeeds with
+/// no per-file entries. If the FE later wants per-companion
+/// granularity, that's an additive field change.
+#[derive(Clone, Debug, Default, Serialize)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
+pub struct RemoveAgentsResult {
+    #[serde(default)]
+    pub removed: Vec<String>,
+    #[serde(default)]
+    pub failures: Vec<RemoveItemFailure>,
+}
+
+/// One failure during a per-content-type removal step. The discriminator
+/// (which content type) is the parent type — no `content_type: String`
+/// field needed (it's expressed structurally via the parent's field
+/// name in [`RemovePluginResult`]).
+#[derive(Clone, Debug, Serialize)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
+pub struct RemoveItemFailure {
+    /// The skill/agent name or steering rel-path rendered via
+    /// [`std::path::Path::display`].
     pub item: String,
     /// Rendered error chain via [`crate::error::error_full_chain`] —
-    /// wire format per CLAUDE.md "in any wire-format `reason`/`error:
-    /// String` field that crosses the FFI, use `error_full_chain(&err)`".
+    /// wire format per CLAUDE.md FFI rule.
     pub error: String,
+}
+
+/// Result of [`KiroProject::remove_plugin`] — per-content-type
+/// sub-results, symmetric with [`crate::service::InstallPluginResult`].
+/// Native companions fold into [`RemoveAgentsResult`] (matches the
+/// install-side asymmetry where native companions are agent-side
+/// artifacts).
+///
+/// No `marketplace` / `plugin` echo fields — caller already passed
+/// those args to `remove_plugin`. (Different from
+/// [`crate::service::InstallPluginResult`] which gained `marketplace`
+/// in Phase 1.5 A4 because that type lives in lists where
+/// self-identification is needed.)
+#[derive(Clone, Debug, Default, Serialize)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
+pub struct RemovePluginResult {
+    pub skills: RemoveSkillsResult,
+    pub steering: RemoveSteeringResult,
+    pub agents: RemoveAgentsResult,
 }
 
 /// Per-`(marketplace, plugin)` accumulator used by
@@ -1395,7 +1435,7 @@ impl KiroProject {
     /// Cascade-remove every tracked entry from `(marketplace, plugin)`
     /// across all three `installed-*.json` tracking files. Unlinks
     /// the on-disk files, updates the tracking JSON files atomically,
-    /// and returns aggregated counts.
+    /// and returns per-content-type sub-results.
     ///
     /// **Orphan-tracking recovery (A-12 + I3).** If a tracking entry
     /// references a path that no longer exists on disk (state
@@ -1406,26 +1446,28 @@ impl KiroProject {
     /// resurrects the plugin in `installed_plugins()`.
     ///
     /// **Per-step failures (I5).** A per-content removal that fails
-    /// mid-cascade does NOT abort. The failure is recorded in
-    /// `result.failed`; the cascade keeps going on the remaining
-    /// content types so partial progress isn't lost. Same policy as
-    /// `InstallPluginResult`'s sub-result `failed` vecs (A-15).
+    /// mid-cascade does NOT abort. The failure is recorded in the
+    /// appropriate sub-result's `failures` vec (e.g.
+    /// `result.skills.failures`); the cascade keeps going on the
+    /// remaining content types so partial progress isn't lost. Same
+    /// policy as `InstallPluginResult`'s sub-result `failed` vecs
+    /// (A-15).
     ///
     /// **`native_companions` cleanup (A-3 + A-16).** After per-agent
     /// removals, the plugin-level `native_companions` entry is
     /// dropped if its `marketplace` field matches `marketplace` (the
     /// map is keyed by plugin name alone, so the marketplace check
     /// disambiguates same-named plugins across marketplaces). A
-    /// failure here also lands in `result.failed` rather than
+    /// failure here lands in `result.agents.failures` rather than
     /// short-circuiting the cascade.
     ///
     /// # Errors
     ///
     /// Reserved for "failed to even read the initial tracking files"
     /// (the three `load_installed*()` calls). Per-step errors during
-    /// the loop go into `result.failed`. Tracking-file loads can fail
-    /// with I/O errors, JSON parse errors, or path-traversal
-    /// validation errors (A-4).
+    /// the loop go into the sub-results' `failures` vecs.
+    /// Tracking-file loads can fail with I/O errors, JSON parse
+    /// errors, or path-traversal validation errors (A-4).
     pub fn remove_plugin(
         &self,
         marketplace: &MarketplaceName,
@@ -1433,9 +1475,7 @@ impl KiroProject {
     ) -> crate::error::Result<RemovePluginResult> {
         let mut result = RemovePluginResult::default();
 
-        // Skills. The A-16 marketplace check is preserved by the newtype
-        // `PartialEq` impl (see also the `native_companions` cleanup at
-        // the bottom of this method).
+        // Skills cascade
         let skills = self.load_installed()?;
         let skills_to_remove: Vec<String> = skills
             .skills
@@ -1446,23 +1486,17 @@ impl KiroProject {
         for name in &skills_to_remove {
             match self.remove_skill(name) {
                 Ok(()) => {
-                    result.skills_removed = result.skills_removed.saturating_add(1);
+                    result.skills.removed.push(name.clone());
                 }
                 Err(e) => {
-                    // I5: collect, don't abort. I3 closed the orphan-
-                    // tracking gap so `SkillError::NotInstalled` from
-                    // here is now "no tracking entry" — which the
-                    // cascade's `filter` already excluded. So this
-                    // arm is for genuine fs / serialisation failures.
                     warn!(
                         skill = %name,
                         plugin = plugin.as_str(),
                         marketplace = marketplace.as_str(),
                         error = %e,
-                        "remove_plugin: skill removal failed; recording in `failed`"
+                        "remove_plugin: skill removal failed; recording in failures"
                     );
-                    result.failed.push(RemovePluginFailure {
-                        content_type: "skill".to_string(),
+                    result.skills.failures.push(RemoveItemFailure {
                         item: name.clone(),
                         error: crate::error::error_full_chain(&e),
                     });
@@ -1470,7 +1504,7 @@ impl KiroProject {
             }
         }
 
-        // Steering files.
+        // Steering cascade
         let steering = self.load_installed_steering()?;
         let steering_to_remove: Vec<PathBuf> = steering
             .files
@@ -1481,7 +1515,7 @@ impl KiroProject {
         for rel in &steering_to_remove {
             match self.remove_steering_file(rel) {
                 Ok(()) => {
-                    result.steering_removed = result.steering_removed.saturating_add(1);
+                    result.steering.removed.push(rel.display().to_string());
                 }
                 Err(e) => {
                     warn!(
@@ -1489,10 +1523,9 @@ impl KiroProject {
                         plugin = plugin.as_str(),
                         marketplace = marketplace.as_str(),
                         error = %e,
-                        "remove_plugin: steering removal failed; recording in `failed`"
+                        "remove_plugin: steering removal failed; recording in failures"
                     );
-                    result.failed.push(RemovePluginFailure {
-                        content_type: "steering".to_string(),
+                    result.steering.failures.push(RemoveItemFailure {
                         item: rel.display().to_string(),
                         error: crate::error::error_full_chain(&e),
                     });
@@ -1500,7 +1533,7 @@ impl KiroProject {
             }
         }
 
-        // Agents.
+        // Agents cascade
         let agents = self.load_installed_agents()?;
         let agents_to_remove: Vec<String> = agents
             .agents
@@ -1511,7 +1544,7 @@ impl KiroProject {
         for name in &agents_to_remove {
             match self.remove_agent(name) {
                 Ok(()) => {
-                    result.agents_removed = result.agents_removed.saturating_add(1);
+                    result.agents.removed.push(name.clone());
                 }
                 Err(e) => {
                     warn!(
@@ -1519,10 +1552,9 @@ impl KiroProject {
                         plugin = plugin.as_str(),
                         marketplace = marketplace.as_str(),
                         error = %e,
-                        "remove_plugin: agent removal failed; recording in `failed`"
+                        "remove_plugin: agent removal failed; recording in failures"
                     );
-                    result.failed.push(RemovePluginFailure {
-                        content_type: "agent".to_string(),
+                    result.agents.failures.push(RemoveItemFailure {
                         item: name.clone(),
                         error: crate::error::error_full_chain(&e),
                     });
@@ -1530,20 +1562,16 @@ impl KiroProject {
             }
         }
 
-        // native_companions cleanup (A-3 + A-16). Idempotent — the
-        // helper returns Ok even if the entry doesn't exist or
-        // belongs to a different marketplace. Per I5 a failure here
-        // also lands in `result.failed` rather than aborting.
+        // Native companions cleanup (A-3 + A-16). Idempotent.
         if let Err(e) = self.remove_native_companions_for_plugin(plugin, marketplace) {
             warn!(
                 plugin = plugin.as_str(),
                 marketplace = marketplace.as_str(),
                 error = %e,
-                "remove_plugin: native_companions cleanup failed; recording in `failed`"
+                "remove_plugin: native_companions cleanup failed; recording in failures"
             );
-            result.failed.push(RemovePluginFailure {
-                content_type: "native_companions".to_string(),
-                item: String::new(),
+            result.agents.failures.push(RemoveItemFailure {
+                item: format!("native_companions:{}", plugin.as_str()),
                 error: crate::error::error_full_chain(&e),
             });
         }
@@ -2580,6 +2608,7 @@ impl KiroProject {
                         version: version.map(String::from),
                         installed_at: chrono::Utc::now(),
                         dialect: AgentDialect::Native,
+                        source_path: None,
                         source_hash: Some(source_hash.to_string()),
                         installed_hash: Some(installed_hash.clone()),
                     },
@@ -3464,6 +3493,7 @@ mod tests {
             version: Some("1.2.3".into()),
             installed_at: Utc::now(),
             dialect: AgentDialect::Claude,
+            source_path: None,
             source_hash: None,
             installed_hash: None,
         };
@@ -3486,6 +3516,7 @@ mod tests {
             version: None,
             installed_at: Utc::now(),
             dialect: AgentDialect::Copilot,
+            source_path: None,
             source_hash: None,
             installed_hash: None,
         };
@@ -3762,6 +3793,174 @@ mod tests {
             }
             other => panic!("expected Error::Io(InvalidData), got {other:?}"),
         }
+    }
+
+    /// NC2 (PR #96 re-review): a tampered `installed-agents.json`
+    /// whose per-agent `source_path` contains a traversal entry would,
+    /// without the `RelativePath` newtype on `InstalledAgentMeta`,
+    /// reach `hash_artifact(agents_dir, &[rel])` at update-detection
+    /// time and read arbitrary host files. The newtype's `Deserialize`
+    /// impl routes through `RelativePath::new` which rejects `..`,
+    /// absolute paths, NUL, and embedded backslashes — failing at
+    /// `serde_json::from_slice` time, before any path joins happen.
+    #[test]
+    fn load_installed_agents_rejects_path_traversal_in_source_path() {
+        let (_dir, project) = temp_project();
+        let tracking_path = project.root.join(".kiro/installed-agents.json");
+        fs::create_dir_all(tracking_path.parent().unwrap()).unwrap();
+        let tampered = serde_json::json!({
+            "agents": {
+                "victim": {
+                    "marketplace": "m",
+                    "plugin": "p",
+                    "version": null,
+                    "installed_at": chrono::Utc::now(),
+                    "dialect": "claude",
+                    "source_path": "../../etc/passwd",
+                }
+            }
+        });
+        fs::write(&tracking_path, tampered.to_string()).unwrap();
+
+        let err = project
+            .load_installed_agents()
+            .expect_err("traversal in source_path must be refused at load time");
+        // serde_json deserialize errors land in Error::Json
+        // (mapped via #[error(transparent)] on Error::Json).
+        match err {
+            crate::error::Error::Json(_) => {}
+            other => panic!("expected Error::Json (RelativePath rejection), got {other:?}"),
+        }
+    }
+
+    /// NC2 + parse-don't-validate sanity: a well-formed `source_path`
+    /// (forward-slash relative path under `agents/`) must round-trip
+    /// through serde and end up as `Some(RelativePath)`.
+    #[test]
+    fn installed_agent_meta_round_trips_valid_source_path() {
+        use crate::validation::RelativePath;
+        let meta = InstalledAgentMeta {
+            marketplace: mp("m"),
+            plugin: pn("p"),
+            version: None,
+            installed_at: Utc::now(),
+            dialect: AgentDialect::Claude,
+            source_path: Some(RelativePath::new("subdir/agent.md").expect("valid rel path")),
+            source_hash: None,
+            installed_hash: None,
+        };
+        let json = serde_json::to_string(&meta).unwrap();
+        assert!(
+            json.contains("\"source_path\":\"subdir/agent.md\""),
+            "wire format must remain a flat string, got: {json}"
+        );
+        let back: InstalledAgentMeta = serde_json::from_str(&json).unwrap();
+        let rp = back.source_path.expect("source_path should be Some");
+        assert_eq!(rp.as_str(), "subdir/agent.md");
+    }
+
+    #[test]
+    fn remove_skills_result_json_shape_default_empty() {
+        let result = RemoveSkillsResult::default();
+        let json = serde_json::to_value(&result).expect("serialize");
+        assert_eq!(json["removed"], serde_json::json!([]));
+        assert_eq!(json["failures"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn remove_skills_result_json_shape_with_populated_removed() {
+        let result = RemoveSkillsResult {
+            removed: vec!["alpha".into(), "beta".into()],
+            failures: vec![],
+        };
+        let json = serde_json::to_value(&result).expect("serialize");
+        assert_eq!(json["removed"], serde_json::json!(["alpha", "beta"]));
+        assert_eq!(json["failures"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn remove_skills_result_json_shape_with_populated_failure() {
+        let result = RemoveSkillsResult {
+            removed: vec![],
+            failures: vec![RemoveItemFailure {
+                item: "broken".into(),
+                error: "io: permission denied".into(),
+            }],
+        };
+        let json = serde_json::to_value(&result).expect("serialize");
+        assert_eq!(json["failures"][0]["item"], "broken");
+        assert_eq!(json["failures"][0]["error"], "io: permission denied");
+    }
+
+    // Symmetric tests for RemoveSteeringResult
+    #[test]
+    fn remove_steering_result_json_shape_default_empty() {
+        let result = RemoveSteeringResult::default();
+        let json = serde_json::to_value(&result).expect("serialize");
+        assert_eq!(json["removed"], serde_json::json!([]));
+        assert_eq!(json["failures"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn remove_steering_result_json_shape_with_populated_removed() {
+        let result = RemoveSteeringResult {
+            removed: vec!["guide.md".into()],
+            failures: vec![],
+        };
+        let json = serde_json::to_value(&result).expect("serialize");
+        assert_eq!(json["removed"], serde_json::json!(["guide.md"]));
+        assert_eq!(json["failures"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn remove_steering_result_json_shape_with_populated_failure() {
+        let result = RemoveSteeringResult {
+            removed: vec![],
+            failures: vec![RemoveItemFailure {
+                item: "broken.md".into(),
+                error: "io: permission denied".into(),
+            }],
+        };
+        let json = serde_json::to_value(&result).expect("serialize");
+        assert_eq!(json["failures"][0]["item"], "broken.md");
+        assert_eq!(json["failures"][0]["error"], "io: permission denied");
+    }
+
+    // Symmetric tests for RemoveAgentsResult
+    #[test]
+    fn remove_agents_result_json_shape_default_empty() {
+        let result = RemoveAgentsResult::default();
+        let json = serde_json::to_value(&result).expect("serialize");
+        assert_eq!(json["removed"], serde_json::json!([]));
+        assert_eq!(json["failures"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn remove_agents_result_json_shape_with_populated_removed() {
+        let result = RemoveAgentsResult {
+            removed: vec!["reviewer".into(), "companions/prompt.md".into()],
+            failures: vec![],
+        };
+        let json = serde_json::to_value(&result).expect("serialize");
+        assert_eq!(
+            json["removed"],
+            serde_json::json!(["reviewer", "companions/prompt.md"])
+        );
+        assert_eq!(json["failures"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn remove_agents_result_json_shape_with_populated_failure() {
+        let result = RemoveAgentsResult {
+            removed: vec![],
+            failures: vec![RemoveItemFailure {
+                item: "broken-agent".into(),
+                error: "io: permission denied".into(),
+            }],
+        };
+        let json = serde_json::to_value(&result).expect("serialize");
+        assert_eq!(json["failures"][0]["item"], "broken-agent");
+        assert_eq!(json["failures"][0]["error"], "io: permission denied");
     }
 
     #[test]
@@ -4463,6 +4662,7 @@ mod tests {
             version: None,
             installed_at: Utc::now(),
             dialect: AgentDialect::Claude,
+            source_path: None,
             source_hash: None,
             installed_hash: None,
         }
@@ -5715,9 +5915,12 @@ mod tests {
         let result = project
             .remove_plugin(&mp("mp"), &pn("p"))
             .expect("remove_plugin");
-        assert_eq!(result.skills_removed, 1);
-        assert_eq!(result.steering_removed, 1);
-        assert_eq!(result.agents_removed, 0);
+        assert_eq!(result.skills.removed, vec!["alpha"]);
+        assert_eq!(result.steering.removed, vec!["guide.md"]);
+        assert!(result.agents.removed.is_empty());
+        assert!(result.skills.failures.is_empty());
+        assert!(result.steering.failures.is_empty());
+        assert!(result.agents.failures.is_empty());
 
         let post = project
             .installed_plugins()
@@ -5770,7 +5973,12 @@ mod tests {
         let result = project
             .remove_plugin(&mp("mp-a"), &pn("p"))
             .expect("remove mp-a/p");
-        assert_eq!(result.steering_removed, 1, "only mp-a/p's entry");
+        assert_eq!(result.steering.removed, vec!["a.md"], "only mp-a/p's entry");
+        assert!(result.skills.removed.is_empty());
+        assert!(result.agents.removed.is_empty());
+        assert!(result.skills.failures.is_empty());
+        assert!(result.steering.failures.is_empty());
+        assert!(result.agents.failures.is_empty());
 
         let tracking = project.load_installed_steering().expect("load");
         assert!(
@@ -5818,14 +6026,19 @@ mod tests {
             .remove_plugin(&mp("mp"), &pn("p"))
             .expect("orphan recovery: must NOT abort");
         assert_eq!(
-            result.skills_removed, 1,
+            result.skills.removed,
+            vec!["orphan"],
             "orphan tracking entry counts as removed (A-12)"
         );
         assert!(
-            result.failed.is_empty(),
+            result.skills.failures.is_empty(),
             "I3: orphan recovery is no longer a `failed` entry; remove_skill \
              drops the tracking row and treats missing on-disk dir as success"
         );
+        assert!(result.steering.removed.is_empty());
+        assert!(result.agents.removed.is_empty());
+        assert!(result.steering.failures.is_empty());
+        assert!(result.agents.failures.is_empty());
         // I3: remove_skill now drops the tracking row on the orphan
         // path, so installed_plugins() must NOT surface this plugin
         // anymore. Closes A-24.
@@ -5848,8 +6061,8 @@ mod tests {
         // whose unlink fails (directory at destination). The cascade
         // must:
         //   - count the skill as removed
-        //   - record the steering failure in `result.failed` (NOT
-        //     short-circuit)
+        //   - record the steering failure in `result.steering.failures`
+        //     (NOT short-circuit)
         //   - still return Ok(result)
         use chrono::Utc;
         let (_dir, project) = temp_project();
@@ -5906,31 +6119,64 @@ mod tests {
             .expect("I5: cascade returns Ok even with per-step failures");
 
         assert_eq!(
-            result.skills_removed, 1,
+            result.skills.removed,
+            vec!["removable"],
             "I5: skill removal succeeded and counted"
         );
-        assert_eq!(
-            result.steering_removed, 0,
-            "I5: steering removal failed — count must NOT increment"
+        assert!(
+            result.steering.removed.is_empty(),
+            "I5: steering removal failed — must NOT appear in removed"
         );
         assert_eq!(
-            result.failed.len(),
+            result.steering.failures.len(),
             1,
-            "I5: exactly one failed entry expected, got {:?}",
-            result.failed
+            "I5: exactly one steering failure expected, got {:?}",
+            result.steering.failures
         );
         assert_eq!(
-            result.failed[0].content_type, "steering",
-            "I5: content_type must identify which sub-step errored"
-        );
-        assert_eq!(
-            result.failed[0].item, "guide.md",
+            result.steering.failures[0].item, "guide.md",
             "I5: item must identify which entry errored"
         );
         assert!(
-            !result.failed[0].error.is_empty(),
+            !result.steering.failures[0].error.is_empty(),
             "I5: error string must be populated via error_full_chain"
         );
+        assert!(result.skills.failures.is_empty());
+        assert!(result.agents.removed.is_empty());
+        assert!(result.agents.failures.is_empty());
+    }
+
+    #[test]
+    fn remove_plugin_result_json_shape_locks_default_empty() {
+        let result = RemovePluginResult::default();
+        let json = serde_json::to_value(&result).expect("serialize");
+        assert!(json["skills"].is_object());
+        assert!(json["steering"].is_object());
+        assert!(json["agents"].is_object());
+        assert_eq!(json["skills"]["removed"], serde_json::json!([]));
+        assert_eq!(json["skills"]["failures"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn remove_plugin_result_json_shape_with_populated_removed_and_failures() {
+        let result = RemovePluginResult {
+            skills: RemoveSkillsResult {
+                removed: vec!["alpha".into()],
+                failures: vec![],
+            },
+            steering: RemoveSteeringResult {
+                removed: vec![],
+                failures: vec![RemoveItemFailure {
+                    item: "broken.md".into(),
+                    error: "io: permission denied".into(),
+                }],
+            },
+            agents: RemoveAgentsResult::default(),
+        };
+        let json = serde_json::to_value(&result).expect("serialize");
+        assert_eq!(json["skills"]["removed"][0], "alpha");
+        assert_eq!(json["steering"]["failures"][0]["item"], "broken.md");
+        assert_eq!(json["agents"]["removed"], serde_json::json!([]));
     }
 
     #[test]
@@ -6002,9 +6248,20 @@ mod tests {
         )
         .expect("agents tracking");
 
-        project
+        let result = project
             .remove_plugin(&mp("mp"), &pn("p"))
             .expect("remove_plugin");
+
+        // P2a-3 sub-decision α: agents.removed does NOT itemize companion
+        // files; the step succeeds with an empty removed vec.
+        assert!(
+            result.agents.removed.is_empty(),
+            "native_companions success yields no per-file entries in agents.removed"
+        );
+        assert!(
+            result.agents.failures.is_empty(),
+            "native_companions cleanup must not fail for matching marketplace"
+        );
 
         let tracking = project.load_installed_agents().expect("load");
         assert!(

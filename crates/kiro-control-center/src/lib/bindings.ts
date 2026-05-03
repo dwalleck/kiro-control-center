@@ -17,6 +17,17 @@ export const commands = {
 	 *  per-skill failures vanished into `warn!` logs, leaving the frontend to
 	 *  wonder why the count shrank; surfacing them structurally lets the UI
 	 *  show "N skills failed to load" with a drill-down.
+	 * 
+	 *  The IPC-boundary [`MarketplaceName::new`] / [`PluginName::new`]
+	 *  constructors plus [`validate_kiro_project_path`] gate the wrapper
+	 *  before any service or filesystem access. Without these guards a
+	 *  frontend-supplied `marketplace = "../etc/passwd"` would reach
+	 *  [`MarketplaceService::marketplace_path`] (`cache::marketplace_path`)
+	 *  via a bare path join and force an FS read at
+	 *  `<registries_dir>/../etc/passwd` — the read-side analogue of the
+	 *  install-side hardening from PR #94's I10. Validation runs *before*
+	 *  [`make_service`] so rejection paths never touch `$HOME` / the cache
+	 *  directory.
 	 */
 	listAvailableSkills: (marketplace: string, plugin: string, projectPath: string) => typedError<PluginSkillsResult, CommandError>(__TAURI_INVOKE("list_available_skills", { marketplace, plugin, projectPath })),
 	/**
@@ -27,6 +38,11 @@ export const commands = {
 	 *  plugin filter is active. The returned [`BulkSkillsResult::skipped`]
 	 *  carries plugin-level errors (missing directory, malformed manifest,
 	 *  remote source) so the frontend can surface a partial-listing warning.
+	 * 
+	 *  The IPC-boundary [`MarketplaceName::new`] plus
+	 *  [`validate_kiro_project_path`] gate the wrapper before any service or
+	 *  filesystem access — same defense-in-depth contract as
+	 *  [`list_available_skills`].
 	 */
 	listAllSkillsForMarketplace: (marketplace: string, projectPath: string) => typedError<BulkSkillsResult, CommandError>(__TAURI_INVOKE("list_all_skills_for_marketplace", { marketplace, projectPath })),
 	/**
@@ -135,13 +151,43 @@ export const commands = {
 	/**
 	 *  Remove every skill, steering file, and agent for a given
 	 *  `(marketplace, plugin)` pair from the project, returning per-content
-	 *  removal counts.
+	 *  `removed: Vec<String>` lists plus per-content `failures` vecs.
 	 * 
 	 *  No `_impl` split (A-19): same rationale as
 	 *  [`list_installed_plugins`] above — `KiroProject`-only read/write,
 	 *  no service.
 	 */
 	removePlugin: (marketplace: string, plugin: string, projectPath: string) => typedError<RemovePluginResult, CommandError>(__TAURI_INVOKE("remove_plugin", { marketplace, plugin, projectPath })),
+	/**
+	 *  Scan installed plugins for available updates by comparing each
+	 *  project tracking entry's recorded `version` and `source_hash`
+	 *  against the corresponding plugin in the marketplace cache. Reads
+	 *  from local cache only — callers that want fresh data run
+	 *  `update_marketplaces` first.
+	 * 
+	 *  Returns a [`DetectUpdatesResult`] split into three vecs:
+	 *  - `updates`: plugins with an available update (typed
+	 *    `change_signal` distinguishes manifest version bump from
+	 *    content drift without version bump).
+	 *  - `failures`: plugins the scan couldn't check, with a typed
+	 *    `kind: PluginUpdateFailureKind` for FE branching (Rule 42).
+	 *  - `partial_load_warnings`: tracking files that failed to load
+	 *    (corrupt JSON etc.) — the other tracking files still
+	 *    contribute and the scan continues.
+	 * 
+	 *  Splits into [`detect_plugin_updates_impl`] per the
+	 *  service-consuming-command convention so the body is testable
+	 *  without a Tauri runtime.
+	 * 
+	 *  # Errors
+	 * 
+	 *  Returns `CommandError::Validation` on an invalid `project_path`.
+	 *  Per-plugin scan failures land in
+	 *  [`DetectUpdatesResult::failures`] (a typed entry, not an
+	 *  `Err(CommandError)`) so a single bad plugin doesn't abort the
+	 *  whole scan.
+	 */
+	detectPluginUpdates: (projectPath: string) => typedError<DetectUpdatesResult, CommandError>(__TAURI_INVOKE("detect_plugin_updates", { projectPath })),
 };
 
 /* Types */
@@ -169,6 +215,26 @@ export type BulkSkillsResult = {
 export type CommandError = {
 	message: string,
 	error_type: ErrorType,
+};
+
+/**
+ *  Result of [`MarketplaceService::detect_plugin_updates`] — a scan over
+ *  installed plugins. `updates` lists plugins with available updates;
+ *  `failures` lists plugins the scan couldn't check (marketplace gone
+ *  from cache, manifest malformed, hash computation failure). Plugins
+ *  with no update available are absent from both vecs (the implicit
+ *  "everything's fine" set).
+ * 
+ *  `partial_load_warnings` carries tracking-file load failures that
+ *  happened before `installed_plugins()` returned — e.g. a corrupt
+ *  `installed-skills.json` means the corresponding skills are missing
+ *  from `plugins` and the warning is surfaced here so the caller can
+ *  render a "partial state" banner.
+ */
+export type DetectUpdatesResult = {
+	updates?: PluginUpdateInfo[],
+	failures?: PluginUpdateFailure[],
+	partial_load_warnings?: TrackingLoadWarning[],
 };
 
 // A discovered Kiro project found during directory scanning.
@@ -922,6 +988,99 @@ export type PluginSkillsResult = {
 	skipped_skills: SkippedSkill[],
 };
 
+/**
+ *  A plugin the update scan couldn't check.
+ * 
+ *  `kind` is the stable programmatic discriminant frontends should
+ *  `match` on (per CLAUDE.md Rule 42: match error types, not error
+ *  strings). `reason` is the rendered error chain via
+ *  [`crate::error::error_full_chain`] per the FFI rule — suitable for
+ *  log lines or fallback UI rendering, but never for branching logic.
+ */
+export type PluginUpdateFailure = {
+	marketplace: MarketplaceName,
+	plugin: PluginName,
+	kind: PluginUpdateFailureKind,
+	reason: string,
+};
+
+/**
+ *  Why an update-detection scan couldn't check a plugin. Tagged enum
+ *  for FFI per the `ffi-enum-serde-tag` plan-lint gate (PR #91):
+ *  `#[serde(tag = "kind", rename_all = "snake_case")]` produces
+ *  `{ "kind": "manifest_unreadable" }` in JSON, which `tauri-specta`
+ *  emits as a discriminated TS union.
+ * 
+ *  Closes original-review I4: `PluginUpdateFailure` was opaque
+ *  (substring matching `reason` to differentiate failure types
+ *  violated CLAUDE.md Rule 42). The classifier
+ *  [`PluginUpdateFailureKind::from_error`] is exhaustive per the
+ *  CLAUDE.md classifier rule — a new error variant either matches
+ *  here explicitly or routes through `Other` after a written-down
+ *  rationale.
+ */
+export type PluginUpdateFailureKind = 
+/**
+ *  Marketplace cache directory missing or plugin removed from
+ *  the marketplace's manifest.
+ */
+{ kind: "marketplace_unavailable" } | 
+/**
+ *  `plugin.json` missing in the marketplace cache (typically the
+ *  plugin was deleted from upstream and the cache hasn't been
+ *  refreshed). Also covers symlink-refused per the C5 defense.
+ */
+{ kind: "manifest_unreadable" } | 
+/**
+ *  `plugin.json` exists but failed to parse (malformed JSON,
+ *  missing required fields, etc.).
+ */
+{ kind: "manifest_invalid" } | 
+/**
+ *  Hash recomputation against an installed file failed (file
+ *  missing in the cache, permission denied, etc.).
+ */
+{ kind: "hash_failed" } | 
+/**
+ *  Catch-all for unanticipated failure shapes. Surfacing this
+ *  rather than panicking lets the FE render a generic "scan
+ *  failed" badge while the typed variants drive specific
+ *  remediation. Each new error class deliberately routed here
+ *  should also be considered for promotion to a typed variant.
+ */
+{ kind: "other" };
+
+/**
+ *  A single plugin with an update available.
+ * 
+ *  The `change_signal` discriminates between manifest-version change
+ *  and content-drift-without-version-bump.
+ */
+export type PluginUpdateInfo = {
+	marketplace: MarketplaceName,
+	plugin: PluginName,
+	/**
+	 *  `None` means the project's tracking file lacked a `version`
+	 *  field at install time (a legacy install pre-Stage-1, before
+	 *  the version field was added to the tracking schema). Cases
+	 *  where the tracking file itself failed to load are surfaced via
+	 *  [`DetectUpdatesResult::partial_load_warnings`], NOT via
+	 *  `Some(None)` here.
+	 */
+	installed_version: string | null,
+	/**
+	 *  `None` means the marketplace plugin manifest exists but lacks
+	 *  a `version` field. After NC1's `ManifestState` 3-state
+	 *  split, cases where the manifest is missing or unreadable
+	 *  (symlinked, `NotFound`) surface as a [`PluginUpdateFailure`] —
+	 *  they no longer collapse into `Some(None)` here. So
+	 *  `available_version: None` is now an unambiguous "marketplace
+	 *  says no version" signal.
+	 */
+	available_version: string | null,
+	change_signal: UpdateChangeSignal,
+};
+
 // Summary information about a Kiro project directory.
 export type ProjectInfo = {
 	path: string,
@@ -946,64 +1105,73 @@ export type ProjectInfo = {
 export type RelativePath = string;
 
 /**
- *  One per-step failure recorded by [`KiroProject::remove_plugin`] when
- *  a per-content removal fails mid-cascade. The cascade keeps going on
- *  remaining content types; the caller surfaces these to the user as a
- *  partial-failure summary.
+ *  Per-content-type sub-result for [`RemovePluginResult`]. Mirrors
+ *  the install-side [`crate::service::InstallAgentsResult`] shape.
+ *  `removed` is a flat vec of translated agent names + native agent
+ *  names. Native companion file paths are NOT itemized (P2a-3
+ *  decision α) — the `native_companions` cascade step succeeds with
+ *  no per-file entries. If the FE later wants per-companion
+ *  granularity, that's an additive field change.
  */
-export type RemovePluginFailure = {
+export type RemoveAgentsResult = {
+	removed?: string[],
+	failures?: RemoveItemFailure[],
+};
+
+/**
+ *  One failure during a per-content-type removal step. The discriminator
+ *  (which content type) is the parent type — no `content_type: String`
+ *  field needed (it's expressed structurally via the parent's field
+ *  name in [`RemovePluginResult`]).
+ */
+export type RemoveItemFailure = {
 	/**
-	 *  Which content type errored: `"skill"` / `"steering"` / `"agent"`
-	 *  / `"native_companions"`.
-	 */
-	content_type: string,
-	/**
-	 *  The item identifier — skill or agent name, or steering rel-path
-	 *  rendered via `Path::display()`. Empty string for the
-	 *  `"native_companions"` row, which is plugin-scoped rather than
-	 *  per-item.
+	 *  The skill/agent name or steering rel-path rendered via
+	 *  [`std::path::Path::display`].
 	 */
 	item: string,
 	/**
 	 *  Rendered error chain via [`crate::error::error_full_chain`] —
-	 *  wire format per CLAUDE.md "in any wire-format `reason`/`error:
-	 *  String` field that crosses the FFI, use `error_full_chain(&err)`".
+	 *  wire format per CLAUDE.md FFI rule.
 	 */
 	error: string,
 };
 
 /**
- *  Aggregated counts returned by
- *  [`KiroProject::remove_plugin`] — one tally per content type so the
- *  caller (CLI / Tauri) can render a one-line "removed N skills,
- *  M steering files, K agents" summary without re-reading the tracking
- *  files.
+ *  Result of [`KiroProject::remove_plugin`] — per-content-type
+ *  sub-results, symmetric with [`crate::service::InstallPluginResult`].
+ *  Native companions fold into [`RemoveAgentsResult`] (matches the
+ *  install-side asymmetry where native companions are agent-side
+ *  artifacts).
  * 
- *  Counts are post-cascade across every per-content removal that
- *  completed successfully. A per-step error during the cascade does
- *  **not** abort the work — the cascade keeps going on the remaining
- *  content types and records the failure in `failed`. Only "failed
- *  to even read the initial tracking files" is surfaced as the
- *  cascade's outer `Err` (I5). Orphan-tracking recoveries (A-12) still
- *  count as "removed" because the per-content remove drops the
- *  tracking row and treats the missing on-disk entry as success.
+ *  No `marketplace` / `plugin` echo fields — caller already passed
+ *  those args to `remove_plugin`. (Different from
+ *  [`crate::service::InstallPluginResult`] which gained `marketplace`
+ *  in Phase 1.5 A4 because that type lives in lists where
+ *  self-identification is needed.)
  */
 export type RemovePluginResult = {
-	skills_removed: number,
-	steering_removed: number,
-	agents_removed: number,
-	/**
-	 *  Per-step errors encountered during the cascade. The cascade
-	 *  keeps making progress on remaining content types when one
-	 *  step fails — same policy as `InstallPluginResult`'s sub-result
-	 *  `failed` vecs (A-15). Empty on a clean cascade.
-	 * 
-	 *  `serde(default)` is kept for legacy-JSON tolerance.
-	 *  `skip_serializing_if` is intentionally absent — `tauri-specta`
-	 *  2.0.0-rc.24 unified mode rejects it (A-25). Empty Vec serializes
-	 *  as `[]` rather than being omitted.
-	 */
-	failed?: RemovePluginFailure[],
+	skills: RemoveSkillsResult,
+	steering: RemoveSteeringResult,
+	agents: RemoveAgentsResult,
+};
+
+/**
+ *  Per-content-type sub-result for [`RemovePluginResult`]. Mirrors
+ *  the install-side [`InstallSkillsResult`] shape.
+ */
+export type RemoveSkillsResult = {
+	removed?: string[],
+	failures?: RemoveItemFailure[],
+};
+
+/**
+ *  Per-content-type sub-result for [`RemovePluginResult`]. Mirrors
+ *  the install-side `InstallSteeringResult` shape.
+ */
+export type RemoveSteeringResult = {
+	removed?: string[],
+	failures?: RemoveItemFailure[],
 };
 
 // Top-level category for a Kiro CLI setting.
@@ -1327,6 +1495,24 @@ export type UnmappedReason =
  *  concept with no reliable Kiro mapping.
  */
 "BareCopilotName";
+
+/**
+ *  Why an update is being surfaced. Tagged enum for FFI per the
+ *  `ffi-enum-serde-tag` plan-lint gate (PR #91): `#[serde(tag = "kind",
+ *  rename_all = "snake_case")]` produces `{ "kind": "version_bumped" }`
+ *  in JSON, which `tauri-specta` emits as a discriminated TS union.
+ */
+export type UpdateChangeSignal = 
+/**
+ *  Manifest version string differs (with or without content hash diff).
+ *  Designed for FE rendering as "Update v1.0 → v1.1".
+ */
+{ kind: "version_bumped" } | 
+/**
+ *  Manifest version unchanged but at least one source-hash diff
+ *  detected. Designed for FE rendering as "Content updated since install".
+ */
+{ kind: "content_changed" };
 
 // Result of updating one or more marketplaces.
 export type UpdateResult = {

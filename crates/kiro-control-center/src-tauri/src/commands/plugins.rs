@@ -1,6 +1,6 @@
 //! Plugin-level commands for the Tauri frontend.
 //!
-//! Three commands live here:
+//! Four commands live here:
 //!
 //! - [`install_plugin`] — orchestrator wrapper around
 //!   [`MarketplaceService::install_plugin`] (Task 1's core method). Carries
@@ -15,9 +15,15 @@
 //! - [`remove_plugin`] — cascade wrapper around
 //!   [`KiroProject::remove_plugin`] (Task 3). No `_impl` per A-19; same
 //!   project-only-read shape as `list_installed_plugins`.
+//! - [`detect_plugin_updates`] — update-detection wrapper around
+//!   [`MarketplaceService::detect_plugin_updates`] (Phase 2a). Splits
+//!   into [`detect_plugin_updates_impl`] per the service-consuming
+//!   convention so the body is testable without a Tauri runtime.
 
 use kiro_market_core::project::{InstalledPluginsView, KiroProject, RemovePluginResult};
-use kiro_market_core::service::{InstallMode, InstallPluginResult, MarketplaceService};
+use kiro_market_core::service::{
+    DetectUpdatesResult, InstallMode, InstallPluginResult, MarketplaceService,
+};
 use kiro_market_core::validation::{MarketplaceName, PluginName};
 
 use crate::commands::{make_service, validate_kiro_project_path};
@@ -71,6 +77,52 @@ fn install_plugin_impl(
         .map_err(CommandError::from)
 }
 
+fn detect_plugin_updates_impl(
+    svc: &MarketplaceService,
+    project_path: &str,
+) -> Result<DetectUpdatesResult, CommandError> {
+    let project_root = validate_kiro_project_path(project_path)?;
+    let project = KiroProject::new(project_root);
+    svc.detect_plugin_updates(&project)
+        .map_err(CommandError::from)
+}
+
+/// Scan installed plugins for available updates by comparing each
+/// project tracking entry's recorded `version` and `source_hash`
+/// against the corresponding plugin in the marketplace cache. Reads
+/// from local cache only — callers that want fresh data run
+/// `update_marketplaces` first.
+///
+/// Returns a [`DetectUpdatesResult`] split into three vecs:
+/// - `updates`: plugins with an available update (typed
+///   `change_signal` distinguishes manifest version bump from
+///   content drift without version bump).
+/// - `failures`: plugins the scan couldn't check, with a typed
+///   `kind: PluginUpdateFailureKind` for FE branching (Rule 42).
+/// - `partial_load_warnings`: tracking files that failed to load
+///   (corrupt JSON etc.) — the other tracking files still
+///   contribute and the scan continues.
+///
+/// Splits into [`detect_plugin_updates_impl`] per the
+/// service-consuming-command convention so the body is testable
+/// without a Tauri runtime.
+///
+/// # Errors
+///
+/// Returns `CommandError::Validation` on an invalid `project_path`.
+/// Per-plugin scan failures land in
+/// [`DetectUpdatesResult::failures`] (a typed entry, not an
+/// `Err(CommandError)`) so a single bad plugin doesn't abort the
+/// whole scan.
+#[tauri::command]
+#[specta::specta]
+pub async fn detect_plugin_updates(
+    project_path: String,
+) -> Result<DetectUpdatesResult, CommandError> {
+    let svc = make_service()?;
+    detect_plugin_updates_impl(&svc, &project_path)
+}
+
 /// List every installed plugin in the project, aggregated by
 /// `(marketplace, plugin)` pair across the three tracking files.
 ///
@@ -91,7 +143,7 @@ pub async fn list_installed_plugins(
 
 /// Remove every skill, steering file, and agent for a given
 /// `(marketplace, plugin)` pair from the project, returning per-content
-/// removal counts.
+/// `removed: Vec<String>` lists plus per-content `failures` vecs.
 ///
 /// No `_impl` split (A-19): same rationale as
 /// [`list_installed_plugins`] above — `KiroProject`-only read/write,
@@ -114,12 +166,14 @@ pub async fn remove_plugin(
 
 #[cfg(test)]
 mod tests {
-    //! `_impl`-level tests for [`install_plugin_impl`] plus wrapper-level
-    //! tests for [`list_installed_plugins`] and [`remove_plugin`] (A-19:
-    //! the latter two have no `_impl`, so the wrapper IS the unit). The
-    //! `#[tauri::command]` attribute on `install_plugin` is a thin serde
-    //! shim and is not re-exercised here; see `commands/browse.rs::tests`
-    //! for the canonical pattern.
+    //! `_impl`-level tests for [`install_plugin_impl`] and
+    //! [`detect_plugin_updates_impl`] plus wrapper-level tests for
+    //! [`list_installed_plugins`] and [`remove_plugin`] (A-19: the
+    //! latter two have no `_impl`, so the wrapper IS the unit). The
+    //! `#[tauri::command]` attribute on `install_plugin` /
+    //! `detect_plugin_updates` is a thin serde shim and is not
+    //! re-exercised here; see `commands/browse.rs::tests` for the
+    //! canonical pattern.
 
     use std::fs;
 
@@ -493,15 +547,15 @@ mod tests {
     // -----------------------------------------------------------------------
 
     /// Removing a `(marketplace, plugin)` pair that was never installed
-    /// returns zeroed counts (not an error). The cascade's
-    /// "filter-then-remove" shape naturally produces zeros when no
-    /// tracking entries match.
+    /// returns empty per-content `removed` lists (not an error). The
+    /// cascade's "filter-then-remove" shape naturally produces empty
+    /// vecs when no tracking entries match.
     #[tokio::test]
     async fn remove_plugin_returns_zeros_for_nonexistent_pair() {
         let dir = tempfile::tempdir().expect("tempdir");
         let project_path = make_kiro_project(dir.path());
 
-        let counts = remove_plugin(
+        let result = remove_plugin(
             "mp-absent".to_string(),
             "plugin-absent".to_string(),
             project_path,
@@ -509,14 +563,18 @@ mod tests {
         .await
         .expect("remove on empty project must succeed");
 
-        assert_eq!(counts.skills_removed, 0);
-        assert_eq!(counts.steering_removed, 0);
-        assert_eq!(counts.agents_removed, 0);
+        assert!(result.skills.removed.is_empty());
+        assert!(result.steering.removed.is_empty());
+        assert!(result.agents.removed.is_empty());
+        assert!(result.skills.failures.is_empty());
+        assert!(result.steering.failures.is_empty());
+        assert!(result.agents.failures.is_empty());
     }
 
     /// After [`install_plugin_impl`] seeds all three content types,
-    /// `remove_plugin` must report counts matching what was installed
-    /// AND the tracking files must reflect the removal.
+    /// `remove_plugin` must report per-content removed lists matching
+    /// what was installed AND the tracking files must reflect the
+    /// removal.
     #[tokio::test]
     async fn remove_plugin_returns_expected_counts_after_install() {
         let (dir, svc) = temp_service();
@@ -538,7 +596,7 @@ mod tests {
         )
         .expect("seed via install_plugin_impl");
 
-        let counts = remove_plugin(
+        let result = remove_plugin(
             "mp1".to_string(),
             "myplugin".to_string(),
             project_path.clone(),
@@ -546,9 +604,12 @@ mod tests {
         .await
         .expect("cascade remove");
 
-        assert_eq!(counts.skills_removed, 1);
-        assert_eq!(counts.steering_removed, 1);
-        assert_eq!(counts.agents_removed, 1);
+        assert_eq!(result.skills.removed, vec!["alpha"]);
+        assert_eq!(result.steering.removed, vec!["guide.md"]);
+        assert_eq!(result.agents.removed, vec!["reviewer"]);
+        assert!(result.skills.failures.is_empty());
+        assert!(result.steering.failures.is_empty());
+        assert!(result.agents.failures.is_empty());
 
         let view_after = list_installed_plugins(project_path)
             .await
@@ -566,6 +627,28 @@ mod tests {
         let err = remove_plugin("mp1".to_string(), "myplugin".to_string(), String::new())
             .await
             .expect_err("empty project_path must error");
+        assert_eq!(err.error_type, ErrorType::Validation);
+    }
+
+    // -----------------------------------------------------------------------
+    // detect_plugin_updates_impl
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn detect_plugin_updates_impl_happy_path() {
+        let (dir, svc) = temp_service();
+        let project_path = make_kiro_project(dir.path());
+        let result = detect_plugin_updates_impl(&svc, &project_path)
+            .expect("scan succeeds with empty project");
+        assert!(result.updates.is_empty());
+        assert!(result.failures.is_empty());
+    }
+
+    #[test]
+    fn detect_plugin_updates_impl_rejects_invalid_project_path() {
+        let (_dir, svc) = temp_service();
+        let result = detect_plugin_updates_impl(&svc, "/nonexistent/path/to/project");
+        let err = result.expect_err("invalid project path must be rejected");
         assert_eq!(err.error_type, ErrorType::Validation);
     }
 }

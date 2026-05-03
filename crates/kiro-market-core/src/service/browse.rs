@@ -184,7 +184,17 @@ impl SkippedReason {
             // `NotFound` and `ManifestNotFound` stay here because they
             // represent "caller asked for the wrong thing" — a user-input
             // bug, not a damaged plugin to fold into `skipped`.
-            PluginError::NotFound { .. } | PluginError::ManifestNotFound { .. } => None,
+            //
+            // The cache-side variants (CacheManifestReadFailed /
+            // CacheManifestInvalid) belong to the update-detection
+            // path (`detect_plugin_updates`), not the bulk-listing
+            // path that produces `SkippedPlugin`. They route through
+            // PluginUpdateFailureKind instead, so they correctly
+            // return None here.
+            PluginError::NotFound { .. }
+            | PluginError::ManifestNotFound { .. }
+            | PluginError::CacheManifestReadFailed { .. }
+            | PluginError::CacheManifestInvalid { .. } => None,
         }
     }
 }
@@ -936,7 +946,7 @@ fn discover_skills_for_plugin(
 /// or its `agents` list is empty. Mirrors the "empty list means no
 /// custom paths, not no agents" fallback policy used by
 /// [`discover_skills_for_plugin`].
-fn agent_scan_paths_for_plugin(manifest: Option<&PluginManifest>) -> Vec<String> {
+pub(super) fn agent_scan_paths_for_plugin(manifest: Option<&PluginManifest>) -> Vec<String> {
     if let Some(m) = manifest.filter(|m| !m.agents.is_empty()) {
         m.agents.clone()
     } else {
@@ -951,7 +961,7 @@ fn agent_scan_paths_for_plugin(manifest: Option<&PluginManifest>) -> Vec<String>
 /// back to [`crate::DEFAULT_STEERING_PATHS`] when the manifest is absent
 /// or its `steering` list is empty. Mirrors
 /// [`agent_scan_paths_for_plugin`].
-fn steering_scan_paths_for_plugin(manifest: Option<&PluginManifest>) -> Vec<String> {
+pub(super) fn steering_scan_paths_for_plugin(manifest: Option<&PluginManifest>) -> Vec<String> {
     if let Some(m) = manifest.filter(|m| !m.steering.is_empty()) {
         m.steering.clone()
     } else {
@@ -1097,7 +1107,13 @@ fn load_plugin_manifest(plugin_dir: &Path) -> Result<Option<PluginManifest>, Err
         }
     }
 
-    let bytes = match fs::read(&manifest_path) {
+    // Resource cap: bound the read at MAX_PLUGIN_MANIFEST_BYTES so a
+    // malicious marketplace shipping a multi-GB plugin.json cannot OOM
+    // the process before serde sees a byte. Mirrors the cap applied to
+    // service::mod::load_plugin_manifest in the Phase 2a detection path.
+    // Pre-existing crate-wide gap flagged by marketplace-security-reviewer
+    // in PR #96 review.
+    let bytes = match super::read_capped(&manifest_path, super::MAX_PLUGIN_MANIFEST_BYTES) {
         Ok(b) => b,
         Err(e) => {
             warn!(
@@ -1544,6 +1560,38 @@ mod tests {
         assert!(
             result.is_none(),
             "symlinked plugin.json must be treated as absent, got: {result:?}"
+        );
+    }
+
+    /// Resource cap regression: a `plugin.json` larger than
+    /// `MAX_PLUGIN_MANIFEST_BYTES` (1 MiB) must be rejected before
+    /// serde sees the bytes. Mitigates the OOM vector flagged by
+    /// marketplace-security-reviewer in PR #96 review (a malicious
+    /// marketplace could otherwise ship a multi-GB manifest and OOM
+    /// the host). The cap fires at `super::read_capped`, which
+    /// returns `io::ErrorKind::InvalidData` — surfaced here as
+    /// [`PluginError::ManifestReadFailed`].
+    #[test]
+    fn load_plugin_manifest_rejects_oversized_file() {
+        use std::io::Write;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let plugin_dir = tmp.path().join("plugin");
+        fs::create_dir_all(&plugin_dir).expect("create plugin dir");
+        let manifest_path = plugin_dir.join("plugin.json");
+        // Write 2 MiB of valid JSON-ish bytes — well over the 1 MiB cap.
+        // The cap fires before parse, so the content shape doesn't
+        // matter. We open with sync_data() to make sure the file is
+        // committed before the read.
+        let mut f = fs::File::create(&manifest_path).expect("create manifest");
+        f.write_all(&vec![b'A'; 2 * 1024 * 1024])
+            .expect("write 2 MiB");
+        f.sync_all().expect("sync");
+
+        let err = load_plugin_manifest(&plugin_dir)
+            .expect_err("oversized plugin.json must be refused at the cap");
+        assert!(
+            matches!(err, Error::Plugin(PluginError::ManifestReadFailed { .. })),
+            "expected ManifestReadFailed for cap-exceeded, got: {err:?}"
         );
     }
 

@@ -446,6 +446,203 @@ pub struct InstallPluginResult {
     pub agents: InstallAgentsResult,
 }
 
+/// Result of [`MarketplaceService::detect_plugin_updates`] — a scan over
+/// installed plugins. `updates` lists plugins with available updates;
+/// `failures` lists plugins the scan couldn't check (marketplace gone
+/// from cache, manifest malformed, hash computation failure). Plugins
+/// with no update available are absent from both vecs (the implicit
+/// "everything's fine" set).
+///
+/// `partial_load_warnings` carries tracking-file load failures that
+/// happened before `installed_plugins()` returned — e.g. a corrupt
+/// `installed-skills.json` means the corresponding skills are missing
+/// from `plugins` and the warning is surfaced here so the caller can
+/// render a "partial state" banner.
+#[derive(Clone, Debug, Default, Serialize)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
+pub struct DetectUpdatesResult {
+    #[serde(default)]
+    pub updates: Vec<PluginUpdateInfo>,
+    #[serde(default)]
+    pub failures: Vec<PluginUpdateFailure>,
+    #[serde(default)]
+    pub partial_load_warnings: Vec<crate::project::TrackingLoadWarning>,
+}
+
+/// A single plugin with an update available.
+///
+/// The `change_signal` discriminates between manifest-version change
+/// and content-drift-without-version-bump.
+#[derive(Clone, Debug, Serialize)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
+pub struct PluginUpdateInfo {
+    pub marketplace: crate::validation::MarketplaceName,
+    pub plugin: crate::validation::PluginName,
+    /// `None` means the project's tracking file lacked a `version`
+    /// field at install time (a legacy install pre-Stage-1, before
+    /// the version field was added to the tracking schema). Cases
+    /// where the tracking file itself failed to load are surfaced via
+    /// [`DetectUpdatesResult::partial_load_warnings`], NOT via
+    /// `Some(None)` here.
+    pub installed_version: Option<String>,
+    /// `None` means the marketplace plugin manifest exists but lacks
+    /// a `version` field. After NC1's `ManifestState` 3-state
+    /// split, cases where the manifest is missing or unreadable
+    /// (symlinked, `NotFound`) surface as a [`PluginUpdateFailure`] —
+    /// they no longer collapse into `Some(None)` here. So
+    /// `available_version: None` is now an unambiguous "marketplace
+    /// says no version" signal.
+    pub available_version: Option<String>,
+    pub change_signal: UpdateChangeSignal,
+}
+
+/// A plugin the update scan couldn't check.
+///
+/// `kind` is the stable programmatic discriminant frontends should
+/// `match` on (per CLAUDE.md Rule 42: match error types, not error
+/// strings). `reason` is the rendered error chain via
+/// [`crate::error::error_full_chain`] per the FFI rule — suitable for
+/// log lines or fallback UI rendering, but never for branching logic.
+#[derive(Clone, Debug, Serialize)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
+pub struct PluginUpdateFailure {
+    pub marketplace: crate::validation::MarketplaceName,
+    pub plugin: crate::validation::PluginName,
+    pub kind: PluginUpdateFailureKind,
+    pub reason: String,
+}
+
+/// Why an update-detection scan couldn't check a plugin. Tagged enum
+/// for FFI per the `ffi-enum-serde-tag` plan-lint gate (PR #91):
+/// `#[serde(tag = "kind", rename_all = "snake_case")]` produces
+/// `{ "kind": "manifest_unreadable" }` in JSON, which `tauri-specta`
+/// emits as a discriminated TS union.
+///
+/// Closes original-review I4: `PluginUpdateFailure` was opaque
+/// (substring matching `reason` to differentiate failure types
+/// violated CLAUDE.md Rule 42). The classifier
+/// [`PluginUpdateFailureKind::from_error`] is exhaustive per the
+/// CLAUDE.md classifier rule — a new error variant either matches
+/// here explicitly or routes through `Other` after a written-down
+/// rationale.
+#[derive(Clone, Debug, Serialize)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
+#[serde(tag = "kind", rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum PluginUpdateFailureKind {
+    /// Marketplace cache directory missing or plugin removed from
+    /// the marketplace's manifest.
+    MarketplaceUnavailable,
+    /// `plugin.json` missing in the marketplace cache (typically the
+    /// plugin was deleted from upstream and the cache hasn't been
+    /// refreshed). Also covers symlink-refused per the C5 defense.
+    ManifestUnreadable,
+    /// `plugin.json` exists but failed to parse (malformed JSON,
+    /// missing required fields, etc.).
+    ManifestInvalid,
+    /// Hash recomputation against an installed file failed (file
+    /// missing in the cache, permission denied, etc.).
+    HashFailed,
+    /// Catch-all for unanticipated failure shapes. Surfacing this
+    /// rather than panicking lets the FE render a generic "scan
+    /// failed" badge while the typed variants drive specific
+    /// remediation. Each new error class deliberately routed here
+    /// should also be considered for promotion to a typed variant.
+    Other,
+}
+
+impl PluginUpdateFailureKind {
+    /// Project an [`Error`] into the right
+    /// [`PluginUpdateFailureKind`] variant. Exhaustive per the
+    /// CLAUDE.md classifier rule — `Error::Plugin` delegates to
+    /// [`classify_plugin_error`] which enumerates every
+    /// [`PluginError`] variant explicitly; remaining top-level
+    /// categories are listed by name. Adding a new
+    /// [`PluginError`] variant produces a compile error in
+    /// `classify_plugin_error`, which is the forcing function the
+    /// rule requires.
+    #[must_use]
+    pub fn from_error(err: &Error) -> Self {
+        match err {
+            Error::Plugin(pe) => classify_plugin_error(pe),
+            Error::Hash(_) => Self::HashFailed,
+            Error::Marketplace(crate::error::MarketplaceError::NotFound { .. }) => {
+                Self::MarketplaceUnavailable
+            }
+            // Remaining top-level Error categories route to Other.
+            // Written down so a new top-level variant lands here
+            // intentionally rather than silently.
+            Error::Marketplace(_)
+            | Error::Skill(_)
+            | Error::Agent(_)
+            | Error::Steering(_)
+            | Error::Git(_)
+            | Error::Validation(_)
+            | Error::Io(_)
+            | Error::Json(_) => Self::Other,
+        }
+    }
+}
+
+/// Classify a [`PluginError`] for [`PluginUpdateFailureKind::from_error`].
+///
+/// Every variant is matched explicitly so a newly-added
+/// [`PluginError`] forces a compile-time decision here. `PluginError`
+/// is `#[non_exhaustive]`, but that attribute only requires a wildcard
+/// in *external* crates — within `kiro-market-core` an exhaustive match
+/// still triggers a non-exhaustive-pattern error when a variant lands
+/// without a corresponding arm. Mirrors
+/// [`crate::service::browse::SkippedReason::from_plugin_error`]'s
+/// structure, which the CLAUDE.md classifier-rule docs cite as the
+/// canonical example.
+fn classify_plugin_error(err: &PluginError) -> PluginUpdateFailureKind {
+    match err {
+        PluginError::NotFound { .. } => PluginUpdateFailureKind::MarketplaceUnavailable,
+        // Cache-side variants are the canonical detection path
+        // (Phase 2a). Project-side variants (`ManifestNotFound`,
+        // `ManifestReadFailed`) map here too because
+        // `check_plugin_for_update` may surface them transitively via
+        // `resolve_local_plugin_dir`, which shares the install-time
+        // error vocabulary.
+        PluginError::ManifestNotFound { .. }
+        | PluginError::ManifestReadFailed { .. }
+        | PluginError::CacheManifestReadFailed { .. } => {
+            PluginUpdateFailureKind::ManifestUnreadable
+        }
+        PluginError::InvalidManifest { .. } | PluginError::CacheManifestInvalid { .. } => {
+            PluginUpdateFailureKind::ManifestInvalid
+        }
+        // The remaining variants all surface during install /
+        // discovery, not detection — they should not reach
+        // `from_error` in practice. Routing them through `Other`
+        // keeps the wire format honest if one ever does, while the
+        // exhaustive match guarantees a new `PluginError` variant
+        // forces a fresh classification decision.
+        PluginError::NoSkills { .. }
+        | PluginError::DirectoryMissing { .. }
+        | PluginError::NotADirectory { .. }
+        | PluginError::SymlinkRefused { .. }
+        | PluginError::DirectoryUnreadable { .. }
+        | PluginError::RemoteSourceNotLocal { .. } => PluginUpdateFailureKind::Other,
+    }
+}
+
+/// Why an update is being surfaced. Tagged enum for FFI per the
+/// `ffi-enum-serde-tag` plan-lint gate (PR #91): `#[serde(tag = "kind",
+/// rename_all = "snake_case")]` produces `{ "kind": "version_bumped" }`
+/// in JSON, which `tauri-specta` emits as a discriminated TS union.
+#[derive(Clone, Debug, Serialize)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum UpdateChangeSignal {
+    /// Manifest version string differs (with or without content hash diff).
+    /// Designed for FE rendering as "Update v1.0 → v1.1".
+    VersionBumped,
+    /// Manifest version unchanged but at least one source-hash diff
+    /// detected. Designed for FE rendering as "Content updated since install".
+    ContentChanged,
+}
+
 /// An agent that failed to install, with the typed error.
 ///
 /// `name` is `Some` once parsing has identified the agent; pre-parse
@@ -1522,6 +1719,7 @@ impl MarketplaceService {
                 version: ctx.version.map(String::from),
                 installed_at: chrono::Utc::now(),
                 dialect: def.dialect,
+                source_path: relative_source_path_for_tracking(&path, plugin_dir),
                 source_hash: None,
                 installed_hash: None,
             };
@@ -2006,6 +2204,666 @@ impl MarketplaceService {
             steering,
             agents,
         })
+    }
+
+    /// Scan installed plugins, comparing each tracking-file `version` and
+    /// `source_hash` against the corresponding marketplace plugin manifest +
+    /// source files in the local cache. Reads from local cache only;
+    /// callers run `update_marketplaces` first if they want fresh data.
+    ///
+    /// "Update available" = at least one source-hash differs from the
+    /// tracking entry's `source_hash`, OR the marketplace plugin manifest's
+    /// `version` is not byte-equal to the most-recently-installed version
+    /// across the three tracking files. Strict string inequality on
+    /// versions, no semver — downgrades pushed by marketplace owners are
+    /// surfaced.
+    ///
+    /// Per-plugin failures (marketplace gone from cache, plugin removed
+    /// from manifest, manifest malformed, hash recomputation failed) land
+    /// in `failures`, not in `Result::Err`. Plugins with no update available
+    /// are absent from both vecs.
+    ///
+    /// Legacy fallback: if any tracked file's `source_hash` is `None`
+    /// (pre-Stage-1 install), drop back to version-only comparison for that
+    /// plugin. Same versions in legacy mode -> no entry in updates (content
+    /// drift undetectable until next install).
+    ///
+    /// # Errors
+    ///
+    /// Returns `Err` only if `project.installed_plugins()` fails to load
+    /// the aggregate view (e.g. a tracking file is unreadable at the
+    /// `installed_plugins()` layer). Per-plugin scan failures are collected
+    /// in `DetectUpdatesResult::failures`, not in `Result::Err`.
+    pub fn detect_plugin_updates(
+        &self,
+        project: &crate::project::KiroProject,
+    ) -> Result<DetectUpdatesResult, Error> {
+        let view = project.installed_plugins()?;
+        // Hoist the three tracking-file loads above the per-plugin
+        // loop (originally-deferred IMPORTANT in PR #96 review). Pre-fix:
+        // `scan_plugin_for_content_drift` called
+        // load_installed{,_steering,_agents}() once per plugin, so a
+        // project with N installed plugins did 3N reads + JSON
+        // deserializations where 3 are sufficient. Side-benefit:
+        // tracking-file load failures no longer get misattributed to
+        // whichever plugin happens to be first in the iteration
+        // order — they're folded into `partial_load_warnings` (the
+        // view already did that walk; here we follow the same
+        // defaulting pattern so a corrupt tracking file doesn't
+        // double-surface as both a warning AND a top-level Err).
+        let installed_skills = project
+            .load_installed()
+            .unwrap_or_else(|_| crate::project::InstalledSkills::default());
+        let installed_steering = project
+            .load_installed_steering()
+            .unwrap_or_else(|_| crate::project::InstalledSteering::default());
+        let installed_agents = project
+            .load_installed_agents()
+            .unwrap_or_else(|_| crate::project::InstalledAgents::default());
+
+        let mut updates = Vec::new();
+        let mut failures = Vec::new();
+        for plugin_info in view.plugins {
+            match self.check_plugin_for_update(
+                &plugin_info,
+                &installed_skills,
+                &installed_steering,
+                &installed_agents,
+            ) {
+                Ok(Some(update)) => updates.push(update),
+                Ok(None) => {}
+                Err(err) => failures.push(PluginUpdateFailure {
+                    marketplace: plugin_info.marketplace.clone(),
+                    plugin: plugin_info.plugin.clone(),
+                    kind: PluginUpdateFailureKind::from_error(&err),
+                    reason: error_full_chain(&err),
+                }),
+            }
+        }
+        Ok(DetectUpdatesResult {
+            updates,
+            failures,
+            partial_load_warnings: view.partial_load_warnings,
+        })
+    }
+
+    fn check_plugin_for_update(
+        &self,
+        plugin_info: &crate::project::InstalledPluginInfo,
+        installed_skills: &crate::project::InstalledSkills,
+        installed_steering: &crate::project::InstalledSteering,
+        installed_agents: &crate::project::InstalledAgents,
+    ) -> Result<Option<PluginUpdateInfo>, Error> {
+        let marketplace_name = plugin_info.marketplace.as_str();
+        let plugin_name = plugin_info.plugin.as_str();
+
+        let entries = self.list_plugin_entries(marketplace_name)?;
+        let entry = entries
+            .iter()
+            .find(|e| e.name == plugin_name)
+            .ok_or_else(|| PluginError::NotFound {
+                plugin: plugin_name.to_owned(),
+                marketplace: marketplace_name.to_owned(),
+            })?;
+
+        let marketplace_path = self.marketplace_path(marketplace_name);
+        let plugin_dir = self.resolve_local_plugin_dir(entry, &marketplace_path)?;
+
+        // NC1 (PR #96 re-review): pre-rename, `load_plugin_manifest_version`
+        // returned `Ok(None)` for both "manifest legitimately lacks
+        // version" and "manifest unreadable", and the latter case
+        // combined with `installed_version: Some(_)` below to emit a
+        // phantom `PluginUpdateInfo { available_version: None,
+        // change_signal: VersionBumped }`. After the `ManifestState`
+        // 3-state split (and rename to `load_plugin_manifest`),
+        // unreadable surfaces as a per-plugin failure that lands in
+        // `DetectUpdatesResult::failures` — never as "update available
+        // to nothing".
+        let manifest = match Self::load_plugin_manifest(&plugin_dir)? {
+            ManifestState::Found(m) => m,
+            ManifestState::Unreadable { reason } => {
+                let manifest_path = plugin_dir.join("plugin.json");
+                // CacheManifestReadFailed's Display embeds the path;
+                // we wrap the symlink/missing distinction into the
+                // carried io::Error so error_full_chain renders both
+                // pieces in the wire-format `PluginUpdateFailure.reason`.
+                // The cache-side variant routes through
+                // PluginUpdateFailureKind::ManifestUnreadable in the
+                // outer detect_plugin_updates loop (see Commit 5).
+                return Err(PluginError::CacheManifestReadFailed {
+                    path: manifest_path,
+                    source: std::io::Error::new(std::io::ErrorKind::NotFound, reason),
+                }
+                .into());
+            }
+        };
+        let available_version = manifest.version.clone();
+
+        // Pass the manifest into the drift scan so steering and
+        // native-companion hashing probe the same scan paths the
+        // install used. Pre-fix, `scan_plugin_for_content_drift`
+        // hardcoded `plugin_dir/steering` and `plugin_dir/agents`,
+        // which produced false-positive drift on every scan for
+        // plugins declaring custom `steering: [...]` /
+        // `agents: [...]` paths.
+        let (content_drift, legacy_fallback) = Self::scan_plugin_for_content_drift(
+            plugin_info,
+            &plugin_dir,
+            Some(&manifest),
+            installed_skills,
+            installed_steering,
+            installed_agents,
+        )?;
+
+        let installed_version = plugin_info.installed_version.clone();
+        let version_differs = installed_version != available_version;
+
+        if version_differs {
+            return Ok(Some(PluginUpdateInfo {
+                marketplace: plugin_info.marketplace.clone(),
+                plugin: plugin_info.plugin.clone(),
+                installed_version,
+                available_version,
+                change_signal: UpdateChangeSignal::VersionBumped,
+            }));
+        }
+
+        if content_drift {
+            return Ok(Some(PluginUpdateInfo {
+                marketplace: plugin_info.marketplace.clone(),
+                plugin: plugin_info.plugin.clone(),
+                installed_version,
+                available_version,
+                change_signal: UpdateChangeSignal::ContentChanged,
+            }));
+        }
+
+        if legacy_fallback {
+            // Drift undetectable for legacy entries (no source_hash) —
+            // same versions means no entry. Logging at debug so the
+            // legacy-fallback case is observable in traces without
+            // surfacing in normal operation.
+            tracing::debug!(
+                marketplace = %plugin_info.marketplace,
+                plugin = %plugin_info.plugin,
+                "scan saw a legacy (pre-Stage-1) tracking entry with no \
+                 source_hash; falling back to version-only comparison and \
+                 returning no update entry"
+            );
+        }
+        Ok(None)
+    }
+
+    /// Load `plugin.json` from `plugin_dir` and return the full parsed
+    /// [`crate::plugin::PluginManifest`] — three semantically distinct
+    /// outcomes per NC1 (PR #96 re-review):
+    ///
+    /// - [`ManifestState::Found`] — manifest read and parsed. Caller
+    ///   reads `.version` for the version comparison AND `.agents` /
+    ///   `.steering` for the scan-path probing in
+    ///   [`Self::scan_plugin_for_content_drift`] (per the
+    ///   manifest-respects-scan-paths fix from the PR #96 re-review;
+    ///   pre-fix, drift detection compared against the hardcoded
+    ///   `./steering/` and `./agents/` defaults regardless of what the
+    ///   manifest declared).
+    /// - [`ManifestState::Unreadable`] — manifest could not be read for
+    ///   a non-fatal reason (symlink-refused or `NotFound`). The
+    ///   caller must surface this as a per-plugin failure rather than
+    ///   collapse it with `Found(_).version.is_none()` — otherwise the
+    ///   version-comparison logic produces a phantom
+    ///   `PluginUpdateInfo { available_version: None, change_signal:
+    ///   VersionBumped }` whenever an installed plugin happens to carry
+    ///   a `version` string.
+    ///
+    /// The symlink defense embedded here exists because the
+    /// `InvalidManifest` error path's `reason` field includes the
+    /// rendered serde error, which on a symlinked manifest would
+    /// surface bytes from the symlink target (a host file outside the
+    /// untrusted cloned-marketplace tree). Refusing to follow symlinks
+    /// at stat time keeps that exfiltration channel closed. Mirrors
+    /// `service::browse::load_plugin_manifest`'s defense.
+    ///
+    /// Resource cap (Commit 9 / pre-existing security observation):
+    /// reads are bounded at [`MAX_PLUGIN_MANIFEST_BYTES`] so a malicious
+    /// marketplace shipping a multi-GB `plugin.json` cannot OOM the
+    /// process before serde sees a byte.
+    fn load_plugin_manifest(plugin_dir: &Path) -> Result<ManifestState, Error> {
+        let manifest_path = plugin_dir.join("plugin.json");
+
+        // Symlink defense: refuse to follow symlinks (C5 security fix).
+        match fs::symlink_metadata(&manifest_path) {
+            Ok(m) if m.file_type().is_symlink() => {
+                warn!(
+                    path = %manifest_path.display(),
+                    "plugin.json is a symlink, refusing to follow; treating as unreadable"
+                );
+                return Ok(ManifestState::Unreadable {
+                    reason: "plugin.json is a symlink — refused".to_owned(),
+                });
+            }
+            Ok(_) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(ManifestState::Unreadable {
+                    reason: "plugin.json missing in marketplace cache".to_owned(),
+                });
+            }
+            Err(e) => {
+                return Err(PluginError::CacheManifestReadFailed {
+                    path: manifest_path,
+                    source: e,
+                }
+                .into());
+            }
+        }
+
+        let bytes = match read_capped(&manifest_path, MAX_PLUGIN_MANIFEST_BYTES) {
+            Ok(b) => b,
+            Err(e) => {
+                return Err(PluginError::CacheManifestReadFailed {
+                    path: manifest_path,
+                    source: e,
+                }
+                .into());
+            }
+        };
+
+        match crate::plugin::PluginManifest::from_json(&bytes) {
+            Ok(manifest) => Ok(ManifestState::Found(manifest)),
+            Err(e) => Err(PluginError::CacheManifestInvalid {
+                path: manifest_path,
+                reason: error_full_chain(&e),
+            }
+            .into()),
+        }
+    }
+
+    /// Scan all tracking entries for `(marketplace, plugin)` and compare
+    /// their stored `source_hash` against freshly-computed hashes from
+    /// `plugin_dir`.
+    ///
+    /// `manifest` is the plugin's parsed `plugin.json`, used to derive
+    /// the configured `agents` / `steering` scan paths so detection
+    /// hashes against the same roots install used. Pre-fix the
+    /// steering and native-companion loops hardcoded `plugin_dir/
+    /// steering` and `plugin_dir/agents`, producing false-positive
+    /// drift on every scan for plugins declaring custom paths
+    /// (PR #96 review #6). The manifest is `Option<&...>` so callers
+    /// that lack a parsed manifest fall back to
+    /// [`crate::DEFAULT_STEERING_PATHS`] / [`crate::DEFAULT_AGENT_PATHS`]
+    /// via the same helpers `MarketplaceService::install_plugin`
+    /// uses.
+    ///
+    /// `content_drift = false && legacy_fallback = true` means "no drift
+    /// detected among hashable entries; some entries had no `source_hash`
+    /// so a clean miss is possible." Callers should treat `legacy_fallback`
+    /// as "drift undetectable" rather than "drift absent."
+    fn scan_plugin_for_content_drift(
+        plugin_info: &crate::project::InstalledPluginInfo,
+        plugin_dir: &Path,
+        manifest: Option<&crate::plugin::PluginManifest>,
+        installed_skills: &crate::project::InstalledSkills,
+        installed_steering: &crate::project::InstalledSteering,
+        installed_agents: &crate::project::InstalledAgents,
+    ) -> Result<(bool, bool), Error> {
+        let mut content_drift = false;
+        let mut legacy_fallback = false;
+
+        // Skills — keyed under `skills/<name>/`. KNOWN BUG (issue #97):
+        // `discover_skills_for_plugin` (browse.rs) honors
+        // `manifest.skills` and a plugin declaring `skills: ["./packs/"]`
+        // installs skill dirs under `<plugin_dir>/packs/<name>/`, but
+        // this loop hardcodes `plugin_dir.join("skills")` and will
+        // false-positive drift on every scan for such plugins — the
+        // same class of bug the steering/agents loops below fixed.
+        //
+        // Closing it requires either (a) probing each declared skill
+        // scan path for a directory named `<name>` (analogous to
+        // `hash_artifact_in_scan_paths` but against `hash_dir_tree`),
+        // or (b) extending `InstalledSkillMeta` with a `source_path`
+        // field so detection knows which scan root to consult without
+        // probing. Option (b) matches the `InstalledAgentMeta`
+        // precedent. Tracked at
+        // https://github.com/dwalleck/kiro-control-center/issues/97
+        // — out of scope for the steering/agents scan-path closure
+        // shipped in PR #96.
+        for (name, meta) in &installed_skills.skills {
+            if meta.marketplace == plugin_info.marketplace && meta.plugin == plugin_info.plugin {
+                match &meta.source_hash {
+                    Some(stored) => {
+                        let skill_dir = plugin_dir.join("skills").join(name);
+                        let computed = crate::hash::hash_dir_tree(&skill_dir)?;
+                        if computed != *stored {
+                            content_drift = true;
+                            return Ok((content_drift, legacy_fallback));
+                        }
+                    }
+                    None => legacy_fallback = true,
+                }
+            }
+        }
+
+        // Steering — probe each configured scan path. Install hashes
+        // via `hash_artifact(&f.scan_root, &[rel])` per
+        // `install_plugin_steering`, so detection MUST iterate the
+        // declared scan paths and use the first one where the file
+        // exists. A single hardcoded `plugin_dir/steering` would
+        // false-positive every plugin declaring `steering: ["./guides/"]`
+        // — see PR #96 review comment #6.
+        let steering_paths = crate::service::browse::steering_scan_paths_for_plugin(manifest);
+        for (rel_path, meta) in &installed_steering.files {
+            if meta.marketplace == plugin_info.marketplace && meta.plugin == plugin_info.plugin {
+                let computed = hash_artifact_in_scan_paths(
+                    plugin_dir,
+                    &steering_paths,
+                    std::slice::from_ref(rel_path),
+                )?;
+                if computed != meta.source_hash {
+                    content_drift = true;
+                    return Ok((content_drift, legacy_fallback));
+                }
+            }
+        }
+
+        // Agents
+        for (name, meta) in &installed_agents.agents {
+            if meta.marketplace == plugin_info.marketplace && meta.plugin == plugin_info.plugin {
+                match &meta.source_hash {
+                    Some(stored) => {
+                        // Two notes on this fallback (C6 area):
+                        // (a) the dialect-default branch only fires for
+                        //     tracking entries written before the
+                        //     `source_path` field existed (legacy
+                        //     installs); post-NC2 entries always carry a
+                        //     validated `RelativePath`.
+                        // (b) Copilot's `.agent.md` (vs `.md`) extension
+                        //     must mirror the install-time naming
+                        //     convention or a content-hash diff will be
+                        //     misreported as drift.
+                        //
+                        // Hash invariant: install-side
+                        // `hash_translated_source` hashes via
+                        // `hash_artifact(parent_dir, &[filename])` so
+                        // the digest's path-component is the bare
+                        // filename. Detection MUST match that recipe,
+                        // i.e. base = parent dir, rel = filename — not
+                        // base = agents_dir + rel = "agents/foo.md".
+                        let (base, filename) = agent_hash_inputs(
+                            plugin_dir,
+                            name,
+                            meta.dialect,
+                            meta.source_path.as_ref(),
+                        );
+                        let computed = match crate::hash::hash_artifact(
+                            &base,
+                            std::slice::from_ref(&filename),
+                        ) {
+                            Ok(h) => h,
+                            Err(crate::hash::HashError::ReadFailed { path, source })
+                                if source.kind() == std::io::ErrorKind::NotFound
+                                    && meta.source_path.is_none() =>
+                            {
+                                // I-N7 (PR #96 re-review): the dialect
+                                // fallback resolved a path that doesn't
+                                // exist in the cache — typical cause is
+                                // a pre-C7 install (no source_path
+                                // tracked) where the install-time
+                                // filename convention disagrees with
+                                // detection's dialect-fallback (e.g. a
+                                // Copilot agent installed under a
+                                // non-`{name}.agent.md` filename).
+                                // Surface an actionable message instead
+                                // of "file not found".
+                                return Err(std::io::Error::new(
+                                    std::io::ErrorKind::NotFound,
+                                    format!(
+                                        "agent `{name}` was installed before \
+                                         `source_path` tracking landed (legacy \
+                                         entry); the dialect-fallback path `{}` is \
+                                         not present in the marketplace cache. \
+                                         Reinstall the plugin to populate \
+                                         `source_path` so update detection can \
+                                         locate the source file unambiguously.",
+                                        path.display(),
+                                    ),
+                                )
+                                .into());
+                            }
+                            Err(e) => return Err(e.into()),
+                        };
+                        if computed != *stored {
+                            content_drift = true;
+                            return Ok((content_drift, legacy_fallback));
+                        }
+                    }
+                    None => legacy_fallback = true,
+                }
+            }
+        }
+
+        // Native companions — same probe-each-scan-path treatment as
+        // steering. Install hashes via `hash_artifact(&scan_root,
+        // &rel_paths)` per `install_native_companions_for_plugin`,
+        // and the install path requires every companion in the bundle
+        // to share a single scan root (`MultipleScanRootsNotSupported`
+        // errors otherwise) — so `meta.files` resolves under whichever
+        // configured agent scan path actually contains the bundle.
+        let agent_paths = crate::service::browse::agent_scan_paths_for_plugin(manifest);
+        for meta in installed_agents.native_companions.values() {
+            if meta.marketplace == plugin_info.marketplace && meta.plugin == plugin_info.plugin {
+                let computed = hash_artifact_in_scan_paths(plugin_dir, &agent_paths, &meta.files)?;
+                if computed != meta.source_hash {
+                    content_drift = true;
+                    return Ok((content_drift, legacy_fallback));
+                }
+            }
+        }
+
+        Ok((content_drift, legacy_fallback))
+    }
+}
+
+/// Try to hash `rel_paths` against each `scan_path` joined to
+/// `plugin_dir`, returning the first successful hash. Probes the
+/// configured scan paths in order and recovers from
+/// `ErrorKind::NotFound` so a plugin whose files moved between
+/// configured scan roots (or whose manifest lists multiple roots) is
+/// detected at whichever root actually contains the bundle.
+/// Non-`NotFound` hash errors propagate immediately so genuine
+/// permission / I/O issues are not masked.
+///
+/// If every scan path returned `NotFound`, the last `NotFound` error
+/// is propagated so the caller (`scan_plugin_for_content_drift`)
+/// surfaces it as a per-plugin failure with a path the user can
+/// investigate. `scan_paths` is empty in practice only if the helpers
+/// in [`crate::service::browse`] regress — both fall back to
+/// non-empty defaults — so the empty-vec branch synthesises a generic
+/// `NotFound` rather than panicking.
+fn hash_artifact_in_scan_paths(
+    plugin_dir: &Path,
+    scan_paths: &[String],
+    rel_paths: &[PathBuf],
+) -> Result<String, Error> {
+    let mut last_not_found: Option<Error> = None;
+    for sp in scan_paths {
+        // `discover_steering_files_in_dirs` and the agent-discovery
+        // siblings strip the leading `./` before joining; mirror that
+        // here so the resolved path matches install-time exactly
+        // regardless of whether the manifest writes `"steering/"` or
+        // `"./steering/"`.
+        let scan_root = plugin_dir.join(sp.trim_start_matches("./"));
+        match crate::hash::hash_artifact(&scan_root, rel_paths) {
+            Ok(h) => return Ok(h),
+            Err(crate::hash::HashError::ReadFailed { path, source })
+                if source.kind() == std::io::ErrorKind::NotFound =>
+            {
+                last_not_found = Some(crate::hash::HashError::ReadFailed { path, source }.into());
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Err(last_not_found.unwrap_or_else(|| {
+        crate::hash::HashError::ReadFailed {
+            path: plugin_dir.to_path_buf(),
+            source: std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "no scan paths configured for plugin",
+            ),
+        }
+        .into()
+    }))
+}
+
+/// 3-state outcome of [`MarketplaceService::load_plugin_manifest`].
+///
+/// Distinguishing "manifest exists, version field absent" from "manifest
+/// could not be read" closes NC1 (PR #96 re-review): collapsing both
+/// into `Option<String>::None` causes `check_plugin_for_update` to emit
+/// a phantom `VersionBumped` entry whenever an installed plugin happens
+/// to carry a `version` and the cache's `plugin.json` is symlinked or
+/// missing.
+///
+/// `Found(_)` carries the full [`crate::plugin::PluginManifest`] so
+/// callers can inspect the `version` field AND the `agents` /
+/// `steering` scan-path declarations — the latter feeds
+/// [`MarketplaceService::scan_plugin_for_content_drift`] so detection
+/// hashes against the same scan roots install used. `Unreadable {
+/// reason }` is "do not compare versions — surface a per-plugin
+/// failure instead". Module-private — the public surface remains
+/// [`PluginUpdateInfo`] / [`PluginUpdateFailure`].
+#[derive(Debug)]
+enum ManifestState {
+    /// Manifest read and parsed; carries the full manifest.
+    Found(crate::plugin::PluginManifest),
+    /// Manifest could not be read for a non-fatal reason
+    /// (symlink-refused or `NotFound` on the cache copy). Caller must
+    /// treat this as a per-plugin failure rather than collapse it with
+    /// `Found(_).version.is_none()` — see NC1 above.
+    Unreadable {
+        /// Human-readable reason; embedded into the wire-format
+        /// `PluginUpdateFailure.reason` via `error_full_chain`. Kept
+        /// out of the typed public API so callers cannot substring-match.
+        reason: String,
+    },
+}
+
+/// Maximum bytes a `plugin.json` is allowed to occupy before
+/// [`read_capped`] returns an error. 1 MiB is well above any plausible
+/// manifest (the largest in this workspace's fixtures is < 4 KiB) and
+/// well below process-OOM territory. Mitigates the resource-exhaustion
+/// vector flagged by marketplace-security-reviewer in PR #96 re-review:
+/// a malicious marketplace could otherwise ship a multi-GB
+/// `plugin.json` and OOM the host before serde sees a byte.
+const MAX_PLUGIN_MANIFEST_BYTES: u64 = 1024 * 1024;
+
+/// Read a file with a hard byte cap. Returns
+/// [`std::io::ErrorKind::InvalidData`] if the file exceeds `cap` bytes
+/// (so callers can distinguish from genuine I/O failure). The cap is
+/// enforced via `Read::take`, so the process never allocates more than
+/// `cap` bytes for the buffer.
+fn read_capped(path: &Path, cap: u64) -> std::io::Result<Vec<u8>> {
+    use std::io::Read;
+    let file = fs::File::open(path)?;
+    let mut buf = Vec::with_capacity(usize::try_from(cap.min(64 * 1024)).unwrap_or(64 * 1024));
+    let read = (&file).take(cap + 1).read_to_end(&mut buf)?;
+    if u64::try_from(read).unwrap_or(u64::MAX) > cap {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("file at {} exceeds the {cap}-byte cap", path.display()),
+        ));
+    }
+    Ok(buf)
+}
+
+/// Compute the `(base_dir, filename)` pair that recreates the
+/// install-side hash recipe used by
+/// [`crate::project::KiroProject::hash_translated_source`] for a
+/// tracked agent. Used by
+/// [`MarketplaceService::scan_plugin_for_content_drift`] so detection
+/// hashes match the bytes the install side fed into BLAKE3 — the
+/// install hashes via `hash_artifact(parent, &[filename])` so detection
+/// MUST also pass `(parent, filename)` rather than `(agents_dir,
+/// "subdir/file.md")`, since the digest includes the rel-path bytes.
+///
+/// `source_path` (when `Some`) is relative to `plugin_dir`. We split
+/// it back into `(plugin_dir + rel.parent(), rel.file_name())` to
+/// match the install recipe. The dialect-fallback branch produces a
+/// bare filename relative to `plugin_dir/agents`, mirroring the
+/// pre-C7 install behavior.
+fn agent_hash_inputs(
+    plugin_dir: &Path,
+    name: &str,
+    dialect: crate::agent::AgentDialect,
+    source_path: Option<&crate::validation::RelativePath>,
+) -> (PathBuf, PathBuf) {
+    if let Some(rp) = source_path {
+        let full = plugin_dir.join(rp.as_str());
+        let parent = full
+            .parent()
+            .map_or_else(|| plugin_dir.to_path_buf(), Path::to_path_buf);
+        let fname = full
+            .file_name()
+            .map_or_else(|| PathBuf::from(rp.as_str()), PathBuf::from);
+        return (parent, fname);
+    }
+    let fname = match dialect {
+        crate::agent::AgentDialect::Native => PathBuf::from(format!("{name}.json")),
+        crate::agent::AgentDialect::Claude => PathBuf::from(format!("{name}.md")),
+        crate::agent::AgentDialect::Copilot => PathBuf::from(format!("{name}.agent.md")),
+    };
+    (plugin_dir.join("agents"), fname)
+}
+
+/// Build the tracking-file `source_path` for a translated agent install
+/// as a [`crate::validation::RelativePath`] so the on-disk JSON
+/// survives the post-load validation pass (NC2).
+///
+/// Today [`crate::agent::discover::discover_agents_in_dirs`] always
+/// yields paths under `plugin_dir`, but a silent `.ok()` would mask any
+/// future invariant break (Rule 35) — explicit `warn!` plus the
+/// dialect-fallback in
+/// [`MarketplaceService::scan_plugin_for_content_drift`] keep detection
+/// working even if `source_path` lands as `None`.
+///
+/// The forward-slash conversion is required because
+/// `RelativePath::new` rejects backslashes for cross-platform
+/// portability of the wire format.
+fn relative_source_path_for_tracking(
+    path: &Path,
+    plugin_dir: &Path,
+) -> Option<crate::validation::RelativePath> {
+    let rel = match path.strip_prefix(plugin_dir) {
+        Ok(r) => r,
+        Err(e) => {
+            warn!(
+                path = %path.display(),
+                plugin_dir = %plugin_dir.display(),
+                error = %e,
+                "agent path is not under plugin_dir; source_path will fall back \
+                 to dialect default during update detection"
+            );
+            return None;
+        }
+    };
+    let rel_str = rel
+        .components()
+        .filter_map(|c| match c {
+            std::path::Component::Normal(s) => Some(s.to_string_lossy()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("/");
+    match crate::validation::RelativePath::new(rel_str) {
+        Ok(rp) => Some(rp),
+        Err(e) => {
+            warn!(
+                path = %path.display(),
+                plugin_dir = %plugin_dir.display(),
+                error = %e,
+                "agent path could not be expressed as RelativePath; source_path \
+                 will fall back to dialect default during update detection"
+            );
+            None
+        }
     }
 }
 
@@ -4872,5 +5730,1420 @@ mod tests {
         // surfaces in this test, not just the default-shape lock.
         assert_eq!(json["marketplace"], "mp");
         assert_eq!(json["plugin"], "p");
+    }
+
+    #[test]
+    fn detect_updates_result_json_shape_default_empty() {
+        let result = DetectUpdatesResult::default();
+        let json = serde_json::to_value(&result).expect("serialize");
+        assert_eq!(json["updates"], serde_json::json!([]));
+        assert_eq!(json["failures"], serde_json::json!([]));
+        assert_eq!(json["partial_load_warnings"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn detect_updates_result_json_shape_with_one_update_and_one_failure() {
+        use crate::service::test_support::{mp, pn};
+        let result = DetectUpdatesResult {
+            updates: vec![PluginUpdateInfo {
+                marketplace: mp("mp1"),
+                plugin: pn("p1"),
+                installed_version: Some("1.0".into()),
+                available_version: Some("1.1".into()),
+                change_signal: UpdateChangeSignal::VersionBumped,
+            }],
+            failures: vec![PluginUpdateFailure {
+                marketplace: mp("mp2"),
+                plugin: pn("p2"),
+                kind: PluginUpdateFailureKind::ManifestUnreadable,
+                reason: "marketplace not in cache".into(),
+            }],
+            partial_load_warnings: vec![crate::project::TrackingLoadWarning {
+                tracking_file: "installed-skills.json".into(),
+                error: "simulated".into(),
+            }],
+        };
+        let json = serde_json::to_value(&result).expect("serialize");
+        assert_eq!(json["updates"][0]["marketplace"], "mp1");
+        assert_eq!(json["updates"][0]["plugin"], "p1");
+        assert_eq!(json["updates"][0]["installed_version"], "1.0");
+        assert_eq!(json["updates"][0]["available_version"], "1.1");
+        assert_eq!(
+            json["updates"][0]["change_signal"]["kind"],
+            "version_bumped"
+        );
+        assert_eq!(json["failures"][0]["marketplace"], "mp2");
+        assert_eq!(json["failures"][0]["plugin"], "p2");
+        assert_eq!(json["failures"][0]["kind"]["kind"], "manifest_unreadable");
+        assert_eq!(json["failures"][0]["reason"], "marketplace not in cache");
+        assert_eq!(
+            json["partial_load_warnings"][0]["tracking_file"],
+            "installed-skills.json"
+        );
+        assert_eq!(json["partial_load_warnings"][0]["error"], "simulated");
+    }
+
+    #[test]
+    fn plugin_update_info_json_shape_version_bumped() {
+        use crate::service::test_support::{mp, pn};
+        let info = PluginUpdateInfo {
+            marketplace: mp("mp"),
+            plugin: pn("p"),
+            installed_version: Some("1.0".into()),
+            available_version: Some("1.1".into()),
+            change_signal: UpdateChangeSignal::VersionBumped,
+        };
+        let json = serde_json::to_value(&info).expect("serialize");
+        assert_eq!(json["change_signal"]["kind"], "version_bumped");
+    }
+
+    #[test]
+    fn plugin_update_info_json_shape_content_changed() {
+        use crate::service::test_support::{mp, pn};
+        let info = PluginUpdateInfo {
+            marketplace: mp("mp"),
+            plugin: pn("p"),
+            installed_version: Some("1.0".into()),
+            available_version: Some("1.0".into()),
+            change_signal: UpdateChangeSignal::ContentChanged,
+        };
+        let json = serde_json::to_value(&info).expect("serialize");
+        assert_eq!(json["change_signal"]["kind"], "content_changed");
+    }
+
+    /// JSON-shape lock for every [`PluginUpdateFailureKind`] variant
+    /// — pins the wire-format discriminator strings so a future
+    /// rename or `serde(rename)` typo lights up tests, not the
+    /// frontend's `match` arms. The frontend must branch on `kind`
+    /// (Rule 42), so each tag string is part of the FFI contract.
+    #[rstest::rstest]
+    #[case(
+        PluginUpdateFailureKind::MarketplaceUnavailable,
+        "marketplace_unavailable"
+    )]
+    #[case(PluginUpdateFailureKind::ManifestUnreadable, "manifest_unreadable")]
+    #[case(PluginUpdateFailureKind::ManifestInvalid, "manifest_invalid")]
+    #[case(PluginUpdateFailureKind::HashFailed, "hash_failed")]
+    #[case(PluginUpdateFailureKind::Other, "other")]
+    fn plugin_update_failure_kind_json_shape(
+        #[case] kind: PluginUpdateFailureKind,
+        #[case] expected_tag: &str,
+    ) {
+        let json = serde_json::to_value(&kind).expect("serialize");
+        assert_eq!(
+            json["kind"], expected_tag,
+            "wire-format discriminator must stay stable for FE branching"
+        );
+    }
+
+    /// Classifier-exhaustiveness witness: every entry-point error
+    /// the scan can produce projects to a known
+    /// [`PluginUpdateFailureKind`]. If the classifier ever silently
+    /// returns `Other` for a variant that should have a typed
+    /// kind, this test surfaces the regression. The compiler enforces
+    /// *exhaustiveness* over `PluginError` (via `classify_plugin_error`),
+    /// but not *correct mapping* — a future swap of `CacheManifestInvalid`
+    /// from `ManifestInvalid` to `Other` would compile clean and silently
+    /// change wire-format kinds. This table locks the routing.
+    #[test]
+    fn plugin_update_failure_kind_from_error_classifies_known_variants() {
+        use crate::error::{MarketplaceError, PluginError};
+        use std::path::PathBuf;
+        let cases: &[(Error, PluginUpdateFailureKind)] = &[
+            (
+                Error::Plugin(PluginError::NotFound {
+                    plugin: "p".into(),
+                    marketplace: "m".into(),
+                }),
+                PluginUpdateFailureKind::MarketplaceUnavailable,
+            ),
+            (
+                Error::Plugin(PluginError::ManifestNotFound {
+                    path: PathBuf::from("/x"),
+                }),
+                PluginUpdateFailureKind::ManifestUnreadable,
+            ),
+            // Cache-side variants — added in PR #96 and the canonical
+            // detection path. Pre-fix these routed through the
+            // `Error::Plugin(_)` wildcard into `Other`; post-fix they
+            // carry typed kinds. Locking the routing so a future
+            // refactor can't silently drop them back to `Other`.
+            (
+                Error::Plugin(PluginError::CacheManifestReadFailed {
+                    path: PathBuf::from("/x"),
+                    source: std::io::Error::new(std::io::ErrorKind::NotFound, "x"),
+                }),
+                PluginUpdateFailureKind::ManifestUnreadable,
+            ),
+            (
+                Error::Plugin(PluginError::CacheManifestInvalid {
+                    path: PathBuf::from("/x"),
+                    reason: "bad".into(),
+                }),
+                PluginUpdateFailureKind::ManifestInvalid,
+            ),
+            // Project-side counterparts that share the install-time
+            // error vocabulary; they may surface transitively via
+            // `resolve_local_plugin_dir`.
+            (
+                Error::Plugin(PluginError::ManifestReadFailed {
+                    path: PathBuf::from("/x"),
+                    source: std::io::Error::new(std::io::ErrorKind::PermissionDenied, "x"),
+                }),
+                PluginUpdateFailureKind::ManifestUnreadable,
+            ),
+            (
+                Error::Plugin(PluginError::InvalidManifest {
+                    path: PathBuf::from("/x"),
+                    reason: "bad".into(),
+                }),
+                PluginUpdateFailureKind::ManifestInvalid,
+            ),
+            (
+                Error::Marketplace(MarketplaceError::NotFound { name: "m".into() }),
+                PluginUpdateFailureKind::MarketplaceUnavailable,
+            ),
+        ];
+        for (err, expected) in cases {
+            let got = PluginUpdateFailureKind::from_error(err);
+            assert!(
+                std::mem::discriminant(&got) == std::mem::discriminant(expected),
+                "from_error({err:?}) -> {got:?}, expected {expected:?}"
+            );
+        }
+    }
+
+    // -------------------------------------------------------------------
+    // detect_plugin_updates behavioral tests
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn detect_plugin_updates_happy_path_no_updates() {
+        use crate::project::KiroProject;
+        use crate::service::test_support::{
+            make_plugin_with_skills, relative_path_entry, seed_marketplace_with_registry,
+            temp_service,
+        };
+
+        let (dir, svc) = temp_service();
+        let entries = vec![relative_path_entry("p", "plugins/p")];
+        let mp_path = seed_marketplace_with_registry(dir.path(), &svc, "mp", &entries);
+        make_plugin_with_skills(&mp_path, "p", &["alpha"]);
+        let plugin_dir = mp_path.join("plugins/p");
+        fs::write(
+            plugin_dir.join("plugin.json"),
+            br#"{"name":"p","version":"1.0"}"#,
+        )
+        .unwrap();
+
+        let project_tmp = tempfile::tempdir().unwrap();
+        let project = KiroProject::new(project_tmp.path().to_path_buf());
+
+        svc.install_plugin(&project, &mp("mp"), &pn("p"), InstallMode::New, false)
+            .expect("install");
+
+        let result = svc.detect_plugin_updates(&project).expect("detect");
+        assert!(
+            result.updates.is_empty(),
+            "expected no updates: {:?}",
+            result.updates
+        );
+        assert!(
+            result.failures.is_empty(),
+            "expected no failures: {:?}",
+            result.failures
+        );
+    }
+
+    #[test]
+    fn detect_plugin_updates_version_bump() {
+        use crate::project::KiroProject;
+        use crate::service::test_support::{
+            make_plugin_with_skills, relative_path_entry, seed_marketplace_with_registry,
+            temp_service,
+        };
+
+        let (dir, svc) = temp_service();
+        let entries = vec![relative_path_entry("p", "plugins/p")];
+        let mp_path = seed_marketplace_with_registry(dir.path(), &svc, "mp", &entries);
+        make_plugin_with_skills(&mp_path, "p", &["alpha"]);
+        let plugin_dir = mp_path.join("plugins/p");
+        fs::write(
+            plugin_dir.join("plugin.json"),
+            br#"{"name":"p","version":"1.0"}"#,
+        )
+        .unwrap();
+
+        let project_tmp = tempfile::tempdir().unwrap();
+        let project = KiroProject::new(project_tmp.path().to_path_buf());
+
+        svc.install_plugin(&project, &mp("mp"), &pn("p"), InstallMode::New, false)
+            .expect("install");
+
+        // Bump manifest version
+        fs::write(
+            plugin_dir.join("plugin.json"),
+            br#"{"name":"p","version":"1.1"}"#,
+        )
+        .unwrap();
+
+        let result = svc.detect_plugin_updates(&project).expect("detect");
+        assert_eq!(result.updates.len(), 1);
+        assert_eq!(result.updates[0].plugin.as_str(), "p");
+        assert!(matches!(
+            result.updates[0].change_signal,
+            UpdateChangeSignal::VersionBumped
+        ));
+        assert!(result.failures.is_empty());
+    }
+
+    #[test]
+    fn detect_plugin_updates_content_drift_without_version_bump() {
+        use crate::project::KiroProject;
+        use crate::service::test_support::{
+            make_plugin_with_skills, relative_path_entry, seed_marketplace_with_registry,
+            temp_service,
+        };
+
+        let (dir, svc) = temp_service();
+        let entries = vec![relative_path_entry("p", "plugins/p")];
+        let mp_path = seed_marketplace_with_registry(dir.path(), &svc, "mp", &entries);
+        make_plugin_with_skills(&mp_path, "p", &["alpha"]);
+        let plugin_dir = mp_path.join("plugins/p");
+        fs::write(
+            plugin_dir.join("plugin.json"),
+            br#"{"name":"p","version":"1.0"}"#,
+        )
+        .unwrap();
+
+        let project_tmp = tempfile::tempdir().unwrap();
+        let project = KiroProject::new(project_tmp.path().to_path_buf());
+
+        svc.install_plugin(&project, &mp("mp"), &pn("p"), InstallMode::New, false)
+            .expect("install");
+
+        // Mutate a skill file in the cache
+        let skill_dir = plugin_dir.join("skills/alpha");
+        fs::write(skill_dir.join("SKILL.md"), "mutated content").unwrap();
+
+        let result = svc.detect_plugin_updates(&project).expect("detect");
+        assert_eq!(result.updates.len(), 1);
+        assert_eq!(result.updates[0].plugin.as_str(), "p");
+        assert!(matches!(
+            result.updates[0].change_signal,
+            UpdateChangeSignal::ContentChanged
+        ));
+        assert!(result.failures.is_empty());
+    }
+
+    #[test]
+    fn detect_plugin_updates_per_plugin_failure_surfacing() {
+        use crate::project::KiroProject;
+        use crate::service::test_support::{
+            make_plugin_with_skills, relative_path_entry, seed_marketplace_with_registry,
+            temp_service,
+        };
+
+        let (dir, svc) = temp_service();
+        let entries = vec![relative_path_entry("p", "plugins/p")];
+        let mp_path = seed_marketplace_with_registry(dir.path(), &svc, "mp", &entries);
+        make_plugin_with_skills(&mp_path, "p", &["alpha"]);
+        let plugin_dir = mp_path.join("plugins/p");
+        fs::write(
+            plugin_dir.join("plugin.json"),
+            br#"{"name":"p","version":"1.0"}"#,
+        )
+        .unwrap();
+
+        let project_tmp = tempfile::tempdir().unwrap();
+        let project = KiroProject::new(project_tmp.path().to_path_buf());
+
+        svc.install_plugin(&project, &mp("mp"), &pn("p"), InstallMode::New, false)
+            .expect("install");
+
+        // Remove marketplace from cache
+        fs::remove_dir_all(&mp_path).unwrap();
+
+        let result = svc.detect_plugin_updates(&project).expect("detect");
+        assert!(result.updates.is_empty());
+        assert_eq!(result.failures.len(), 1);
+        assert_eq!(result.failures[0].plugin.as_str(), "p");
+        assert_eq!(result.failures[0].marketplace.as_str(), "mp");
+    }
+
+    #[test]
+    fn detect_plugin_updates_structured_source_returns_failure() {
+        use crate::marketplace::{PluginEntry, PluginSource, StructuredSource};
+        use crate::project::KiroProject;
+        use crate::service::test_support::{mp, pn, seed_marketplace_with_registry, temp_service};
+
+        let (dir, svc) = temp_service();
+
+        // Seed marketplace with a structured-source plugin.
+        let entries = vec![PluginEntry {
+            name: "structured-p".into(),
+            description: None,
+            source: PluginSource::Structured(StructuredSource::GitHub {
+                repo: "foo/bar".into(),
+                git_ref: Some("main".into()),
+                sha: None,
+            }),
+        }];
+        let _mp_path = seed_marketplace_with_registry(dir.path(), &svc, "mp", &entries);
+
+        // Manually create a project with a tracking entry for this plugin.
+        let project_tmp = tempfile::tempdir().unwrap();
+        let project = KiroProject::new(project_tmp.path().to_path_buf());
+
+        let tracking = crate::project::InstalledSkills {
+            skills: [(
+                "dummy-skill".into(),
+                crate::project::InstalledSkillMeta {
+                    marketplace: mp("mp"),
+                    plugin: pn("structured-p"),
+                    version: Some("1.0".into()),
+                    installed_at: chrono::Utc::now(),
+                    source_hash: None,
+                    installed_hash: None,
+                },
+            )]
+            .into_iter()
+            .collect(),
+        };
+        let tracking_path = project_tmp.path().join(".kiro/installed-skills.json");
+        std::fs::create_dir_all(tracking_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &tracking_path,
+            serde_json::to_vec_pretty(&tracking).unwrap(),
+        )
+        .unwrap();
+
+        // Detection must NOT clone; it should return a per-plugin failure.
+        let result = svc.detect_plugin_updates(&project).expect("detect");
+        assert!(result.updates.is_empty());
+        assert_eq!(result.failures.len(), 1);
+        assert_eq!(result.failures[0].plugin.as_str(), "structured-p");
+        assert_eq!(result.failures[0].marketplace.as_str(), "mp");
+        assert!(
+            result.failures[0].reason.contains("remote source"),
+            "expected remote-source failure, got: {}",
+            result.failures[0].reason
+        );
+    }
+
+    #[test]
+    fn detect_plugin_updates_legacy_fallback_source_hash_none() {
+        use crate::project::KiroProject;
+        use crate::service::test_support::{
+            make_plugin_with_skills, relative_path_entry, seed_marketplace_with_registry,
+            temp_service,
+        };
+
+        let (dir, svc) = temp_service();
+        let entries = vec![relative_path_entry("p", "plugins/p")];
+        let mp_path = seed_marketplace_with_registry(dir.path(), &svc, "mp", &entries);
+        make_plugin_with_skills(&mp_path, "p", &["alpha"]);
+        let plugin_dir = mp_path.join("plugins/p");
+        fs::write(
+            plugin_dir.join("plugin.json"),
+            br#"{"name":"p","version":"1.0"}"#,
+        )
+        .unwrap();
+
+        let project_tmp = tempfile::tempdir().unwrap();
+        let project = KiroProject::new(project_tmp.path().to_path_buf());
+
+        svc.install_plugin(&project, &mp("mp"), &pn("p"), InstallMode::New, false)
+            .expect("install");
+
+        // Set source_hash: None in tracking file
+        let mut tracking = project.load_installed().unwrap();
+        for meta in tracking.skills.values_mut() {
+            meta.source_hash = None;
+        }
+        let tracking_path = project_tmp.path().join(".kiro/installed-skills.json");
+        fs::write(
+            &tracking_path,
+            serde_json::to_vec_pretty(&tracking).unwrap(),
+        )
+        .unwrap();
+
+        // Bump version
+        fs::write(
+            plugin_dir.join("plugin.json"),
+            br#"{"name":"p","version":"1.1"}"#,
+        )
+        .unwrap();
+
+        let result = svc.detect_plugin_updates(&project).expect("detect");
+        assert_eq!(result.updates.len(), 1);
+        assert_eq!(result.updates[0].plugin.as_str(), "p");
+        assert!(matches!(
+            result.updates[0].change_signal,
+            UpdateChangeSignal::VersionBumped
+        ));
+        assert!(result.failures.is_empty());
+    }
+
+    #[test]
+    fn detect_plugin_updates_legacy_fallback_no_version_bump_returns_no_update() {
+        use crate::project::KiroProject;
+        use crate::service::test_support::{
+            make_plugin_with_skills, relative_path_entry, seed_marketplace_with_registry,
+            temp_service,
+        };
+
+        let (dir, svc) = temp_service();
+        let entries = vec![relative_path_entry("p", "plugins/p")];
+        let mp_path = seed_marketplace_with_registry(dir.path(), &svc, "mp", &entries);
+        make_plugin_with_skills(&mp_path, "p", &["alpha"]);
+        let plugin_dir = mp_path.join("plugins/p");
+        fs::write(
+            plugin_dir.join("plugin.json"),
+            br#"{"name":"p","version":"1.0"}"#,
+        )
+        .unwrap();
+
+        let project_tmp = tempfile::tempdir().unwrap();
+        let project = KiroProject::new(project_tmp.path().to_path_buf());
+
+        svc.install_plugin(&project, &mp("mp"), &pn("p"), InstallMode::New, false)
+            .expect("install");
+
+        // Set source_hash: None in tracking file
+        let mut tracking = project.load_installed().unwrap();
+        for meta in tracking.skills.values_mut() {
+            meta.source_hash = None;
+        }
+        let tracking_path = project_tmp.path().join(".kiro/installed-skills.json");
+        fs::write(
+            &tracking_path,
+            serde_json::to_vec_pretty(&tracking).unwrap(),
+        )
+        .unwrap();
+
+        // Same version, no mutation
+        let result = svc.detect_plugin_updates(&project).expect("detect");
+        assert!(result.updates.is_empty());
+        assert!(result.failures.is_empty());
+    }
+
+    #[test]
+    fn detect_plugin_updates_mixed_scenario() {
+        use crate::project::KiroProject;
+        use crate::service::test_support::{
+            make_plugin_with_skills, relative_path_entry, seed_marketplace_with_registry,
+            temp_service,
+        };
+
+        let (dir, svc) = temp_service();
+
+        // Marketplace mp with 3 plugins
+        let primary_entries = vec![
+            relative_path_entry("no_update", "plugins/no_update"),
+            relative_path_entry("version_bumped", "plugins/version_bumped"),
+            relative_path_entry("content_drift", "plugins/content_drift"),
+        ];
+        let mp_path = seed_marketplace_with_registry(dir.path(), &svc, "mp", &primary_entries);
+        for name in ["no_update", "version_bumped", "content_drift"] {
+            // Use plugin-specific skill names so they don't collide across plugins.
+            let skill_name = format!("{name}_skill");
+            make_plugin_with_skills(&mp_path, name, &[&skill_name]);
+            let pdir = mp_path.join(format!("plugins/{name}"));
+            fs::write(
+                pdir.join("plugin.json"),
+                format!(r#"{{"name":"{name}","version":"1.0"}}"#),
+            )
+            .unwrap();
+        }
+
+        // Marketplace mp2 with 1 plugin
+        let secondary_entries = vec![relative_path_entry("missing", "plugins/missing")];
+        let mp2_path = seed_marketplace_with_registry(dir.path(), &svc, "mp2", &secondary_entries);
+        make_plugin_with_skills(&mp2_path, "missing", &["missing_skill"]);
+        fs::write(
+            mp2_path.join("plugins/missing/plugin.json"),
+            br#"{"name":"missing","version":"1.0"}"#,
+        )
+        .unwrap();
+
+        let project_tmp = tempfile::tempdir().unwrap();
+        let project = KiroProject::new(project_tmp.path().to_path_buf());
+
+        for name in ["no_update", "version_bumped", "content_drift"] {
+            svc.install_plugin(&project, &mp("mp"), &pn(name), InstallMode::New, false)
+                .unwrap_or_else(|_| panic!("install {name}"));
+        }
+        svc.install_plugin(
+            &project,
+            &mp("mp2"),
+            &pn("missing"),
+            InstallMode::New,
+            false,
+        )
+        .expect("install missing");
+
+        // version_bumped: bump version
+        fs::write(
+            mp_path.join("plugins/version_bumped/plugin.json"),
+            br#"{"name":"version_bumped","version":"1.1"}"#,
+        )
+        .unwrap();
+
+        // content_drift: mutate skill file
+        fs::write(
+            mp_path.join("plugins/content_drift/skills/content_drift_skill/SKILL.md"),
+            "mutated content",
+        )
+        .unwrap();
+
+        // missing: remove mp2 marketplace directory and registry
+        fs::remove_dir_all(&mp2_path).unwrap();
+        let reg_path = dir.path().join("registries/mp2.json");
+        if reg_path.exists() {
+            fs::remove_file(&reg_path).unwrap();
+        }
+
+        let result = svc.detect_plugin_updates(&project).expect("detect");
+        assert_eq!(
+            result.updates.len(),
+            2,
+            "expected 2 updates: {:?}",
+            result.updates
+        );
+        assert_eq!(
+            result.failures.len(),
+            1,
+            "expected 1 failure: {:?}",
+            result.failures
+        );
+
+        let update_names: Vec<&str> = result.updates.iter().map(|u| u.plugin.as_str()).collect();
+        assert!(update_names.contains(&"version_bumped"));
+        assert!(update_names.contains(&"content_drift"));
+
+        assert_eq!(result.failures[0].plugin.as_str(), "missing");
+        assert_eq!(result.failures[0].marketplace.as_str(), "mp2");
+    }
+
+    #[test]
+    fn detect_plugin_updates_per_plugin_granularity() {
+        use crate::project::KiroProject;
+        use crate::service::test_support::{
+            make_plugin_with_skills, relative_path_entry, seed_marketplace_with_registry,
+            temp_service,
+        };
+
+        let (dir, svc) = temp_service();
+        let entries = vec![relative_path_entry("p", "plugins/p")];
+        let mp_path = seed_marketplace_with_registry(dir.path(), &svc, "mp", &entries);
+        make_plugin_with_skills(&mp_path, "p", &["s1", "s2", "s3"]);
+
+        let plugin_dir = mp_path.join("plugins/p");
+        fs::write(
+            plugin_dir.join("plugin.json"),
+            br#"{"name":"p","version":"1.0"}"#,
+        )
+        .unwrap();
+
+        let steering_dir = plugin_dir.join("steering");
+        fs::create_dir_all(&steering_dir).unwrap();
+        fs::write(steering_dir.join("guide1.md"), "guide1").unwrap();
+        fs::write(steering_dir.join("guide2.md"), "guide2").unwrap();
+
+        let agents_dir = plugin_dir.join("agents");
+        fs::create_dir_all(&agents_dir).unwrap();
+        fs::write(agents_dir.join("a.md"), "---\nname: a\n---\n").unwrap();
+
+        let project_tmp = tempfile::tempdir().unwrap();
+        let project = KiroProject::new(project_tmp.path().to_path_buf());
+
+        svc.install_plugin(&project, &mp("mp"), &pn("p"), InstallMode::New, false)
+            .expect("install");
+
+        // Mutate exactly one steering file
+        fs::write(steering_dir.join("guide1.md"), "mutated guide1").unwrap();
+
+        let result = svc.detect_plugin_updates(&project).expect("detect");
+        assert_eq!(
+            result.updates.len(),
+            1,
+            "expected 1 update: {:?}",
+            result.updates
+        );
+        assert_eq!(result.updates[0].plugin.as_str(), "p");
+        assert!(matches!(
+            result.updates[0].change_signal,
+            UpdateChangeSignal::ContentChanged
+        ));
+        assert!(result.failures.is_empty());
+    }
+
+    /// P2a-1 finding: malformed plugin.json must surface as a per-plugin
+    /// failure, not as a toplevel Err.
+    #[test]
+    fn detect_plugin_updates_malformed_plugin_json_surfaces_as_failure() {
+        use crate::project::KiroProject;
+        use crate::service::test_support::{
+            make_plugin_with_skills, relative_path_entry, seed_marketplace_with_registry,
+            temp_service,
+        };
+
+        let (dir, svc) = temp_service();
+        let entries = vec![relative_path_entry("p", "plugins/p")];
+        let mp_path = seed_marketplace_with_registry(dir.path(), &svc, "mp", &entries);
+        make_plugin_with_skills(&mp_path, "p", &["alpha"]);
+        let plugin_dir = mp_path.join("plugins/p");
+        // Write a VALID manifest for install, then corrupt it after.
+        fs::write(
+            plugin_dir.join("plugin.json"),
+            br#"{"name":"p","version":"1.0"}"#,
+        )
+        .unwrap();
+
+        let project_tmp = tempfile::tempdir().unwrap();
+        let project = KiroProject::new(project_tmp.path().to_path_buf());
+
+        svc.install_plugin(&project, &mp("mp"), &pn("p"), InstallMode::New, false)
+            .expect("install");
+
+        // Now corrupt the manifest so the detection scan hits InvalidManifest.
+        fs::write(
+            plugin_dir.join("plugin.json"),
+            br#"{"name":"p","version":1.0}"#, // 1.0 is a number, not a string — malformed
+        )
+        .unwrap();
+
+        let result = svc.detect_plugin_updates(&project).expect("detect");
+        assert!(
+            result.updates.is_empty(),
+            "malformed manifest must not produce an update entry"
+        );
+        assert_eq!(
+            result.failures.len(),
+            1,
+            "malformed manifest must produce exactly one failure, got: {:?}",
+            result.failures
+        );
+        assert_eq!(result.failures[0].plugin.as_str(), "p");
+        assert!(
+            result.failures[0].reason.contains("manifest"),
+            "failure reason must mention the manifest, got: {}",
+            result.failures[0].reason
+        );
+    }
+
+    /// P2a-1 finding: an unreadable plugin.json (directory instead of file)
+    /// must surface as a per-plugin failure via `ManifestReadFailed`.
+    #[test]
+    fn detect_plugin_updates_unreadable_plugin_json_surfaces_as_failure() {
+        use crate::project::KiroProject;
+        use crate::service::test_support::{
+            make_plugin_with_skills, relative_path_entry, seed_marketplace_with_registry,
+            temp_service,
+        };
+
+        let (dir, svc) = temp_service();
+        let entries = vec![relative_path_entry("p", "plugins/p")];
+        let mp_path = seed_marketplace_with_registry(dir.path(), &svc, "mp", &entries);
+        make_plugin_with_skills(&mp_path, "p", &["alpha"]);
+        let plugin_dir = mp_path.join("plugins/p");
+        fs::write(
+            plugin_dir.join("plugin.json"),
+            br#"{"name":"p","version":"1.0"}"#,
+        )
+        .unwrap();
+
+        let project_tmp = tempfile::tempdir().unwrap();
+        let project = KiroProject::new(project_tmp.path().to_path_buf());
+
+        svc.install_plugin(&project, &mp("mp"), &pn("p"), InstallMode::New, false)
+            .expect("install");
+
+        // Replace plugin.json with a directory so fs::read fails
+        fs::remove_file(plugin_dir.join("plugin.json")).unwrap();
+        fs::create_dir(plugin_dir.join("plugin.json")).unwrap();
+
+        let result = svc.detect_plugin_updates(&project).expect("detect");
+        assert!(
+            result.updates.is_empty(),
+            "unreadable manifest must not produce an update entry"
+        );
+        assert_eq!(
+            result.failures.len(),
+            1,
+            "unreadable manifest must produce exactly one failure, got: {:?}",
+            result.failures
+        );
+        assert_eq!(result.failures[0].plugin.as_str(), "p");
+        assert!(
+            result.failures[0].reason.contains("manifest"),
+            "failure reason must mention the manifest, got: {}",
+            result.failures[0].reason
+        );
+    }
+
+    /// P2a-4 finding: agents have the same `Option<String>` `source_hash` shape
+    /// as skills and must follow the same legacy fallback path. Uses a
+    /// native-format agent to avoid the translated-agent companion-files
+    /// path-reconstruction complexity (C7).
+    #[test]
+    fn detect_plugin_updates_agent_legacy_fallback_source_hash_none() {
+        use crate::project::KiroProject;
+        use crate::service::test_support::{
+            make_plugin_with_skills, relative_path_entry, seed_marketplace_with_registry,
+            temp_service,
+        };
+
+        let (dir, svc) = temp_service();
+        let entries = vec![relative_path_entry("p", "plugins/p")];
+        let mp_path = seed_marketplace_with_registry(dir.path(), &svc, "mp", &entries);
+        make_plugin_with_skills(&mp_path, "p", &["alpha"]);
+        let plugin_dir = mp_path.join("plugins/p");
+        let agents_dir = plugin_dir.join("agents");
+        fs::create_dir_all(&agents_dir).unwrap();
+        fs::write(
+            agents_dir.join("reviewer.json"),
+            br#"{"name":"reviewer","description":"Reviews"}"#,
+        )
+        .unwrap();
+        fs::write(
+            plugin_dir.join("plugin.json"),
+            br#"{"name":"p","version":"1.0","format":"kiro-cli"}"#,
+        )
+        .unwrap();
+
+        let project_tmp = tempfile::tempdir().unwrap();
+        let project = KiroProject::new(project_tmp.path().to_path_buf());
+
+        svc.install_plugin(&project, &mp("mp"), &pn("p"), InstallMode::New, false)
+            .expect("install");
+
+        // Verify the agent was actually installed before mutating.
+        let tracking_pre = project.load_installed_agents().unwrap();
+        assert!(
+            tracking_pre.agents.contains_key("reviewer"),
+            "agent must be installed before test mutation"
+        );
+
+        // Set agent source_hash: None in tracking file
+        let mut tracking = project.load_installed_agents().unwrap();
+        for meta in tracking.agents.values_mut() {
+            meta.source_hash = None;
+        }
+        let tracking_path = project_tmp.path().join(".kiro/installed-agents.json");
+        fs::write(
+            &tracking_path,
+            serde_json::to_vec_pretty(&tracking).unwrap(),
+        )
+        .unwrap();
+
+        // Bump version
+        fs::write(
+            plugin_dir.join("plugin.json"),
+            br#"{"name":"p","version":"1.1","format":"kiro-cli"}"#,
+        )
+        .unwrap();
+
+        let result = svc.detect_plugin_updates(&project).expect("detect");
+        assert_eq!(
+            result.updates.len(),
+            1,
+            "agent with source_hash: None and version bump must surface as update, got: {result:?}"
+        );
+        assert_eq!(result.updates[0].plugin.as_str(), "p");
+        assert!(matches!(
+            result.updates[0].change_signal,
+            UpdateChangeSignal::VersionBumped
+        ));
+        assert!(result.failures.is_empty());
+    }
+
+    /// NC1 (PR #96 re-review): the C5 symlink defense returned
+    /// `Ok(None)` from `load_plugin_manifest_version` (pre-rename) when
+    /// the `plugin.json` symlink was refused. That `None` then collapsed
+    /// with `installed_version: Some("1.0")` in the version-comparison
+    /// path to emit a phantom `PluginUpdateInfo { available_version:
+    /// None, change_signal: VersionBumped }` — telling the user "an
+    /// update is available to nothing" whenever an installed plugin's
+    /// cache `plugin.json` had been swapped for a symlink.
+    ///
+    /// Post-fix: the 3-state `ManifestState` enum routes
+    /// "unreadable" through the per-plugin failure arm. This test
+    /// pins the no-phantom-update contract by deleting the cache
+    /// `plugin.json` after install and asserting the scan produces
+    /// zero updates and exactly one failure (not an update with
+    /// `available_version: None`).
+    #[test]
+    fn detect_plugin_updates_unreadable_manifest_does_not_phantom_version_bump() {
+        use crate::project::KiroProject;
+        use crate::service::test_support::{
+            make_plugin_with_skills, relative_path_entry, seed_marketplace_with_registry,
+            temp_service,
+        };
+
+        let (dir, svc) = temp_service();
+        let entries = vec![relative_path_entry("p", "plugins/p")];
+        let mp_path = seed_marketplace_with_registry(dir.path(), &svc, "mp", &entries);
+        make_plugin_with_skills(&mp_path, "p", &["alpha"]);
+        let plugin_dir = mp_path.join("plugins/p");
+        // Install with a manifest carrying version "1.0" so the
+        // tracking file records `installed_version: Some("1.0")` —
+        // the precondition for the phantom-version-bump regression.
+        fs::write(
+            plugin_dir.join("plugin.json"),
+            br#"{"name":"p","version":"1.0"}"#,
+        )
+        .unwrap();
+
+        let project_tmp = tempfile::tempdir().unwrap();
+        let project = KiroProject::new(project_tmp.path().to_path_buf());
+        svc.install_plugin(&project, &mp("mp"), &pn("p"), InstallMode::New, false)
+            .expect("install");
+
+        // Tracking should now carry version="1.0".
+        let tracking = project.load_installed().expect("load tracking");
+        assert_eq!(
+            tracking
+                .skills
+                .get("alpha")
+                .and_then(|m| m.version.as_deref()),
+            Some("1.0"),
+            "precondition: tracking carries installed_version Some(\"1.0\")"
+        );
+
+        // Now make the cache plugin.json unreadable: delete it.
+        // Pre-NC1 fix: load_plugin_manifest_version (pre-rename)
+        // returned Ok(None), version_differs became true
+        // (Some("1.0") != None), and the result had a phantom
+        // `VersionBumped` update with available_version: None.
+        fs::remove_file(plugin_dir.join("plugin.json")).unwrap();
+
+        let result = svc.detect_plugin_updates(&project).expect("detect");
+
+        // Post-fix: zero updates, one failure.
+        assert!(
+            result.updates.is_empty(),
+            "unreadable cache plugin.json must NOT phantom-bump to a \
+             VersionBumped update with available_version: None; got: {:?}",
+            result.updates
+        );
+        assert_eq!(
+            result.failures.len(),
+            1,
+            "unreadable cache manifest must surface as exactly one \
+             per-plugin failure, got: {:?}",
+            result.failures
+        );
+        assert_eq!(result.failures[0].plugin.as_str(), "p");
+    }
+
+    /// PR #96 review #6: a plugin whose `plugin.json` declares a
+    /// custom `steering: ["./guides/"]` scan path would false-positive
+    /// drift on every detection scan — install hashed against
+    /// `<plugin_dir>/guides/`, but pre-fix `scan_plugin_for_content_drift`
+    /// hardcoded `<plugin_dir>/steering/` regardless of the manifest.
+    /// This test installs such a plugin without modifying the source
+    /// and asserts the scan reports zero updates and zero failures.
+    /// A regression here means hashing fell back to the hardcoded
+    /// default again.
+    #[test]
+    fn detect_plugin_updates_steering_with_custom_scan_path_no_false_drift() {
+        use crate::project::KiroProject;
+        use crate::service::test_support::{
+            relative_path_entry, seed_marketplace_with_registry, temp_service,
+        };
+
+        let (dir, svc) = temp_service();
+        let entries = vec![relative_path_entry("p", "plugins/p")];
+        let mp_path = seed_marketplace_with_registry(dir.path(), &svc, "mp", &entries);
+        let plugin_dir = mp_path.join("plugins/p");
+        fs::create_dir_all(plugin_dir.join("guides")).expect("create guides dir");
+        // Steering source under a NON-default path. If detection used
+        // the hardcoded `./steering/` default, hash_artifact would
+        // return NotFound and the plugin would surface as a failure.
+        fs::write(plugin_dir.join("guides/playbook.md"), b"how to ship\n")
+            .expect("write steering source");
+        // Manifest declares the custom scan path. The Phase 2a fix
+        // makes `scan_plugin_for_content_drift` consult this field.
+        fs::write(
+            plugin_dir.join("plugin.json"),
+            br#"{"name":"p","version":"1.0","steering":["./guides/"]}"#,
+        )
+        .expect("write plugin.json");
+
+        let project_tmp = tempfile::tempdir().expect("project tempdir");
+        let project = KiroProject::new(project_tmp.path().to_path_buf());
+
+        svc.install_plugin(&project, &mp("mp"), &pn("p"), InstallMode::New, false)
+            .expect("install");
+
+        // Sanity: install actually placed the steering file under
+        // `.kiro/steering/` so the tracking entry exists for the scan
+        // to compare against. Without this precondition the test would
+        // pass vacuously.
+        assert!(
+            project_tmp
+                .path()
+                .join(".kiro/steering/playbook.md")
+                .exists(),
+            "precondition: steering file must be installed"
+        );
+
+        let result = svc.detect_plugin_updates(&project).expect("detect");
+        assert!(
+            result.updates.is_empty(),
+            "expected no updates for an unchanged source under a custom \
+             steering scan path; got: {:?}",
+            result.updates
+        );
+        assert!(
+            result.failures.is_empty(),
+            "expected no failures (pre-fix would return a hash NotFound \
+             error because detection looked under hardcoded `./steering/`); \
+             got: {:?}",
+            result.failures
+        );
+    }
+
+    /// PR #96 review I1: sibling of the steering test above for the
+    /// **native-companions** loop, which got the symmetric scan-path
+    /// fix. A plugin declaring `agents: ["./companions/"]` stores
+    /// companion files under `<plugin_dir>/companions/`, but pre-fix
+    /// detection hardcoded `<plugin_dir>/agents/` and would emit a
+    /// hash `NotFound` failure on every scan.
+    ///
+    /// The native-companions cascade has a separate, pre-existing
+    /// install-time hash bug (documented on
+    /// `detect_plugin_updates_copilot_agent_legacy_fallback` above —
+    /// install hashes against the destination, detection re-hashes
+    /// against the source, so the two never match through the install
+    /// path). To isolate the scan-path fix, we synthesize the tracking
+    /// entry by hand: compute the source-side hash directly via
+    /// `crate::hash::hash_artifact` and write it into
+    /// `installed-agents.json`. With the scan-path fix, detection
+    /// finds the companion under the declared `./companions/` root,
+    /// recomputes the matching hash, and reports no drift. Without
+    /// the scan-path fix, detection would look under `./agents/`
+    /// (which doesn't exist in this fixture), `hash_artifact` would
+    /// return `NotFound`, and the plugin would surface as a failure.
+    #[test]
+    fn detect_plugin_updates_native_companions_with_custom_scan_path_no_false_drift() {
+        use crate::project::{
+            InstalledAgentMeta, InstalledAgents, InstalledNativeCompanionsMeta, KiroProject,
+        };
+        use crate::service::test_support::{
+            relative_path_entry, seed_marketplace_with_registry, temp_service,
+        };
+        use std::collections::HashMap;
+        use std::path::PathBuf;
+
+        let (dir, svc) = temp_service();
+        let entries = vec![relative_path_entry("p", "plugins/p")];
+        let mp_path = seed_marketplace_with_registry(dir.path(), &svc, "mp", &entries);
+        let plugin_dir = mp_path.join("plugins/p");
+
+        // Companion source under a NON-default agent scan path. If
+        // detection used the hardcoded `./agents/` default,
+        // `hash_artifact_in_scan_paths` would return its synthesised
+        // NotFound and the plugin would surface as a HashFailed
+        // failure.
+        let companions_root = plugin_dir.join("companions");
+        let prompts_dir = companions_root.join("prompts");
+        fs::create_dir_all(&prompts_dir).expect("create prompts dir");
+        fs::write(prompts_dir.join("reviewer.md"), b"prompt body\n")
+            .expect("write companion source");
+
+        // Manifest declares the custom scan path. The Phase 2a fix
+        // makes `scan_plugin_for_content_drift`'s native-companions
+        // loop consult `agent_scan_paths_for_plugin(manifest)` instead
+        // of `plugin_dir.join("agents")`.
+        fs::write(
+            plugin_dir.join("plugin.json"),
+            br#"{"name":"p","version":"1.0","agents":["./companions/"]}"#,
+        )
+        .expect("write plugin.json");
+
+        // Compute the source hash directly using the install-side
+        // recipe so we can construct a tracking entry whose
+        // `source_hash` matches what the (post-fix) detection scan
+        // will recompute against the same scan root. `meta.files` is
+        // relative to the scan root, mirroring
+        // `install_native_companions_for_plugin`'s persistence shape.
+        let companion_rel = PathBuf::from("prompts/reviewer.md");
+        let source_hash =
+            crate::hash::hash_artifact(&companions_root, std::slice::from_ref(&companion_rel))
+                .expect("hash source companion");
+
+        let project_tmp = tempfile::tempdir().expect("project tempdir");
+        let project = KiroProject::new(project_tmp.path().to_path_buf());
+        let kiro_dir = project_tmp.path().join(".kiro");
+        fs::create_dir_all(&kiro_dir).expect("create .kiro");
+
+        // `installed_plugins()` aggregates from `agents.agents`,
+        // `skills.skills`, and `steering.files` — but NOT from
+        // `agents.native_companions`. Without an entry in one of those
+        // three maps the plugin would not surface in the scan loop and
+        // the test would pass vacuously. Mirror the pattern used by
+        // `detect_plugin_updates_copilot_agent_legacy_fallback`: a
+        // single legacy translated-agent entry (`source_hash: None`)
+        // registers the plugin and triggers only the harmless
+        // `legacy_fallback = true` branch, leaving the
+        // native-companions cascade as the only thing the assertion
+        // depends on.
+        let mut agents_map = HashMap::new();
+        agents_map.insert(
+            "registrar".to_string(),
+            InstalledAgentMeta {
+                marketplace: mp("mp"),
+                plugin: pn("p"),
+                version: Some("1.0".to_owned()),
+                installed_at: chrono::Utc::now(),
+                dialect: crate::agent::AgentDialect::Native,
+                source_path: None,
+                source_hash: None,
+                installed_hash: None,
+            },
+        );
+
+        let mut companions = HashMap::new();
+        companions.insert(
+            "p".to_string(),
+            InstalledNativeCompanionsMeta {
+                marketplace: mp("mp"),
+                plugin: pn("p"),
+                version: Some("1.0".to_owned()),
+                installed_at: chrono::Utc::now(),
+                files: vec![companion_rel.clone()],
+                source_hash: source_hash.clone(),
+                // installed_hash isn't consulted by the drift scan;
+                // any value works for this test.
+                installed_hash: source_hash,
+            },
+        );
+        let installed = InstalledAgents {
+            agents: agents_map,
+            native_companions: companions,
+        };
+        fs::write(
+            kiro_dir.join("installed-agents.json"),
+            serde_json::to_vec_pretty(&installed).expect("serialize tracking"),
+        )
+        .expect("write installed-agents.json");
+
+        let result = svc.detect_plugin_updates(&project).expect("detect");
+        assert!(
+            result.updates.is_empty(),
+            "expected no updates for an unchanged native-companions bundle \
+             under a custom agent scan path; got: {:?}",
+            result.updates
+        );
+        assert!(
+            result.failures.is_empty(),
+            "expected no failures (pre-fix would return a hash NotFound \
+             error because detection looked under hardcoded `./agents/`); \
+             got: {:?}",
+            result.failures
+        );
+    }
+
+    /// Commit 9 / Phase 2a sibling of
+    /// `service::browse::tests::load_plugin_manifest_rejects_oversized_file`:
+    /// the detection-side `load_plugin_manifest` shares the
+    /// same `read_capped` defense; verify it fires here too.
+    #[test]
+    fn load_plugin_manifest_rejects_oversized_file() {
+        use std::io::Write;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let plugin_dir = tmp.path().join("plugin");
+        fs::create_dir_all(&plugin_dir).expect("create plugin dir");
+        let manifest_path = plugin_dir.join("plugin.json");
+        let mut f = fs::File::create(&manifest_path).expect("create manifest");
+        f.write_all(&vec![b'A'; 2 * 1024 * 1024])
+            .expect("write 2 MiB");
+        f.sync_all().expect("sync");
+
+        let err = MarketplaceService::load_plugin_manifest(&plugin_dir)
+            .expect_err("oversized plugin.json must be refused at the cap");
+        assert!(
+            matches!(
+                err,
+                Error::Plugin(PluginError::CacheManifestReadFailed { .. })
+            ),
+            "expected CacheManifestReadFailed for cap-exceeded, got: {err:?}"
+        );
+    }
+
+    /// I-N2 (PR #96 re-review): mirrors `service::browse::tests::
+    /// load_plugin_manifest_refuses_symlinked_manifest` for the Phase 2a
+    /// detection-side function. Without this test, a future refactor
+    /// could replace the `symlink_metadata` check with `Path::exists()`
+    /// (which follows symlinks) and silently re-open the C5 leak vector
+    /// — the cache `plugin.json`'s parse error embeds the symlinked
+    /// target bytes via `error_full_chain` into the wire-format
+    /// `PluginUpdateFailure.reason`.
+    ///
+    /// Asserts the function returns `ManifestState::Unreadable { ... }`,
+    /// NOT `ManifestState::Found(_)`. `PluginManifest` requires `name`
+    /// (else parse fails); the symlink target is a complete valid
+    /// manifest so absence/presence is unambiguous.
+    #[cfg(unix)]
+    #[test]
+    fn load_plugin_manifest_refuses_symlink() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let plugin_dir = tmp.path().join("plugin");
+        fs::create_dir_all(&plugin_dir).expect("create plugin dir");
+
+        // A target with valid PluginManifest content so we can tell
+        // "absent" from "parsed but wrong". PluginManifest requires
+        // the `name` field — the previous agent's broken fixture
+        // omitted it.
+        let sensitive = tmp.path().join("secrets.json");
+        fs::write(
+            &sensitive,
+            br#"{"name":"leaked","version":"1.0","skills":[]}"#,
+        )
+        .expect("write target");
+
+        std::os::unix::fs::symlink(&sensitive, plugin_dir.join("plugin.json"))
+            .expect("create symlink");
+
+        let result = MarketplaceService::load_plugin_manifest(&plugin_dir)
+            .expect("symlink must yield ManifestState::Unreadable, not Err");
+        match result {
+            ManifestState::Unreadable { reason } => {
+                assert!(
+                    reason.contains("symlink"),
+                    "reason must mention symlink, got: {reason}"
+                );
+            }
+            ManifestState::Found(m) => {
+                panic!(
+                    "symlinked plugin.json must NOT be parsed; got Found(name={:?}, version={:?}) — \
+                     symlink defense regressed",
+                    m.name, m.version
+                );
+            }
+        }
+    }
+
+    /// I-N3 (PR #96 re-review) — DEFERRED VARIANT: directly testing
+    /// the Copilot dialect through the translated install path
+    /// surfaces a separate pre-existing bug in
+    /// [`scan_plugin_for_content_drift`]'s `native_companions` arm
+    /// (companion `source_hash` is computed against the destination
+    /// `project/.kiro/agents/` at install time, but detection
+    /// re-hashes against the marketplace cache `plugin_dir/agents/`,
+    /// so the paths never resolve and a `PluginUpdateFailure` is
+    /// always emitted). That bug is unrelated to NC1/NC2/C7 and is
+    /// out of scope for this remediation cycle — it requires routing
+    /// the destination dir through `scan_plugin_for_content_drift`,
+    /// which is a Phase 2b structural change.
+    ///
+    /// Until the upstream `native_companions` detection bug is fixed,
+    /// the Copilot legacy-fallback path is exercised in a unit test
+    /// that bypasses the install path. Below: build the tracking
+    /// state by hand so we can isolate the dialect-classifier branch
+    /// without dragging in the broken `native_companions` cascade.
+    #[test]
+    fn detect_plugin_updates_copilot_agent_legacy_fallback() {
+        use crate::project::{InstalledAgentMeta, InstalledAgents, KiroProject};
+        use crate::service::test_support::{
+            relative_path_entry, seed_marketplace_with_registry, temp_service,
+        };
+        use std::collections::HashMap;
+
+        let (dir, svc) = temp_service();
+        let entries = vec![relative_path_entry("p", "plugins/p")];
+        let mp_path = seed_marketplace_with_registry(dir.path(), &svc, "mp", &entries);
+        let plugin_dir = mp_path.join("plugins/p");
+        let agents_dir = plugin_dir.join("agents");
+        fs::create_dir_all(&agents_dir).unwrap();
+        // Filename stem matches the frontmatter name so the dialect
+        // fallback `{name}.agent.md` resolves.
+        let agent_body = b"---\nname: reviewer\ndescription: Reviews\n---\n\nBody.\n";
+        fs::write(agents_dir.join("reviewer.agent.md"), agent_body).unwrap();
+        fs::write(
+            plugin_dir.join("plugin.json"),
+            br#"{"name":"p","version":"1.0"}"#,
+        )
+        .unwrap();
+
+        // Build a hand-crafted installed-agents.json that mirrors a
+        // pre-C7 install (no source_path, no source_hash) so we
+        // exercise the dialect-fallback branch in isolation. Skip
+        // synthesizing native_companions to sidestep the unrelated
+        // pre-existing bug noted in the rustdoc above.
+        let project_tmp = tempfile::tempdir().unwrap();
+        let project = KiroProject::new(project_tmp.path().to_path_buf());
+        let kiro_dir = project_tmp.path().join(".kiro");
+        fs::create_dir_all(&kiro_dir).unwrap();
+        let mut agents_map = HashMap::new();
+        agents_map.insert(
+            "reviewer".to_string(),
+            InstalledAgentMeta {
+                marketplace: mp("mp"),
+                plugin: pn("p"),
+                version: Some("1.0".to_owned()),
+                installed_at: chrono::Utc::now(),
+                dialect: crate::agent::AgentDialect::Copilot,
+                source_path: None,
+                // Legacy entry: no source_hash → triggers
+                // `legacy_fallback = true` in scan; version-comparison
+                // path then drives the result.
+                source_hash: None,
+                installed_hash: None,
+            },
+        );
+        let installed = InstalledAgents {
+            agents: agents_map,
+            native_companions: HashMap::new(),
+        };
+        fs::write(
+            kiro_dir.join("installed-agents.json"),
+            serde_json::to_vec_pretty(&installed).unwrap(),
+        )
+        .unwrap();
+
+        // Bump version so we get a deterministic update entry.
+        fs::write(
+            plugin_dir.join("plugin.json"),
+            br#"{"name":"p","version":"1.1"}"#,
+        )
+        .unwrap();
+
+        let result = svc.detect_plugin_updates(&project).expect("detect");
+        assert!(
+            result.failures.is_empty(),
+            "Copilot legacy-fallback path must succeed, got failures: {:?}",
+            result.failures
+        );
+        assert_eq!(
+            result.updates.len(),
+            1,
+            "Copilot agent legacy fallback + version bump must surface as exactly \
+             one update, got: {result:?}"
+        );
+        assert!(matches!(
+            result.updates[0].change_signal,
+            UpdateChangeSignal::VersionBumped
+        ));
+    }
+
+    /// I-N3 sibling: a Copilot agent with `source_path: Some(rel)`
+    /// (post-C7 install shape) — detection finds the file via the
+    /// populated path, NOT the dialect fallback. Bypasses the
+    /// translated install path for the same reason as the legacy
+    /// test above.
+    #[test]
+    fn detect_plugin_updates_copilot_agent_with_source_path() {
+        use crate::project::{InstalledAgentMeta, InstalledAgents, KiroProject};
+        use crate::service::test_support::{
+            relative_path_entry, seed_marketplace_with_registry, temp_service,
+        };
+        use crate::validation::RelativePath;
+        use std::collections::HashMap;
+
+        let (dir, svc) = temp_service();
+        let entries = vec![relative_path_entry("p", "plugins/p")];
+        let mp_path = seed_marketplace_with_registry(dir.path(), &svc, "mp", &entries);
+        let plugin_dir = mp_path.join("plugins/p");
+        let agents_dir = plugin_dir.join("agents");
+        fs::create_dir_all(&agents_dir).unwrap();
+        let agent_body = b"---\nname: reviewer\ndescription: Reviews\n---\n\nBody.\n";
+        fs::write(agents_dir.join("reviewer.agent.md"), agent_body).unwrap();
+        fs::write(
+            plugin_dir.join("plugin.json"),
+            br#"{"name":"p","version":"1.0"}"#,
+        )
+        .unwrap();
+
+        // Compute the expected hash the same way install_translated_agents_inner's
+        // hash_translated_source helper does: hash_artifact(parent, &[filename]).
+        let expected_hash =
+            crate::hash::hash_artifact(&agents_dir, &[PathBuf::from("reviewer.agent.md")])
+                .expect("hash");
+
+        let project_tmp = tempfile::tempdir().unwrap();
+        let project = KiroProject::new(project_tmp.path().to_path_buf());
+        let kiro_dir = project_tmp.path().join(".kiro");
+        fs::create_dir_all(&kiro_dir).unwrap();
+        let mut agents_map = HashMap::new();
+        agents_map.insert(
+            "reviewer".to_string(),
+            InstalledAgentMeta {
+                marketplace: mp("mp"),
+                plugin: pn("p"),
+                version: Some("1.0".to_owned()),
+                installed_at: chrono::Utc::now(),
+                dialect: crate::agent::AgentDialect::Copilot,
+                source_path: Some(
+                    RelativePath::new("agents/reviewer.agent.md").expect("valid rel"),
+                ),
+                source_hash: Some(expected_hash),
+                installed_hash: None,
+            },
+        );
+        let installed = InstalledAgents {
+            agents: agents_map,
+            native_companions: HashMap::new(),
+        };
+        fs::write(
+            kiro_dir.join("installed-agents.json"),
+            serde_json::to_vec_pretty(&installed).unwrap(),
+        )
+        .unwrap();
+
+        let result = svc.detect_plugin_updates(&project).expect("detect");
+        assert!(
+            result.failures.is_empty(),
+            "Copilot source_path detection must succeed, got failures: {:?}",
+            result.failures
+        );
+        assert!(
+            result.updates.is_empty(),
+            "no mutation; updates must be empty, got: {:?}",
+            result.updates
+        );
+    }
+
+    /// I-N6 (PR #96 re-review): C4 plumbing test. Default-empty + JSON-
+    /// shape locks didn't verify the `partial_load_warnings` field is
+    /// actually populated from `view.partial_load_warnings` — only
+    /// that the field exists on the wire. This test corrupts
+    /// `installed-skills.json` directly and asserts the warning bubbles
+    /// through `installed_plugins() -> detect_plugin_updates ->
+    /// DetectUpdatesResult::partial_load_warnings`.
+    #[test]
+    fn detect_plugin_updates_forwards_partial_load_warnings() {
+        use crate::project::KiroProject;
+
+        let project_tmp = tempfile::tempdir().unwrap();
+        let kiro_dir = project_tmp.path().join(".kiro");
+        fs::create_dir_all(&kiro_dir).expect("kiro dir");
+        // Invalid JSON in installed-skills.json — installed_plugins()
+        // must surface this in partial_load_warnings rather than
+        // aborting.
+        fs::write(
+            kiro_dir.join("installed-skills.json"),
+            b"{ this is not json",
+        )
+        .expect("write corrupt tracking");
+
+        let project = KiroProject::new(project_tmp.path().to_path_buf());
+        let (_dir, svc) = crate::service::test_support::temp_service();
+
+        let result = svc.detect_plugin_updates(&project).expect("detect");
+        assert_eq!(
+            result.partial_load_warnings.len(),
+            1,
+            "corrupt installed-skills.json must surface as exactly one \
+             partial_load_warnings entry, got: {:?}",
+            result.partial_load_warnings
+        );
+        assert_eq!(
+            result.partial_load_warnings[0].tracking_file, "installed-skills.json",
+            "warning must name the corrupt tracking file"
+        );
     }
 }

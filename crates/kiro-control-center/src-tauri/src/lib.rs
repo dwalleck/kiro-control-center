@@ -38,6 +38,7 @@ fn create_builder() -> Builder<tauri::Wry> {
         commands::plugins::install_plugin,
         commands::plugins::list_installed_plugins,
         commands::plugins::remove_plugin,
+        commands::plugins::detect_plugin_updates,
     ])
 }
 
