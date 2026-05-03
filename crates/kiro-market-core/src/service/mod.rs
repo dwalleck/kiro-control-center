@@ -1256,7 +1256,8 @@ impl MarketplaceService {
     pub fn install_skills(
         &self,
         project: &crate::project::KiroProject,
-        skill_dirs: &[PathBuf],
+        plugin_dir: &Path,
+        skill_dirs: &[crate::plugin::DiscoveredSkill],
         filter: &InstallFilter<'_>,
         mode: InstallMode,
         marketplace: &crate::validation::MarketplaceName,
@@ -1266,52 +1267,31 @@ impl MarketplaceService {
         let mut result = InstallSkillsResult::default();
         let mut processed: std::collections::HashSet<String> = std::collections::HashSet::new();
 
-        for skill_dir in skill_dirs {
-            let skill_md_path = skill_dir.join("SKILL.md");
-            let content = match fs::read_to_string(&skill_md_path) {
-                Ok(c) => c,
-                Err(e) => {
-                    warn!(
-                        path = %skill_md_path.display(),
-                        error = %e,
-                        "failed to read SKILL.md, skipping"
-                    );
-                    result.skipped_skills.push(browse::SkippedSkill {
-                        plugin: plugin.as_str().to_owned(),
-                        name_hint: browse::name_hint_from_skill_dir(skill_dir),
-                        path: skill_md_path,
-                        reason: browse::SkippedSkillReason::ReadFailed {
-                            reason: error_full_chain(&e),
-                        },
-                    });
-                    continue;
-                }
-            };
-
-            let (frontmatter, _body_offset) = match crate::skill::parse_frontmatter(&content) {
-                Ok(r) => r,
-                Err(e) => {
-                    warn!(
-                        path = %skill_md_path.display(),
-                        error = %e,
-                        "failed to parse SKILL.md frontmatter, skipping"
-                    );
-                    result.skipped_skills.push(browse::SkippedSkill {
-                        plugin: plugin.as_str().to_owned(),
-                        name_hint: browse::name_hint_from_skill_dir(skill_dir),
-                        path: skill_md_path,
-                        reason: browse::SkippedSkillReason::FrontmatterInvalid {
-                            reason: error_full_chain(&e),
-                        },
-                    });
-                    continue;
-                }
+        for discovered in skill_dirs {
+            let skill_dir = &discovered.skill_dir;
+            let Some(frontmatter) = read_and_parse_skill_md(skill_dir, plugin, &mut result) else {
+                continue;
             };
 
             if !filter_matches(filter, &frontmatter.name) {
                 continue;
             }
             processed.insert(frontmatter.name.clone());
+
+            // Compute source_scan_root from the discovered scan_root.
+            // Discovery yields absolute paths under plugin_dir, so the
+            // Err arm is defensive (see required_skill_scan_root).
+            let source_scan_root = match required_skill_scan_root(
+                &discovered.scan_root,
+                plugin_dir,
+                &frontmatter.name,
+            ) {
+                Ok(rp) => rp,
+                Err(failed) => {
+                    result.failed.push(failed);
+                    continue;
+                }
+            };
 
             let meta = crate::project::InstalledSkillMeta {
                 marketplace: marketplace.clone(),
@@ -1320,6 +1300,7 @@ impl MarketplaceService {
                 installed_at: chrono::Utc::now(),
                 source_hash: None,
                 installed_hash: None,
+                source_scan_root,
             };
 
             let outcome = if mode.is_force() {
@@ -2172,6 +2153,7 @@ impl MarketplaceService {
 
         let skills = self.install_skills(
             project,
+            &ctx.plugin_dir,
             &ctx.skill_dirs,
             &InstallFilter::All,
             mode,
@@ -2518,29 +2500,16 @@ impl MarketplaceService {
         let mut content_drift = false;
         let mut legacy_fallback = false;
 
-        // Skills — keyed under `skills/<name>/`. KNOWN BUG (issue #97):
-        // `discover_skills_for_plugin` (browse.rs) honors
-        // `manifest.skills` and a plugin declaring `skills: ["./packs/"]`
-        // installs skill dirs under `<plugin_dir>/packs/<name>/`, but
-        // this loop hardcodes `plugin_dir.join("skills")` and will
-        // false-positive drift on every scan for such plugins — the
-        // same class of bug the steering/agents loops below fixed.
-        //
-        // Closing it requires either (a) probing each declared skill
-        // scan path for a directory named `<name>` (analogous to
-        // `hash_artifact_in_scan_paths` but against `hash_dir_tree`),
-        // or (b) extending `InstalledSkillMeta` with a `source_path`
-        // field so detection knows which scan root to consult without
-        // probing. Option (b) matches the `InstalledAgentMeta`
-        // precedent. Tracked at
-        // https://github.com/dwalleck/kiro-control-center/issues/97
-        // — out of scope for the steering/agents scan-path closure
-        // shipped in PR #96.
+        // Skills — direct lookup against the install-recorded scan
+        // root. Closes #97; install populates source_scan_root so
+        // detection hashes against the same directory the install
+        // copied from. (source_hash stays Option<String> for now;
+        // tightened in Task 6 alongside the legacy_fallback removal.)
         for (name, meta) in &installed_skills.skills {
             if meta.marketplace == plugin_info.marketplace && meta.plugin == plugin_info.plugin {
                 match &meta.source_hash {
                     Some(stored) => {
-                        let skill_dir = plugin_dir.join("skills").join(name);
+                        let skill_dir = plugin_dir.join(meta.source_scan_root.as_str()).join(name);
                         let computed = crate::hash::hash_dir_tree(&skill_dir)?;
                         if computed != *stored {
                             content_drift = true;
@@ -2777,6 +2746,89 @@ fn translated_agent_blocked_by_mcp_gate(
         return true;
     }
     false
+}
+
+/// Read SKILL.md from a discovered skill directory and parse its
+/// frontmatter. On failure, pushes a structured `SkippedSkill` entry
+/// onto the result and returns `None`. Used by `install_skills` to
+/// keep the per-skill loop body terse.
+fn read_and_parse_skill_md(
+    skill_dir: &Path,
+    plugin: &crate::validation::PluginName,
+    result: &mut InstallSkillsResult,
+) -> Option<crate::skill::SkillFrontmatter> {
+    let skill_md_path = skill_dir.join("SKILL.md");
+    let content = match fs::read_to_string(&skill_md_path) {
+        Ok(c) => c,
+        Err(e) => {
+            warn!(
+                path = %skill_md_path.display(),
+                error = %e,
+                "failed to read SKILL.md, skipping"
+            );
+            result.skipped_skills.push(browse::SkippedSkill {
+                plugin: plugin.as_str().to_owned(),
+                name_hint: browse::name_hint_from_skill_dir(skill_dir),
+                path: skill_md_path,
+                reason: browse::SkippedSkillReason::ReadFailed {
+                    reason: error_full_chain(&e),
+                },
+            });
+            return None;
+        }
+    };
+    match crate::skill::parse_frontmatter(&content) {
+        Ok((fm, _body_offset)) => Some(fm),
+        Err(e) => {
+            warn!(
+                path = %skill_md_path.display(),
+                error = %e,
+                "failed to parse SKILL.md frontmatter, skipping"
+            );
+            result.skipped_skills.push(browse::SkippedSkill {
+                plugin: plugin.as_str().to_owned(),
+                name_hint: browse::name_hint_from_skill_dir(skill_dir),
+                path: skill_md_path,
+                reason: browse::SkippedSkillReason::FrontmatterInvalid {
+                    reason: error_full_chain(&e),
+                },
+            });
+            None
+        }
+    }
+}
+
+/// Compute the install-time `source_scan_root` for a discovered skill
+/// or build a [`FailedSkill`] entry if the discovered `scan_root`
+/// can't be expressed as a `RelativePath` under `plugin_dir`.
+/// Discovery yields paths under `plugin_dir` in practice, so the
+/// `Err` arm is a defensive catch for a future invariant break —
+/// required-field schema means we can't install without recording
+/// `source_scan_root`.
+fn required_skill_scan_root(
+    scan_root: &Path,
+    plugin_dir: &Path,
+    skill_name: &str,
+) -> Result<crate::validation::RelativePath, FailedSkill> {
+    crate::validation::RelativePath::from_path_under(scan_root, plugin_dir).map_err(|e| {
+        warn!(
+            scan_root = %scan_root.display(),
+            plugin_dir = %plugin_dir.display(),
+            error = %e,
+            "discovered skill scan_root not under plugin_dir; skipping"
+        );
+        FailedSkill::install_failed(
+            skill_name.to_owned(),
+            &Error::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "skill scan_root `{}` not under plugin_dir `{}`: {e}",
+                    scan_root.display(),
+                    plugin_dir.display(),
+                ),
+            )),
+        )
+    })
 }
 
 /// Compute the install-time `source_path` for a discovered agent file,
@@ -5293,21 +5345,33 @@ mod tests {
         let project = KiroProject::new(project_tmp.path().to_path_buf());
 
         let plugin_tmp = tempfile::tempdir().unwrap();
-        let ok_dir = plugin_tmp.path().join("ok");
+        let plugin_dir = plugin_tmp.path();
+        let scan_root = plugin_dir.join("skills");
+        let ok_dir = scan_root.join("ok");
         fs::create_dir_all(&ok_dir).unwrap();
         fs::write(
             ok_dir.join("SKILL.md"),
             "---\nname: ok\ndescription: works\n---\nbody\n",
         )
         .unwrap();
-        let broken_dir = plugin_tmp.path().join("broken");
+        let broken_dir = scan_root.join("broken");
         fs::create_dir_all(&broken_dir).unwrap();
         // Missing closing `---` breaks the frontmatter parse.
         fs::write(broken_dir.join("SKILL.md"), "---\nname: broken\n").unwrap();
 
-        let skill_dirs = vec![ok_dir, broken_dir];
+        let skill_dirs = vec![
+            crate::plugin::DiscoveredSkill {
+                scan_root: scan_root.clone(),
+                skill_dir: ok_dir,
+            },
+            crate::plugin::DiscoveredSkill {
+                scan_root: scan_root.clone(),
+                skill_dir: broken_dir,
+            },
+        ];
         let result = svc.install_skills(
             &project,
+            plugin_dir,
             &skill_dirs,
             &InstallFilter::All,
             InstallMode::New,
@@ -5346,7 +5410,9 @@ mod tests {
         let project = KiroProject::new(project_tmp.path().to_path_buf());
 
         let plugin_tmp = tempfile::tempdir().unwrap();
-        let only_dir = plugin_tmp.path().join("present");
+        let plugin_dir = plugin_tmp.path();
+        let scan_root = plugin_dir.join("skills");
+        let only_dir = scan_root.join("present");
         fs::create_dir_all(&only_dir).unwrap();
         fs::write(
             only_dir.join("SKILL.md"),
@@ -5357,7 +5423,11 @@ mod tests {
         let requested = vec!["absent".to_string()];
         let result = svc.install_skills(
             &project,
-            &[only_dir],
+            plugin_dir,
+            &[crate::plugin::DiscoveredSkill {
+                scan_root,
+                skill_dir: only_dir,
+            }],
             &InstallFilter::Names(&requested),
             InstallMode::New,
             &mp("mp1"),
@@ -5435,7 +5505,9 @@ mod tests {
         let project = KiroProject::new(project_tmp.path().to_path_buf());
 
         let plugin_tmp = tempfile::tempdir().unwrap();
-        let skill_dir = plugin_tmp.path().join("vault");
+        let plugin_dir = plugin_tmp.path();
+        let scan_root = plugin_dir.join("skills");
+        let skill_dir = scan_root.join("vault");
         fs::create_dir_all(&skill_dir).unwrap();
         let skill_md = skill_dir.join("SKILL.md");
         fs::write(
@@ -5449,7 +5521,11 @@ mod tests {
 
         let result = svc.install_skills(
             &project,
-            std::slice::from_ref(&skill_dir),
+            plugin_dir,
+            &[crate::plugin::DiscoveredSkill {
+                scan_root,
+                skill_dir: skill_dir.clone(),
+            }],
             &InstallFilter::All,
             InstallMode::New,
             &mp("mp1"),
@@ -5502,7 +5578,9 @@ mod tests {
         let project = KiroProject::new(project_tmp.path().to_path_buf());
 
         let plugin_tmp = tempfile::tempdir().unwrap();
-        let skill_dir = plugin_tmp.path().join("target");
+        let plugin_dir = plugin_tmp.path();
+        let scan_root = plugin_dir.join("skills");
+        let skill_dir = scan_root.join("target");
         fs::create_dir_all(&skill_dir).unwrap();
         fs::write(
             skill_dir.join("SKILL.md"),
@@ -5512,7 +5590,11 @@ mod tests {
 
         let result = svc.install_skills(
             &project,
-            &[skill_dir],
+            plugin_dir,
+            &[crate::plugin::DiscoveredSkill {
+                scan_root,
+                skill_dir,
+            }],
             &InstallFilter::All,
             InstallMode::New,
             &mp("mp1"),
@@ -6060,6 +6142,8 @@ mod tests {
                     installed_at: chrono::Utc::now(),
                     source_hash: None,
                     installed_hash: None,
+                    source_scan_root: crate::validation::RelativePath::new("skills")
+                        .expect("valid"),
                 },
             )]
             .into_iter()
@@ -6657,6 +6741,75 @@ mod tests {
             "expected no failures (pre-fix would return a hash NotFound \
              error because detection looked under hardcoded `./steering/`); \
              got: {:?}",
+            result.failures
+        );
+    }
+
+    /// Closes #97: a plugin declaring `skills: ["./packs/"]` installs
+    /// skill dirs under `<plugin_dir>/packs/<name>/`. Pre-fix detection
+    /// hardcoded `<plugin_dir>/skills/<name>/` and would surface every
+    /// such plugin as a `HashFailed` failure on every scan. Post-fix,
+    /// detection consults `meta.source_scan_root` (recorded at install
+    /// time via the refactored `discover_skill_dirs` returning
+    /// `DiscoveredSkill { scan_root, skill_dir }`) and looks at the
+    /// right path.
+    #[test]
+    fn detect_plugin_updates_skills_with_custom_scan_path_no_false_drift() {
+        use crate::project::KiroProject;
+        use crate::service::test_support::{
+            relative_path_entry, seed_marketplace_with_registry, temp_service,
+        };
+
+        let (dir, svc) = temp_service();
+        let entries = vec![relative_path_entry("p", "plugins/p")];
+        let mp_path = seed_marketplace_with_registry(dir.path(), &svc, "mp", &entries);
+        let plugin_dir = mp_path.join("plugins/p");
+
+        // Skill source under a NON-default scan path. Pre-fix
+        // detection would look at <plugin_dir>/skills/alpha and hit
+        // NotFound.
+        let alpha_dir = plugin_dir.join("packs").join("alpha");
+        fs::create_dir_all(&alpha_dir).expect("create skill dir");
+        fs::write(
+            alpha_dir.join("SKILL.md"),
+            "---\nname: alpha\ndescription: test\n---\n",
+        )
+        .expect("write SKILL.md");
+
+        // Manifest declares the custom scan path.
+        fs::write(
+            plugin_dir.join("plugin.json"),
+            br#"{"name":"p","version":"1.0","skills":["./packs/"]}"#,
+        )
+        .expect("write plugin.json");
+
+        let project_tmp = tempfile::tempdir().expect("project tempdir");
+        let project = KiroProject::new(project_tmp.path().to_path_buf());
+
+        svc.install_plugin(&project, &mp("mp"), &pn("p"), InstallMode::New, false)
+            .expect("install");
+
+        // Sanity: install actually placed the skill so the tracking
+        // entry exists for detection to compare against.
+        assert!(
+            project_tmp
+                .path()
+                .join(".kiro/skills/alpha/SKILL.md")
+                .exists(),
+            "precondition: skill must be installed"
+        );
+
+        let result = svc.detect_plugin_updates(&project).expect("detect");
+        assert!(
+            result.updates.is_empty(),
+            "expected no updates for an unchanged skill source under a custom \
+             scan path; got: {:?}",
+            result.updates
+        );
+        assert!(
+            result.failures.is_empty(),
+            "expected no failures (pre-fix would return a HashFailed because \
+             detection looked under hardcoded `./skills/`); got: {:?}",
             result.failures
         );
     }

@@ -385,19 +385,39 @@ fn scan_for_plugins(
 /// Name of the skill definition file.
 const SKILL_MD: &str = "SKILL.md";
 
+/// One skill directory discovered under a plugin's manifest-declared
+/// skill scan paths. Carries both the scan root and the resolved skill
+/// directory so install can record `scan_root` on
+/// [`crate::project::InstalledSkillMeta::source_scan_root`] for later
+/// drift detection.
+#[derive(Debug, Clone)]
+pub struct DiscoveredSkill {
+    /// Absolute path to the scan root that contains `skill_dir`,
+    /// e.g. `<plugin_dir>/skills/` or `<plugin_dir>/packs/`.
+    /// Recorded on tracking after `strip_prefix(plugin_dir)` so
+    /// detection knows where to look without probing.
+    pub scan_root: PathBuf,
+    /// Absolute path to the skill directory itself,
+    /// e.g. `<plugin_dir>/skills/alpha/`. Contains a `SKILL.md`.
+    pub skill_dir: PathBuf,
+}
+
 /// Discover skill directories within a plugin root given a list of paths.
 ///
 /// Each entry in `skill_paths` is interpreted relative to `plugin_root`:
 ///
 /// - If it ends with `/`, it is treated as a directory to scan: every
 ///   immediate subdirectory that contains a `SKILL.md` is included.
-/// - Otherwise it is treated as a specific directory; it is included only
-///   if it contains a `SKILL.md`.
+///   The candidate path itself is the scan root for those skills.
+/// - Otherwise it is treated as a specific directory; it is included
+///   only if it contains a `SKILL.md`. The scan root is the candidate's
+///   parent (or `plugin_root` if there's no parent under it).
 ///
-/// The returned paths are sorted for deterministic ordering.
+/// The returned records are sorted on `skill_dir` for deterministic
+/// ordering.
 #[must_use]
-pub fn discover_skill_dirs(plugin_root: &Path, skill_paths: &[&str]) -> Vec<PathBuf> {
-    let mut dirs = Vec::new();
+pub fn discover_skill_dirs(plugin_root: &Path, skill_paths: &[&str]) -> Vec<DiscoveredSkill> {
+    let mut found = Vec::new();
 
     for &path_str in skill_paths {
         if let Err(e) = crate::validation::validate_relative_path(path_str) {
@@ -413,6 +433,7 @@ pub fn discover_skill_dirs(plugin_root: &Path, skill_paths: &[&str]) -> Vec<Path
 
         if path_str.ends_with('/') || path_str.ends_with('\\') {
             // Scan subdirectories for those containing SKILL.md.
+            // The candidate path IS the scan root for this branch.
             match fs::read_dir(&candidate) {
                 Ok(entries) => {
                     for entry in entries {
@@ -429,7 +450,10 @@ pub fn discover_skill_dirs(plugin_root: &Path, skill_paths: &[&str]) -> Vec<Path
                         };
                         let entry_path = entry.path();
                         if entry_path.is_dir() && entry_path.join(SKILL_MD).exists() {
-                            dirs.push(entry_path);
+                            found.push(DiscoveredSkill {
+                                scan_root: candidate.clone(),
+                                skill_dir: entry_path,
+                            });
                         }
                     }
                 }
@@ -442,7 +466,16 @@ pub fn discover_skill_dirs(plugin_root: &Path, skill_paths: &[&str]) -> Vec<Path
                 }
             }
         } else if candidate.is_dir() && candidate.join(SKILL_MD).exists() {
-            dirs.push(candidate);
+            // Bare-path branch: the scan root is the candidate's
+            // parent (or plugin_root if no parent under it). The
+            // skill dir IS the candidate.
+            let scan_root = candidate
+                .parent()
+                .map_or_else(|| plugin_root.to_path_buf(), Path::to_path_buf);
+            found.push(DiscoveredSkill {
+                scan_root,
+                skill_dir: candidate,
+            });
         } else {
             debug!(
                 path = %candidate.display(),
@@ -451,8 +484,8 @@ pub fn discover_skill_dirs(plugin_root: &Path, skill_paths: &[&str]) -> Vec<Path
         }
     }
 
-    dirs.sort();
-    dirs
+    found.sort_by(|a, b| a.skill_dir.cmp(&b.skill_dir));
+    found
 }
 
 #[cfg(test)]
@@ -564,17 +597,21 @@ mod tests {
         let dirs = discover_skill_dirs(root, &["./skills/"]);
 
         assert_eq!(dirs.len(), 2);
-        // Results should be sorted, so efcore comes before tunit.
+        // Results should be sorted on skill_dir, so efcore comes
+        // before tunit.
         assert!(
-            dirs[0].ends_with("efcore"),
+            dirs[0].skill_dir.ends_with("efcore"),
             "first should be efcore, got {:?}",
             dirs[0]
         );
         assert!(
-            dirs[1].ends_with("tunit"),
+            dirs[1].skill_dir.ends_with("tunit"),
             "second should be tunit, got {:?}",
             dirs[1]
         );
+        // Both skills came from the same scan root.
+        assert_eq!(dirs[0].scan_root, root.join("skills/"));
+        assert_eq!(dirs[1].scan_root, root.join("skills/"));
     }
 
     #[test]
@@ -590,7 +627,7 @@ mod tests {
 
         assert_eq!(dirs.len(), 1);
         assert!(
-            dirs[0].ends_with("tunit"),
+            dirs[0].skill_dir.ends_with("tunit"),
             "should find tunit, got {:?}",
             dirs[0]
         );
@@ -630,7 +667,7 @@ mod tests {
 
         assert_eq!(dirs.len(), 1, "traversal path should be skipped");
         assert!(
-            dirs[0].ends_with("legit"),
+            dirs[0].skill_dir.ends_with("legit"),
             "only the valid skill should be returned, got {:?}",
             dirs[0]
         );
@@ -647,7 +684,7 @@ mod tests {
 
         assert_eq!(dirs.len(), 1, "absolute path should be skipped");
         assert!(
-            dirs[0].ends_with("safe"),
+            dirs[0].skill_dir.ends_with("safe"),
             "only the valid skill should be returned, got {:?}",
             dirs[0]
         );

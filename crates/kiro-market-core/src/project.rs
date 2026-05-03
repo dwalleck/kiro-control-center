@@ -48,6 +48,16 @@ pub struct InstalledSkillMeta {
     /// for entries written before Stage 1 landed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub installed_hash: Option<String>,
+
+    /// Scan root (relative to `plugin_dir`) that this skill was
+    /// installed from. Required at install time; populated from the
+    /// `DiscoveredSkill.scan_root` field which `discover_skill_dirs`
+    /// returns alongside each found skill directory. Drift detection at
+    /// [`crate::service::MarketplaceService::scan_plugin_for_content_drift`]
+    /// uses this directly to locate the source skill dir for hash
+    /// recomputation, closing #97 (the hardcoded
+    /// `plugin_dir.join("skills")` bug).
+    pub source_scan_root: RelativePath,
 }
 
 /// The on-disk structure of `installed-skills.json`.
@@ -3497,6 +3507,7 @@ mod tests {
             installed_at: Utc::now(),
             source_hash: None,
             installed_hash: None,
+            source_scan_root: RelativePath::new("skills").expect("valid"),
         }
     }
 
@@ -3660,6 +3671,7 @@ mod tests {
                     "version": null,
                     "installed_at": chrono::Utc::now(),
                     "source_hash": "blake3:abc",
+                    "source_scan_root": "skills",
                 }
             }
         });
@@ -4015,7 +4027,8 @@ mod tests {
                     "plugin": "plug-a",
                     "version": "1.0.0",
                     "installed_at": now,
-                    "source_hash": "deadbeef"
+                    "source_hash": "deadbeef",
+                    "source_scan_root": "skills"
                 }
             }
         });
@@ -4095,7 +4108,8 @@ mod tests {
                 "alpha": {
                     "marketplace": "mp", "plugin": "p",
                     "version": "1.0.0", "installed_at": same_time,
-                    "source_hash": "deadbeef"
+                    "source_hash": "deadbeef",
+                    "source_scan_root": "skills"
                 }
             }
         });
@@ -4164,7 +4178,8 @@ mod tests {
             serde_json::json!({
                 "marketplace": "mp", "plugin": "p",
                 "version": "1.0.0", "installed_at": now,
-                "source_hash": "x"
+                "source_hash": "x",
+                "source_scan_root": "skills"
             })
         };
         let steering_meta = || {
@@ -5417,6 +5432,7 @@ mod tests {
                         "marketplace": "mp", "plugin": "p",
                         "version": "1.0.0", "installed_at": now,
                         "source_hash": "deadbeef",
+                        "source_scan_root": "skills",
                     }
                 }
             }))
@@ -5906,6 +5922,7 @@ mod tests {
                         "marketplace": "mp", "plugin": "p",
                         "version": "1.0.0", "installed_at": now,
                         "source_hash": "deadbeef",
+                        "source_scan_root": "skills",
                     }
                 }
             }))
@@ -6032,6 +6049,7 @@ mod tests {
                         "marketplace": "mp", "plugin": "p",
                         "version": "1.0.0", "installed_at": now,
                         "source_hash": "deadbeef",
+                        "source_scan_root": "skills",
                     }
                 }
             }))
@@ -6105,6 +6123,7 @@ mod tests {
                     installed_at: Utc::now(),
                     source_hash: Some("deadbeef".into()),
                     installed_hash: Some("deadbeef".into()),
+                    source_scan_root: RelativePath::new("skills").expect("valid"),
                 },
             )
             .expect("install skill");
@@ -6730,24 +6749,11 @@ mod tests {
         assert!(installed.skills.contains_key("racey"));
     }
 
-    #[test]
-    fn installed_skill_meta_loads_legacy_json_without_hash_fields() {
-        // Old tracking files (pre-Stage-1) lack source_hash / installed_hash.
-        // The new schema must deserialize them with both fields = None.
-        let legacy = br#"{
-            "marketplace": "m",
-            "plugin": "p",
-            "version": "1.0.0",
-            "installed_at": "2026-01-01T00:00:00Z"
-        }"#;
-
-        let meta: InstalledSkillMeta = serde_json::from_slice(legacy).unwrap();
-
-        assert_eq!(meta.marketplace, "m");
-        assert_eq!(meta.plugin, "p");
-        assert!(meta.source_hash.is_none());
-        assert!(meta.installed_hash.is_none());
-    }
+    // Deleted: `installed_skill_meta_loads_legacy_json_without_hash_fields` —
+    // legacy JSON without `source_scan_root` now fails to deserialize
+    // by design (install↔detect symmetry pass; no users → required
+    // field). The inverse contract is pinned by the deserialize-rejection
+    // tests added in Task 7 of the install-detect-symmetry plan.
 
     // Deleted: `installed_agent_meta_loads_legacy_json_without_hash_fields` —
     // legacy JSON without `source_path` now fails to deserialize by
@@ -6815,6 +6821,7 @@ mod tests {
             installed_at: chrono::Utc::now(),
             source_hash: None,
             installed_hash: None,
+            source_scan_root: RelativePath::new("skills").expect("valid"),
         };
 
         project

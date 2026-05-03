@@ -87,6 +87,8 @@ mod tests {
             installed_at: Utc::now(),
             source_hash: None,
             installed_hash: None,
+            source_scan_root: kiro_market_core::validation::RelativePath::new("skills")
+                .expect("valid"),
         };
         let skill_src = tempfile::tempdir().expect("skill src");
         std::fs::write(
@@ -115,6 +117,8 @@ mod tests {
                 installed_at: Utc::now(),
                 source_hash: None,
                 installed_hash: None,
+                source_scan_root: kiro_market_core::validation::RelativePath::new("skills")
+                    .expect("valid"),
             };
             let skill_src = tempfile::tempdir().expect("skill src");
             std::fs::write(skill_src.path().join("SKILL.md"), "# Skill\nBody")

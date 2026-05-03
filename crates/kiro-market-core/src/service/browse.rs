@@ -391,7 +391,7 @@ pub struct PluginInstallContext {
     /// [`MarketplaceService::install_plugin_agents`].
     pub plugin_dir: PathBuf,
     pub version: Option<String>,
-    pub skill_dirs: Vec<PathBuf>,
+    pub skill_dirs: Vec<crate::plugin::DiscoveredSkill>,
     /// Directories to scan for agent `.md` files inside the plugin.
     /// Derived from `plugin.json`'s `agents` field, or
     /// [`crate::DEFAULT_AGENT_PATHS`] when the manifest is absent or
@@ -846,7 +846,8 @@ fn collect_skills_for_plugin_into(
     let skill_dirs = discover_skills_for_plugin(&plugin_dir, plugin_manifest.as_ref());
     out.reserve(skill_dirs.len());
 
-    for skill_dir in &skill_dirs {
+    for discovered in &skill_dirs {
+        let skill_dir = &discovered.skill_dir;
         let skill_md_path = skill_dir.join("SKILL.md");
         let content = match fs::read_to_string(&skill_md_path) {
             Ok(c) => c,
@@ -923,15 +924,20 @@ pub(crate) fn name_hint_from_skill_dir(skill_dir: &Path) -> Option<String> {
         .map(|s| s.to_string_lossy().into_owned())
 }
 
-/// Resolve the skill-discovery paths for a plugin. Uses
+/// Resolve the skill-discovery records for a plugin. Uses
 /// `manifest.skills` when the manifest specifies any, otherwise falls
 /// back to [`crate::DEFAULT_SKILL_PATHS`]. The manifest-empty-list case
 /// also falls back — an empty `skills` field means "no custom paths",
 /// not "no skills."
+///
+/// Returns `Vec<DiscoveredSkill>` (post install↔detect symmetry) so
+/// the install caller has both the resolved skill directory AND the
+/// scan root it came from in scope, for populating
+/// `InstalledSkillMeta.source_scan_root`.
 fn discover_skills_for_plugin(
     plugin_dir: &Path,
     manifest: Option<&PluginManifest>,
-) -> Vec<PathBuf> {
+) -> Vec<crate::plugin::DiscoveredSkill> {
     let skill_paths: Vec<&str> = if let Some(m) = manifest.filter(|m| !m.skills.is_empty()) {
         m.skills.iter().map(String::as_str).collect()
     } else {
@@ -1854,6 +1860,7 @@ mod tests {
                 installed_at: Utc::now(),
                 source_hash: None,
                 installed_hash: None,
+                source_scan_root: crate::validation::RelativePath::new("skills").expect("valid"),
             },
         );
         InstalledSkills { skills }
@@ -2704,8 +2711,9 @@ mod tests {
         let mut names: Vec<String> = ctx
             .skill_dirs
             .iter()
-            .map(|p| {
-                p.file_name()
+            .map(|d| {
+                d.skill_dir
+                    .file_name()
                     .and_then(|s| s.to_str())
                     .expect("skill dir has valid UTF-8 name")
                     .to_string()
@@ -2717,7 +2725,9 @@ mod tests {
             vec!["alpha".to_string(), "beta".to_string(), "gamma".to_string()]
         );
         assert!(
-            ctx.skill_dirs.iter().all(|p| p.join("SKILL.md").is_file()),
+            ctx.skill_dirs
+                .iter()
+                .all(|d| d.skill_dir.join("SKILL.md").is_file()),
             "every skill dir must contain a SKILL.md: {:?}",
             ctx.skill_dirs
         );
@@ -2803,8 +2813,9 @@ mod tests {
         let mut names: Vec<String> = ctx
             .skill_dirs
             .iter()
-            .map(|p| {
-                p.file_name()
+            .map(|d| {
+                d.skill_dir
+                    .file_name()
                     .and_then(|s| s.to_str())
                     .expect("skill dir has valid UTF-8 name")
                     .to_string()
@@ -2813,16 +2824,18 @@ mod tests {
         names.sort();
         assert_eq!(names, vec!["bar".to_string(), "foo".to_string()]);
         assert!(
-            ctx.skill_dirs.iter().all(|p| {
-                p.components()
+            ctx.skill_dirs.iter().all(|d| {
+                d.skill_dir
+                    .components()
                     .any(|c| c.as_os_str() == std::ffi::OsStr::new("agents"))
             }),
             "every skill dir must live under agents/: {:?}",
             ctx.skill_dirs
         );
         assert!(
-            ctx.skill_dirs.iter().all(|p| {
-                !p.components()
+            ctx.skill_dirs.iter().all(|d| {
+                !d.skill_dir
+                    .components()
                     .any(|c| c.as_os_str() == std::ffi::OsStr::new("skills"))
             }),
             "no skill dir should live under the default skills/ tree: {:?}",

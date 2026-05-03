@@ -80,6 +80,7 @@ pub fn run(
     let skill_result = run_skill_install(
         &svc,
         &project,
+        &ctx.plugin_dir,
         &ctx.skill_dirs,
         skill_filter,
         mode,
@@ -176,7 +177,8 @@ fn fetch_plugin_dir(
 fn run_skill_install(
     svc: &MarketplaceService,
     project: &KiroProject,
-    skill_dirs: &[PathBuf],
+    plugin_dir: &std::path::Path,
+    skill_dirs: &[kiro_market_core::plugin::DiscoveredSkill],
     skill_filter: Option<&str>,
     mode: InstallMode,
     marketplace: &MarketplaceName,
@@ -192,6 +194,7 @@ fn run_skill_install(
     };
     svc.install_skills(
         project,
+        plugin_dir,
         skill_dirs,
         &filter,
         mode,
