@@ -1070,7 +1070,7 @@ export type PluginUpdateInfo = {
 	installed_version: string | null,
 	/**
 	 *  `None` means the marketplace plugin manifest exists but lacks
-	 *  a `version` field. After NC1's `ManifestVersion` 3-state
+	 *  a `version` field. After NC1's `ManifestState` 3-state
 	 *  split, cases where the manifest is missing or unreadable
 	 *  (symlinked, `NotFound`) surface as a [`PluginUpdateFailure`] —
 	 *  they no longer collapse into `Some(None)` here. So

@@ -2309,12 +2309,13 @@ impl MarketplaceService {
         let marketplace_path = self.marketplace_path(marketplace_name);
         let plugin_dir = self.resolve_local_plugin_dir(entry, &marketplace_path)?;
 
-        // NC1 (PR #96 re-review): when `load_plugin_manifest`
-        // collapsed `Ok(None)` for "manifest legitimately lacks
-        // version" and "manifest unreadable", the latter case combined
-        // with `installed_version: Some(_)` below to emit a phantom
-        // `PluginUpdateInfo { available_version: None, change_signal:
-        // VersionBumped }`. After the `ManifestState` 3-state split,
+        // NC1 (PR #96 re-review): pre-rename, `load_plugin_manifest_version`
+        // returned `Ok(None)` for both "manifest legitimately lacks
+        // version" and "manifest unreadable", and the latter case
+        // combined with `installed_version: Some(_)` below to emit a
+        // phantom `PluginUpdateInfo { available_version: None,
+        // change_signal: VersionBumped }`. After the `ManifestState`
+        // 3-state split (and rename to `load_plugin_manifest`),
         // unreadable surfaces as a per-plugin failure that lands in
         // `DetectUpdatesResult::failures` — never as "update available
         // to nothing".
@@ -2507,14 +2508,23 @@ impl MarketplaceService {
         let mut content_drift = false;
         let mut legacy_fallback = false;
 
-        // Skills — keyed under `skills/<name>/` per the install path's
-        // `discover_skill_dirs` recipe. Skills do not currently support
-        // a custom scan-path declaration on the manifest (the
-        // `manifest.skills: Vec<String>` field exists but the install
-        // path treats it identically across declared roots), so the
-        // hardcoded `plugin_dir.join("skills")` here is the same shape
-        // install uses today. Out of scope for the steering/agents
-        // scan-path fix.
+        // Skills — keyed under `skills/<name>/`. KNOWN BUG:
+        // `discover_skills_for_plugin` (browse.rs) honors
+        // `manifest.skills` and a plugin declaring `skills: ["./packs/"]`
+        // installs skill dirs under `<plugin_dir>/packs/<name>/`, but
+        // this loop hardcodes `plugin_dir.join("skills")` and will
+        // false-positive drift on every scan for such plugins — the
+        // same class of bug the steering/agents loops below fixed.
+        //
+        // Closing it requires either (a) probing each declared skill
+        // scan path for a directory named `<name>` (analogous to
+        // `hash_artifact_in_scan_paths` but against `hash_dir_tree`),
+        // or (b) extending `InstalledSkillMeta` with a `source_path`
+        // field so detection knows which scan root to consult without
+        // probing. Option (b) matches the `InstalledAgentMeta`
+        // precedent. Either fix is broader than the steering/agents
+        // scan-path closure shipped in this commit; tracked as a
+        // follow-up rather than expanding scope here.
         for (name, meta) in &installed_skills.skills {
             if meta.marketplace == plugin_info.marketplace && meta.plugin == plugin_info.plugin {
                 match &meta.source_hash {
@@ -5829,7 +5839,11 @@ mod tests {
     /// the scan can produce projects to a known
     /// [`PluginUpdateFailureKind`]. If the classifier ever silently
     /// returns `Other` for a variant that should have a typed
-    /// kind, this test surfaces the regression.
+    /// kind, this test surfaces the regression. The compiler enforces
+    /// *exhaustiveness* over `PluginError` (via `classify_plugin_error`),
+    /// but not *correct mapping* — a future swap of `CacheManifestInvalid`
+    /// from `ManifestInvalid` to `Other` would compile clean and silently
+    /// change wire-format kinds. This table locks the routing.
     #[test]
     fn plugin_update_failure_kind_from_error_classifies_known_variants() {
         use crate::error::{MarketplaceError, PluginError};
@@ -5845,6 +5859,35 @@ mod tests {
             (
                 Error::Plugin(PluginError::ManifestNotFound {
                     path: PathBuf::from("/x"),
+                }),
+                PluginUpdateFailureKind::ManifestUnreadable,
+            ),
+            // Cache-side variants — added in PR #96 and the canonical
+            // detection path. Pre-fix these routed through the
+            // `Error::Plugin(_)` wildcard into `Other`; post-fix they
+            // carry typed kinds. Locking the routing so a future
+            // refactor can't silently drop them back to `Other`.
+            (
+                Error::Plugin(PluginError::CacheManifestReadFailed {
+                    path: PathBuf::from("/x"),
+                    source: std::io::Error::new(std::io::ErrorKind::NotFound, "x"),
+                }),
+                PluginUpdateFailureKind::ManifestUnreadable,
+            ),
+            (
+                Error::Plugin(PluginError::CacheManifestInvalid {
+                    path: PathBuf::from("/x"),
+                    reason: "bad".into(),
+                }),
+                PluginUpdateFailureKind::ManifestInvalid,
+            ),
+            // Project-side counterparts that share the install-time
+            // error vocabulary; they may surface transitively via
+            // `resolve_local_plugin_dir`.
+            (
+                Error::Plugin(PluginError::ManifestReadFailed {
+                    path: PathBuf::from("/x"),
+                    source: std::io::Error::new(std::io::ErrorKind::PermissionDenied, "x"),
                 }),
                 PluginUpdateFailureKind::ManifestUnreadable,
             ),
@@ -6657,6 +6700,147 @@ mod tests {
             result.failures.is_empty(),
             "expected no failures (pre-fix would return a hash NotFound \
              error because detection looked under hardcoded `./steering/`); \
+             got: {:?}",
+            result.failures
+        );
+    }
+
+    /// PR #96 review I1: sibling of the steering test above for the
+    /// **native-companions** loop, which got the symmetric scan-path
+    /// fix. A plugin declaring `agents: ["./companions/"]` stores
+    /// companion files under `<plugin_dir>/companions/`, but pre-fix
+    /// detection hardcoded `<plugin_dir>/agents/` and would emit a
+    /// hash `NotFound` failure on every scan.
+    ///
+    /// The native-companions cascade has a separate, pre-existing
+    /// install-time hash bug (documented on
+    /// `detect_plugin_updates_copilot_agent_legacy_fallback` above —
+    /// install hashes against the destination, detection re-hashes
+    /// against the source, so the two never match through the install
+    /// path). To isolate the scan-path fix, we synthesize the tracking
+    /// entry by hand: compute the source-side hash directly via
+    /// `crate::hash::hash_artifact` and write it into
+    /// `installed-agents.json`. With the scan-path fix, detection
+    /// finds the companion under the declared `./companions/` root,
+    /// recomputes the matching hash, and reports no drift. Without
+    /// the scan-path fix, detection would look under `./agents/`
+    /// (which doesn't exist in this fixture), `hash_artifact` would
+    /// return `NotFound`, and the plugin would surface as a failure.
+    #[test]
+    fn detect_plugin_updates_native_companions_with_custom_scan_path_no_false_drift() {
+        use crate::project::{
+            InstalledAgentMeta, InstalledAgents, InstalledNativeCompanionsMeta, KiroProject,
+        };
+        use crate::service::test_support::{
+            relative_path_entry, seed_marketplace_with_registry, temp_service,
+        };
+        use std::collections::HashMap;
+        use std::path::PathBuf;
+
+        let (dir, svc) = temp_service();
+        let entries = vec![relative_path_entry("p", "plugins/p")];
+        let mp_path = seed_marketplace_with_registry(dir.path(), &svc, "mp", &entries);
+        let plugin_dir = mp_path.join("plugins/p");
+
+        // Companion source under a NON-default agent scan path. If
+        // detection used the hardcoded `./agents/` default,
+        // `hash_artifact_in_scan_paths` would return its synthesised
+        // NotFound and the plugin would surface as a HashFailed
+        // failure.
+        let companions_root = plugin_dir.join("companions");
+        let prompts_dir = companions_root.join("prompts");
+        fs::create_dir_all(&prompts_dir).expect("create prompts dir");
+        fs::write(prompts_dir.join("reviewer.md"), b"prompt body\n")
+            .expect("write companion source");
+
+        // Manifest declares the custom scan path. The Phase 2a fix
+        // makes `scan_plugin_for_content_drift`'s native-companions
+        // loop consult `agent_scan_paths_for_plugin(manifest)` instead
+        // of `plugin_dir.join("agents")`.
+        fs::write(
+            plugin_dir.join("plugin.json"),
+            br#"{"name":"p","version":"1.0","agents":["./companions/"]}"#,
+        )
+        .expect("write plugin.json");
+
+        // Compute the source hash directly using the install-side
+        // recipe so we can construct a tracking entry whose
+        // `source_hash` matches what the (post-fix) detection scan
+        // will recompute against the same scan root. `meta.files` is
+        // relative to the scan root, mirroring
+        // `install_native_companions_for_plugin`'s persistence shape.
+        let companion_rel = PathBuf::from("prompts/reviewer.md");
+        let source_hash =
+            crate::hash::hash_artifact(&companions_root, std::slice::from_ref(&companion_rel))
+                .expect("hash source companion");
+
+        let project_tmp = tempfile::tempdir().expect("project tempdir");
+        let project = KiroProject::new(project_tmp.path().to_path_buf());
+        let kiro_dir = project_tmp.path().join(".kiro");
+        fs::create_dir_all(&kiro_dir).expect("create .kiro");
+
+        // `installed_plugins()` aggregates from `agents.agents`,
+        // `skills.skills`, and `steering.files` — but NOT from
+        // `agents.native_companions`. Without an entry in one of those
+        // three maps the plugin would not surface in the scan loop and
+        // the test would pass vacuously. Mirror the pattern used by
+        // `detect_plugin_updates_copilot_agent_legacy_fallback`: a
+        // single legacy translated-agent entry (`source_hash: None`)
+        // registers the plugin and triggers only the harmless
+        // `legacy_fallback = true` branch, leaving the
+        // native-companions cascade as the only thing the assertion
+        // depends on.
+        let mut agents_map = HashMap::new();
+        agents_map.insert(
+            "registrar".to_string(),
+            InstalledAgentMeta {
+                marketplace: mp("mp"),
+                plugin: pn("p"),
+                version: Some("1.0".to_owned()),
+                installed_at: chrono::Utc::now(),
+                dialect: crate::agent::AgentDialect::Native,
+                source_path: None,
+                source_hash: None,
+                installed_hash: None,
+            },
+        );
+
+        let mut companions = HashMap::new();
+        companions.insert(
+            "p".to_string(),
+            InstalledNativeCompanionsMeta {
+                marketplace: mp("mp"),
+                plugin: pn("p"),
+                version: Some("1.0".to_owned()),
+                installed_at: chrono::Utc::now(),
+                files: vec![companion_rel.clone()],
+                source_hash: source_hash.clone(),
+                // installed_hash isn't consulted by the drift scan;
+                // any value works for this test.
+                installed_hash: source_hash,
+            },
+        );
+        let installed = InstalledAgents {
+            agents: agents_map,
+            native_companions: companions,
+        };
+        fs::write(
+            kiro_dir.join("installed-agents.json"),
+            serde_json::to_vec_pretty(&installed).expect("serialize tracking"),
+        )
+        .expect("write installed-agents.json");
+
+        let result = svc.detect_plugin_updates(&project).expect("detect");
+        assert!(
+            result.updates.is_empty(),
+            "expected no updates for an unchanged native-companions bundle \
+             under a custom agent scan path; got: {:?}",
+            result.updates
+        );
+        assert!(
+            result.failures.is_empty(),
+            "expected no failures (pre-fix would return a hash NotFound \
+             error because detection looked under hardcoded `./agents/`); \
              got: {:?}",
             result.failures
         );
