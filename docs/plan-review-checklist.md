@@ -7,13 +7,18 @@ plan that produced the PR).
 Originated from the PR #64 retrospective. The April 23 plan-review pass
 caught 17 grounding issues before any code was written — the gates here
 codify *what* that pass was looking for so future plan-reviews don't
-have to rediscover the categories. Reading order: this doc complements
-the upstream `superpowers:writing-plans` skill; apply these gates after
-the skill's own self-review step.
+have to rediscover the categories. Gate 6 was added later from the
+PR #96 retrospective (the steering/agents scan-path bug, with its
+skills sibling tracked at issue #97) — three loops in one function
+shipped the same "implementer faithfully encoded a plan that
+transcribed install-time output instead of citing install-time
+mechanism" bug. Reading order: this doc complements the upstream
+`superpowers:writing-plans` skill; apply these gates after the
+skill's own self-review step.
 
 ## When to apply
 
-- After writing a plan, before opening it for code: run all five gates
+- After writing a plan, before opening it for code: run all six gates
   yourself and patch the plan with an amendments doc (see
   `docs/plans/2026-04-24-stage2-3-plan-amendments.md` for the precedent
   format).
@@ -245,6 +250,89 @@ both at plan-review time.
 - `InstalledSteeringOutcome { was_idempotent: bool, forced_overwrite:
   bool }` with a meaningless `(true, true)` state — fixed mid-plan
   (Issue #59) with `InstallOutcomeKind` 3-variant enum.
+
+---
+
+## Gate 6 — Reference vs Transcription
+
+**What to check.** For every literal value the plan includes —
+concrete paths, type shapes, JSON examples, error variant lists,
+function-signature paraphrases, hash recipes — ask: "Is this
+transcribed from code that already exists?" If yes, replace the
+transcription with a citation (`see X at file:line`, `mirrors Y in
+module::function`, `derived via helper Z`). Transcriptions fork the
+spec into two sources of truth that drift: the original code and the
+plan's restatement. The implementer faithfully encodes the plan's
+restatement, and any drift between the restatement and current code
+ships as a bug — one that reads as correct because the implementation
+matches the plan.
+
+**Where to look.**
+
+- Scan the plan for literal-looking content: path strings, type
+  definitions, JSON blobs, variant lists, function-signature
+  paraphrases. For each, ask whether it describes something that
+  already exists in the codebase.
+- For every "mirrors X" / "matches install" / "same as Y" claim,
+  check that the plan names the actual operation (with a `file:line`
+  reference) rather than describing what that operation produces
+  *under current default settings*.
+- Net-new types and shapes the plan is *introducing* are exempt —
+  mark them with a "NEW:" prefix or place them in a "Net-new types"
+  section so reviewers can distinguish "introduced by this plan"
+  from "copied from existing code." Truncated illustrative examples
+  are also fine — mark with "(example; canonical shape at X)".
+
+**Fail signature.** PR #96's update-detection plan transcribed the
+cache-path resolution recipe as literal path strings:
+
+```
+Cache path resolution:
+  - Skills:           <marketplace_path>/skills/<skill_name>/
+  - Steering:         <marketplace_path>/steering/<rel_path>
+  - Agents:           <marketplace_path>/agents/<rel_path>
+  - Native companions: <marketplace_path>/<companion_paths>
+```
+
+These were what `discover_skills_for_plugin`,
+`discover_steering_files_in_dirs`, and the native-agent discovery
+sites produce *under default scan paths*. The implementer faithfully
+encoded `plugin_dir.join("skills")` / `plugin_dir.join("steering")` /
+`plugin_dir.join("agents")` and the implementation false-positive-
+drifted every plugin declaring `skills: ["./packs/"]` /
+`steering: ["./guides/"]` / `agents: ["./companions/"]`. Three loops
+in one function, three identical bugs. Fixed for steering + agents
+in PR #96 review-of-review (commit `01bc89d`); skills tracked at
+issue #97.
+
+The 5-gate plan-review pass at write-time didn't catch it because
+the literal path strings *look correct on a casual read* — they ARE
+what the cache layout looks like for plugins that use the default
+scan paths. Cite-don't-transcribe would have caught it: the plan
+should have said
+
+> "Use `steering_scan_paths_for_plugin(manifest)` to resolve scan
+> roots; mirror the install path's `hash_artifact(scan_root, &[rel])`
+> recipe at `service/mod.rs:1568`."
+
+instead of writing literal path strings. The same shape applies more
+broadly:
+
+- A plan that re-states a struct's field list when the struct
+  already exists has the same drift risk (see PR #96 review #2 — a
+  Phase 1 design doc's `RemovePluginResult` sketch had drifted from
+  the implementation by the time Phase 2a landed).
+- A plan that paraphrases a JSON wire format derived via
+  `serde::Serialize` will drift the moment a field is added,
+  removed, or renamed.
+- A plan that paraphrases an error enum's variant list will silently
+  exclude variants added between plan-write and plan-execute.
+
+Anywhere the plan paraphrases code that already exists is a
+cite-don't-transcribe candidate. Every literal value in a plan is a
+future drift point; replacing it with a citation costs almost
+nothing at write-time and prevents an entire class of "implementation
+faithfully encoded a stale spec" bugs.
 
 ---
 
