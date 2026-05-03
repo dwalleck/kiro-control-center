@@ -149,6 +149,13 @@ pub struct InstalledNativeCompanionsMeta {
     pub files: Vec<PathBuf>,
     pub source_hash: String,
     pub installed_hash: String,
+    /// Scan root (relative to `plugin_dir`) that this companion bundle
+    /// was installed from. Required at install time. The
+    /// single-scan-root invariant is enforced upstream by
+    /// `multiple_companion_scan_roots`, so all `files` resolve under
+    /// this single root. Drift detection uses it directly, replacing
+    /// PR #96's `hash_artifact_in_scan_paths` probe.
+    pub source_scan_root: RelativePath,
 }
 
 /// The on-disk structure of `installed-agents.json`.
@@ -318,6 +325,11 @@ pub struct NativeCompanionsInput<'a> {
     pub version: Option<&'a str>,
     pub source_hash: &'a str,
     pub mode: crate::service::InstallMode,
+    /// Plugin root directory; used to compute
+    /// [`InstalledNativeCompanionsMeta::source_scan_root`] from
+    /// `scan_root` at install time so detection can lookup the
+    /// source location directly without probing.
+    pub plugin_dir: &'a Path,
 }
 
 /// Input bundle for [`KiroProject::install_native_agent`]. Groups the
@@ -683,6 +695,15 @@ struct CompanionInput<'a> {
     version: Option<&'a str>,
     agents_root: &'a Path,
     prompt_rel: &'a Path,
+    /// Scan root (relative to `plugin_dir`) under which the original
+    /// agent .md was discovered; used to populate
+    /// [`InstalledNativeCompanionsMeta::source_scan_root`]. For the
+    /// translated-agents companion synthesis path the prompts are
+    /// extracted (not separately stored in the source tree), so this
+    /// value is the agent's source-side scan root by convention —
+    /// closing C-1 (the install/detect hash recipe asymmetry for
+    /// translated companions) is tracked at issue #99.
+    source_scan_root: &'a RelativePath,
 }
 
 /// Output of [`KiroProject::promote_staged_agent`]: paths placed at their
@@ -2215,6 +2236,27 @@ impl KiroProject {
                 let marketplace = meta.marketplace.clone();
                 let plugin = meta.plugin.clone();
                 let version = meta.version.clone();
+                // Source-side scan root for the synthesized companion
+                // entry: prompt is extracted from agent .md, so use
+                // the agent's source_path.parent() (typically
+                // "agents") by convention. C-1 (issue #99) tracks
+                // install/detect hash recipe alignment.
+                let companion_scan_root = meta
+                    .source_path
+                    .as_str()
+                    .rsplit_once('/')
+                    .and_then(|(parent, _)| crate::validation::RelativePath::new(parent).ok())
+                    .unwrap_or_else(|| {
+                        // Static literal "agents" trivially passes
+                        // validate_relative_path; the unchecked
+                        // constructor is the right shape per CLAUDE.md
+                        // (no .expect() in production code) and matches
+                        // existing internal callers like
+                        // DiscoveredPlugin::as_relative_path.
+                        crate::validation::RelativePath::from_internal_unchecked(
+                            "agents".to_owned(),
+                        )
+                    });
 
                 installed.agents.insert(def.name.clone(), meta);
 
@@ -2254,6 +2296,7 @@ impl KiroProject {
                         version: version.as_deref(),
                         agents_root: &agents_root,
                         prompt_rel: &prompt_rel,
+                        source_scan_root: &companion_scan_root,
                     },
                 ) {
                     warn!(
@@ -2478,6 +2521,7 @@ impl KiroProject {
                 files: Vec::new(),
                 source_hash: String::new(),
                 installed_hash: String::new(),
+                source_scan_root: input.source_scan_root.clone(),
             });
         // Refresh marketplace/version/timestamp on every install.
         companion_entry.marketplace = input.marketplace.clone();
@@ -2945,6 +2989,20 @@ impl KiroProject {
         let diffed_prior_files =
             Self::diff_prior_companion_files(&installed, input.plugin, input.rel_paths);
 
+        let source_scan_root =
+            crate::validation::RelativePath::from_path_under(input.scan_root, input.plugin_dir)
+                .map_err(|e| AgentError::InstallFailed {
+                    path: input.scan_root.to_path_buf(),
+                    source: Box::new(crate::error::Error::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!(
+                            "native companion scan_root `{}` not under plugin_dir `{}`: {e}",
+                            input.scan_root.display(),
+                            input.plugin_dir.display(),
+                        ),
+                    ))),
+                })?;
+
         installed.native_companions.insert(
             // HashMap key remains `String` (out of scope per Phase 1.5
             // design — only the meta-value's `plugin: PluginName` field
@@ -2958,6 +3016,7 @@ impl KiroProject {
                 files: input.rel_paths.to_vec(),
                 source_hash: input.source_hash.to_string(),
                 installed_hash: installed_hash.clone(),
+                source_scan_root,
             },
         );
 
@@ -3793,6 +3852,7 @@ mod tests {
                     "files": [],
                     "source_hash": "blake3:abc",
                     "installed_hash": "blake3:abc",
+                    "source_scan_root": "agents",
                 }
             }
         });
@@ -3836,6 +3896,7 @@ mod tests {
                     "files": ["../../etc/passwd"],
                     "source_hash": "blake3:abc",
                     "installed_hash": "blake3:abc",
+                    "source_scan_root": "agents",
                 }
             }
         });
@@ -5317,6 +5378,7 @@ mod tests {
                 version: None,
                 source_hash: &h_a,
                 mode: crate::service::InstallMode::New,
+                plugin_dir: scratch_a.path(),
             })
             .expect("plugin-a install");
 
@@ -5346,6 +5408,7 @@ mod tests {
                 version: None,
                 source_hash: &h_b,
                 mode: crate::service::InstallMode::Force,
+                plugin_dir: scratch_b.path(),
             })
             .expect("plugin-b force install");
 
@@ -5872,6 +5935,7 @@ mod tests {
                         "files": [],
                         "source_hash": "x",
                         "installed_hash": "x",
+                        "source_scan_root": "agents",
                     }
                 }
             }))
@@ -5921,6 +5985,7 @@ mod tests {
                         "files": ["prompts/helper.md"],
                         "source_hash": "x",
                         "installed_hash": "x",
+                        "source_scan_root": "agents",
                     }
                 }
             }))
@@ -6335,6 +6400,7 @@ mod tests {
                         "files": [],
                         "source_hash": "x",
                         "installed_hash": "x",
+                        "source_scan_root": "agents",
                     }
                 }
             }))
@@ -6838,6 +6904,7 @@ mod tests {
             ],
             source_hash: "blake3:abc".into(),
             installed_hash: "blake3:abc".into(),
+            source_scan_root: RelativePath::new("agents").expect("valid"),
         };
         let bytes = serde_json::to_vec(&meta).unwrap();
         let back: InstalledNativeCompanionsMeta = serde_json::from_slice(&bytes).unwrap();
@@ -7520,6 +7587,7 @@ mod tests {
                 version: Some("0.1.0"),
                 source_hash: &source_hash,
                 mode: crate::service::InstallMode::New,
+                plugin_dir: dir.path(),
             })
             .expect("install companions");
 
@@ -7568,6 +7636,7 @@ mod tests {
                 version: None,
                 source_hash: "blake3:empty",
                 mode: crate::service::InstallMode::New,
+                plugin_dir: std::path::Path::new("/tmp"),
             })
             .expect("empty install");
         assert_eq!(outcome.kind, InstallOutcomeKind::Idempotent);
@@ -7612,6 +7681,7 @@ mod tests {
                 version: None,
                 source_hash: &h,
                 mode: crate::service::InstallMode::New,
+                plugin_dir: scratch.path(),
             })
             .expect_err("hardlinked source must be refused");
         match err {
@@ -7655,6 +7725,7 @@ mod tests {
                 plugin: &pn("p"),
                 version: None,
                 source_hash: &h_v1,
+                plugin_dir: scratch.path(),
                 mode: crate::service::InstallMode::New,
             })
             .expect("v1 install");
@@ -7689,6 +7760,7 @@ mod tests {
                 version: None,
                 source_hash: &h_v2,
                 mode: crate::service::InstallMode::Force,
+                plugin_dir: scratch.path(),
             })
             .expect_err("tracking write must fail");
         assert!(matches!(err, AgentError::InstallFailed { .. }));
@@ -7746,6 +7818,7 @@ mod tests {
                 version: None,
                 source_hash: &source_hash,
                 mode: crate::service::InstallMode::New,
+                plugin_dir: scratch.path(),
             })
             .expect_err("tracking write must fail with .tmp dir blocker in place");
         assert!(matches!(err, AgentError::InstallFailed { .. }));
@@ -7825,6 +7898,7 @@ mod tests {
             version: None,
             source_hash: &f.source_hash,
             mode,
+            plugin_dir: f.scratch.path(),
         })
     }
 
@@ -7994,6 +8068,7 @@ mod tests {
                 version: None,
                 source_hash: &h_b,
                 mode: crate::service::InstallMode::New,
+                plugin_dir: companion_bundle.scratch.path(),
             })
             .expect_err("must refuse");
         match err {
@@ -8017,6 +8092,7 @@ mod tests {
                 version: None,
                 source_hash: &h_b,
                 mode: crate::service::InstallMode::Force,
+                plugin_dir: companion_bundle.scratch.path(),
             })
             .expect("force transfer");
         assert_eq!(outcome.kind, InstallOutcomeKind::ForceOverwrote);

@@ -1950,6 +1950,7 @@ impl MarketplaceService {
             version: ctx.version,
             source_hash: &source_hash,
             mode: ctx.mode,
+            plugin_dir,
         }) {
             Ok(outcome) => result.installed_companions = Some(outcome),
             Err(err) => result.failed.push(FailedAgent {
@@ -2342,7 +2343,6 @@ impl MarketplaceService {
         let (content_drift, legacy_fallback) = Self::scan_plugin_for_content_drift(
             plugin_info,
             &plugin_dir,
-            Some(&manifest),
             installed_skills,
             installed_steering,
             installed_agents,
@@ -2493,7 +2493,6 @@ impl MarketplaceService {
     fn scan_plugin_for_content_drift(
         plugin_info: &crate::project::InstalledPluginInfo,
         plugin_dir: &Path,
-        manifest: Option<&crate::plugin::PluginManifest>,
         installed_skills: &crate::project::InstalledSkills,
         installed_steering: &crate::project::InstalledSteering,
         installed_agents: &crate::project::InstalledAgents,
@@ -2561,17 +2560,14 @@ impl MarketplaceService {
             }
         }
 
-        // Native companions — same probe-each-scan-path treatment as
-        // steering. Install hashes via `hash_artifact(&scan_root,
-        // &rel_paths)` per `install_native_companions_for_plugin`,
-        // and the install path requires every companion in the bundle
-        // to share a single scan root (`MultipleScanRootsNotSupported`
-        // errors otherwise) — so `meta.files` resolves under whichever
-        // configured agent scan path actually contains the bundle.
-        let agent_paths = crate::service::browse::agent_scan_paths_for_plugin(manifest);
+        // Native companions — direct lookup against the install-recorded
+        // scan root. Single-scan-root invariant is enforced upstream
+        // by `multiple_companion_scan_roots`, so all `meta.files`
+        // resolve under one root.
         for meta in installed_agents.native_companions.values() {
             if meta.marketplace == plugin_info.marketplace && meta.plugin == plugin_info.plugin {
-                let computed = hash_artifact_in_scan_paths(plugin_dir, &agent_paths, &meta.files)?;
+                let scan_root = plugin_dir.join(meta.source_scan_root.as_str());
+                let computed = crate::hash::hash_artifact(&scan_root, &meta.files)?;
                 if computed != meta.source_hash {
                     content_drift = true;
                     return Ok((content_drift, legacy_fallback));
@@ -2581,57 +2577,6 @@ impl MarketplaceService {
 
         Ok((content_drift, legacy_fallback))
     }
-}
-
-/// Try to hash `rel_paths` against each `scan_path` joined to
-/// `plugin_dir`, returning the first successful hash. Probes the
-/// configured scan paths in order and recovers from
-/// `ErrorKind::NotFound` so a plugin whose files moved between
-/// configured scan roots (or whose manifest lists multiple roots) is
-/// detected at whichever root actually contains the bundle.
-/// Non-`NotFound` hash errors propagate immediately so genuine
-/// permission / I/O issues are not masked.
-///
-/// If every scan path returned `NotFound`, the last `NotFound` error
-/// is propagated so the caller (`scan_plugin_for_content_drift`)
-/// surfaces it as a per-plugin failure with a path the user can
-/// investigate. `scan_paths` is empty in practice only if the helpers
-/// in [`crate::service::browse`] regress — both fall back to
-/// non-empty defaults — so the empty-vec branch synthesises a generic
-/// `NotFound` rather than panicking.
-fn hash_artifact_in_scan_paths(
-    plugin_dir: &Path,
-    scan_paths: &[String],
-    rel_paths: &[PathBuf],
-) -> Result<String, Error> {
-    let mut last_not_found: Option<Error> = None;
-    for sp in scan_paths {
-        // `discover_steering_files_in_dirs` and the agent-discovery
-        // siblings strip the leading `./` before joining; mirror that
-        // here so the resolved path matches install-time exactly
-        // regardless of whether the manifest writes `"steering/"` or
-        // `"./steering/"`.
-        let scan_root = plugin_dir.join(sp.trim_start_matches("./"));
-        match crate::hash::hash_artifact(&scan_root, rel_paths) {
-            Ok(h) => return Ok(h),
-            Err(crate::hash::HashError::ReadFailed { path, source })
-                if source.kind() == std::io::ErrorKind::NotFound =>
-            {
-                last_not_found = Some(crate::hash::HashError::ReadFailed { path, source }.into());
-            }
-            Err(e) => return Err(e.into()),
-        }
-    }
-    Err(last_not_found.unwrap_or_else(|| {
-        crate::hash::HashError::ReadFailed {
-            path: plugin_dir.to_path_buf(),
-            source: std::io::Error::new(
-                std::io::ErrorKind::NotFound,
-                "no scan paths configured for plugin",
-            ),
-        }
-        .into()
-    }))
 }
 
 /// 3-state outcome of [`MarketplaceService::load_plugin_manifest`].
@@ -6927,6 +6872,10 @@ mod tests {
                 // installed_hash isn't consulted by the drift scan;
                 // any value works for this test.
                 installed_hash: source_hash,
+                // Test installs companion at <plugin_dir>/companions/...,
+                // so source_scan_root must point detection there.
+                source_scan_root: crate::validation::RelativePath::new("companions")
+                    .expect("valid"),
             },
         );
         let installed = InstalledAgents {
