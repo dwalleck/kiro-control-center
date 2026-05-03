@@ -946,7 +946,7 @@ fn discover_skills_for_plugin(
 /// or its `agents` list is empty. Mirrors the "empty list means no
 /// custom paths, not no agents" fallback policy used by
 /// [`discover_skills_for_plugin`].
-fn agent_scan_paths_for_plugin(manifest: Option<&PluginManifest>) -> Vec<String> {
+pub(super) fn agent_scan_paths_for_plugin(manifest: Option<&PluginManifest>) -> Vec<String> {
     if let Some(m) = manifest.filter(|m| !m.agents.is_empty()) {
         m.agents.clone()
     } else {
@@ -961,7 +961,7 @@ fn agent_scan_paths_for_plugin(manifest: Option<&PluginManifest>) -> Vec<String>
 /// back to [`crate::DEFAULT_STEERING_PATHS`] when the manifest is absent
 /// or its `steering` list is empty. Mirrors
 /// [`agent_scan_paths_for_plugin`].
-fn steering_scan_paths_for_plugin(manifest: Option<&PluginManifest>) -> Vec<String> {
+pub(super) fn steering_scan_paths_for_plugin(manifest: Option<&PluginManifest>) -> Vec<String> {
     if let Some(m) = manifest.filter(|m| !m.steering.is_empty()) {
         m.steering.clone()
     } else {

@@ -227,6 +227,15 @@ No new Tauri command. The update action is `install_plugin(project, &marketplace
 
 Phase 1's `RemovePluginResult { skills_removed: u32, steering_removed: u32, agents_removed: u32 }` is asymmetric with `InstallPluginResult` (which carries `Vec`-typed sub-results, not just counts). Phase 1.5 deferred this reshape so the wire-format change could land alongside the InstalledTab UI work that consumes it.
 
+> **Superseded by Phase 2a.** The sketch below was the design-time
+> shape; the implementation that landed in PR #96 uses nested
+> per-content-type sub-results (`skills`, `steering`, `agents` each
+> carrying `removed` + `failures`) and drops the `marketplace` /
+> `plugin` echo fields (caller already passed them to `remove_plugin`).
+> See `docs/plans/2026-04-30-phase-2a-update-detection-design.md` for
+> the canonical shape and `crates/kiro-market-core/src/project.rs`'s
+> `RemovePluginResult` for the implementation.
+
 ```rust
 pub struct RemovePluginResult {
     pub marketplace: MarketplaceName,

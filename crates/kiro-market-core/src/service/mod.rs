@@ -486,7 +486,7 @@ pub struct PluginUpdateInfo {
     /// `Some(None)` here.
     pub installed_version: Option<String>,
     /// `None` means the marketplace plugin manifest exists but lacks
-    /// a `version` field. After NC1's `ManifestVersion` 3-state
+    /// a `version` field. After NC1's `ManifestState` 3-state
     /// split, cases where the manifest is missing or unreadable
     /// (symlinked, `NotFound`) surface as a [`PluginUpdateFailure`] —
     /// they no longer collapse into `Some(None)` here. So
@@ -554,37 +554,25 @@ pub enum PluginUpdateFailureKind {
 impl PluginUpdateFailureKind {
     /// Project an [`Error`] into the right
     /// [`PluginUpdateFailureKind`] variant. Exhaustive per the
-    /// CLAUDE.md classifier rule — every entry-point error class
-    /// `check_plugin_for_update` can produce is enumerated; the
-    /// final `Other` arm is reserved for genuinely unanticipated
-    /// errors and is intentional rather than a `_` catch-all.
+    /// CLAUDE.md classifier rule — `Error::Plugin` delegates to
+    /// [`classify_plugin_error`] which enumerates every
+    /// [`PluginError`] variant explicitly; remaining top-level
+    /// categories are listed by name. Adding a new
+    /// [`PluginError`] variant produces a compile error in
+    /// `classify_plugin_error`, which is the forcing function the
+    /// rule requires.
     #[must_use]
     pub fn from_error(err: &Error) -> Self {
         match err {
-            Error::Plugin(PluginError::NotFound { .. }) => Self::MarketplaceUnavailable,
-            // Cache-side variants are the canonical detection path
-            // (Phase 2a). Project-side variants
-            // (`ManifestReadFailed` / `InvalidManifest`) map here too
-            // because `check_plugin_for_update` may surface them
-            // transitively via `resolve_local_plugin_dir` which
-            // shares the install-time error vocabulary.
-            Error::Plugin(
-                PluginError::ManifestNotFound { .. }
-                | PluginError::ManifestReadFailed { .. }
-                | PluginError::CacheManifestReadFailed { .. },
-            ) => Self::ManifestUnreadable,
-            Error::Plugin(
-                PluginError::InvalidManifest { .. } | PluginError::CacheManifestInvalid { .. },
-            ) => Self::ManifestInvalid,
+            Error::Plugin(pe) => classify_plugin_error(pe),
             Error::Hash(_) => Self::HashFailed,
             Error::Marketplace(crate::error::MarketplaceError::NotFound { .. }) => {
                 Self::MarketplaceUnavailable
             }
-            // All other Plugin variants and all other top-level
-            // Error categories route to Other. Written down so a new
-            // variant lands here intentionally rather than silently.
-            Error::Plugin(_)
-            | Error::Marketplace(_)
+            // Remaining top-level Error categories route to Other.
+            // Written down so a new top-level variant lands here
+            // intentionally rather than silently.
+            Error::Marketplace(_)
             | Error::Skill(_)
             | Error::Agent(_)
             | Error::Steering(_)
@@ -593,6 +581,49 @@ impl PluginUpdateFailureKind {
             | Error::Io(_)
             | Error::Json(_) => Self::Other,
         }
+    }
+}
+
+/// Classify a [`PluginError`] for [`PluginUpdateFailureKind::from_error`].
+///
+/// Every variant is matched explicitly so a newly-added
+/// [`PluginError`] forces a compile-time decision here. `PluginError`
+/// is `#[non_exhaustive]`, but that attribute only requires a wildcard
+/// in *external* crates — within `kiro-market-core` an exhaustive match
+/// still triggers a non-exhaustive-pattern error when a variant lands
+/// without a corresponding arm. Mirrors
+/// [`crate::service::browse::SkippedReason::from_plugin_error`]'s
+/// structure, which the CLAUDE.md classifier-rule docs cite as the
+/// canonical example.
+fn classify_plugin_error(err: &PluginError) -> PluginUpdateFailureKind {
+    match err {
+        PluginError::NotFound { .. } => PluginUpdateFailureKind::MarketplaceUnavailable,
+        // Cache-side variants are the canonical detection path
+        // (Phase 2a). Project-side variants (`ManifestNotFound`,
+        // `ManifestReadFailed`) map here too because
+        // `check_plugin_for_update` may surface them transitively via
+        // `resolve_local_plugin_dir`, which shares the install-time
+        // error vocabulary.
+        PluginError::ManifestNotFound { .. }
+        | PluginError::ManifestReadFailed { .. }
+        | PluginError::CacheManifestReadFailed { .. } => {
+            PluginUpdateFailureKind::ManifestUnreadable
+        }
+        PluginError::InvalidManifest { .. } | PluginError::CacheManifestInvalid { .. } => {
+            PluginUpdateFailureKind::ManifestInvalid
+        }
+        // The remaining variants all surface during install /
+        // discovery, not detection — they should not reach
+        // `from_error` in practice. Routing them through `Other`
+        // keeps the wire format honest if one ever does, while the
+        // exhaustive match guarantees a new `PluginError` variant
+        // forces a fresh classification decision.
+        PluginError::NoSkills { .. }
+        | PluginError::DirectoryMissing { .. }
+        | PluginError::NotADirectory { .. }
+        | PluginError::SymlinkRefused { .. }
+        | PluginError::DirectoryUnreadable { .. }
+        | PluginError::RemoteSourceNotLocal { .. } => PluginUpdateFailureKind::Other,
     }
 }
 
@@ -2278,18 +2309,18 @@ impl MarketplaceService {
         let marketplace_path = self.marketplace_path(marketplace_name);
         let plugin_dir = self.resolve_local_plugin_dir(entry, &marketplace_path)?;
 
-        // NC1 (PR #96 re-review): when `load_plugin_manifest_version`
+        // NC1 (PR #96 re-review): when `load_plugin_manifest`
         // collapsed `Ok(None)` for "manifest legitimately lacks
         // version" and "manifest unreadable", the latter case combined
         // with `installed_version: Some(_)` below to emit a phantom
         // `PluginUpdateInfo { available_version: None, change_signal:
-        // VersionBumped }`. After the `ManifestVersion` 3-state split,
+        // VersionBumped }`. After the `ManifestState` 3-state split,
         // unreadable surfaces as a per-plugin failure that lands in
         // `DetectUpdatesResult::failures` — never as "update available
         // to nothing".
-        let available_version = match Self::load_plugin_manifest_version(&plugin_dir)? {
-            ManifestVersion::Found(v) => v,
-            ManifestVersion::Unreadable { reason } => {
+        let manifest = match Self::load_plugin_manifest(&plugin_dir)? {
+            ManifestState::Found(m) => m,
+            ManifestState::Unreadable { reason } => {
                 let manifest_path = plugin_dir.join("plugin.json");
                 // CacheManifestReadFailed's Display embeds the path;
                 // we wrap the symlink/missing distinction into the
@@ -2305,10 +2336,19 @@ impl MarketplaceService {
                 .into());
             }
         };
+        let available_version = manifest.version.clone();
 
+        // Pass the manifest into the drift scan so steering and
+        // native-companion hashing probe the same scan paths the
+        // install used. Pre-fix, `scan_plugin_for_content_drift`
+        // hardcoded `plugin_dir/steering` and `plugin_dir/agents`,
+        // which produced false-positive drift on every scan for
+        // plugins declaring custom `steering: [...]` /
+        // `agents: [...]` paths.
         let (content_drift, legacy_fallback) = Self::scan_plugin_for_content_drift(
             plugin_info,
             &plugin_dir,
+            Some(&manifest),
             installed_skills,
             installed_steering,
             installed_agents,
@@ -2353,18 +2393,22 @@ impl MarketplaceService {
         Ok(None)
     }
 
-    /// Load `plugin.json` from `plugin_dir` and report the manifest's
-    /// `version` field — distinguishing between three semantically
-    /// distinct outcomes per NC1 (PR #96 re-review):
+    /// Load `plugin.json` from `plugin_dir` and return the full parsed
+    /// [`crate::plugin::PluginManifest`] — three semantically distinct
+    /// outcomes per NC1 (PR #96 re-review):
     ///
-    /// - [`ManifestVersion::Found(Some(v))`] — manifest read; `version`
-    ///   field present.
-    /// - [`ManifestVersion::Found(None)`] — manifest read; `version`
-    ///   field legitimately absent.
-    /// - [`ManifestVersion::Unreadable`] — manifest could not be read for
+    /// - [`ManifestState::Found`] — manifest read and parsed. Caller
+    ///   reads `.version` for the version comparison AND `.agents` /
+    ///   `.steering` for the scan-path probing in
+    ///   [`Self::scan_plugin_for_content_drift`] (per the
+    ///   manifest-respects-scan-paths fix from the PR #96 re-review;
+    ///   pre-fix, drift detection compared against the hardcoded
+    ///   `./steering/` and `./agents/` defaults regardless of what the
+    ///   manifest declared).
+    /// - [`ManifestState::Unreadable`] — manifest could not be read for
     ///   a non-fatal reason (symlink-refused or `NotFound`). The
     ///   caller must surface this as a per-plugin failure rather than
-    ///   collapse it with the `Found(None)` arm — otherwise the
+    ///   collapse it with `Found(_).version.is_none()` — otherwise the
     ///   version-comparison logic produces a phantom
     ///   `PluginUpdateInfo { available_version: None, change_signal:
     ///   VersionBumped }` whenever an installed plugin happens to carry
@@ -2382,7 +2426,7 @@ impl MarketplaceService {
     /// reads are bounded at [`MAX_PLUGIN_MANIFEST_BYTES`] so a malicious
     /// marketplace shipping a multi-GB `plugin.json` cannot OOM the
     /// process before serde sees a byte.
-    fn load_plugin_manifest_version(plugin_dir: &Path) -> Result<ManifestVersion, Error> {
+    fn load_plugin_manifest(plugin_dir: &Path) -> Result<ManifestState, Error> {
         let manifest_path = plugin_dir.join("plugin.json");
 
         // Symlink defense: refuse to follow symlinks (C5 security fix).
@@ -2392,13 +2436,13 @@ impl MarketplaceService {
                     path = %manifest_path.display(),
                     "plugin.json is a symlink, refusing to follow; treating as unreadable"
                 );
-                return Ok(ManifestVersion::Unreadable {
+                return Ok(ManifestState::Unreadable {
                     reason: "plugin.json is a symlink — refused".to_owned(),
                 });
             }
             Ok(_) => {}
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(ManifestVersion::Unreadable {
+                return Ok(ManifestState::Unreadable {
                     reason: "plugin.json missing in marketplace cache".to_owned(),
                 });
             }
@@ -2423,7 +2467,7 @@ impl MarketplaceService {
         };
 
         match crate::plugin::PluginManifest::from_json(&bytes) {
-            Ok(manifest) => Ok(ManifestVersion::Found(manifest.version)),
+            Ok(manifest) => Ok(ManifestState::Found(manifest)),
             Err(e) => Err(PluginError::CacheManifestInvalid {
                 path: manifest_path,
                 reason: error_full_chain(&e),
@@ -2436,6 +2480,18 @@ impl MarketplaceService {
     /// their stored `source_hash` against freshly-computed hashes from
     /// `plugin_dir`.
     ///
+    /// `manifest` is the plugin's parsed `plugin.json`, used to derive
+    /// the configured `agents` / `steering` scan paths so detection
+    /// hashes against the same roots install used. Pre-fix the
+    /// steering and native-companion loops hardcoded `plugin_dir/
+    /// steering` and `plugin_dir/agents`, producing false-positive
+    /// drift on every scan for plugins declaring custom paths
+    /// (PR #96 review #6). The manifest is `Option<&...>` so callers
+    /// that lack a parsed manifest fall back to
+    /// [`crate::DEFAULT_STEERING_PATHS`] / [`crate::DEFAULT_AGENT_PATHS`]
+    /// via the same helpers `MarketplaceService::install_plugin`
+    /// uses.
+    ///
     /// `content_drift = false && legacy_fallback = true` means "no drift
     /// detected among hashable entries; some entries had no `source_hash`
     /// so a clean miss is possible." Callers should treat `legacy_fallback`
@@ -2443,6 +2499,7 @@ impl MarketplaceService {
     fn scan_plugin_for_content_drift(
         plugin_info: &crate::project::InstalledPluginInfo,
         plugin_dir: &Path,
+        manifest: Option<&crate::plugin::PluginManifest>,
         installed_skills: &crate::project::InstalledSkills,
         installed_steering: &crate::project::InstalledSteering,
         installed_agents: &crate::project::InstalledAgents,
@@ -2450,7 +2507,14 @@ impl MarketplaceService {
         let mut content_drift = false;
         let mut legacy_fallback = false;
 
-        // Skills
+        // Skills — keyed under `skills/<name>/` per the install path's
+        // `discover_skill_dirs` recipe. Skills do not currently support
+        // a custom scan-path declaration on the manifest (the
+        // `manifest.skills: Vec<String>` field exists but the install
+        // path treats it identically across declared roots), so the
+        // hardcoded `plugin_dir.join("skills")` here is the same shape
+        // install uses today. Out of scope for the steering/agents
+        // scan-path fix.
         for (name, meta) in &installed_skills.skills {
             if meta.marketplace == plugin_info.marketplace && meta.plugin == plugin_info.plugin {
                 match &meta.source_hash {
@@ -2467,12 +2531,21 @@ impl MarketplaceService {
             }
         }
 
-        // Steering
+        // Steering — probe each configured scan path. Install hashes
+        // via `hash_artifact(&f.scan_root, &[rel])` per
+        // `install_plugin_steering`, so detection MUST iterate the
+        // declared scan paths and use the first one where the file
+        // exists. A single hardcoded `plugin_dir/steering` would
+        // false-positive every plugin declaring `steering: ["./guides/"]`
+        // — see PR #96 review comment #6.
+        let steering_paths = crate::service::browse::steering_scan_paths_for_plugin(manifest);
         for (rel_path, meta) in &installed_steering.files {
             if meta.marketplace == plugin_info.marketplace && meta.plugin == plugin_info.plugin {
-                let steering_dir = plugin_dir.join("steering");
-                let computed =
-                    crate::hash::hash_artifact(&steering_dir, std::slice::from_ref(rel_path))?;
+                let computed = hash_artifact_in_scan_paths(
+                    plugin_dir,
+                    &steering_paths,
+                    std::slice::from_ref(rel_path),
+                )?;
                 if computed != meta.source_hash {
                     content_drift = true;
                     return Ok((content_drift, legacy_fallback));
@@ -2556,11 +2629,17 @@ impl MarketplaceService {
             }
         }
 
-        // Native companions
+        // Native companions — same probe-each-scan-path treatment as
+        // steering. Install hashes via `hash_artifact(&scan_root,
+        // &rel_paths)` per `install_native_companions_for_plugin`,
+        // and the install path requires every companion in the bundle
+        // to share a single scan root (`MultipleScanRootsNotSupported`
+        // errors otherwise) — so `meta.files` resolves under whichever
+        // configured agent scan path actually contains the bundle.
+        let agent_paths = crate::service::browse::agent_scan_paths_for_plugin(manifest);
         for meta in installed_agents.native_companions.values() {
             if meta.marketplace == plugin_info.marketplace && meta.plugin == plugin_info.plugin {
-                let agents_dir = plugin_dir.join("agents");
-                let computed = crate::hash::hash_artifact(&agents_dir, &meta.files)?;
+                let computed = hash_artifact_in_scan_paths(plugin_dir, &agent_paths, &meta.files)?;
                 if computed != meta.source_hash {
                     content_drift = true;
                     return Ok((content_drift, legacy_fallback));
@@ -2572,7 +2651,58 @@ impl MarketplaceService {
     }
 }
 
-/// 3-state outcome of [`MarketplaceService::load_plugin_manifest_version`].
+/// Try to hash `rel_paths` against each `scan_path` joined to
+/// `plugin_dir`, returning the first successful hash. Probes the
+/// configured scan paths in order and recovers from
+/// `ErrorKind::NotFound` so a plugin whose files moved between
+/// configured scan roots (or whose manifest lists multiple roots) is
+/// detected at whichever root actually contains the bundle.
+/// Non-`NotFound` hash errors propagate immediately so genuine
+/// permission / I/O issues are not masked.
+///
+/// If every scan path returned `NotFound`, the last `NotFound` error
+/// is propagated so the caller (`scan_plugin_for_content_drift`)
+/// surfaces it as a per-plugin failure with a path the user can
+/// investigate. `scan_paths` is empty in practice only if the helpers
+/// in [`crate::service::browse`] regress — both fall back to
+/// non-empty defaults — so the empty-vec branch synthesises a generic
+/// `NotFound` rather than panicking.
+fn hash_artifact_in_scan_paths(
+    plugin_dir: &Path,
+    scan_paths: &[String],
+    rel_paths: &[PathBuf],
+) -> Result<String, Error> {
+    let mut last_not_found: Option<Error> = None;
+    for sp in scan_paths {
+        // `discover_steering_files_in_dirs` and the agent-discovery
+        // siblings strip the leading `./` before joining; mirror that
+        // here so the resolved path matches install-time exactly
+        // regardless of whether the manifest writes `"steering/"` or
+        // `"./steering/"`.
+        let scan_root = plugin_dir.join(sp.trim_start_matches("./"));
+        match crate::hash::hash_artifact(&scan_root, rel_paths) {
+            Ok(h) => return Ok(h),
+            Err(crate::hash::HashError::ReadFailed { path, source })
+                if source.kind() == std::io::ErrorKind::NotFound =>
+            {
+                last_not_found = Some(crate::hash::HashError::ReadFailed { path, source }.into());
+            }
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Err(last_not_found.unwrap_or_else(|| {
+        crate::hash::HashError::ReadFailed {
+            path: plugin_dir.to_path_buf(),
+            source: std::io::Error::new(
+                std::io::ErrorKind::NotFound,
+                "no scan paths configured for plugin",
+            ),
+        }
+        .into()
+    }))
+}
+
+/// 3-state outcome of [`MarketplaceService::load_plugin_manifest`].
 ///
 /// Distinguishing "manifest exists, version field absent" from "manifest
 /// could not be read" closes NC1 (PR #96 re-review): collapsing both
@@ -2581,18 +2711,22 @@ impl MarketplaceService {
 /// to carry a `version` and the cache's `plugin.json` is symlinked or
 /// missing.
 ///
-/// `Found(Some(v))` and `Found(None)` are both "scan succeeded";
-/// `Unreadable { reason }` is "do not compare versions — surface a
-/// per-plugin failure instead". Module-private — the public surface
-/// remains [`PluginUpdateInfo`] / [`PluginUpdateFailure`].
+/// `Found(_)` carries the full [`crate::plugin::PluginManifest`] so
+/// callers can inspect the `version` field AND the `agents` /
+/// `steering` scan-path declarations — the latter feeds
+/// [`MarketplaceService::scan_plugin_for_content_drift`] so detection
+/// hashes against the same scan roots install used. `Unreadable {
+/// reason }` is "do not compare versions — surface a per-plugin
+/// failure instead". Module-private — the public surface remains
+/// [`PluginUpdateInfo`] / [`PluginUpdateFailure`].
 #[derive(Debug)]
-enum ManifestVersion {
-    /// Manifest read; carries the (possibly absent) `version` field.
-    Found(Option<String>),
+enum ManifestState {
+    /// Manifest read and parsed; carries the full manifest.
+    Found(crate::plugin::PluginManifest),
     /// Manifest could not be read for a non-fatal reason
     /// (symlink-refused or `NotFound` on the cache copy). Caller must
     /// treat this as a per-plugin failure rather than collapse it with
-    /// `Found(None)` — see NC1 above.
+    /// `Found(_).version.is_none()` — see NC1 above.
     Unreadable {
         /// Human-readable reason; embedded into the wire-format
         /// `PluginUpdateFailure.reason` via `error_full_chain`. Kept
@@ -6382,15 +6516,15 @@ mod tests {
     }
 
     /// NC1 (PR #96 re-review): the C5 symlink defense returned
-    /// `Ok(None)` from `load_plugin_manifest_version` when the
-    /// `plugin.json` symlink was refused. That `None` then collapsed
+    /// `Ok(None)` from `load_plugin_manifest_version` (pre-rename) when
+    /// the `plugin.json` symlink was refused. That `None` then collapsed
     /// with `installed_version: Some("1.0")` in the version-comparison
     /// path to emit a phantom `PluginUpdateInfo { available_version:
     /// None, change_signal: VersionBumped }` — telling the user "an
     /// update is available to nothing" whenever an installed plugin's
     /// cache `plugin.json` had been swapped for a symlink.
     ///
-    /// Post-fix: the 3-state `ManifestVersion` enum routes
+    /// Post-fix: the 3-state `ManifestState` enum routes
     /// "unreadable" through the per-plugin failure arm. This test
     /// pins the no-phantom-update contract by deleting the cache
     /// `plugin.json` after install and asserting the scan produces
@@ -6435,10 +6569,10 @@ mod tests {
         );
 
         // Now make the cache plugin.json unreadable: delete it.
-        // Pre-NC1 fix: load_plugin_manifest_version returns Ok(None),
-        // version_differs becomes true (Some("1.0") != None), and the
-        // result has a phantom `VersionBumped` update with
-        // available_version: None.
+        // Pre-NC1 fix: load_plugin_manifest_version (pre-rename)
+        // returned Ok(None), version_differs became true
+        // (Some("1.0") != None), and the result had a phantom
+        // `VersionBumped` update with available_version: None.
         fs::remove_file(plugin_dir.join("plugin.json")).unwrap();
 
         let result = svc.detect_plugin_updates(&project).expect("detect");
@@ -6460,12 +6594,80 @@ mod tests {
         assert_eq!(result.failures[0].plugin.as_str(), "p");
     }
 
+    /// PR #96 review #6: a plugin whose `plugin.json` declares a
+    /// custom `steering: ["./guides/"]` scan path would false-positive
+    /// drift on every detection scan — install hashed against
+    /// `<plugin_dir>/guides/`, but pre-fix `scan_plugin_for_content_drift`
+    /// hardcoded `<plugin_dir>/steering/` regardless of the manifest.
+    /// This test installs such a plugin without modifying the source
+    /// and asserts the scan reports zero updates and zero failures.
+    /// A regression here means hashing fell back to the hardcoded
+    /// default again.
+    #[test]
+    fn detect_plugin_updates_steering_with_custom_scan_path_no_false_drift() {
+        use crate::project::KiroProject;
+        use crate::service::test_support::{
+            relative_path_entry, seed_marketplace_with_registry, temp_service,
+        };
+
+        let (dir, svc) = temp_service();
+        let entries = vec![relative_path_entry("p", "plugins/p")];
+        let mp_path = seed_marketplace_with_registry(dir.path(), &svc, "mp", &entries);
+        let plugin_dir = mp_path.join("plugins/p");
+        fs::create_dir_all(plugin_dir.join("guides")).expect("create guides dir");
+        // Steering source under a NON-default path. If detection used
+        // the hardcoded `./steering/` default, hash_artifact would
+        // return NotFound and the plugin would surface as a failure.
+        fs::write(plugin_dir.join("guides/playbook.md"), b"how to ship\n")
+            .expect("write steering source");
+        // Manifest declares the custom scan path. The Phase 2a fix
+        // makes `scan_plugin_for_content_drift` consult this field.
+        fs::write(
+            plugin_dir.join("plugin.json"),
+            br#"{"name":"p","version":"1.0","steering":["./guides/"]}"#,
+        )
+        .expect("write plugin.json");
+
+        let project_tmp = tempfile::tempdir().expect("project tempdir");
+        let project = KiroProject::new(project_tmp.path().to_path_buf());
+
+        svc.install_plugin(&project, &mp("mp"), &pn("p"), InstallMode::New, false)
+            .expect("install");
+
+        // Sanity: install actually placed the steering file under
+        // `.kiro/steering/` so the tracking entry exists for the scan
+        // to compare against. Without this precondition the test would
+        // pass vacuously.
+        assert!(
+            project_tmp
+                .path()
+                .join(".kiro/steering/playbook.md")
+                .exists(),
+            "precondition: steering file must be installed"
+        );
+
+        let result = svc.detect_plugin_updates(&project).expect("detect");
+        assert!(
+            result.updates.is_empty(),
+            "expected no updates for an unchanged source under a custom \
+             steering scan path; got: {:?}",
+            result.updates
+        );
+        assert!(
+            result.failures.is_empty(),
+            "expected no failures (pre-fix would return a hash NotFound \
+             error because detection looked under hardcoded `./steering/`); \
+             got: {:?}",
+            result.failures
+        );
+    }
+
     /// Commit 9 / Phase 2a sibling of
     /// `service::browse::tests::load_plugin_manifest_rejects_oversized_file`:
-    /// the detection-side `load_plugin_manifest_version` shares the
+    /// the detection-side `load_plugin_manifest` shares the
     /// same `read_capped` defense; verify it fires here too.
     #[test]
-    fn load_plugin_manifest_version_rejects_oversized_file() {
+    fn load_plugin_manifest_rejects_oversized_file() {
         use std::io::Write;
         let tmp = tempfile::tempdir().expect("tempdir");
         let plugin_dir = tmp.path().join("plugin");
@@ -6476,7 +6678,7 @@ mod tests {
             .expect("write 2 MiB");
         f.sync_all().expect("sync");
 
-        let err = MarketplaceService::load_plugin_manifest_version(&plugin_dir)
+        let err = MarketplaceService::load_plugin_manifest(&plugin_dir)
             .expect_err("oversized plugin.json must be refused at the cap");
         assert!(
             matches!(
@@ -6496,13 +6698,13 @@ mod tests {
     /// target bytes via `error_full_chain` into the wire-format
     /// `PluginUpdateFailure.reason`.
     ///
-    /// Asserts the function returns `ManifestVersion::Unreadable { ... }`,
-    /// NOT `ManifestVersion::Found(_)`. `PluginManifest` requires `name`
+    /// Asserts the function returns `ManifestState::Unreadable { ... }`,
+    /// NOT `ManifestState::Found(_)`. `PluginManifest` requires `name`
     /// (else parse fails); the symlink target is a complete valid
     /// manifest so absence/presence is unambiguous.
     #[cfg(unix)]
     #[test]
-    fn load_plugin_manifest_version_refuses_symlink() {
+    fn load_plugin_manifest_refuses_symlink() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let plugin_dir = tmp.path().join("plugin");
         fs::create_dir_all(&plugin_dir).expect("create plugin dir");
@@ -6521,19 +6723,20 @@ mod tests {
         std::os::unix::fs::symlink(&sensitive, plugin_dir.join("plugin.json"))
             .expect("create symlink");
 
-        let result = MarketplaceService::load_plugin_manifest_version(&plugin_dir)
-            .expect("symlink must yield ManifestVersion::Unreadable, not Err");
+        let result = MarketplaceService::load_plugin_manifest(&plugin_dir)
+            .expect("symlink must yield ManifestState::Unreadable, not Err");
         match result {
-            ManifestVersion::Unreadable { reason } => {
+            ManifestState::Unreadable { reason } => {
                 assert!(
                     reason.contains("symlink"),
                     "reason must mention symlink, got: {reason}"
                 );
             }
-            ManifestVersion::Found(v) => {
+            ManifestState::Found(m) => {
                 panic!(
-                    "symlinked plugin.json must NOT be parsed; got Found({v:?}) — \
-                     symlink defense regressed"
+                    "symlinked plugin.json must NOT be parsed; got Found(name={:?}, version={:?}) — \
+                     symlink defense regressed",
+                    m.name, m.version
                 );
             }
         }
