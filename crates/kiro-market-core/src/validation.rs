@@ -107,7 +107,17 @@ impl RelativePath {
             .collect::<Vec<_>>()
             .join("/")
             .replace('\\', "/");
-        Self::new(rel_str)
+        // `path == base` produces an empty rel string (Components yields
+        // zero Normal entries), which `RelativePath::new` rejects.
+        // Substitute "." so the call still succeeds and downstream
+        // `plugin_dir.join(".").join(name)` resolves correctly. Closes
+        // PR #100 review C2 (bare-path skill at plugin root regression).
+        let normalised = if rel_str.is_empty() {
+            ".".to_owned()
+        } else {
+            rel_str
+        };
+        Self::new(normalised)
     }
 
     /// View the validated path as a `&str`.
@@ -1242,5 +1252,23 @@ mod tests {
         let source = PathBuf::from("/tmp/plugin/agents/reviewer.md");
         let rel = RelativePath::from_path_under(&source, &plugin_dir).expect("valid input");
         assert_eq!(rel.as_str(), "agents/reviewer.md");
+    }
+
+    /// PR #100 review C2: a manifest declaring `skills: ["my-skill"]`
+    /// (bare path, no `./skills/` directory) makes `discover_skill_dirs`
+    /// set `scan_root = candidate.parent() = plugin_root`, then install
+    /// calls `from_path_under(scan_root=plugin_root, plugin_dir=plugin_root)`.
+    /// Pre-fix this errored with empty-rel; install pushed `FailedSkill`
+    /// for a skill that pre-PR would have installed cleanly. Post-fix
+    /// returns `RelativePath("." )` so detection can use
+    /// `plugin_dir.join(".").join(name)` to resolve back to the right
+    /// directory.
+    #[test]
+    fn from_path_under_returns_dot_when_path_equals_base() {
+        use std::path::PathBuf;
+        let plugin_dir = PathBuf::from("/tmp/plugin");
+        let rel = RelativePath::from_path_under(&plugin_dir, &plugin_dir)
+            .expect("path == base must produce a valid sentinel, not error");
+        assert_eq!(rel.as_str(), ".");
     }
 }

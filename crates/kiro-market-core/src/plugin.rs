@@ -633,6 +633,38 @@ mod tests {
         );
     }
 
+    /// PR #100 review C2: a manifest declaring `skills: ["my-skill"]`
+    /// (bare path with NO `./skills/` parent — i.e. the skill lives at
+    /// the plugin root) makes the bare-path branch set
+    /// `scan_root = candidate.parent() = plugin_root`. Pre-fix this
+    /// resulted in install pushing `FailedSkill` because
+    /// `RelativePath::from_path_under(plugin_root, plugin_root)` errored
+    /// on empty rel. Post-fix `from_path_under` returns
+    /// `RelativePath(".")` so install + detection round-trip cleanly.
+    /// This test asserts only that `discover_skill_dirs` produces the
+    /// `scan_root == plugin_root` case the install code now handles.
+    #[test]
+    fn discover_skills_bare_path_at_plugin_root_uses_root_as_scan_root() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+
+        create_skill_md(&root.join("my-skill"));
+
+        let dirs = discover_skill_dirs(root, &["my-skill"]);
+        assert_eq!(dirs.len(), 1);
+        assert_eq!(
+            dirs[0].skill_dir,
+            root.join("my-skill"),
+            "skill_dir is the candidate path itself for bare-path branch"
+        );
+        assert_eq!(
+            dirs[0].scan_root,
+            root.to_path_buf(),
+            "bare-path branch sets scan_root to the candidate's parent, \
+             which equals plugin_root for skills at the plugin root"
+        );
+    }
+
     #[test]
     fn discover_skills_skips_missing_skill_md() {
         let tmp = tempfile::tempdir().expect("tempdir");

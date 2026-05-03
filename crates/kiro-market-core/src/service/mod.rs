@@ -2640,24 +2640,6 @@ fn read_capped(path: &Path, cap: u64) -> std::io::Result<Vec<u8>> {
     Ok(buf)
 }
 
-/// Compute the `(base_dir, filename)` pair that recreates the
-/// install-side hash recipe used by
-/// [`crate::project::KiroProject::hash_translated_source`] for a
-/// tracked agent. Used by
-/// [`MarketplaceService::scan_plugin_for_content_drift`] so detection
-/// hashes match the bytes the install side fed into BLAKE3 — the
-/// install hashes via `hash_artifact(parent, &[filename])` so detection
-/// MUST also pass `(parent, filename)` rather than `(agents_dir,
-/// "subdir/file.md")`, since the digest includes the rel-path bytes.
-///
-/// `source_path` is relative to `plugin_dir` (always present after the
-/// install↔detect symmetry pass — `InstalledAgentMeta.source_path` is
-/// required). We split it back into
-/// `(plugin_dir + rel.parent(), rel.file_name())` to match the install
-/// recipe. The dialect-fallback branch (which previously synthesised a
-/// `{name}.{md|agent.md|json}` filename when `source_path` was `None`)
-/// is gone — required-field schema means we always have the precise
-/// install-time path.
 /// MCP opt-in gate for translated agents. An agent that brings MCP
 /// servers can run arbitrary subprocesses (Stdio) or open network
 /// connections (Http/Sse) on the user's host. The cache persists, so a
@@ -2801,6 +2783,24 @@ fn required_source_path(
     })
 }
 
+/// Compute the `(base_dir, filename)` pair that recreates the
+/// install-side hash recipe used by
+/// [`crate::project::KiroProject::hash_translated_source`] for a
+/// tracked agent. Used by
+/// [`MarketplaceService::scan_plugin_for_content_drift`] so detection
+/// hashes match the bytes the install side fed into BLAKE3 — the
+/// install hashes via `hash_artifact(parent, &[filename])` so detection
+/// MUST also pass `(parent, filename)` rather than `(agents_dir,
+/// "subdir/file.md")`, since the digest includes the rel-path bytes.
+///
+/// `source_path` is relative to `plugin_dir` (always present after the
+/// install↔detect symmetry pass — `InstalledAgentMeta.source_path` is
+/// required). We split it back into
+/// `(plugin_dir + rel.parent(), rel.file_name())` to match the install
+/// recipe. The dialect-fallback branch (which previously synthesised a
+/// `{name}.{md|agent.md|json}` filename when `source_path` was `None`)
+/// is gone — required-field schema means we always have the precise
+/// install-time path.
 fn agent_hash_inputs(
     plugin_dir: &Path,
     source_path: &crate::validation::RelativePath,

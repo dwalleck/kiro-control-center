@@ -203,24 +203,26 @@ pub struct InstalledSteeringMeta {
 
 /// Compute the install-time `source_scan_root` for a discovered
 /// steering file, mapping the path-not-under-plugin-dir error to a
-/// `SteeringError::SourceReadFailed`. Extracted from
+/// `SteeringError::ScanRootInvalid`. Extracted from
 /// `install_steering_file_locked` to keep that function under
 /// clippy's 100-line cap after the install↔detect symmetry pass.
+///
+/// `ScanRootInvalid` is structurally distinct from `SourceReadFailed`:
+/// the latter is an I/O failure on a content file, the former is a
+/// structural validation failure on the scan-root *path*. Wrapping it
+/// as a synthetic `io::Error` (the pre-PR-#100-review shape) lied
+/// about the failure mode in the wire-format `reason` field — this
+/// constructor preserves the real `ValidationError` via `#[source]`
+/// so chained renderers see the precise cause.
 pub(crate) fn required_steering_scan_root(
     scan_root: &std::path::Path,
     plugin_dir: &std::path::Path,
 ) -> Result<RelativePath, crate::steering::SteeringError> {
-    RelativePath::from_path_under(scan_root, plugin_dir).map_err(|e| {
-        crate::steering::SteeringError::SourceReadFailed {
+    RelativePath::from_path_under(scan_root, plugin_dir).map_err(|source| {
+        crate::steering::SteeringError::ScanRootInvalid {
             path: scan_root.to_path_buf(),
-            source: std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!(
-                    "steering scan_root `{}` not under plugin_dir `{}`: {e}",
-                    scan_root.display(),
-                    plugin_dir.display(),
-                ),
-            ),
+            plugin_dir: plugin_dir.to_path_buf(),
+            source,
         }
     })
 }
@@ -2021,6 +2023,17 @@ impl KiroProject {
             CollisionDecision::Proceed { forced_overwrite } => forced_overwrite,
         };
 
+        // Compute source_scan_root BEFORE staging/promotion. The
+        // validation has no dependency on staging (only on
+        // source.scan_root + ctx.plugin_dir), and a defensive failure
+        // here AFTER promote would leak placed files + backups since
+        // bare ? skips rollback. Atomicity contract: every failure
+        // mode after promote_staged_steering must call
+        // rollback_companion_promotion; computing this upfront keeps
+        // the contract honest by removing one failure source from the
+        // post-promote span.
+        let source_scan_root = required_steering_scan_root(&source.scan_root, ctx.plugin_dir)?;
+
         // `_staging` is held as a RAII guard so its TempDir Drop sweeps
         // the staging directory at end-of-scope, including on early
         // returns from the rest of this function.
@@ -2037,8 +2050,6 @@ impl KiroProject {
         {
             installed.files.remove(rel_path);
         }
-
-        let source_scan_root = required_steering_scan_root(&source.scan_root, ctx.plugin_dir)?;
 
         installed.files.insert(
             rel_path.to_path_buf(),
@@ -2952,6 +2963,28 @@ impl KiroProject {
                 CollisionDecision::Proceed { forced_overwrite } => forced_overwrite,
             };
 
+        // Compute source_scan_root BEFORE staging/promotion. The
+        // validation has no dependency on staging (only on
+        // input.scan_root + input.plugin_dir), and a defensive failure
+        // here AFTER promote would leak placed files + backups since
+        // bare ? skips rollback. Atomicity contract: every failure
+        // mode after promote_native_companions must call
+        // rollback_companion_promotion; computing this upfront removes
+        // one failure source from the post-promote span.
+        let source_scan_root =
+            crate::validation::RelativePath::from_path_under(input.scan_root, input.plugin_dir)
+                .map_err(|e| AgentError::InstallFailed {
+                    path: input.scan_root.to_path_buf(),
+                    source: Box::new(crate::error::Error::Io(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!(
+                            "native companion scan_root `{}` not under plugin_dir `{}`: {e}",
+                            input.scan_root.display(),
+                            input.plugin_dir.display(),
+                        ),
+                    ))),
+                })?;
+
         let (staging, installed_hash) =
             self.stage_native_companion_files(input.plugin, input.scan_root, input.rel_paths)?;
 
@@ -2988,20 +3021,6 @@ impl KiroProject {
         // tracking on a write failure.
         let diffed_prior_files =
             Self::diff_prior_companion_files(&installed, input.plugin, input.rel_paths);
-
-        let source_scan_root =
-            crate::validation::RelativePath::from_path_under(input.scan_root, input.plugin_dir)
-                .map_err(|e| AgentError::InstallFailed {
-                    path: input.scan_root.to_path_buf(),
-                    source: Box::new(crate::error::Error::Io(std::io::Error::new(
-                        std::io::ErrorKind::InvalidInput,
-                        format!(
-                            "native companion scan_root `{}` not under plugin_dir `{}`: {e}",
-                            input.scan_root.display(),
-                            input.plugin_dir.display(),
-                        ),
-                    ))),
-                })?;
 
         installed.native_companions.insert(
             // HashMap key remains `String` (out of scope per Phase 1.5
@@ -6909,6 +6928,47 @@ mod tests {
         let bytes = serde_json::to_vec(&meta).unwrap();
         let back: InstalledNativeCompanionsMeta = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(back.files.len(), 2);
+        // PR #100 review I6: the round-trip used to assert only on
+        // `files.len()`, which was satisfied long before
+        // `source_scan_root` joined the schema. Locking the field
+        // explicitly so a future regression that drops or re-types it
+        // breaks here instead of silently round-tripping a
+        // default/empty value.
+        assert_eq!(back.source_scan_root.as_str(), "agents");
+    }
+
+    /// PR #100 review I1: `required_steering_scan_root` must surface a
+    /// structural validation failure as `SteeringError::ScanRootInvalid`,
+    /// not a synthetic `SourceReadFailed { source: io::Error }`. The
+    /// real `ValidationError` propagates via `#[source]` so the
+    /// `error_full_chain` projection used at FFI/log boundaries renders
+    /// the precise cause instead of a fabricated I/O message.
+    #[test]
+    fn required_steering_scan_root_returns_scan_root_invalid_when_outside_plugin_dir() {
+        let plugin_dir = std::path::PathBuf::from("/plugins/foo");
+        let scan_root = std::path::PathBuf::from("/somewhere/else");
+
+        let err = required_steering_scan_root(&scan_root, &plugin_dir)
+            .expect_err("scan_root outside plugin_dir must fail");
+
+        match err {
+            crate::steering::SteeringError::ScanRootInvalid {
+                ref path,
+                plugin_dir: ref pd,
+                ..
+            } => {
+                assert_eq!(path, &scan_root);
+                assert_eq!(pd, &plugin_dir);
+            }
+            other => panic!("expected ScanRootInvalid, got {other:?}"),
+        }
+        // The variant carries the underlying ValidationError via
+        // `#[source]` so chained renderers see "scan_root invalid → not
+        // under base" instead of a fabricated InvalidInput io::Error.
+        assert!(
+            std::error::Error::source(&err).is_some(),
+            "ScanRootInvalid must expose its ValidationError via Error::source"
+        );
     }
 
     // ---------------------------------------------------------------------
