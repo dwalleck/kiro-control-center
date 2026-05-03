@@ -2508,7 +2508,7 @@ impl MarketplaceService {
         let mut content_drift = false;
         let mut legacy_fallback = false;
 
-        // Skills — keyed under `skills/<name>/`. KNOWN BUG:
+        // Skills — keyed under `skills/<name>/`. KNOWN BUG (issue #97):
         // `discover_skills_for_plugin` (browse.rs) honors
         // `manifest.skills` and a plugin declaring `skills: ["./packs/"]`
         // installs skill dirs under `<plugin_dir>/packs/<name>/`, but
@@ -2522,9 +2522,10 @@ impl MarketplaceService {
         // or (b) extending `InstalledSkillMeta` with a `source_path`
         // field so detection knows which scan root to consult without
         // probing. Option (b) matches the `InstalledAgentMeta`
-        // precedent. Either fix is broader than the steering/agents
-        // scan-path closure shipped in this commit; tracked as a
-        // follow-up rather than expanding scope here.
+        // precedent. Tracked at
+        // https://github.com/dwalleck/kiro-control-center/issues/97
+        // — out of scope for the steering/agents scan-path closure
+        // shipped in PR #96.
         for (name, meta) in &installed_skills.skills {
             if meta.marketplace == plugin_info.marketplace && meta.plugin == plugin_info.plugin {
                 match &meta.source_hash {
