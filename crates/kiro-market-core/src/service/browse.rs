@@ -1858,8 +1858,8 @@ mod tests {
                 plugin: pn(plugin),
                 version: None,
                 installed_at: Utc::now(),
-                source_hash: None,
-                installed_hash: None,
+                source_hash: String::new(),
+                installed_hash: String::new(),
                 source_scan_root: crate::validation::RelativePath::new("skills").expect("valid"),
             },
         );

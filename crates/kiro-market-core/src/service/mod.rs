@@ -1298,8 +1298,12 @@ impl MarketplaceService {
                 plugin: plugin.clone(),
                 version: version.map(str::to_owned),
                 installed_at: chrono::Utc::now(),
-                source_hash: None,
-                installed_hash: None,
+                // Stamped pre-install with empty placeholders;
+                // `install_skill_from_dir` overwrites both with the
+                // staging-time + post-rename hashes before the entry
+                // is committed to tracking.
+                source_hash: String::new(),
+                installed_hash: String::new(),
                 source_scan_root,
             };
 
@@ -1697,8 +1701,12 @@ impl MarketplaceService {
                 installed_at: chrono::Utc::now(),
                 dialect: def.dialect,
                 source_path,
-                source_hash: None,
-                installed_hash: None,
+                // Stamped pre-install with empty placeholders;
+                // `install_agent_inner` overwrites both with the
+                // hash_translated_source / staging-time hashes before
+                // the entry is committed to tracking.
+                source_hash: String::new(),
+                installed_hash: String::new(),
             };
             let install_result = if ctx.mode.is_force() {
                 project.install_agent_force(&def, &mapped, meta, Some(&path))
@@ -2340,7 +2348,7 @@ impl MarketplaceService {
         // which produced false-positive drift on every scan for
         // plugins declaring custom `steering: [...]` /
         // `agents: [...]` paths.
-        let (content_drift, legacy_fallback) = Self::scan_plugin_for_content_drift(
+        let content_drift = Self::scan_plugin_for_content_drift(
             plugin_info,
             &plugin_dir,
             installed_skills,
@@ -2371,19 +2379,6 @@ impl MarketplaceService {
             }));
         }
 
-        if legacy_fallback {
-            // Drift undetectable for legacy entries (no source_hash) —
-            // same versions means no entry. Logging at debug so the
-            // legacy-fallback case is observable in traces without
-            // surfacing in normal operation.
-            tracing::debug!(
-                marketplace = %plugin_info.marketplace,
-                plugin = %plugin_info.plugin,
-                "scan saw a legacy (pre-Stage-1) tracking entry with no \
-                 source_hash; falling back to version-only comparison and \
-                 returning no update entry"
-            );
-        }
         Ok(None)
     }
 
@@ -2486,37 +2481,32 @@ impl MarketplaceService {
     /// via the same helpers `MarketplaceService::install_plugin`
     /// uses.
     ///
-    /// `content_drift = false && legacy_fallback = true` means "no drift
-    /// detected among hashable entries; some entries had no `source_hash`
-    /// so a clean miss is possible." Callers should treat `legacy_fallback`
-    /// as "drift undetectable" rather than "drift absent."
+    /// PR #100 review I2 dropped the `legacy_fallback` second return
+    /// value: after the install↔detect symmetry pass made
+    /// `source_scan_root` required AND tightened `source_hash` to
+    /// required `String`, no in-tree tracking entry can land here
+    /// without both fields. The previous `Option<String>` matching
+    /// arms (`None => legacy_fallback = true`) were unreachable at
+    /// runtime, so the helper now returns just `bool` and the caller
+    /// no longer logs a "legacy entry" debug line that could never
+    /// fire.
     fn scan_plugin_for_content_drift(
         plugin_info: &crate::project::InstalledPluginInfo,
         plugin_dir: &Path,
         installed_skills: &crate::project::InstalledSkills,
         installed_steering: &crate::project::InstalledSteering,
         installed_agents: &crate::project::InstalledAgents,
-    ) -> Result<(bool, bool), Error> {
-        let mut content_drift = false;
-        let mut legacy_fallback = false;
-
+    ) -> Result<bool, Error> {
         // Skills — direct lookup against the install-recorded scan
         // root. Closes #97; install populates source_scan_root so
         // detection hashes against the same directory the install
-        // copied from. (source_hash stays Option<String> for now;
-        // tightened in Task 6 alongside the legacy_fallback removal.)
+        // copied from.
         for (name, meta) in &installed_skills.skills {
             if meta.marketplace == plugin_info.marketplace && meta.plugin == plugin_info.plugin {
-                match &meta.source_hash {
-                    Some(stored) => {
-                        let skill_dir = plugin_dir.join(meta.source_scan_root.as_str()).join(name);
-                        let computed = crate::hash::hash_dir_tree(&skill_dir)?;
-                        if computed != *stored {
-                            content_drift = true;
-                            return Ok((content_drift, legacy_fallback));
-                        }
-                    }
-                    None => legacy_fallback = true,
+                let skill_dir = plugin_dir.join(meta.source_scan_root.as_str()).join(name);
+                let computed = crate::hash::hash_dir_tree(&skill_dir)?;
+                if computed != meta.source_hash {
+                    return Ok(true);
                 }
             }
         }
@@ -2532,30 +2522,24 @@ impl MarketplaceService {
                 let computed =
                     crate::hash::hash_artifact(&scan_root, std::slice::from_ref(rel_path))?;
                 if computed != meta.source_hash {
-                    content_drift = true;
-                    return Ok((content_drift, legacy_fallback));
+                    return Ok(true);
                 }
             }
         }
 
         // Agents — direct lookup against the install-recorded
-        // source_path. After the install↔detect symmetry pass, the
-        // dialect-fallback machinery and the I-N7 actionable-error
-        // branch are gone: install always records source_path, so
-        // detection always knows the precise file to hash.
+        // source_path. After the install↔detect symmetry pass + I2
+        // tightening, the dialect-fallback machinery, the I-N7
+        // actionable-error branch, AND the legacy-source_hash
+        // fallback are gone: install always records source_path AND
+        // source_hash, so detection always knows the precise file to
+        // hash and what to compare against.
         for meta in installed_agents.agents.values() {
             if meta.marketplace == plugin_info.marketplace && meta.plugin == plugin_info.plugin {
-                match &meta.source_hash {
-                    Some(stored) => {
-                        let (base, filename) = agent_hash_inputs(plugin_dir, &meta.source_path);
-                        let computed =
-                            crate::hash::hash_artifact(&base, std::slice::from_ref(&filename))?;
-                        if computed != *stored {
-                            content_drift = true;
-                            return Ok((content_drift, legacy_fallback));
-                        }
-                    }
-                    None => legacy_fallback = true,
+                let (base, filename) = agent_hash_inputs(plugin_dir, &meta.source_path);
+                let computed = crate::hash::hash_artifact(&base, std::slice::from_ref(&filename))?;
+                if computed != meta.source_hash {
+                    return Ok(true);
                 }
             }
         }
@@ -2569,13 +2553,12 @@ impl MarketplaceService {
                 let scan_root = plugin_dir.join(meta.source_scan_root.as_str());
                 let computed = crate::hash::hash_artifact(&scan_root, &meta.files)?;
                 if computed != meta.source_hash {
-                    content_drift = true;
-                    return Ok((content_drift, legacy_fallback));
+                    return Ok(true);
                 }
             }
         }
 
-        Ok((content_drift, legacy_fallback))
+        Ok(false)
     }
 }
 
@@ -2722,6 +2705,38 @@ fn read_and_parse_skill_md(
 }
 
 /// Compute the install-time `source_scan_root` for a discovered skill
+/// Build a synthetic `io::Error` describing a structural validation
+/// failure on a path that should have been expressible as a
+/// [`crate::validation::RelativePath`] under `plugin_dir`.
+///
+/// Shared by [`required_skill_scan_root`] and [`required_source_path`]
+/// per PR #100 review S7 — both helpers were independently formatting
+/// near-identical messages, which would drift one wording tweak apart
+/// the next time either was edited. This helper is the single source
+/// of truth for the wire-format string.
+///
+/// Note the asymmetry with `required_steering_scan_root`: the steering
+/// path uses the typed `SteeringError::ScanRootInvalid` variant
+/// (added by PR #100 review I1) and does NOT funnel through this
+/// helper. `SkillError` and `AgentError` don't yet have an analogous
+/// typed variant; a future cleanup mirroring I1 across all three
+/// error enums would let this synthetic-`io::Error` helper retire.
+fn scan_root_invalid_io_err(
+    label: &str,
+    scan_root: &Path,
+    plugin_dir: &Path,
+    cause: &crate::error::ValidationError,
+) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::InvalidInput,
+        format!(
+            "{label} `{}` not under plugin_dir `{}`: {cause}",
+            scan_root.display(),
+            plugin_dir.display(),
+        ),
+    )
+}
+
 /// or build a [`FailedSkill`] entry if the discovered `scan_root`
 /// can't be expressed as a `RelativePath` under `plugin_dir`.
 /// Discovery yields paths under `plugin_dir` in practice, so the
@@ -2742,13 +2757,11 @@ fn required_skill_scan_root(
         );
         FailedSkill::install_failed(
             skill_name.to_owned(),
-            &Error::Io(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!(
-                    "skill scan_root `{}` not under plugin_dir `{}`: {e}",
-                    scan_root.display(),
-                    plugin_dir.display(),
-                ),
+            &Error::Io(scan_root_invalid_io_err(
+                "skill scan_root",
+                scan_root,
+                plugin_dir,
+                &e,
             )),
         )
     })
@@ -2770,14 +2783,11 @@ fn required_source_path(
         source_path: path.to_path_buf(),
         error: crate::error::AgentError::InstallFailed {
             path: path.to_path_buf(),
-            source: Box::new(crate::error::Error::Io(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                format!(
-                    "discovered agent path `{}` is not expressible as a \
-                     RelativePath under plugin_dir `{}`: {e}",
-                    path.display(),
-                    plugin_dir.display(),
-                ),
+            source: Box::new(crate::error::Error::Io(scan_root_invalid_io_err(
+                "discovered agent path",
+                path,
+                plugin_dir,
+                &e,
             ))),
         },
     })
@@ -6084,8 +6094,8 @@ mod tests {
                     plugin: pn("structured-p"),
                     version: Some("1.0".into()),
                     installed_at: chrono::Utc::now(),
-                    source_hash: None,
-                    installed_hash: None,
+                    source_hash: String::new(),
+                    installed_hash: String::new(),
                     source_scan_root: crate::validation::RelativePath::new("skills")
                         .expect("valid"),
                 },
@@ -6114,102 +6124,16 @@ mod tests {
         );
     }
 
-    #[test]
-    fn detect_plugin_updates_legacy_fallback_source_hash_none() {
-        use crate::project::KiroProject;
-        use crate::service::test_support::{
-            make_plugin_with_skills, relative_path_entry, seed_marketplace_with_registry,
-            temp_service,
-        };
-
-        let (dir, svc) = temp_service();
-        let entries = vec![relative_path_entry("p", "plugins/p")];
-        let mp_path = seed_marketplace_with_registry(dir.path(), &svc, "mp", &entries);
-        make_plugin_with_skills(&mp_path, "p", &["alpha"]);
-        let plugin_dir = mp_path.join("plugins/p");
-        fs::write(
-            plugin_dir.join("plugin.json"),
-            br#"{"name":"p","version":"1.0"}"#,
-        )
-        .unwrap();
-
-        let project_tmp = tempfile::tempdir().unwrap();
-        let project = KiroProject::new(project_tmp.path().to_path_buf());
-
-        svc.install_plugin(&project, &mp("mp"), &pn("p"), InstallMode::New, false)
-            .expect("install");
-
-        // Set source_hash: None in tracking file
-        let mut tracking = project.load_installed().unwrap();
-        for meta in tracking.skills.values_mut() {
-            meta.source_hash = None;
-        }
-        let tracking_path = project_tmp.path().join(".kiro/installed-skills.json");
-        fs::write(
-            &tracking_path,
-            serde_json::to_vec_pretty(&tracking).unwrap(),
-        )
-        .unwrap();
-
-        // Bump version
-        fs::write(
-            plugin_dir.join("plugin.json"),
-            br#"{"name":"p","version":"1.1"}"#,
-        )
-        .unwrap();
-
-        let result = svc.detect_plugin_updates(&project).expect("detect");
-        assert_eq!(result.updates.len(), 1);
-        assert_eq!(result.updates[0].plugin.as_str(), "p");
-        assert!(matches!(
-            result.updates[0].change_signal,
-            UpdateChangeSignal::VersionBumped
-        ));
-        assert!(result.failures.is_empty());
-    }
-
-    #[test]
-    fn detect_plugin_updates_legacy_fallback_no_version_bump_returns_no_update() {
-        use crate::project::KiroProject;
-        use crate::service::test_support::{
-            make_plugin_with_skills, relative_path_entry, seed_marketplace_with_registry,
-            temp_service,
-        };
-
-        let (dir, svc) = temp_service();
-        let entries = vec![relative_path_entry("p", "plugins/p")];
-        let mp_path = seed_marketplace_with_registry(dir.path(), &svc, "mp", &entries);
-        make_plugin_with_skills(&mp_path, "p", &["alpha"]);
-        let plugin_dir = mp_path.join("plugins/p");
-        fs::write(
-            plugin_dir.join("plugin.json"),
-            br#"{"name":"p","version":"1.0"}"#,
-        )
-        .unwrap();
-
-        let project_tmp = tempfile::tempdir().unwrap();
-        let project = KiroProject::new(project_tmp.path().to_path_buf());
-
-        svc.install_plugin(&project, &mp("mp"), &pn("p"), InstallMode::New, false)
-            .expect("install");
-
-        // Set source_hash: None in tracking file
-        let mut tracking = project.load_installed().unwrap();
-        for meta in tracking.skills.values_mut() {
-            meta.source_hash = None;
-        }
-        let tracking_path = project_tmp.path().join(".kiro/installed-skills.json");
-        fs::write(
-            &tracking_path,
-            serde_json::to_vec_pretty(&tracking).unwrap(),
-        )
-        .unwrap();
-
-        // Same version, no mutation
-        let result = svc.detect_plugin_updates(&project).expect("detect");
-        assert!(result.updates.is_empty());
-        assert!(result.failures.is_empty());
-    }
+    // Deleted: `detect_plugin_updates_legacy_fallback_source_hash_none`
+    // and `detect_plugin_updates_legacy_fallback_no_version_bump_returns_no_update`
+    // — they exercised the `Option<String>::None => legacy_fallback = true`
+    // arm of `scan_plugin_for_content_drift`, which PR #100 review I2
+    // removed. Post-I2 the field is required `String` and a tracking
+    // entry without `source_hash` fails to deserialize at the
+    // `load_installed()` boundary; the contract is pinned by
+    // `load_installed_rejects_legacy_entry_without_source_hash` and
+    // `load_installed_agents_rejects_legacy_entry_without_source_hash`
+    // in the project tests.
 
     #[test]
     fn detect_plugin_updates_mixed_scenario() {
@@ -6512,7 +6436,7 @@ mod tests {
         // Set agent source_hash: None in tracking file
         let mut tracking = project.load_installed_agents().unwrap();
         for meta in tracking.agents.values_mut() {
-            meta.source_hash = None;
+            meta.source_hash = String::new();
         }
         let tracking_path = project_tmp.path().join(".kiro/installed-agents.json");
         fs::write(
@@ -6766,11 +6690,14 @@ mod tests {
     /// hash `NotFound` failure on every scan.
     ///
     /// The native-companions cascade has a separate, pre-existing
-    /// install-time hash bug (documented on
-    /// `detect_plugin_updates_copilot_agent_legacy_fallback` above —
-    /// install hashes against the destination, detection re-hashes
-    /// against the source, so the two never match through the install
-    /// path). To isolate the scan-path fix, we synthesize the tracking
+    /// install-time hash bug: install hashes against the destination,
+    /// detection re-hashes against the source, so the two never match
+    /// through the install path. (The canonical reference test
+    /// previously named `detect_plugin_updates_copilot_agent_legacy_fallback`
+    /// has been removed — see PR #100's deserialize-rejection sweep,
+    /// which invalidated the legacy-Option-shape fixture it relied on.
+    /// The bug itself is still real and the workaround below still
+    /// applies.) To isolate the scan-path fix, we synthesize the tracking
     /// entry by hand: compute the source-side hash directly via
     /// `crate::hash::hash_artifact` and write it into
     /// `installed-agents.json`. With the scan-path fix, detection
@@ -6836,13 +6763,27 @@ mod tests {
         // `skills.skills`, and `steering.files` — but NOT from
         // `agents.native_companions`. Without an entry in one of those
         // three maps the plugin would not surface in the scan loop and
-        // the test would pass vacuously. Mirror the pattern used by
-        // `detect_plugin_updates_copilot_agent_legacy_fallback`: a
-        // single legacy translated-agent entry (`source_hash: None`)
-        // registers the plugin and triggers only the harmless
-        // `legacy_fallback = true` branch, leaving the
+        // the test would pass vacuously. We register a single native
+        // agent at `<plugin_dir>/agents/registrar.json` with a real
+        // pre-computed source_hash so the plugin surfaces in the scan
+        // loop AND the agent itself doesn't drift — leaving the
         // native-companions cascade as the only thing the assertion
         // depends on.
+        //
+        // PR #100 review I2 dropped the legacy_fallback escape hatch
+        // (source_hash: None used to be a "skip me" sentinel for the
+        // drift scan); after I2 every entry must have a real source
+        // file on disk and a real source_hash, so the registrar agent
+        // had to grow a real .json file at install-time.
+        let agents_default_root = plugin_dir.join("agents");
+        fs::create_dir_all(&agents_default_root).expect("create agents/ dir");
+        let registrar_json = br#"{"name":"registrar"}"#;
+        fs::write(agents_default_root.join("registrar.json"), registrar_json)
+            .expect("write registrar.json");
+        let registrar_source_hash =
+            crate::hash::hash_artifact(&agents_default_root, &[PathBuf::from("registrar.json")])
+                .expect("hash registrar source");
+
         let mut agents_map = HashMap::new();
         agents_map.insert(
             "registrar".to_string(),
@@ -6854,8 +6795,8 @@ mod tests {
                 dialect: crate::agent::AgentDialect::Native,
                 source_path: crate::validation::RelativePath::new("agents/registrar.json")
                     .expect("valid"),
-                source_hash: None,
-                installed_hash: None,
+                source_hash: registrar_source_hash.clone(),
+                installed_hash: registrar_source_hash,
             },
         );
 
@@ -7032,8 +6973,8 @@ mod tests {
                 installed_at: chrono::Utc::now(),
                 dialect: crate::agent::AgentDialect::Copilot,
                 source_path: RelativePath::new("agents/reviewer.agent.md").expect("valid rel"),
-                source_hash: Some(expected_hash),
-                installed_hash: None,
+                source_hash: expected_hash,
+                installed_hash: String::new(),
             },
         );
         let installed = InstalledAgents {

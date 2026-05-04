@@ -390,16 +390,62 @@ const SKILL_MD: &str = "SKILL.md";
 /// directory so install can record `scan_root` on
 /// [`crate::project::InstalledSkillMeta::source_scan_root`] for later
 /// drift detection.
+///
+/// **Invariant:** `skill_dir.starts_with(scan_root)`. The downstream
+/// install path uses `skill_dir.strip_prefix(scan_root)` to derive the
+/// install-time relative name; a mismatched pair would produce a
+/// nonsense `RelativePath`. Construction goes through
+/// [`Self::new_unchecked`] (in-crate only — the discover sites
+/// guarantee the invariant by construction) which `debug_assert!`s the
+/// prefix relationship; fields are `pub(crate)` so external crates
+/// must read through the [`Self::scan_root`] / [`Self::skill_dir`]
+/// accessors and cannot bypass the invariant with a struct literal.
+/// Per PR #100 review S4.
 #[derive(Debug, Clone)]
 pub struct DiscoveredSkill {
     /// Absolute path to the scan root that contains `skill_dir`,
     /// e.g. `<plugin_dir>/skills/` or `<plugin_dir>/packs/`.
     /// Recorded on tracking after `strip_prefix(plugin_dir)` so
     /// detection knows where to look without probing.
-    pub scan_root: PathBuf,
+    pub(crate) scan_root: PathBuf,
     /// Absolute path to the skill directory itself,
     /// e.g. `<plugin_dir>/skills/alpha/`. Contains a `SKILL.md`.
-    pub skill_dir: PathBuf,
+    pub(crate) skill_dir: PathBuf,
+}
+
+impl DiscoveredSkill {
+    /// Construct a `DiscoveredSkill`, asserting the
+    /// `skill_dir.starts_with(scan_root)` invariant. `pub(crate)`
+    /// because the only sound producers of a `DiscoveredSkill` are the
+    /// two construction sites in [`discover_skill_dirs`] which compose
+    /// `scan_root` and `skill_dir` such that the invariant holds by
+    /// construction. The `debug_assert!` catches contract violations in
+    /// tests rather than allowing a silent wrong-prefix that would
+    /// later derail `strip_prefix(...)` at the install boundary.
+    pub(crate) fn new_unchecked(scan_root: PathBuf, skill_dir: PathBuf) -> Self {
+        debug_assert!(
+            skill_dir.starts_with(&scan_root),
+            "DiscoveredSkill invariant violated: skill_dir `{}` is not under scan_root `{}`",
+            skill_dir.display(),
+            scan_root.display(),
+        );
+        Self {
+            scan_root,
+            skill_dir,
+        }
+    }
+
+    /// The scan root that contains [`Self::skill_dir`].
+    #[must_use]
+    pub fn scan_root(&self) -> &Path {
+        &self.scan_root
+    }
+
+    /// The skill directory containing `SKILL.md`.
+    #[must_use]
+    pub fn skill_dir(&self) -> &Path {
+        &self.skill_dir
+    }
 }
 
 /// Discover skill directories within a plugin root given a list of paths.
@@ -450,10 +496,10 @@ pub fn discover_skill_dirs(plugin_root: &Path, skill_paths: &[&str]) -> Vec<Disc
                         };
                         let entry_path = entry.path();
                         if entry_path.is_dir() && entry_path.join(SKILL_MD).exists() {
-                            found.push(DiscoveredSkill {
-                                scan_root: candidate.clone(),
-                                skill_dir: entry_path,
-                            });
+                            found.push(DiscoveredSkill::new_unchecked(
+                                candidate.clone(),
+                                entry_path,
+                            ));
                         }
                     }
                 }
@@ -472,10 +518,7 @@ pub fn discover_skill_dirs(plugin_root: &Path, skill_paths: &[&str]) -> Vec<Disc
             let scan_root = candidate
                 .parent()
                 .map_or_else(|| plugin_root.to_path_buf(), Path::to_path_buf);
-            found.push(DiscoveredSkill {
-                scan_root,
-                skill_dir: candidate,
-            });
+            found.push(DiscoveredSkill::new_unchecked(scan_root, candidate));
         } else {
             debug!(
                 path = %candidate.display(),
@@ -662,6 +705,53 @@ mod tests {
             root.to_path_buf(),
             "bare-path branch sets scan_root to the candidate's parent, \
              which equals plugin_root for skills at the plugin root"
+        );
+    }
+
+    /// PR #100 review S6: a manifest declaring TWO scan roots
+    /// (`["./packs/", "./extras/"]`) with skills under each must
+    /// produce one `DiscoveredSkill` per skill, each carrying its OWN
+    /// scan root — not the most-recently-seen root for all of them.
+    /// Catches a future "optimize the discover loop" refactor that
+    /// might collapse `scan_root` to a single value across iterations
+    /// (since none of the existing tests exercised the multi-root case
+    /// they wouldn't have caught it).
+    #[test]
+    fn discover_skills_with_multiple_scan_roots_records_each_skills_own_root() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+
+        create_skill_md(&root.join("packs/alpha"));
+        create_skill_md(&root.join("packs/beta"));
+        create_skill_md(&root.join("extras/gamma"));
+
+        let dirs = discover_skill_dirs(root, &["./packs/", "./extras/"]);
+        assert_eq!(dirs.len(), 3);
+
+        let by_dir: std::collections::HashMap<_, _> = dirs
+            .iter()
+            .map(|d| (d.skill_dir(), d.scan_root()))
+            .collect();
+
+        let alpha = root.join("packs/alpha");
+        let beta = root.join("packs/beta");
+        let gamma = root.join("extras/gamma");
+        assert_eq!(
+            by_dir.get(alpha.as_path()),
+            Some(&root.join("./packs/").as_path()),
+            "alpha must record packs/ as its scan_root"
+        );
+        assert_eq!(
+            by_dir.get(beta.as_path()),
+            Some(&root.join("./packs/").as_path()),
+            "beta must record packs/ as its scan_root"
+        );
+        assert_eq!(
+            by_dir.get(gamma.as_path()),
+            Some(&root.join("./extras/").as_path()),
+            "gamma must record extras/ as its scan_root, NOT packs/ — \
+             a refactor that hoisted scan_root out of the loop would \
+             produce extras for everything (last write wins)"
         );
     }
 
