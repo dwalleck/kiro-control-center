@@ -2524,7 +2524,7 @@ impl MarketplaceService {
 
         // Agents — direct lookup against the install-recorded
         // source_path. After the install↔detect symmetry pass + I2
-        // tightening, the dialect-fallback machinery, the I-N7
+        // tightening, the dialect-fallback machinery, the
         // actionable-error branch, AND the legacy-source_hash
         // fallback are gone: install always records source_path AND
         // source_hash, so detection always knows the precise file to

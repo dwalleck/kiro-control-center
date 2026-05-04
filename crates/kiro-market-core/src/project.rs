@@ -102,7 +102,7 @@ pub struct InstalledAgentMeta {
     /// **Was `Option<RelativePath>`** before the install↔detect symmetry
     /// pass; tightened to required when the no-users assumption let us
     /// drop the legacy-fallback machinery (the dialect-fallback branch
-    /// in `agent_hash_inputs` and the I-N7 actionable-error branch in
+    /// in `agent_hash_inputs` and the actionable-error branch in
     /// the agents loop). A tracking file written before the field
     /// existed now fails to deserialize — pinned by the
     /// `load_installed_agents_rejects_legacy_entry` test.
