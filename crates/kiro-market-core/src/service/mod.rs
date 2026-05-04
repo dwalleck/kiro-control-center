@@ -2778,18 +2778,21 @@ fn required_source_path(
     plugin_dir: &Path,
     agent_name: String,
 ) -> Result<crate::validation::RelativePath, FailedAgent> {
-    crate::validation::RelativePath::from_path_under(path, plugin_dir).map_err(|e| FailedAgent {
-        name: Some(agent_name),
-        source_path: path.to_path_buf(),
-        error: crate::error::AgentError::InstallFailed {
-            path: path.to_path_buf(),
-            source: Box::new(crate::error::Error::Io(scan_root_invalid_io_err(
-                "discovered agent path",
-                path,
-                plugin_dir,
-                &e,
-            ))),
-        },
+    crate::validation::RelativePath::from_path_under(path, plugin_dir).map_err(|e| {
+        let path_buf = path.to_path_buf();
+        FailedAgent {
+            name: Some(agent_name),
+            source_path: path_buf.clone(),
+            error: crate::error::AgentError::InstallFailed {
+                path: path_buf,
+                source: Box::new(crate::error::Error::Io(scan_root_invalid_io_err(
+                    "discovered agent path",
+                    path,
+                    plugin_dir,
+                    &e,
+                ))),
+            },
+        }
     })
 }
 
