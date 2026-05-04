@@ -39,15 +39,18 @@ pub struct InstalledSkillMeta {
     pub installed_at: DateTime<Utc>,
 
     /// Tree-hash of the skill source as it existed in the marketplace at
-    /// install time. `None` for entries written before Stage 1 of the
-    /// native-kiro-import work landed.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub source_hash: Option<String>,
+    /// install time. Required after PR #100 review I2 — every install
+    /// path computes this, and the install↔detect symmetry pass made
+    /// `source_scan_root` required which means any post-Stage-1+
+    /// tracking entry has both. The deferred `legacy_fallback` plumbing
+    /// in `scan_plugin_for_content_drift` was unreachable in practice
+    /// once `source_scan_root` became required (no entry could have
+    /// `scan_root` without `source_hash`) and is gone.
+    pub source_hash: String,
 
-    /// Tree-hash of the skill as it was copied into the project. `None`
-    /// for entries written before Stage 1 landed.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub installed_hash: Option<String>,
+    /// Tree-hash of the skill as it was copied into the project.
+    /// Required after PR #100 review I2; see [`Self::source_hash`].
+    pub installed_hash: String,
 
     /// Scan root (relative to `plugin_dir`) that this skill was
     /// installed from. Required at install time; populated from the
@@ -107,15 +110,16 @@ pub struct InstalledAgentMeta {
     pub source_path: RelativePath,
 
     /// Tree-hash of the agent source as it existed in the marketplace at
-    /// install time. `None` for entries written before Stage 1 of the
-    /// native-kiro-import work landed.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub source_hash: Option<String>,
+    /// install time. Required after PR #100 review I2; mirrors the
+    /// `InstalledSkillMeta::source_hash` tightening — every install
+    /// path computes it, and the post-symmetry-pass schema makes a
+    /// missing-source_hash entry impossible (the matching
+    /// `source_path` and `dialect` fields are also required).
+    pub source_hash: String,
 
-    /// Tree-hash of the agent as it was copied into the project. `None`
-    /// for entries written before Stage 1 landed.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub installed_hash: Option<String>,
+    /// Tree-hash of the agent as it was copied into the project.
+    /// Required after PR #100 review I2; see [`Self::source_hash`].
+    pub installed_hash: String,
 }
 
 /// Tracking entry for a plugin's companion file bundle that lives under
@@ -2164,9 +2168,16 @@ impl KiroProject {
     /// thin air); otherwise delegates to [`crate::hash::hash_artifact`]
     /// for the canonical hash format. Lifted out of `install_agent_inner`
     /// to keep that function under the line cap.
-    fn hash_translated_source(source_path: Option<&Path>) -> crate::error::Result<Option<String>> {
+    fn hash_translated_source(source_path: Option<&Path>) -> crate::error::Result<String> {
+        // PR #100 review I2 tightened `InstalledAgentMeta::source_hash`
+        // to required `String` (was `Option<String>`). Production
+        // callers always pass `Some(path)` — the only `None` callers
+        // are test fixtures that synthesise an `AgentDefinition` from
+        // thin air and don't care about drift detection. For those the
+        // empty-string sentinel is the deliberate "no source-side
+        // hash recorded" marker; in production it's never observed.
         let Some(p) = source_path else {
-            return Ok(None);
+            return Ok(String::new());
         };
         // Production callers always pass a fully-qualified file path so
         // both `parent()` and `file_name()` are guaranteed `Some`. The
@@ -2185,10 +2196,10 @@ impl KiroProject {
                 format!("source path `{}` has no file name", p.display()),
             )
         })?;
-        Ok(Some(crate::hash::hash_artifact(
+        Ok(crate::hash::hash_artifact(
             parent,
             &[std::path::PathBuf::from(filename)],
-        )?))
+        )?)
     }
 
     fn install_agent_inner(
@@ -2241,7 +2252,7 @@ impl KiroProject {
                 let agents_root = self.agents_dir(); // needed for companion hash below
 
                 meta.source_hash = source_hash;
-                meta.installed_hash = Some(installed_hash);
+                meta.installed_hash = installed_hash;
 
                 // Capture plugin identity before moving meta into the map.
                 let marketplace = meta.marketplace.clone();
@@ -2257,17 +2268,7 @@ impl KiroProject {
                     .as_str()
                     .rsplit_once('/')
                     .and_then(|(parent, _)| crate::validation::RelativePath::new(parent).ok())
-                    .unwrap_or_else(|| {
-                        // Static literal "agents" trivially passes
-                        // validate_relative_path; the unchecked
-                        // constructor is the right shape per CLAUDE.md
-                        // (no .expect() in production code) and matches
-                        // existing internal callers like
-                        // DiscoveredPlugin::as_relative_path.
-                        crate::validation::RelativePath::from_internal_unchecked(
-                            "agents".to_owned(),
-                        )
-                    });
+                    .unwrap_or_else(crate::validation::RelativePath::agents_root);
 
                 installed.agents.insert(def.name.clone(), meta);
 
@@ -2534,10 +2535,20 @@ impl KiroProject {
                 installed_hash: String::new(),
                 source_scan_root: input.source_scan_root.clone(),
             });
-        // Refresh marketplace/version/timestamp on every install.
+        // Refresh marketplace/version/timestamp + source_scan_root on
+        // every install. PR #100 review I3: the post-insert refresh
+        // initially missed `source_scan_root`, so a manifest that
+        // changed its scan paths between installs would keep the stale
+        // root recorded forever — the install-time scan_root is what
+        // detection consults to locate the source side, so a stale
+        // value is a latent false-drift bug. Issue #99 currently masks
+        // this for translated companions (they don't yet read the
+        // field at detect time), but the moment that lands the
+        // staleness becomes a real bug.
         companion_entry.marketplace = input.marketplace.clone();
         companion_entry.version = input.version.map(str::to_owned);
         companion_entry.installed_at = chrono::Utc::now();
+        companion_entry.source_scan_root = input.source_scan_root.clone();
         if !companion_entry
             .files
             .contains(&input.prompt_rel.to_path_buf())
@@ -2576,14 +2587,14 @@ impl KiroProject {
     ) -> crate::error::Result<CollisionDecision<InstalledNativeAgentOutcome>> {
         match installed.agents.get(agent_name) {
             Some(existing) if existing.plugin == *plugin => {
-                if existing.source_hash.as_deref() == Some(source_hash) {
+                if existing.source_hash == source_hash {
                     return Ok(CollisionDecision::Idempotent(Box::new(
                         InstalledNativeAgentOutcome {
                             name: agent_name.to_owned(),
                             json_path: json_target.to_path_buf(),
                             kind: InstallOutcomeKind::Idempotent,
                             source_hash: source_hash.to_owned(),
-                            installed_hash: existing.installed_hash.clone().unwrap_or_default(),
+                            installed_hash: existing.installed_hash.clone(),
                         },
                     )));
                 }
@@ -2725,8 +2736,8 @@ impl KiroProject {
                         installed_at: chrono::Utc::now(),
                         dialect: AgentDialect::Native,
                         source_path: input.source_path.clone(),
-                        source_hash: Some(input.source_hash.to_string()),
-                        installed_hash: Some(installed_hash.clone()),
+                        source_hash: input.source_hash.to_string(),
+                        installed_hash: installed_hash.clone(),
                     },
                 );
 
@@ -3553,8 +3564,8 @@ impl KiroProject {
             // entry that staging.path() pointed at is gone; TempDir's Drop
             // will see NotFound and silently skip cleanup.
             fs::rename(staging.path(), &dir)?;
-            meta.source_hash = Some(source_hash);
-            meta.installed_hash = Some(installed_hash);
+            meta.source_hash = source_hash;
+            meta.installed_hash = installed_hash;
 
             // Update tracking. If this fails, roll back the rename so the
             // filesystem and tracking file stay consistent.
@@ -3619,8 +3630,12 @@ mod tests {
             plugin: pn("test-plugin"),
             version: Some("1.0.0".into()),
             installed_at: Utc::now(),
-            source_hash: None,
-            installed_hash: None,
+            // Empty placeholders — `install_skill_from_dir` overwrites
+            // both with real hashes during the install path. Tests that
+            // pre-stamp tracking entries (no install call) and assert
+            // on the field carry their own real hash.
+            source_hash: String::new(),
+            installed_hash: String::new(),
             source_scan_root: RelativePath::new("skills").expect("valid"),
         }
     }
@@ -3634,8 +3649,8 @@ mod tests {
             installed_at: Utc::now(),
             dialect: AgentDialect::Claude,
             source_path: RelativePath::new("agents/reviewer.md").expect("valid"),
-            source_hash: None,
-            installed_hash: None,
+            source_hash: String::new(),
+            installed_hash: String::new(),
         };
         let json = serde_json::to_string(&meta).unwrap();
         let back: InstalledAgentMeta = serde_json::from_str(&json).unwrap();
@@ -3657,8 +3672,8 @@ mod tests {
             installed_at: Utc::now(),
             dialect: AgentDialect::Copilot,
             source_path: RelativePath::new("agents/reviewer.agent.md").expect("valid"),
-            source_hash: None,
-            installed_hash: None,
+            source_hash: String::new(),
+            installed_hash: String::new(),
         };
         let json = serde_json::to_string(&meta).unwrap();
         assert!(json.contains("\"dialect\":\"copilot\""));
@@ -3787,6 +3802,7 @@ mod tests {
                     "version": null,
                     "installed_at": chrono::Utc::now(),
                     "source_hash": "blake3:abc",
+                    "installed_hash": "blake3:abc",
                     "source_scan_root": "skills",
                 }
             }
@@ -3829,6 +3845,8 @@ mod tests {
                     "installed_at": chrono::Utc::now(),
                     "dialect": "claude",
                     "source_path": "agents/etc.md",
+                    "source_hash": "x",
+                    "installed_hash": "x",
                 }
             }
         });
@@ -3991,8 +4009,8 @@ mod tests {
             installed_at: Utc::now(),
             dialect: AgentDialect::Claude,
             source_path: RelativePath::new("subdir/agent.md").expect("valid rel path"),
-            source_hash: None,
-            installed_hash: None,
+            source_hash: String::new(),
+            installed_hash: String::new(),
         };
         let json = serde_json::to_string(&meta).unwrap();
         assert!(
@@ -4147,6 +4165,7 @@ mod tests {
                     "version": "1.0.0",
                     "installed_at": now,
                     "source_hash": "deadbeef",
+                    "installed_hash": "deadbeef",
                     "source_scan_root": "skills"
                 }
             }
@@ -4230,6 +4249,7 @@ mod tests {
                     "marketplace": "mp", "plugin": "p",
                     "version": "1.0.0", "installed_at": same_time,
                     "source_hash": "deadbeef",
+                    "installed_hash": "deadbeef",
                     "source_scan_root": "skills"
                 }
             }
@@ -4301,6 +4321,7 @@ mod tests {
                 "marketplace": "mp", "plugin": "p",
                 "version": "1.0.0", "installed_at": now,
                 "source_hash": "x",
+                "installed_hash": "x",
                 "source_scan_root": "skills"
             })
         };
@@ -4317,7 +4338,9 @@ mod tests {
                 "marketplace": "mp", "plugin": "p",
                 "version": "1.0.0", "installed_at": now,
                 "dialect": "claude",
-                "source_path": "agents/x.md"
+                "source_path": "agents/x.md",
+                "source_hash": "x",
+                "installed_hash": "x"
             })
         };
 
@@ -4822,8 +4845,8 @@ mod tests {
             installed_at: Utc::now(),
             dialect: AgentDialect::Claude,
             source_path: RelativePath::new("agents/reviewer.md").expect("valid"),
-            source_hash: None,
-            installed_hash: None,
+            source_hash: String::new(),
+            installed_hash: String::new(),
         }
     }
 
@@ -5563,6 +5586,7 @@ mod tests {
                         "marketplace": "mp", "plugin": "p",
                         "version": "1.0.0", "installed_at": now,
                         "source_hash": "deadbeef",
+                        "installed_hash": "deadbeef",
                         "source_scan_root": "skills",
                     }
                 }
@@ -5851,6 +5875,8 @@ mod tests {
                         "installed_at": now,
                         "dialect": "native",
                         "source_path": "agents/ghost.json",
+                        "source_hash": "x",
+                        "installed_hash": "x",
                     }
                 }
             }))
@@ -6058,6 +6084,7 @@ mod tests {
                         "marketplace": "mp", "plugin": "p",
                         "version": "1.0.0", "installed_at": now,
                         "source_hash": "deadbeef",
+                        "installed_hash": "deadbeef",
                         "source_scan_root": "skills",
                     }
                 }
@@ -6188,6 +6215,7 @@ mod tests {
                         "marketplace": "mp", "plugin": "p",
                         "version": "1.0.0", "installed_at": now,
                         "source_hash": "deadbeef",
+                        "installed_hash": "deadbeef",
                         "source_scan_root": "skills",
                     }
                 }
@@ -6260,8 +6288,8 @@ mod tests {
                     plugin: pn("p"),
                     version: Some("1.0.0".into()),
                     installed_at: Utc::now(),
-                    source_hash: Some("deadbeef".into()),
-                    installed_hash: Some("deadbeef".into()),
+                    source_hash: "deadbeef".into(),
+                    installed_hash: "deadbeef".into(),
                     source_scan_root: RelativePath::new("skills").expect("valid"),
                 },
             )
@@ -7071,6 +7099,80 @@ mod tests {
         );
     }
 
+    /// PR #100 review I2: a tracking entry with `source_scan_root` but
+    /// without `source_hash` / `installed_hash` was unreachable in
+    /// practice (every install path that records `scan_root` also
+    /// records hashes), but the deferred `Option<String>` field type
+    /// kept the `legacy_fallback` escape hatch alive in detection.
+    /// After I2 the fields are required `String` and a contradictory
+    /// entry (`scan_root` present, hashes absent) fails to deserialize
+    /// at the boundary.
+    #[test]
+    fn load_installed_skills_rejects_legacy_entry_without_source_hash() {
+        let (_dir, project) = temp_project();
+        let kiro_dir = project.kiro_dir();
+        std::fs::create_dir_all(&kiro_dir).expect("create .kiro");
+
+        let legacy_json = br#"{
+            "skills": {
+                "alpha": {
+                    "marketplace": "mp",
+                    "plugin": "p",
+                    "version": "1.0",
+                    "installed_at": "2026-01-01T00:00:00Z",
+                    "source_scan_root": "skills"
+                }
+            }
+        }"#;
+        std::fs::write(kiro_dir.join("installed-skills.json"), legacy_json)
+            .expect("write legacy tracking");
+
+        let err = project
+            .load_installed()
+            .expect_err("legacy entry without source_hash must fail to deserialize");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("source_hash") || msg.contains("installed_hash"),
+            "error must mention the missing required field; got: {msg}"
+        );
+    }
+
+    /// PR #100 review I2 sibling for agents: a tracking entry that
+    /// has `source_path` (the Stage-1+ symmetry-pass marker) but
+    /// lacks `source_hash` / `installed_hash` is structurally
+    /// contradictory and must be rejected at the deserialize
+    /// boundary, not silently skipped at scan time.
+    #[test]
+    fn load_installed_agents_rejects_legacy_entry_without_source_hash() {
+        let (_dir, project) = temp_project();
+        let kiro_dir = project.kiro_dir();
+        std::fs::create_dir_all(&kiro_dir).expect("create .kiro");
+
+        let legacy_json = br#"{
+            "agents": {
+                "reviewer": {
+                    "marketplace": "mp",
+                    "plugin": "p",
+                    "version": "1.0",
+                    "installed_at": "2026-01-01T00:00:00Z",
+                    "dialect": "native",
+                    "source_path": "agents/reviewer.json"
+                }
+            }
+        }"#;
+        std::fs::write(kiro_dir.join("installed-agents.json"), legacy_json)
+            .expect("write legacy tracking");
+
+        let err = project
+            .load_installed_agents()
+            .expect_err("legacy agent entry without source_hash must fail to deserialize");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("source_hash") || msg.contains("installed_hash"),
+            "error must mention the missing required field; got: {msg}"
+        );
+    }
+
     #[test]
     fn load_installed_native_companions_rejects_legacy_entry_without_source_scan_root() {
         let (_dir, project) = temp_project();
@@ -7135,8 +7237,8 @@ mod tests {
             plugin: pn("p"),
             version: Some("1.0.0".into()),
             installed_at: chrono::Utc::now(),
-            source_hash: None,
-            installed_hash: None,
+            source_hash: String::new(),
+            installed_hash: String::new(),
             source_scan_root: RelativePath::new("skills").expect("valid"),
         };
 
@@ -7147,11 +7249,8 @@ mod tests {
         let installed = project.load_installed().unwrap();
         let entry = installed.skills.get("test").expect("entry persisted");
 
-        let src_hash = entry.source_hash.as_ref().expect("source_hash populated");
-        let inst_hash = entry
-            .installed_hash
-            .as_ref()
-            .expect("installed_hash populated");
+        let src_hash = &entry.source_hash;
+        let inst_hash = &entry.installed_hash;
 
         assert!(src_hash.starts_with("blake3:"));
         assert!(inst_hash.starts_with("blake3:"));
@@ -7177,8 +7276,8 @@ mod tests {
         };
         let mapped: Vec<crate::agent::tools::MappedTool> = vec![];
         let mut meta = sample_agent_meta();
-        meta.source_hash = None;
-        meta.installed_hash = None;
+        meta.source_hash = String::new();
+        meta.installed_hash = String::new();
         let plugin_name = meta.plugin.clone();
 
         project
@@ -7188,8 +7287,8 @@ mod tests {
         let installed = project.load_installed_agents().unwrap();
         let entry = installed.agents.get("rev").expect("entry persisted");
 
-        let src = entry.source_hash.as_ref().expect("source_hash set");
-        let inst = entry.installed_hash.as_ref().expect("installed_hash set");
+        let src = &entry.source_hash;
+        let inst = &entry.installed_hash;
         assert!(src.starts_with("blake3:"));
         assert!(inst.starts_with("blake3:"));
         // Translated path: source bytes (raw .md) differ from installed bytes
@@ -7242,8 +7341,8 @@ mod tests {
                 dialect: crate::agent::AgentDialect::Claude,
             };
             let mut meta = sample_agent_meta();
-            meta.source_hash = None;
-            meta.installed_hash = None;
+            meta.source_hash = String::new();
+            meta.installed_hash = String::new();
             project
                 .install_agent(&def, &[], meta, Some(&source_md))
                 .expect("install succeeds");
@@ -7264,6 +7363,88 @@ mod tests {
             companion
                 .files
                 .contains(&std::path::PathBuf::from("prompts/beta.md"))
+        );
+    }
+
+    /// PR #100 review I3: when a plugin's manifest changes its
+    /// translated-agent source path between installs, the recorded
+    /// `source_scan_root` on the existing `native_companions` entry
+    /// must refresh to the latest install's scan root — otherwise
+    /// drift detection (once issue #99 lands and starts consulting
+    /// the field) would look up the source under the stale root and
+    /// emit false drift on every scan. Pre-fix the `or_insert_with`
+    /// initializer set the value once and the post-insert refresh
+    /// updated `marketplace`/`version`/`installed_at`/`files` but
+    /// skipped `source_scan_root`, so the very first install's value
+    /// stuck forever.
+    #[test]
+    fn install_agent_translated_refreshes_source_scan_root_on_subsequent_install() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = KiroProject::new(tmp.path().to_path_buf());
+
+        // First install: source under `agents/`.
+        let alpha_md = write_agent(tmp.path(), "alpha", "body");
+        let alpha_def = crate::agent::AgentDefinition {
+            name: "alpha".into(),
+            description: None,
+            prompt_body: "body".into(),
+            model: None,
+            source_tools: vec![],
+            mcp_servers: std::collections::BTreeMap::new(),
+            dialect: crate::agent::AgentDialect::Claude,
+        };
+        let mut meta_alpha = sample_agent_meta();
+        meta_alpha.source_path = RelativePath::new("agents/alpha.md").expect("valid");
+        meta_alpha.source_hash = String::new();
+        meta_alpha.installed_hash = String::new();
+        project
+            .install_agent(&alpha_def, &[], meta_alpha, Some(&alpha_md))
+            .expect("install alpha");
+
+        let installed = project.load_installed_agents().unwrap();
+        let plugin_key = sample_agent_meta().plugin.clone();
+        assert_eq!(
+            installed
+                .native_companions
+                .get(plugin_key.as_str())
+                .expect("entry after first install")
+                .source_scan_root
+                .as_str(),
+            "agents",
+            "first install records its own scan root"
+        );
+
+        // Second install for the SAME plugin from a manifest that
+        // moved its agents under `prompts/` — the recorded
+        // source_scan_root must follow.
+        let beta_md = write_agent(tmp.path(), "beta", "body2");
+        let beta_def = crate::agent::AgentDefinition {
+            name: "beta".into(),
+            description: None,
+            prompt_body: "body2".into(),
+            model: None,
+            source_tools: vec![],
+            mcp_servers: std::collections::BTreeMap::new(),
+            dialect: crate::agent::AgentDialect::Claude,
+        };
+        let mut meta_beta = sample_agent_meta();
+        meta_beta.source_path = RelativePath::new("prompts/beta.md").expect("valid");
+        meta_beta.source_hash = String::new();
+        meta_beta.installed_hash = String::new();
+        project
+            .install_agent(&beta_def, &[], meta_beta, Some(&beta_md))
+            .expect("install beta");
+
+        let installed = project.load_installed_agents().unwrap();
+        let companion = installed
+            .native_companions
+            .get(plugin_key.as_str())
+            .expect("entry after second install");
+        assert_eq!(
+            companion.source_scan_root.as_str(),
+            "prompts",
+            "second install must refresh the recorded source_scan_root \
+             (regression: pre-fix it stuck at the first install's value)"
         );
     }
 
@@ -7411,11 +7592,8 @@ mod tests {
         assert_eq!(entry.dialect, crate::agent::AgentDialect::Native);
         assert_eq!(entry.plugin, "plugin-y");
         assert_eq!(entry.marketplace, "marketplace-x");
-        assert_eq!(entry.source_hash.as_deref(), Some(source_hash.as_str()));
-        assert_eq!(
-            entry.installed_hash.as_deref(),
-            Some(outcome.installed_hash.as_str())
-        );
+        assert_eq!(entry.source_hash, source_hash);
+        assert_eq!(entry.installed_hash, outcome.installed_hash);
     }
 
     #[rstest]

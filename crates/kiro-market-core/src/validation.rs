@@ -61,6 +61,21 @@ impl RelativePath {
         Self(value)
     }
 
+    /// The conventional `agents/` scan-root used by the translated
+    /// agent install path when the source-side scan root cannot be
+    /// recovered from `meta.source_path` (legacy `agent.md` discovered
+    /// without a configured scan path, hand-synthesised test fixtures,
+    /// etc.). Replaces the previous `from_internal_unchecked("agents".to_owned())`
+    /// site at `KiroProject::install_agent_inner` per PR #100 review S2:
+    /// the unchecked-constructor pattern was sound but anonymous —
+    /// every reader had to re-derive that `"agents"` is a constant
+    /// string. A named `agents_root()` makes the intent explicit and
+    /// removes one audited-by-convention site.
+    #[must_use]
+    pub fn agents_root() -> Self {
+        Self::from_internal_unchecked("agents".to_owned())
+    }
+
     /// Convert a `Path` to a [`RelativePath`] by stripping `base` and
     /// normalising path separators to forward-slash. Returns `Err` if
     /// `path` is not under `base` or the resulting relative path fails
@@ -98,15 +113,30 @@ impl RelativePath {
         // as ONE `Normal` component and we'd hand `RelativePath::new` a
         // backslash it rejects. The explicit `.replace('\\', '/')`
         // closes that gap; harmless when components already split.
-        let rel_str = rel
+        //
+        // PR #100 review I4: components are converted via `to_str()`,
+        // not `to_string_lossy()`. Lossy conversion silently substitutes
+        // `U+FFFD` for invalid UTF-8 sequences, so a non-UTF-8 OsStr
+        // component would round-trip as a valid-looking `RelativePath`
+        // that doesn't correspond to anything on disk — detection-side
+        // hashing later misses with `NotFound` and the user sees a
+        // misleading "missing file" error. Failing the construction
+        // here surfaces the real cause at the parse boundary.
+        let parts: Vec<&str> = rel
             .components()
             .filter_map(|c| match c {
-                std::path::Component::Normal(s) => Some(s.to_string_lossy().into_owned()),
+                std::path::Component::Normal(s) => Some(s),
                 _ => None,
             })
-            .collect::<Vec<_>>()
-            .join("/")
-            .replace('\\', "/");
+            .map(|s| {
+                s.to_str()
+                    .ok_or_else(|| ValidationError::InvalidRelativePath {
+                        path: path.display().to_string(),
+                        reason: "path contains a non-UTF-8 component".to_owned(),
+                    })
+            })
+            .collect::<Result<_, _>>()?;
+        let rel_str = parts.join("/").replace('\\', "/");
         // `path == base` produces an empty rel string (Components yields
         // zero Normal entries), which `RelativePath::new` rejects.
         // Substitute "." so the call still succeeds and downstream
@@ -1270,5 +1300,39 @@ mod tests {
         let rel = RelativePath::from_path_under(&plugin_dir, &plugin_dir)
             .expect("path == base must produce a valid sentinel, not error");
         assert_eq!(rel.as_str(), ".");
+    }
+
+    /// PR #100 review I4: a path component containing invalid UTF-8 must
+    /// produce `ValidationError::InvalidRelativePath { reason: "...non-UTF-8..." }`,
+    /// not a `to_string_lossy`-substituted U+FFFD that round-trips
+    /// through validation but doesn't match anything on disk. Unix-only
+    /// because Windows `OsStr` is WTF-16 and constructing an invalid
+    /// component takes a different path; the production code is
+    /// platform-agnostic — a Unix-only regression test is sufficient
+    /// since it pins the same `to_str()` call site on every target.
+    #[cfg(unix)]
+    #[test]
+    fn from_path_under_rejects_non_utf8_component() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+        use std::path::{Path, PathBuf};
+
+        // 0xFF is invalid as a UTF-8 start byte; the resulting OsStr is
+        // a valid Unix filename but has no UTF-8 representation.
+        let bad_component = OsStr::from_bytes(&[b'a', 0xFF, b'b']);
+        let base = PathBuf::from("/plugins/foo");
+        let path = base.join(Path::new(bad_component));
+
+        let err = RelativePath::from_path_under(&path, &base)
+            .expect_err("non-UTF-8 component must error, not lossy-substitute");
+        match err {
+            crate::error::ValidationError::InvalidRelativePath { reason, .. } => {
+                assert!(
+                    reason.contains("non-UTF-8"),
+                    "reason should call out non-UTF-8, got: {reason}"
+                );
+            }
+            other => panic!("expected InvalidRelativePath, got {other:?}"),
+        }
     }
 }
