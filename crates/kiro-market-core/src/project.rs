@@ -2171,11 +2171,9 @@ impl KiroProject {
     /// function under the line cap.
     ///
     /// `Option<&Path>` is preserved on the public install signature so
-    /// the ~20 in-tree synthetic-agent tests don't all need a real
-    /// source file. The `BlakeHash` field invariant (well-formed
-    /// `"blake3:" + 64-hex`) holds either way — replacing the prior
-    /// `String::new()` empty-string sentinel that could not survive
-    /// the post-PR #101 `BlakeHash::Deserialize` boundary.
+    /// the synthetic-agent tests don't all need a real source file; the
+    /// `BlakeHash` field invariant (well-formed `"blake3:" + 64-hex`)
+    /// holds either way.
     fn hash_translated_source(
         source_path: Option<&Path>,
     ) -> crate::error::Result<crate::hash::BlakeHash> {

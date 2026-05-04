@@ -6391,13 +6391,10 @@ mod tests {
     }
 
     /// A version bump on a plugin whose tracked agent has a content-mismatched
-    /// `source_hash` must surface as an update. The original test simulated
-    /// the legacy `Option<String>` "no hash recorded" case via empty-string;
-    /// post-`BlakeHash` newtype that shape is structurally impossible, so this
-    /// substitutes [`BlakeHash::placeholder`] which round-trips through
-    /// `Deserialize` but won't match any real content hash. Uses a native-
-    /// format agent to avoid the translated-agent companion-files
-    /// path-reconstruction complexity (C7).
+    /// `source_hash` must surface as an update. Uses [`BlakeHash::placeholder`]
+    /// to deliberately mismatch any real content hash without needing a
+    /// real fixture file. Native-format agent avoids the translated-agent
+    /// companion-files path-reconstruction complexity (C7).
     #[test]
     fn detect_plugin_updates_agent_version_bump_with_mismatched_hash_surfaces_update() {
         use crate::project::KiroProject;
@@ -6437,9 +6434,10 @@ mod tests {
             "agent must be installed before test mutation"
         );
 
-        // Replace the recorded source_hash with a deliberate placeholder
-        // that won't match the on-disk content. Combined with the version
-        // bump below, this exercises the drift-detection path that
+        // The placeholder hash is content-meaningless and will not equal
+        // the recomputed source hash, so it stands in for a drifted entry
+        // without needing to mutate the on-disk source file. Combined
+        // with the version bump below this exercises the drift path that
         // surfaces an update.
         let mut tracking = project.load_installed_agents().unwrap();
         for meta in tracking.agents.values_mut() {
@@ -6463,7 +6461,7 @@ mod tests {
         assert_eq!(
             result.updates.len(),
             1,
-            "agent with source_hash: None and version bump must surface as update, got: {result:?}"
+            "agent with placeholder source_hash and version bump must surface as update, got: {result:?}"
         );
         assert_eq!(result.updates[0].plugin.as_str(), "p");
         assert!(matches!(

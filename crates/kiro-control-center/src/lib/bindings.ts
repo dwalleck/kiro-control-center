@@ -199,9 +199,9 @@ export const commands = {
  *  to construct one are (a) `BlakeHash::new` (validates the format),
  *  (b) the artifact-hash producers in this module ([`hash_artifact`]
  *  / [`hash_dir_tree`], which build the canonical form by
- *  construction), or (c) the [`BlakeHash::placeholder`] constructor used
- *  during install scaffolding (and in test fixtures that don't care about
- *  the actual content).
+ *  construction), or (c) the `placeholder` constructor used during
+ *  install scaffolding (and in test fixtures that don't care about the
+ *  actual content).
  * 
  *  The `Deserialize` impl routes through `new`, so a tracking file
  *  containing `"source_hash": ""` (or any other malformed value) fails

@@ -1385,4 +1385,28 @@ mod tests {
             other => panic!("expected InvalidRelativePath, got {other:?}"),
         }
     }
+
+    /// `RootDir` (a leading separator) is structurally illegal under a
+    /// relative-path contract. Pre-S-4 the `_ => None` filter silently
+    /// dropped it; this test pins the explicit error so a future
+    /// refactor can't collapse the arm back into a silent discard.
+    /// `Prefix` (Windows drive letters) shares the same arm and is
+    /// covered by the same regression by construction.
+    #[cfg(unix)]
+    #[test]
+    fn from_path_under_rejects_absolute_path() {
+        use std::path::Path;
+
+        let err = RelativePath::from_path_under(Path::new("/etc/passwd"), Path::new(""))
+            .expect_err("absolute path must error, not silently disappear");
+        match err {
+            crate::error::ValidationError::InvalidRelativePath { reason, .. } => {
+                assert!(
+                    reason.contains("absolute") || reason.contains("prefix"),
+                    "reason should call out the absolute/prefix component, got: {reason}"
+                );
+            }
+            other => panic!("expected InvalidRelativePath, got {other:?}"),
+        }
+    }
 }

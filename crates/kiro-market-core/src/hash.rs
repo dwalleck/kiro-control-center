@@ -22,19 +22,26 @@ use thiserror::Error;
 /// to construct one are (a) `BlakeHash::new` (validates the format),
 /// (b) the artifact-hash producers in this module ([`hash_artifact`]
 /// / [`hash_dir_tree`], which build the canonical form by
-/// construction), or (c) the [`BlakeHash::placeholder`] constructor used
-/// during install scaffolding (and in test fixtures that don't care about
-/// the actual content).
+/// construction), or (c) the `placeholder` constructor used during
+/// install scaffolding (and in test fixtures that don't care about the
+/// actual content).
 ///
 /// The `Deserialize` impl routes through `new`, so a tracking file
 /// containing `"source_hash": ""` (or any other malformed value) fails
 /// to load instead of being silently accepted as a sentinel.
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize)]
 #[cfg_attr(feature = "specta", derive(specta::Type))]
+#[serde(transparent)]
 pub struct BlakeHash(String);
 
 const BLAKE_HASH_PREFIX: &str = "blake3:";
 const BLAKE_HASH_HEX_LEN: usize = 64;
+/// Inner string for [`BlakeHash::placeholder`]. Centralised so a future
+/// change to `BLAKE_HASH_PREFIX` / `BLAKE_HASH_HEX_LEN` can't desync the
+/// placeholder from `validate_blake_hash` — the
+/// `placeholder_satisfies_blake_hash_validation` test pins this.
+const BLAKE_HASH_PLACEHOLDER_HEX: &str =
+    "0000000000000000000000000000000000000000000000000000000000000000";
 
 impl BlakeHash {
     /// Construct a `BlakeHash` from a string, validating the canonical
@@ -45,7 +52,8 @@ impl BlakeHash {
     /// Returns [`BlakeHashParseError`] if `value` doesn't start with
     /// `"blake3:"`, isn't exactly 64 hex chars after the prefix, or
     /// contains non-ASCII-hex characters.
-    pub fn new(value: String) -> Result<Self, BlakeHashParseError> {
+    pub fn new(value: impl Into<String>) -> Result<Self, BlakeHashParseError> {
+        let value = value.into();
         validate_blake_hash(&value)?;
         Ok(Self(value))
     }
@@ -83,9 +91,31 @@ impl<'de> Deserialize<'de> for BlakeHash {
     }
 }
 
+/// Production visibility for [`BlakeHash::placeholder`]. In-crate scaffolding
+/// sites (skill/agent/companion install paths) construct the meta value
+/// before the real hash is known, then overwrite both hash fields against
+/// the staged content before committing to tracking. Keeping this
+/// `pub(crate)` in production builds prevents external crates from
+/// minting a content-meaningless hash that could later reach disk.
+#[cfg(not(any(test, feature = "test-support")))]
 impl BlakeHash {
-    /// A canonical-but-content-meaningless `BlakeHash`, used for two
-    /// patterns:
+    pub(crate) fn placeholder() -> Self {
+        Self(format!("{BLAKE_HASH_PREFIX}{BLAKE_HASH_PLACEHOLDER_HEX}"))
+    }
+}
+
+/// Test-build visibility for [`BlakeHash::placeholder`]. The Tauri crate's
+/// dev-dependencies activate `test-support`, so test fixtures across
+/// crates can build meta values without rigging up a real source file.
+/// The placeholder value is well-formed under the `BlakeHash` invariant
+/// (it round-trips through `Deserialize`), so leaking one into a
+/// production tracking file would cause loud content-drift on the next
+/// install rather than silent corruption — but production code should
+/// still go through the in-crate scaffolding sites that overwrite
+/// before persistence.
+#[cfg(any(test, feature = "test-support"))]
+impl BlakeHash {
+    /// A canonical-but-content-meaningless `BlakeHash` for two patterns:
     ///
     /// 1. **Install scaffolding**: an `InstalledSkillMeta` /
     ///    `InstalledAgentMeta` / `InstalledNativeCompanionsMeta` is
@@ -94,17 +124,16 @@ impl BlakeHash {
     ///    the entry is committed to tracking. The placeholder is
     ///    well-formed (it will round-trip through `Deserialize`) but
     ///    must never reach disk — the install-finalisation step is
-    ///    responsible for the overwrite.
-    /// 2. **Test fixtures** that synthesise a meta value from thin
-    ///    air and don't exercise drift detection. Tests asserting
-    ///    drift behaviour should compute a real hash via
-    ///    [`hash_artifact`] instead.
+    ///    responsible for the overwrite. **Do not branch on equality
+    ///    with `placeholder()` to detect "unset"** — the all-zeros
+    ///    value is computationally indistinguishable from a real hash.
+    /// 2. **Test fixtures** that synthesise a meta value from thin air
+    ///    and don't exercise drift detection. Tests asserting drift
+    ///    behaviour should compute a real hash via [`hash_artifact`]
+    ///    instead.
     #[must_use]
     pub fn placeholder() -> Self {
-        Self(format!(
-            "{BLAKE_HASH_PREFIX}{}",
-            "0".repeat(BLAKE_HASH_HEX_LEN)
-        ))
+        Self(format!("{BLAKE_HASH_PREFIX}{BLAKE_HASH_PLACEHOLDER_HEX}"))
     }
 }
 
@@ -519,9 +548,8 @@ mod tests {
 
     #[test]
     fn blake_hash_deserialize_routes_through_new() {
-        // A legacy tracking file with `"source_hash": ""` must fail to load
-        // rather than being silently accepted as a sentinel — that was the
-        // I-1 finding under PR #100/#101 review.
+        // A tracking file with `"source_hash": ""` must fail to load
+        // rather than being silently accepted as a sentinel.
         let err = serde_json::from_str::<BlakeHash>("\"\"")
             .expect_err("empty string must fail deserialize");
         assert!(
@@ -536,6 +564,18 @@ mod tests {
         let json = format!("\"{canonical}\"");
         let h: BlakeHash = serde_json::from_str(&json).unwrap();
         assert_eq!(h.as_str(), canonical);
+    }
+
+    /// `placeholder()` and `validate_blake_hash` must agree on the format —
+    /// otherwise a future change to `BLAKE_HASH_PREFIX` /
+    /// `BLAKE_HASH_HEX_LEN` could desync the placeholder constant from the
+    /// validator without any caller noticing (until a `Deserialize`
+    /// round-trip on a placeholder-bearing tracking file blew up at load
+    /// time).
+    #[test]
+    fn placeholder_satisfies_blake_hash_validation() {
+        let p = BlakeHash::placeholder();
+        BlakeHash::new(p.as_str().to_owned()).expect("placeholder must satisfy validation");
     }
 
     #[test]
