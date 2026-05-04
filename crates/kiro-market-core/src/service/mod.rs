@@ -512,13 +512,12 @@ pub struct PluginUpdateFailure {
     pub reason: String,
 }
 
-/// Why an update-detection scan couldn't check a plugin. Tagged enum
-/// for FFI per the `ffi-enum-serde-tag` plan-lint gate (PR #91):
+/// Why an update-detection scan couldn't check a plugin.
 /// `#[serde(tag = "kind", rename_all = "snake_case")]` produces
 /// `{ "kind": "manifest_unreadable" }` in JSON, which `tauri-specta`
 /// emits as a discriminated TS union.
 ///
-/// Closes original-review I4: `PluginUpdateFailure` was opaque
+/// `PluginUpdateFailure` was previously opaque
 /// (substring matching `reason` to differentiate failure types
 /// violated CLAUDE.md Rule 42). The classifier
 /// [`PluginUpdateFailureKind::from_error`] is exhaustive per the
@@ -627,8 +626,7 @@ fn classify_plugin_error(err: &PluginError) -> PluginUpdateFailureKind {
     }
 }
 
-/// Why an update is being surfaced. Tagged enum for FFI per the
-/// `ffi-enum-serde-tag` plan-lint gate (PR #91): `#[serde(tag = "kind",
+/// Why an update is being surfaced. `#[serde(tag = "kind",
 /// rename_all = "snake_case")]` produces `{ "kind": "version_bumped" }`
 /// in JSON, which `tauri-specta` emits as a discriminated TS union.
 #[derive(Clone, Debug, Serialize)]
@@ -2242,7 +2240,7 @@ impl MarketplaceService {
     ) -> Result<DetectUpdatesResult, Error> {
         let view = project.installed_plugins()?;
         // Hoist the three tracking-file loads above the per-plugin
-        // loop (originally-deferred IMPORTANT in PR #96 review). Pre-fix:
+        // loop. Previously,
         // `scan_plugin_for_content_drift` called
         // load_installed{,_steering,_agents}() once per plugin, so a
         // project with N installed plugins did 3N reads + JSON
@@ -2311,7 +2309,7 @@ impl MarketplaceService {
         let marketplace_path = self.marketplace_path(marketplace_name);
         let plugin_dir = self.resolve_local_plugin_dir(entry, &marketplace_path)?;
 
-        // NC1 (PR #96 re-review): pre-rename, `load_plugin_manifest_version`
+        // `load_plugin_manifest_version` previously
         // returned `Ok(None)` for both "manifest legitimately lacks
         // version" and "manifest unreadable", and the latter case
         // combined with `installed_version: Some(_)` below to emit a
@@ -2384,16 +2382,15 @@ impl MarketplaceService {
 
     /// Load `plugin.json` from `plugin_dir` and return the full parsed
     /// [`crate::plugin::PluginManifest`] — three semantically distinct
-    /// outcomes per NC1 (PR #96 re-review):
+    /// outcomes:
     ///
     /// - [`ManifestState::Found`] — manifest read and parsed. Caller
     ///   reads `.version` for the version comparison AND `.agents` /
     ///   `.steering` for the scan-path probing in
-    ///   [`Self::scan_plugin_for_content_drift`] (per the
-    ///   manifest-respects-scan-paths fix from the PR #96 re-review;
-    ///   pre-fix, drift detection compared against the hardcoded
-    ///   `./steering/` and `./agents/` defaults regardless of what the
-    ///   manifest declared).
+    ///   [`Self::scan_plugin_for_content_drift`] (the
+    ///   manifest-respects-scan-paths fix; previously, drift detection
+    ///   compared against the hardcoded `./steering/` and `./agents/`
+    ///   defaults regardless of what the manifest declared).
     /// - [`ManifestState::Unreadable`] — manifest could not be read for
     ///   a non-fatal reason (symlink-refused or `NotFound`). The
     ///   caller must surface this as a per-plugin failure rather than
@@ -2474,22 +2471,20 @@ impl MarketplaceService {
     /// hashes against the same roots install used. Pre-fix the
     /// steering and native-companion loops hardcoded `plugin_dir/
     /// steering` and `plugin_dir/agents`, producing false-positive
-    /// drift on every scan for plugins declaring custom paths
-    /// (PR #96 review #6). The manifest is `Option<&...>` so callers
+    /// drift on every scan for plugins declaring custom paths.
+    /// The manifest is `Option<&...>` so callers
     /// that lack a parsed manifest fall back to
     /// [`crate::DEFAULT_STEERING_PATHS`] / [`crate::DEFAULT_AGENT_PATHS`]
     /// via the same helpers `MarketplaceService::install_plugin`
     /// uses.
     ///
-    /// PR #100 review I2 dropped the `legacy_fallback` second return
-    /// value: after the install↔detect symmetry pass made
-    /// `source_scan_root` required AND tightened `source_hash` to
-    /// required `String`, no in-tree tracking entry can land here
-    /// without both fields. The previous `Option<String>` matching
-    /// arms (`None => legacy_fallback = true`) were unreachable at
-    /// runtime, so the helper now returns just `bool` and the caller
-    /// no longer logs a "legacy entry" debug line that could never
-    /// fire.
+    /// After the install↔detect symmetry pass made `source_scan_root`
+    /// required AND tightened `source_hash` to required `String`, no
+    /// in-tree tracking entry can land here without both fields. The
+    /// previous `Option<String>` matching arms (`None => legacy_fallback
+    /// = true`) were unreachable at runtime, so the helper now returns
+    /// just `bool` and the caller no longer logs a "legacy entry" debug
+    /// line that could never fire.
     fn scan_plugin_for_content_drift(
         plugin_info: &crate::project::InstalledPluginInfo,
         plugin_dir: &Path,
@@ -2565,7 +2560,7 @@ impl MarketplaceService {
 /// 3-state outcome of [`MarketplaceService::load_plugin_manifest`].
 ///
 /// Distinguishing "manifest exists, version field absent" from "manifest
-/// could not be read" closes NC1 (PR #96 re-review): collapsing both
+/// could not be read": collapsing both
 /// into `Option<String>::None` causes `check_plugin_for_update` to emit
 /// a phantom `VersionBumped` entry whenever an installed plugin happens
 /// to carry a `version` and the cache's `plugin.json` is symlinked or
@@ -2599,8 +2594,7 @@ enum ManifestState {
 /// [`read_capped`] returns an error. 1 MiB is well above any plausible
 /// manifest (the largest in this workspace's fixtures is < 4 KiB) and
 /// well below process-OOM territory. Mitigates the resource-exhaustion
-/// vector flagged by marketplace-security-reviewer in PR #96 re-review:
-/// a malicious marketplace could otherwise ship a multi-GB
+/// vector: a malicious marketplace could otherwise ship a multi-GB
 /// `plugin.json` and OOM the host before serde sees a byte.
 const MAX_PLUGIN_MANIFEST_BYTES: u64 = 1024 * 1024;
 
@@ -2709,14 +2703,14 @@ fn read_and_parse_skill_md(
 /// [`crate::validation::RelativePath`] under `plugin_dir`.
 ///
 /// Shared by [`required_skill_scan_root`] and [`required_source_path`]
-/// per PR #100 review S7 — both helpers were independently formatting
+/// — both helpers were independently formatting
 /// near-identical messages, which would drift one wording tweak apart
 /// the next time either was edited. This helper is the single source
 /// of truth for the wire-format string.
 ///
 /// Note the asymmetry with `required_steering_scan_root`: the steering
 /// path uses the typed `SteeringError::ScanRootInvalid` variant
-/// (added by PR #100 review I1) and does NOT funnel through this
+/// and does NOT funnel through this helper.
 /// helper. `SkillError` and `AgentError` don't yet have an analogous
 /// typed variant; a future cleanup mirroring I1 across all three
 /// error enums would let this synthetic-`io::Error` helper retire.
@@ -5857,9 +5851,9 @@ mod tests {
                 }),
                 PluginUpdateFailureKind::ManifestUnreadable,
             ),
-            // Cache-side variants — added in PR #96 and the canonical
-            // detection path. Pre-fix these routed through the
-            // `Error::Plugin(_)` wildcard into `Other`; post-fix they
+            // Cache-side variants — the canonical detection path.
+            // These previously routed through the
+            // `Error::Plugin(_)` wildcard into `Other`; now they
             // carry typed kinds. Locking the routing so a future
             // refactor can't silently drop them back to `Other`.
             (
@@ -6127,11 +6121,8 @@ mod tests {
         );
     }
 
-    // Deleted: `detect_plugin_updates_legacy_fallback_source_hash_none`
-    // and `detect_plugin_updates_legacy_fallback_no_version_bump_returns_no_update`
-    // — they exercised the `Option<String>::None => legacy_fallback = true`
-    // arm of `scan_plugin_for_content_drift`, which PR #100 review I2
-    // removed. Post-I2 the field is required `String` and a tracking
+    // The `legacy_fallback` arm of `scan_plugin_for_content_drift` was
+    // removed. The field is now required `String` and a tracking
     // entry without `source_hash` fails to deserialize at the
     // `load_installed()` boundary; the contract is pinned by
     // `load_installed_rejects_legacy_entry_without_source_hash` and
@@ -6474,8 +6465,8 @@ mod tests {
         assert!(result.failures.is_empty());
     }
 
-    /// NC1 (PR #96 re-review): the C5 symlink defense returned
-    /// `Ok(None)` from `load_plugin_manifest_version` (pre-rename) when
+    /// The C5 symlink defense previously returned
+    /// `Ok(None)` from `load_plugin_manifest_version` when
     /// the `plugin.json` symlink was refused. That `None` then collapsed
     /// with `installed_version: Some("1.0")` in the version-comparison
     /// path to emit a phantom `PluginUpdateInfo { available_version:
@@ -6483,7 +6474,7 @@ mod tests {
     /// update is available to nothing" whenever an installed plugin's
     /// cache `plugin.json` had been swapped for a symlink.
     ///
-    /// Post-fix: the 3-state `ManifestState` enum routes
+    /// Now the 3-state `ManifestState` enum routes
     /// "unreadable" through the per-plugin failure arm. This test
     /// pins the no-phantom-update contract by deleting the cache
     /// `plugin.json` after install and asserting the scan produces
@@ -6553,7 +6544,7 @@ mod tests {
         assert_eq!(result.failures[0].plugin.as_str(), "p");
     }
 
-    /// PR #96 review #6: a plugin whose `plugin.json` declares a
+    /// A plugin whose `plugin.json` declares a
     /// custom `steering: ["./guides/"]` scan path would false-positive
     /// drift on every detection scan — install hashed against
     /// `<plugin_dir>/guides/`, but pre-fix `scan_plugin_for_content_drift`
@@ -6690,10 +6681,10 @@ mod tests {
         );
     }
 
-    /// PR #96 review I1: sibling of the steering test above for the
+    /// Sibling of the steering test above for the
     /// **native-companions** loop, which got the symmetric scan-path
     /// fix. A plugin declaring `agents: ["./companions/"]` stores
-    /// companion files under `<plugin_dir>/companions/`, but pre-fix
+    /// companion files under `<plugin_dir>/companions/`, but previously
     /// detection hardcoded `<plugin_dir>/agents/` and would emit a
     /// hash `NotFound` failure on every scan.
     ///
@@ -6702,8 +6693,8 @@ mod tests {
     /// detection re-hashes against the source, so the two never match
     /// through the install path. (The canonical reference test
     /// previously named `detect_plugin_updates_copilot_agent_legacy_fallback`
-    /// has been removed — see PR #100's deserialize-rejection sweep,
-    /// which invalidated the legacy-Option-shape fixture it relied on.
+    /// has been removed — the deserialize-rejection sweep
+    /// invalidated the legacy-Option-shape fixture it relied on.
     /// The bug itself is still real and the workaround below still
     /// applies.) To isolate the scan-path fix, we synthesize the tracking
     /// entry by hand: compute the source-side hash directly via
@@ -6778,7 +6769,7 @@ mod tests {
         // native-companions cascade as the only thing the assertion
         // depends on.
         //
-        // PR #100 review I2 dropped the legacy_fallback escape hatch
+        // The legacy_fallback escape hatch was dropped
         // (source_hash: None used to be a "skip me" sentinel for the
         // drift scan); after I2 every entry must have a real source
         // file on disk and a real source_hash, so the registrar agent
@@ -6880,7 +6871,7 @@ mod tests {
         );
     }
 
-    /// I-N2 (PR #96 re-review): mirrors `service::browse::tests::
+    /// Mirrors `service::browse::tests::
     /// load_plugin_manifest_refuses_symlinked_manifest` for the Phase 2a
     /// detection-side function. Without this test, a future refactor
     /// could replace the `symlink_metadata` check with `Path::exists()`
@@ -7008,7 +6999,7 @@ mod tests {
         );
     }
 
-    /// I-N6 (PR #96 re-review): C4 plumbing test. Default-empty + JSON-
+    /// C4 plumbing test. Default-empty + JSON-
     /// shape locks didn't verify the `partial_load_warnings` field is
     /// actually populated from `view.partial_load_warnings` — only
     /// that the field exists on the wire. This test corrupts

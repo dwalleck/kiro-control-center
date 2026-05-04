@@ -39,17 +39,16 @@ pub struct InstalledSkillMeta {
     pub installed_at: DateTime<Utc>,
 
     /// Tree-hash of the skill source as it existed in the marketplace at
-    /// install time. Required after PR #100 review I2 — every install
-    /// path computes this, and the install↔detect symmetry pass made
-    /// `source_scan_root` required which means any post-Stage-1+
-    /// tracking entry has both. The deferred `legacy_fallback` plumbing
-    /// in `scan_plugin_for_content_drift` was unreachable in practice
-    /// once `source_scan_root` became required (no entry could have
-    /// `scan_root` without `source_hash`) and is gone.
+    /// install time. Required — every install path computes this, and
+    /// the install↔detect symmetry pass made `source_scan_root` required
+    /// which means any entry that tracks a scan root must also track a
+    /// source hash. The deferred `legacy_fallback` plumbing in
+    /// `scan_plugin_for_content_drift` was unreachable in practice once
+    /// `source_scan_root` became required and is gone.
     pub source_hash: crate::hash::BlakeHash,
 
     /// Tree-hash of the skill as it was copied into the project.
-    /// Required after PR #100 review I2; see [`Self::source_hash`].
+    /// Required; see [`Self::source_hash`].
     pub installed_hash: crate::hash::BlakeHash,
 
     /// Scan root (relative to `plugin_dir`) that this skill was
@@ -110,7 +109,7 @@ pub struct InstalledAgentMeta {
     pub source_path: RelativePath,
 
     /// Tree-hash of the agent source as it existed in the marketplace at
-    /// install time. Required after PR #100 review I2; mirrors the
+    /// install time. Required; mirrors the
     /// `InstalledSkillMeta::source_hash` tightening — every install
     /// path computes it, and the post-symmetry-pass schema makes a
     /// missing-source_hash entry impossible (the matching
@@ -118,7 +117,7 @@ pub struct InstalledAgentMeta {
     pub source_hash: crate::hash::BlakeHash,
 
     /// Tree-hash of the agent as it was copied into the project.
-    /// Required after PR #100 review I2; see [`Self::source_hash`].
+    /// Required; see [`Self::source_hash`].
     pub installed_hash: crate::hash::BlakeHash,
 }
 
@@ -157,8 +156,7 @@ pub struct InstalledNativeCompanionsMeta {
     /// was installed from. Required at install time. The
     /// single-scan-root invariant is enforced upstream by
     /// `multiple_companion_scan_roots`, so all `files` resolve under
-    /// this single root. Drift detection uses it directly, replacing
-    /// PR #96's `hash_artifact_in_scan_paths` probe.
+    /// this single root. Drift detection uses it directly.
     pub source_scan_root: RelativePath,
 }
 
@@ -200,8 +198,7 @@ pub struct InstalledSteeringMeta {
     /// the agent discover sites). Drift detection at
     /// [`crate::service::MarketplaceService::scan_plugin_for_content_drift`]
     /// uses this directly to locate the source file for hash
-    /// recomputation, replacing PR #96's `hash_artifact_in_scan_paths`
-    /// probe helper.
+    /// recomputation.
     pub source_scan_root: RelativePath,
 }
 
@@ -2537,7 +2534,7 @@ impl KiroProject {
                 source_scan_root: input.source_scan_root.clone(),
             });
         // Refresh marketplace/version/timestamp + source_scan_root on
-        // every install. PR #100 review I3: the post-insert refresh
+        // every install. The post-insert refresh
         // initially missed `source_scan_root`, so a manifest that
         // changed its scan paths between installs would keep the stale
         // root recorded forever — the install-time scan_root is what
@@ -3960,7 +3957,7 @@ mod tests {
         }
     }
 
-    /// NC2 (PR #96 re-review): a tampered `installed-agents.json`
+    /// A tampered `installed-agents.json`
     /// whose per-agent `source_path` contains a traversal entry would,
     /// without the `RelativePath` newtype on `InstalledAgentMeta`,
     /// reach `hash_artifact(agents_dir, &[rel])` at update-detection
@@ -6957,7 +6954,7 @@ mod tests {
         let bytes = serde_json::to_vec(&meta).unwrap();
         let back: InstalledNativeCompanionsMeta = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(back.files.len(), 2);
-        // PR #100 review I6: the round-trip used to assert only on
+        // The round-trip used to assert only on
         // `files.len()`, which was satisfied long before
         // `source_scan_root` joined the schema. Locking the field
         // explicitly so a future regression that drops or re-types it
@@ -6966,7 +6963,7 @@ mod tests {
         assert_eq!(back.source_scan_root.as_str(), "agents");
     }
 
-    /// PR #100 review I1: `required_steering_scan_root` must surface a
+    /// `required_steering_scan_root` must surface a
     /// structural validation failure as `SteeringError::ScanRootInvalid`,
     /// not a synthetic `SourceReadFailed { source: io::Error }`. The
     /// real `ValidationError` propagates via `#[source]` so the
@@ -7100,12 +7097,12 @@ mod tests {
         );
     }
 
-    /// PR #100 review I2: a tracking entry with `source_scan_root` but
+    /// A tracking entry with `source_scan_root` but
     /// without `source_hash` / `installed_hash` was unreachable in
     /// practice (every install path that records `scan_root` also
     /// records hashes), but the deferred `Option<String>` field type
     /// kept the `legacy_fallback` escape hatch alive in detection.
-    /// After I2 the fields are required `String` and a contradictory
+    /// With the fields now required, a contradictory
     /// entry (`scan_root` present, hashes absent) fails to deserialize
     /// at the boundary.
     #[test]
@@ -7138,7 +7135,7 @@ mod tests {
         );
     }
 
-    /// PR #100 review I2 sibling for agents: a tracking entry that
+    /// Sibling for agents: a tracking entry that
     /// has `source_path` (the Stage-1+ symmetry-pass marker) but
     /// lacks `source_hash` / `installed_hash` is structurally
     /// contradictory and must be rejected at the deserialize
@@ -7367,13 +7364,13 @@ mod tests {
         );
     }
 
-    /// PR #100 review I3: when a plugin's manifest changes its
+    /// When a plugin's manifest changes its
     /// translated-agent source path between installs, the recorded
     /// `source_scan_root` on the existing `native_companions` entry
     /// must refresh to the latest install's scan root — otherwise
     /// drift detection (once issue #99 lands and starts consulting
     /// the field) would look up the source under the stale root and
-    /// emit false drift on every scan. Pre-fix the `or_insert_with`
+    /// emit false drift on every scan. Previously the `or_insert_with`
     /// initializer set the value once and the post-insert refresh
     /// updated `marketplace`/`version`/`installed_at`/`files` but
     /// skipped `source_scan_root`, so the very first install's value

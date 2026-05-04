@@ -789,8 +789,7 @@ mod tests {
         // Pin the specific CLI subcommand. `kiro-market install` is the
         // remediation because it uses the cloning resolver; previously
         // this hint said `kiro-market add` which does not exist as a
-        // subcommand (flagged by gemini-code-assist on PR #35). The
-        // `install` substring catches a regression back to any
+        // subcommand. The `install` substring catches a regression back to any
         // non-existent command.
         assert!(
             cli.contains("kiro-market install"),
