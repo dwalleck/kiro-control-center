@@ -486,7 +486,7 @@ pub struct PluginUpdateInfo {
     /// `Some(None)` here.
     pub installed_version: Option<String>,
     /// `None` means the marketplace plugin manifest exists but lacks
-    /// a `version` field. After NC1's `ManifestState` 3-state
+    /// a `version` field. The `ManifestState` 3-state
     /// split, cases where the manifest is missing or unreadable
     /// (symlinked, `NotFound`) surface as a [`PluginUpdateFailure`] —
     /// they no longer collapse into `Some(None)` here. So
@@ -597,8 +597,8 @@ impl PluginUpdateFailureKind {
 fn classify_plugin_error(err: &PluginError) -> PluginUpdateFailureKind {
     match err {
         PluginError::NotFound { .. } => PluginUpdateFailureKind::MarketplaceUnavailable,
-        // Cache-side variants are the canonical detection path
-        // (Phase 2a). Project-side variants (`ManifestNotFound`,
+        // Cache-side variants are the canonical detection path.
+        // Project-side variants (`ManifestNotFound`,
         // `ManifestReadFailed`) map here too because
         // `check_plugin_for_update` may surface them transitively via
         // `resolve_local_plugin_dir`, which shares the install-time
@@ -2329,7 +2329,7 @@ impl MarketplaceService {
                 // pieces in the wire-format `PluginUpdateFailure.reason`.
                 // The cache-side variant routes through
                 // PluginUpdateFailureKind::ManifestUnreadable in the
-                // outer detect_plugin_updates loop (see Commit 5).
+                // outer detect_plugin_updates loop.
                 return Err(PluginError::CacheManifestReadFailed {
                     path: manifest_path,
                     source: std::io::Error::new(std::io::ErrorKind::NotFound, reason),
@@ -2408,7 +2408,7 @@ impl MarketplaceService {
     /// at stat time keeps that exfiltration channel closed. Mirrors
     /// `service::browse::load_plugin_manifest`'s defense.
     ///
-    /// Resource cap (Commit 9 / pre-existing security observation):
+    /// Resource cap (pre-existing security observation):
     /// reads are bounded at [`MAX_PLUGIN_MANIFEST_BYTES`] so a malicious
     /// marketplace shipping a multi-GB `plugin.json` cannot OOM the
     /// process before serde sees a byte.
@@ -2581,7 +2581,7 @@ enum ManifestState {
     /// Manifest could not be read for a non-fatal reason
     /// (symlink-refused or `NotFound` on the cache copy). Caller must
     /// treat this as a per-plugin failure rather than collapse it with
-    /// `Found(_).version.is_none()` — see NC1 above.
+    /// `Found(_).version.is_none()` — see above.
     Unreadable {
         /// Human-readable reason; embedded into the wire-format
         /// `PluginUpdateFailure.reason` via `error_full_chain`. Kept
@@ -6519,7 +6519,7 @@ mod tests {
         );
 
         // Now make the cache plugin.json unreadable: delete it.
-        // Pre-NC1 fix: load_plugin_manifest_version (pre-rename)
+        // Previously: load_plugin_manifest_version
         // returned Ok(None), version_differs became true
         // (Some("1.0") != None), and the result had a phantom
         // `VersionBumped` update with available_version: None.
@@ -6570,7 +6570,7 @@ mod tests {
         // return NotFound and the plugin would surface as a failure.
         fs::write(plugin_dir.join("guides/playbook.md"), b"how to ship\n")
             .expect("write steering source");
-        // Manifest declares the custom scan path. The Phase 2a fix
+        // Manifest declares the custom scan path. The fix
         // makes `scan_plugin_for_content_drift` consult this field.
         fs::write(
             plugin_dir.join("plugin.json"),
@@ -6844,7 +6844,7 @@ mod tests {
         );
     }
 
-    /// Commit 9 / Phase 2a sibling of
+    /// Sibling of
     /// `service::browse::tests::load_plugin_manifest_rejects_oversized_file`:
     /// the detection-side `load_plugin_manifest` shares the
     /// same `read_capped` defense; verify it fires here too.
@@ -6872,7 +6872,7 @@ mod tests {
     }
 
     /// Mirrors `service::browse::tests::
-    /// load_plugin_manifest_refuses_symlinked_manifest` for the Phase 2a
+    /// load_plugin_manifest_refuses_symlinked_manifest` for the
     /// detection-side function. Without this test, a future refactor
     /// could replace the `symlink_metadata` check with `Path::exists()`
     /// (which follows symlinks) and silently re-open the C5 leak vector
@@ -6924,7 +6924,7 @@ mod tests {
         }
     }
 
-    /// I-N3 sibling: a Copilot agent with `source_path: Some(rel)`
+    /// Sibling: a Copilot agent with `source_path: Some(rel)`
     /// (post-C7 install shape) — detection finds the file via the
     /// populated path, NOT the dialect fallback. Bypasses the
     /// translated install path for the same reason as the legacy

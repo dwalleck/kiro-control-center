@@ -1116,7 +1116,7 @@ fn load_plugin_manifest(plugin_dir: &Path) -> Result<Option<PluginManifest>, Err
     // Resource cap: bound the read at MAX_PLUGIN_MANIFEST_BYTES so a
     // malicious marketplace shipping a multi-GB plugin.json cannot OOM
     // the process before serde sees a byte. Mirrors the cap applied to
-    // service::mod::load_plugin_manifest in the Phase 2a detection path.
+    // service::mod::load_plugin_manifest in the detection path.
     // Pre-existing crate-wide gap flagged by marketplace-security-reviewer.
     let bytes = match super::read_capped(&manifest_path, super::MAX_PLUGIN_MANIFEST_BYTES) {
         Ok(b) => b,

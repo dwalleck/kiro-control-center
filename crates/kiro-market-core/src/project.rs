@@ -3995,7 +3995,7 @@ mod tests {
         }
     }
 
-    /// NC2 + parse-don't-validate sanity: a well-formed `source_path`
+    /// Parse-don't-validate sanity: a well-formed `source_path`
     /// (forward-slash relative path under `agents/`) must round-trip
     /// through serde.
     #[test]
