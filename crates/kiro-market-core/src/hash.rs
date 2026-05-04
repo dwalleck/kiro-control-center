@@ -45,7 +45,12 @@ const BLAKE_HASH_PLACEHOLDER_HEX: &str =
 
 impl BlakeHash {
     /// Construct a `BlakeHash` from a string, validating the canonical
-    /// `"blake3:" + 64 hex` format.
+    /// `"blake3:" + 64 hex` format. The hex payload is normalised to
+    /// lowercase so two `BlakeHash` values that represent the same
+    /// content always compare equal, even if one was authored in
+    /// uppercase (e.g. by a hand-edited tracking file or an external
+    /// producer). Lowercase is canonical because `blake3::Hash::Display`
+    /// and `from_blake3_digest` both emit lowercase.
     ///
     /// # Errors
     ///
@@ -53,8 +58,12 @@ impl BlakeHash {
     /// `"blake3:"`, isn't exactly 64 hex chars after the prefix, or
     /// contains non-ASCII-hex characters.
     pub fn new(value: impl Into<String>) -> Result<Self, BlakeHashParseError> {
-        let value = value.into();
+        let mut value = value.into();
         validate_blake_hash(&value)?;
+        // Validation accepts mixed case; equality is case-sensitive on
+        // the inner String. Normalise post-validation so the canonical
+        // form is the only representation that ever lands in `Self`.
+        value.make_ascii_lowercase();
         Ok(Self(value))
     }
 
@@ -66,12 +75,11 @@ impl BlakeHash {
     /// Build a `BlakeHash` directly from a finalized blake3 digest.
     /// Crate-internal because the caller holds the raw digest bytes —
     /// no string parsing involved, format invariant holds by
-    /// construction.
+    /// construction. Uses `blake3::Hash`'s `Display` impl (lowercase
+    /// hex) so the produced value is in canonical form and round-trips
+    /// through `Deserialize` without re-normalisation.
     pub(crate) fn from_blake3_digest(digest: &blake3::Hash) -> Self {
-        Self(format!(
-            "{BLAKE_HASH_PREFIX}{}",
-            hex::encode(digest.as_bytes())
-        ))
+        Self(format!("{BLAKE_HASH_PREFIX}{digest}"))
     }
 }
 
@@ -564,6 +572,24 @@ mod tests {
         let json = format!("\"{canonical}\"");
         let h: BlakeHash = serde_json::from_str(&json).unwrap();
         assert_eq!(h.as_str(), canonical);
+    }
+
+    /// Two `BlakeHash` values authored in different cases but representing
+    /// the same content must compare equal. `validate_blake_hash` accepts
+    /// mixed case, so without lowercase normalisation in `new` an
+    /// uppercase-authored entry from a hand-edited tracking file would
+    /// fail to match the lowercase output of `from_blake3_digest`,
+    /// producing spurious drift on every detection pass.
+    #[test]
+    fn blake_hash_normalises_case_so_equality_is_canonical() {
+        let upper = BlakeHash::new(format!("blake3:{}", "ABCDEF1234567890".repeat(4))).unwrap();
+        let lower = BlakeHash::new(format!("blake3:{}", "abcdef1234567890".repeat(4))).unwrap();
+        assert_eq!(upper, lower, "case-different inputs must compare equal");
+        assert_eq!(
+            upper.as_str(),
+            format!("blake3:{}", "abcdef1234567890".repeat(4)),
+            "stored form must be lowercase canonical"
+        );
     }
 
     /// `placeholder()` and `validate_blake_hash` must agree on the format —
