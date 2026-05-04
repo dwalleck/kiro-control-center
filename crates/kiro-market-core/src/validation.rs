@@ -122,18 +122,42 @@ impl RelativePath {
         // hashing later misses with `NotFound` and the user sees a
         // misleading "missing file" error. Failing the construction
         // here surfaces the real cause at the parse boundary.
+        // Match each component explicitly rather than `_ => None`. Only
+        // `CurDir` (`.`) is silently discarded; `ParentDir` (`..`),
+        // `Prefix` (Windows drive letters), and `RootDir` (a leading
+        // separator) are structurally illegal under a relative-path
+        // contract and must error rather than silently disappear into the
+        // filter. Without this gate a hand-built path lexically containing
+        // `..` after `strip_prefix` would round-trip as a "clean"
+        // `RelativePath` that doesn't represent the input.
         let parts: Vec<&str> = rel
             .components()
             .filter_map(|c| match c {
-                std::path::Component::Normal(s) => Some(s),
-                _ => None,
-            })
-            .map(|s| {
-                s.to_str()
-                    .ok_or_else(|| ValidationError::InvalidRelativePath {
+                std::path::Component::Normal(s) => Some(Ok(s)),
+                std::path::Component::CurDir => None,
+                std::path::Component::ParentDir => {
+                    Some(Err(ValidationError::InvalidRelativePath {
                         path: path.display().to_string(),
-                        reason: "path contains a non-UTF-8 component".to_owned(),
-                    })
+                        reason: "path contains a `..` component".to_owned(),
+                    }))
+                }
+                std::path::Component::Prefix(_) | std::path::Component::RootDir => {
+                    Some(Err(ValidationError::InvalidRelativePath {
+                        path: path.display().to_string(),
+                        reason: "path contains an absolute or prefix component after \
+                                 strip_prefix"
+                            .to_owned(),
+                    }))
+                }
+            })
+            .map(|c| {
+                c.and_then(|s| {
+                    s.to_str()
+                        .ok_or_else(|| ValidationError::InvalidRelativePath {
+                            path: path.display().to_string(),
+                            reason: "path contains a non-UTF-8 component".to_owned(),
+                        })
+                })
             })
             .collect::<Result<_, _>>()?;
         let rel_str = parts.join("/").replace('\\', "/");
@@ -1330,6 +1354,56 @@ mod tests {
                 assert!(
                     reason.contains("non-UTF-8"),
                     "reason should call out non-UTF-8, got: {reason}"
+                );
+            }
+            other => panic!("expected InvalidRelativePath, got {other:?}"),
+        }
+    }
+
+    /// `..` component in the post-`strip_prefix` path must error rather
+    /// than silently disappear into the component filter. Without this
+    /// gate a hand-built path lexically containing `..` would round-trip
+    /// as a "clean" `RelativePath` that doesn't represent the input —
+    /// the precondition for a path-traversal smuggling bug.
+    ///
+    /// Constructs the relative path directly via `Path::new("..")` and
+    /// passes a base of `""` so `strip_prefix` is a no-op and the `..`
+    /// reaches the component-classification arm.
+    #[test]
+    fn from_path_under_rejects_parent_dir_component() {
+        use std::path::Path;
+
+        let err = RelativePath::from_path_under(Path::new("../etc/passwd"), Path::new(""))
+            .expect_err("ParentDir component must error, not silently disappear");
+        match err {
+            crate::error::ValidationError::InvalidRelativePath { reason, .. } => {
+                assert!(
+                    reason.contains(".."),
+                    "reason should call out the `..` component, got: {reason}"
+                );
+            }
+            other => panic!("expected InvalidRelativePath, got {other:?}"),
+        }
+    }
+
+    /// `RootDir` (a leading separator) is structurally illegal under a
+    /// relative-path contract. Pre-S-4 the `_ => None` filter silently
+    /// dropped it; this test pins the explicit error so a future
+    /// refactor can't collapse the arm back into a silent discard.
+    /// `Prefix` (Windows drive letters) shares the same arm and is
+    /// covered by the same regression by construction.
+    #[cfg(unix)]
+    #[test]
+    fn from_path_under_rejects_absolute_path() {
+        use std::path::Path;
+
+        let err = RelativePath::from_path_under(Path::new("/etc/passwd"), Path::new(""))
+            .expect_err("absolute path must error, not silently disappear");
+        match err {
+            crate::error::ValidationError::InvalidRelativePath { reason, .. } => {
+                assert!(
+                    reason.contains("absolute") || reason.contains("prefix"),
+                    "reason should call out the absolute/prefix component, got: {reason}"
                 );
             }
             other => panic!("expected InvalidRelativePath, got {other:?}"),

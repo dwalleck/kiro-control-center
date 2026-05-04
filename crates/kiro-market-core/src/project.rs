@@ -46,11 +46,11 @@ pub struct InstalledSkillMeta {
     /// in `scan_plugin_for_content_drift` was unreachable in practice
     /// once `source_scan_root` became required (no entry could have
     /// `scan_root` without `source_hash`) and is gone.
-    pub source_hash: String,
+    pub source_hash: crate::hash::BlakeHash,
 
     /// Tree-hash of the skill as it was copied into the project.
     /// Required after PR #100 review I2; see [`Self::source_hash`].
-    pub installed_hash: String,
+    pub installed_hash: crate::hash::BlakeHash,
 
     /// Scan root (relative to `plugin_dir`) that this skill was
     /// installed from. Required at install time; populated from the
@@ -115,11 +115,11 @@ pub struct InstalledAgentMeta {
     /// path computes it, and the post-symmetry-pass schema makes a
     /// missing-source_hash entry impossible (the matching
     /// `source_path` and `dialect` fields are also required).
-    pub source_hash: String,
+    pub source_hash: crate::hash::BlakeHash,
 
     /// Tree-hash of the agent as it was copied into the project.
     /// Required after PR #100 review I2; see [`Self::source_hash`].
-    pub installed_hash: String,
+    pub installed_hash: crate::hash::BlakeHash,
 }
 
 /// Tracking entry for a plugin's companion file bundle that lives under
@@ -151,8 +151,8 @@ pub struct InstalledNativeCompanionsMeta {
     /// by this plugin. Used for collision detection (cross-plugin path
     /// overlap) and for uninstall.
     pub files: Vec<PathBuf>,
-    pub source_hash: String,
-    pub installed_hash: String,
+    pub source_hash: crate::hash::BlakeHash,
+    pub installed_hash: crate::hash::BlakeHash,
     /// Scan root (relative to `plugin_dir`) that this companion bundle
     /// was installed from. Required at install time. The
     /// single-scan-root invariant is enforced upstream by
@@ -192,8 +192,8 @@ pub struct InstalledSteeringMeta {
     pub plugin: PluginName,
     pub version: Option<String>,
     pub installed_at: DateTime<Utc>,
-    pub source_hash: String,
-    pub installed_hash: String,
+    pub source_hash: crate::hash::BlakeHash,
+    pub installed_hash: crate::hash::BlakeHash,
     /// Scan root (relative to `plugin_dir`) that this steering file
     /// was installed from. Required at install time; populated from
     /// `DiscoveredNativeFile.scan_root` (which steering shares with
@@ -273,8 +273,8 @@ pub struct InstalledNativeAgentOutcome {
     pub name: String,
     pub json_path: PathBuf,
     pub kind: InstallOutcomeKind,
-    pub source_hash: String,
-    pub installed_hash: String,
+    pub source_hash: crate::hash::BlakeHash,
+    pub installed_hash: crate::hash::BlakeHash,
 }
 
 /// Output of any classifier that decides between "early-return idempotent
@@ -307,7 +307,7 @@ enum CollisionDecision<T> {
 /// reinstalls — visible to Tauri callers via the
 /// `#[derive(specta::Type)]` on `InstalledSteeringOutcome`.
 struct SteeringIdempotentEcho {
-    prior_installed_hash: String,
+    prior_installed_hash: crate::hash::BlakeHash,
 }
 
 /// Input bundle for [`KiroProject::install_native_companions`]. Groups the
@@ -329,7 +329,7 @@ pub struct NativeCompanionsInput<'a> {
     pub marketplace: &'a MarketplaceName,
     pub plugin: &'a PluginName,
     pub version: Option<&'a str>,
-    pub source_hash: &'a str,
+    pub source_hash: &'a crate::hash::BlakeHash,
     pub mode: crate::service::InstallMode,
     /// Plugin root directory; used to compute
     /// [`InstalledNativeCompanionsMeta::source_scan_root`] from
@@ -350,7 +350,7 @@ pub struct NativeAgentInstallInput<'a> {
     pub marketplace: &'a MarketplaceName,
     pub plugin: &'a PluginName,
     pub version: Option<&'a str>,
-    pub source_hash: &'a str,
+    pub source_hash: &'a crate::hash::BlakeHash,
     pub source_path: &'a crate::validation::RelativePath,
     pub mode: crate::service::InstallMode,
 }
@@ -375,8 +375,8 @@ pub struct InstalledNativeCompanionsOutcome {
     pub plugin: String,
     pub files: Vec<PathBuf>,
     pub kind: InstallOutcomeKind,
-    pub source_hash: String,
-    pub installed_hash: String,
+    pub source_hash: crate::hash::BlakeHash,
+    pub installed_hash: crate::hash::BlakeHash,
 }
 
 /// Aggregated view of a single installed plugin — the union of
@@ -1742,7 +1742,7 @@ impl KiroProject {
         &self,
         source: &Path,
         rel_path: &Path,
-    ) -> crate::error::Result<(tempfile::TempDir, PathBuf, String)> {
+    ) -> crate::error::Result<(tempfile::TempDir, PathBuf, crate::hash::BlakeHash)> {
         let kiro_dir = self.kiro_dir();
         fs::create_dir_all(&kiro_dir).map_err(|src| {
             crate::steering::SteeringError::DestinationDirFailed {
@@ -1839,13 +1839,13 @@ impl KiroProject {
         installed: &InstalledSteering,
         rel_path: &Path,
         plugin: &PluginName,
-        source_hash: &str,
+        source_hash: &crate::hash::BlakeHash,
         dest: &Path,
         mode: crate::service::InstallMode,
     ) -> Result<CollisionDecision<SteeringIdempotentEcho>, crate::steering::SteeringError> {
         match installed.files.get(rel_path) {
             Some(existing) if existing.plugin == *plugin => {
-                if existing.source_hash == source_hash {
+                if existing.source_hash == *source_hash {
                     return Ok(CollisionDecision::Idempotent(Box::new(
                         SteeringIdempotentEcho {
                             prior_installed_hash: existing.installed_hash.clone(),
@@ -1939,7 +1939,7 @@ impl KiroProject {
     pub fn install_steering_file(
         &self,
         source: &crate::agent::DiscoveredNativeFile,
-        source_hash: &str,
+        source_hash: &crate::hash::BlakeHash,
         ctx: crate::steering::SteeringInstallContext<'_>,
     ) -> Result<crate::steering::InstalledSteeringOutcome, crate::steering::SteeringError> {
         let rel_path = match source.source.strip_prefix(&source.scan_root) {
@@ -1986,7 +1986,7 @@ impl KiroProject {
         source: &crate::agent::DiscoveredNativeFile,
         rel_path: &Path,
         dest: &Path,
-        source_hash: &str,
+        source_hash: &crate::hash::BlakeHash,
         ctx: crate::steering::SteeringInstallContext<'_>,
     ) -> crate::error::Result<crate::steering::InstalledSteeringOutcome> {
         let tracking_path = self.steering_tracking_path();
@@ -2163,21 +2163,22 @@ impl KiroProject {
     }
 
     /// Hash a translated-agent source file against its parent
-    /// directory + filename. Returns `Ok(None)` for `None` input
-    /// (test fixtures sometimes synthesize an `AgentDefinition` from
-    /// thin air); otherwise delegates to [`crate::hash::hash_artifact`]
-    /// for the canonical hash format. Lifted out of `install_agent_inner`
-    /// to keep that function under the line cap.
-    fn hash_translated_source(source_path: Option<&Path>) -> crate::error::Result<String> {
-        // PR #100 review I2 tightened `InstalledAgentMeta::source_hash`
-        // to required `String` (was `Option<String>`). Production
-        // callers always pass `Some(path)` — the only `None` callers
-        // are test fixtures that synthesise an `AgentDefinition` from
-        // thin air and don't care about drift detection. For those the
-        // empty-string sentinel is the deliberate "no source-side
-        // hash recorded" marker; in production it's never observed.
+    /// directory + filename. For `Some(path)` (the production case)
+    /// delegates to [`crate::hash::hash_artifact`] for the canonical
+    /// hash format; for `None` (synthetic test agents only) returns
+    /// [`BlakeHash::placeholder`] so the meta's hash field stays
+    /// well-formed. Lifted out of `install_agent_inner` to keep that
+    /// function under the line cap.
+    ///
+    /// `Option<&Path>` is preserved on the public install signature so
+    /// the synthetic-agent tests don't all need a real source file; the
+    /// `BlakeHash` field invariant (well-formed `"blake3:" + 64-hex`)
+    /// holds either way.
+    fn hash_translated_source(
+        source_path: Option<&Path>,
+    ) -> crate::error::Result<crate::hash::BlakeHash> {
         let Some(p) = source_path else {
-            return Ok(String::new());
+            return Ok(crate::hash::BlakeHash::placeholder());
         };
         // Production callers always pass a fully-qualified file path so
         // both `parent()` and `file_name()` are guaranteed `Some`. The
@@ -2456,7 +2457,7 @@ impl KiroProject {
         name: &str,
         json_bytes: &[u8],
         prompt_bytes: &[u8],
-    ) -> crate::error::Result<(tempfile::TempDir, PathBuf, PathBuf, String)> {
+    ) -> crate::error::Result<(tempfile::TempDir, PathBuf, PathBuf, crate::hash::BlakeHash)> {
         // TempDir RAII: any `?` propagation below cleans up the staging
         // dir on Drop, so error branches don't need explicit cleanup.
         let staging = tempfile::Builder::new()
@@ -2531,8 +2532,8 @@ impl KiroProject {
                 version: input.version.map(str::to_owned),
                 installed_at: chrono::Utc::now(),
                 files: Vec::new(),
-                source_hash: String::new(),
-                installed_hash: String::new(),
+                source_hash: crate::hash::BlakeHash::placeholder(),
+                installed_hash: crate::hash::BlakeHash::placeholder(),
                 source_scan_root: input.source_scan_root.clone(),
             });
         // Refresh marketplace/version/timestamp + source_scan_root on
@@ -2581,13 +2582,13 @@ impl KiroProject {
         installed: &InstalledAgents,
         agent_name: &str,
         plugin: &PluginName,
-        source_hash: &str,
+        source_hash: &crate::hash::BlakeHash,
         json_target: &Path,
         mode: crate::service::InstallMode,
     ) -> crate::error::Result<CollisionDecision<InstalledNativeAgentOutcome>> {
         match installed.agents.get(agent_name) {
             Some(existing) if existing.plugin == *plugin => {
-                if existing.source_hash == source_hash {
+                if existing.source_hash == *source_hash {
                     return Ok(CollisionDecision::Idempotent(Box::new(
                         InstalledNativeAgentOutcome {
                             name: agent_name.to_owned(),
@@ -2736,7 +2737,7 @@ impl KiroProject {
                         installed_at: chrono::Utc::now(),
                         dialect: AgentDialect::Native,
                         source_path: input.source_path.clone(),
-                        source_hash: input.source_hash.to_string(),
+                        source_hash: input.source_hash.clone(),
                         installed_hash: installed_hash.clone(),
                     },
                 );
@@ -2793,7 +2794,7 @@ impl KiroProject {
                     } else {
                         InstallOutcomeKind::Installed
                     },
-                    source_hash: input.source_hash.to_string(),
+                    source_hash: input.source_hash.clone(),
                     installed_hash,
                 })
             });
@@ -2818,7 +2819,7 @@ impl KiroProject {
         &self,
         name: &str,
         raw_bytes: &[u8],
-    ) -> crate::error::Result<(tempfile::TempDir, PathBuf, String)> {
+    ) -> crate::error::Result<(tempfile::TempDir, PathBuf, crate::hash::BlakeHash)> {
         let staging = tempfile::Builder::new()
             .prefix(&format!("_installing-agent-{name}-"))
             .tempdir_in(self.kiro_dir())?;
@@ -2938,8 +2939,8 @@ impl KiroProject {
                 plugin: input.plugin.to_string(),
                 files: Vec::new(),
                 kind: InstallOutcomeKind::Idempotent,
-                source_hash: input.source_hash.to_string(),
-                installed_hash: input.source_hash.to_string(),
+                source_hash: input.source_hash.clone(),
+                installed_hash: input.source_hash.clone(),
             });
         }
 
@@ -3044,7 +3045,7 @@ impl KiroProject {
                 version: input.version.map(String::from),
                 installed_at: chrono::Utc::now(),
                 files: input.rel_paths.to_vec(),
-                source_hash: input.source_hash.to_string(),
+                source_hash: input.source_hash.clone(),
                 installed_hash: installed_hash.clone(),
                 source_scan_root,
             },
@@ -3095,7 +3096,7 @@ impl KiroProject {
             } else {
                 InstallOutcomeKind::Installed
             },
-            source_hash: input.source_hash.to_string(),
+            source_hash: input.source_hash.clone(),
             installed_hash,
         })
     }
@@ -3114,13 +3115,13 @@ impl KiroProject {
         // The HashMap key is still `String` (out of scope), so look up
         // by string view; equality below uses the same shape.
         if let Some(existing) = installed.native_companions.get(input.plugin.as_str()) {
-            if existing.source_hash == input.source_hash {
+            if existing.source_hash == *input.source_hash {
                 return Ok(CollisionDecision::Idempotent(Box::new(
                     InstalledNativeCompanionsOutcome {
                         plugin: input.plugin.to_string(),
                         files: existing.files.iter().map(|p| agents_dir.join(p)).collect(),
                         kind: InstallOutcomeKind::Idempotent,
-                        source_hash: input.source_hash.to_string(),
+                        source_hash: input.source_hash.clone(),
                         installed_hash: existing.installed_hash.clone(),
                     },
                 )));
@@ -3181,7 +3182,7 @@ impl KiroProject {
         plugin: &PluginName,
         scan_root: &Path,
         rel_paths: &[PathBuf],
-    ) -> crate::error::Result<(tempfile::TempDir, String)> {
+    ) -> crate::error::Result<(tempfile::TempDir, crate::hash::BlakeHash)> {
         let staging = tempfile::Builder::new()
             .prefix(&format!("_installing-companions-{}-", plugin.as_str()))
             .tempdir_in(self.kiro_dir())?;
@@ -3510,7 +3511,7 @@ impl KiroProject {
         source_dir: &Path,
         mut meta: InstalledSkillMeta,
         force: bool,
-        source_hash: String,
+        source_hash: crate::hash::BlakeHash,
     ) -> crate::error::Result<()> {
         crate::file_lock::with_file_lock(&self.tracking_path(), || -> crate::error::Result<()> {
             let dir = self.skill_dir(name);
@@ -3634,8 +3635,8 @@ mod tests {
             // both with real hashes during the install path. Tests that
             // pre-stamp tracking entries (no install call) and assert
             // on the field carry their own real hash.
-            source_hash: String::new(),
-            installed_hash: String::new(),
+            source_hash: crate::hash::BlakeHash::placeholder(),
+            installed_hash: crate::hash::BlakeHash::placeholder(),
             source_scan_root: RelativePath::new("skills").expect("valid"),
         }
     }
@@ -3649,8 +3650,8 @@ mod tests {
             installed_at: Utc::now(),
             dialect: AgentDialect::Claude,
             source_path: RelativePath::new("agents/reviewer.md").expect("valid"),
-            source_hash: String::new(),
-            installed_hash: String::new(),
+            source_hash: crate::hash::BlakeHash::placeholder(),
+            installed_hash: crate::hash::BlakeHash::placeholder(),
         };
         let json = serde_json::to_string(&meta).unwrap();
         let back: InstalledAgentMeta = serde_json::from_str(&json).unwrap();
@@ -3672,8 +3673,8 @@ mod tests {
             installed_at: Utc::now(),
             dialect: AgentDialect::Copilot,
             source_path: RelativePath::new("agents/reviewer.agent.md").expect("valid"),
-            source_hash: String::new(),
-            installed_hash: String::new(),
+            source_hash: crate::hash::BlakeHash::placeholder(),
+            installed_hash: crate::hash::BlakeHash::placeholder(),
         };
         let json = serde_json::to_string(&meta).unwrap();
         assert!(json.contains("\"dialect\":\"copilot\""));
@@ -3705,8 +3706,8 @@ mod tests {
                 plugin: pn("p"),
                 version: Some("0.1.0".into()),
                 installed_at: chrono::Utc::now(),
-                source_hash: "blake3:abc".into(),
-                installed_hash: "blake3:abc".into(),
+                source_hash: crate::hash::BlakeHash::placeholder(),
+                installed_hash: crate::hash::BlakeHash::placeholder(),
                 source_scan_root: RelativePath::new("steering").expect("valid"),
             },
         );
@@ -3759,8 +3760,8 @@ mod tests {
                     "plugin": "p",
                     "version": null,
                     "installed_at": chrono::Utc::now(),
-                    "source_hash": "blake3:abc",
-                    "installed_hash": "blake3:abc",
+                    "source_hash": "blake3:0000000000000000000000000000000000000000000000000000000000000000",
+                    "installed_hash": "blake3:0000000000000000000000000000000000000000000000000000000000000000",
                     "source_scan_root": "steering",
                 }
             }
@@ -3801,8 +3802,8 @@ mod tests {
                     "plugin": "p",
                     "version": null,
                     "installed_at": chrono::Utc::now(),
-                    "source_hash": "blake3:abc",
-                    "installed_hash": "blake3:abc",
+                    "source_hash": "blake3:0000000000000000000000000000000000000000000000000000000000000000",
+                    "installed_hash": "blake3:0000000000000000000000000000000000000000000000000000000000000000",
                     "source_scan_root": "skills",
                 }
             }
@@ -3845,8 +3846,8 @@ mod tests {
                     "installed_at": chrono::Utc::now(),
                     "dialect": "claude",
                     "source_path": "agents/etc.md",
-                    "source_hash": "x",
-                    "installed_hash": "x",
+                    "source_hash": "blake3:0000000000000000000000000000000000000000000000000000000000000000",
+                    "installed_hash": "blake3:0000000000000000000000000000000000000000000000000000000000000000",
                 }
             }
         });
@@ -3887,8 +3888,8 @@ mod tests {
                     "version": null,
                     "installed_at": chrono::Utc::now(),
                     "files": [],
-                    "source_hash": "blake3:abc",
-                    "installed_hash": "blake3:abc",
+                    "source_hash": "blake3:0000000000000000000000000000000000000000000000000000000000000000",
+                    "installed_hash": "blake3:0000000000000000000000000000000000000000000000000000000000000000",
                     "source_scan_root": "agents",
                 }
             }
@@ -3931,8 +3932,8 @@ mod tests {
                     "version": null,
                     "installed_at": chrono::Utc::now(),
                     "files": ["../../etc/passwd"],
-                    "source_hash": "blake3:abc",
-                    "installed_hash": "blake3:abc",
+                    "source_hash": "blake3:0000000000000000000000000000000000000000000000000000000000000000",
+                    "installed_hash": "blake3:0000000000000000000000000000000000000000000000000000000000000000",
                     "source_scan_root": "agents",
                 }
             }
@@ -4009,8 +4010,8 @@ mod tests {
             installed_at: Utc::now(),
             dialect: AgentDialect::Claude,
             source_path: RelativePath::new("subdir/agent.md").expect("valid rel path"),
-            source_hash: String::new(),
-            installed_hash: String::new(),
+            source_hash: crate::hash::BlakeHash::placeholder(),
+            installed_hash: crate::hash::BlakeHash::placeholder(),
         };
         let json = serde_json::to_string(&meta).unwrap();
         assert!(
@@ -4137,8 +4138,8 @@ mod tests {
                 plugin: pn("p"),
                 version: None,
                 installed_at: chrono::Utc::now(),
-                source_hash: "blake3:abc".into(),
-                installed_hash: "blake3:abc".into(),
+                source_hash: crate::hash::BlakeHash::placeholder(),
+                installed_hash: crate::hash::BlakeHash::placeholder(),
                 source_scan_root: RelativePath::new("steering").expect("valid"),
             },
         );
@@ -4164,8 +4165,8 @@ mod tests {
                     "plugin": "plug-a",
                     "version": "1.0.0",
                     "installed_at": now,
-                    "source_hash": "deadbeef",
-                    "installed_hash": "deadbeef",
+                    "source_hash": "blake3:0000000000000000000000000000000000000000000000000000000000000000",
+                    "installed_hash": "blake3:0000000000000000000000000000000000000000000000000000000000000000",
                     "source_scan_root": "skills"
                 }
             }
@@ -4183,8 +4184,8 @@ mod tests {
                     "plugin": "plug-a",
                     "version": "1.0.0",
                     "installed_at": now,
-                    "source_hash": "cafebabe",
-                    "installed_hash": "cafebabe",
+                    "source_hash": "blake3:0000000000000000000000000000000000000000000000000000000000000000",
+                    "installed_hash": "blake3:0000000000000000000000000000000000000000000000000000000000000000",
                     "source_scan_root": "steering"
                 },
                 "review.md": {
@@ -4192,8 +4193,8 @@ mod tests {
                     "plugin": "plug-b",
                     "version": "0.5.0",
                     "installed_at": now,
-                    "source_hash": "feedface",
-                    "installed_hash": "feedface",
+                    "source_hash": "blake3:0000000000000000000000000000000000000000000000000000000000000000",
+                    "installed_hash": "blake3:0000000000000000000000000000000000000000000000000000000000000000",
                     "source_scan_root": "steering"
                 }
             }
@@ -4248,8 +4249,8 @@ mod tests {
                 "alpha": {
                     "marketplace": "mp", "plugin": "p",
                     "version": "1.0.0", "installed_at": same_time,
-                    "source_hash": "deadbeef",
-                    "installed_hash": "deadbeef",
+                    "source_hash": "blake3:0000000000000000000000000000000000000000000000000000000000000000",
+                    "installed_hash": "blake3:0000000000000000000000000000000000000000000000000000000000000000",
                     "source_scan_root": "skills"
                 }
             }
@@ -4265,7 +4266,7 @@ mod tests {
                 "guide.md": {
                     "marketplace": "mp", "plugin": "p",
                     "version": "2.0.0", "installed_at": same_time,
-                    "source_hash": "cafebabe", "installed_hash": "cafebabe",
+                    "source_hash": "blake3:0000000000000000000000000000000000000000000000000000000000000000", "installed_hash": "blake3:0000000000000000000000000000000000000000000000000000000000000000",
                     "source_scan_root": "steering"
                 }
             }
@@ -4320,8 +4321,8 @@ mod tests {
             serde_json::json!({
                 "marketplace": "mp", "plugin": "p",
                 "version": "1.0.0", "installed_at": now,
-                "source_hash": "x",
-                "installed_hash": "x",
+                "source_hash": "blake3:0000000000000000000000000000000000000000000000000000000000000000",
+                "installed_hash": "blake3:0000000000000000000000000000000000000000000000000000000000000000",
                 "source_scan_root": "skills"
             })
         };
@@ -4329,7 +4330,7 @@ mod tests {
             serde_json::json!({
                 "marketplace": "mp", "plugin": "p",
                 "version": "1.0.0", "installed_at": now,
-                "source_hash": "x", "installed_hash": "x",
+                "source_hash": "blake3:0000000000000000000000000000000000000000000000000000000000000000", "installed_hash": "blake3:0000000000000000000000000000000000000000000000000000000000000000",
                 "source_scan_root": "steering"
             })
         };
@@ -4339,8 +4340,8 @@ mod tests {
                 "version": "1.0.0", "installed_at": now,
                 "dialect": "claude",
                 "source_path": "agents/x.md",
-                "source_hash": "x",
-                "installed_hash": "x"
+                "source_hash": "blake3:0000000000000000000000000000000000000000000000000000000000000000",
+                "installed_hash": "blake3:0000000000000000000000000000000000000000000000000000000000000000"
             })
         };
 
@@ -4437,7 +4438,7 @@ mod tests {
                     "guide.md": {
                         "marketplace": "mp", "plugin": "p",
                         "version": "1.0.0", "installed_at": now,
-                        "source_hash": "x", "installed_hash": "x",
+                        "source_hash": "blake3:0000000000000000000000000000000000000000000000000000000000000000", "installed_hash": "blake3:0000000000000000000000000000000000000000000000000000000000000000",
                         "source_scan_root": "steering",
                     }
                 }
@@ -4495,7 +4496,7 @@ mod tests {
         project: KiroProject,
         scan_root: PathBuf,
         rel_path: PathBuf,
-        source_hash: String,
+        source_hash: crate::hash::BlakeHash,
     }
 
     impl SteeringFile {
@@ -4807,7 +4808,7 @@ mod tests {
         assert!(dest.exists(), "destination file must exist on disk");
         assert_eq!(fs::read(&dest).unwrap(), b"# Steering Guide\n\nbody");
         assert_eq!(outcome.source_hash, source_hash);
-        assert!(outcome.installed_hash.starts_with("blake3:"));
+        assert!(outcome.installed_hash.as_str().starts_with("blake3:"));
         assert_eq!(outcome.kind, InstallOutcomeKind::Installed);
 
         // Tracking entry must be present.
@@ -4845,8 +4846,8 @@ mod tests {
             installed_at: Utc::now(),
             dialect: AgentDialect::Claude,
             source_path: RelativePath::new("agents/reviewer.md").expect("valid"),
-            source_hash: String::new(),
-            installed_hash: String::new(),
+            source_hash: crate::hash::BlakeHash::placeholder(),
+            installed_hash: crate::hash::BlakeHash::placeholder(),
         }
     }
 
@@ -5585,8 +5586,8 @@ mod tests {
                     "orphan": {
                         "marketplace": "mp", "plugin": "p",
                         "version": "1.0.0", "installed_at": now,
-                        "source_hash": "deadbeef",
-                        "installed_hash": "deadbeef",
+                        "source_hash": "blake3:0000000000000000000000000000000000000000000000000000000000000000",
+                        "installed_hash": "blake3:0000000000000000000000000000000000000000000000000000000000000000",
                         "source_scan_root": "skills",
                     }
                 }
@@ -5625,8 +5626,8 @@ mod tests {
                         "plugin": "p",
                         "version": "1.0.0",
                         "installed_at": now,
-                        "source_hash": "feedface",
-                        "installed_hash": "feedface",
+                        "source_hash": "blake3:0000000000000000000000000000000000000000000000000000000000000000",
+                        "installed_hash": "blake3:0000000000000000000000000000000000000000000000000000000000000000",
                         "source_scan_root": "steering",
                     }
                 }
@@ -5689,8 +5690,8 @@ mod tests {
                         "plugin": "p",
                         "version": "1.0.0",
                         "installed_at": now,
-                        "source_hash": "x",
-                        "installed_hash": "x",
+                        "source_hash": "blake3:0000000000000000000000000000000000000000000000000000000000000000",
+                        "installed_hash": "blake3:0000000000000000000000000000000000000000000000000000000000000000",
                         "source_scan_root": "steering",
                     }
                 }
@@ -5734,8 +5735,8 @@ mod tests {
                         "plugin": "p",
                         "version": "1.0.0",
                         "installed_at": now,
-                        "source_hash": "x",
-                        "installed_hash": "x",
+                        "source_hash": "blake3:0000000000000000000000000000000000000000000000000000000000000000",
+                        "installed_hash": "blake3:0000000000000000000000000000000000000000000000000000000000000000",
                         "source_scan_root": "steering",
                     }
                 }
@@ -5807,8 +5808,8 @@ mod tests {
                         "installed_at": now,
                         "dialect": "native",
                         "source_path": "agents/reviewer.json",
-                        "source_hash": "deadbeef",
-                        "installed_hash": "deadbeef",
+                        "source_hash": "blake3:0000000000000000000000000000000000000000000000000000000000000000",
+                        "installed_hash": "blake3:0000000000000000000000000000000000000000000000000000000000000000",
                     }
                 }
             }))
@@ -5875,8 +5876,8 @@ mod tests {
                         "installed_at": now,
                         "dialect": "native",
                         "source_path": "agents/ghost.json",
-                        "source_hash": "x",
-                        "installed_hash": "x",
+                        "source_hash": "blake3:0000000000000000000000000000000000000000000000000000000000000000",
+                        "installed_hash": "blake3:0000000000000000000000000000000000000000000000000000000000000000",
                     }
                 }
             }))
@@ -5929,8 +5930,8 @@ mod tests {
                         "installed_at": now,
                         "dialect": "native",
                         "source_path": "agents/reviewer.json",
-                        "source_hash": "deadbeef",
-                        "installed_hash": "deadbeef",
+                        "source_hash": "blake3:0000000000000000000000000000000000000000000000000000000000000000",
+                        "installed_hash": "blake3:0000000000000000000000000000000000000000000000000000000000000000",
                     }
                 }
             }))
@@ -5978,8 +5979,8 @@ mod tests {
                         "version": null,
                         "installed_at": now,
                         "files": [],
-                        "source_hash": "x",
-                        "installed_hash": "x",
+                        "source_hash": "blake3:0000000000000000000000000000000000000000000000000000000000000000",
+                        "installed_hash": "blake3:0000000000000000000000000000000000000000000000000000000000000000",
                         "source_scan_root": "agents",
                     }
                 }
@@ -6028,8 +6029,8 @@ mod tests {
                         "version": null,
                         "installed_at": now,
                         "files": ["prompts/helper.md"],
-                        "source_hash": "x",
-                        "installed_hash": "x",
+                        "source_hash": "blake3:0000000000000000000000000000000000000000000000000000000000000000",
+                        "installed_hash": "blake3:0000000000000000000000000000000000000000000000000000000000000000",
                         "source_scan_root": "agents",
                     }
                 }
@@ -6083,8 +6084,8 @@ mod tests {
                     "alpha": {
                         "marketplace": "mp", "plugin": "p",
                         "version": "1.0.0", "installed_at": now,
-                        "source_hash": "deadbeef",
-                        "installed_hash": "deadbeef",
+                        "source_hash": "blake3:0000000000000000000000000000000000000000000000000000000000000000",
+                        "installed_hash": "blake3:0000000000000000000000000000000000000000000000000000000000000000",
                         "source_scan_root": "skills",
                     }
                 }
@@ -6100,7 +6101,7 @@ mod tests {
                     "guide.md": {
                         "marketplace": "mp", "plugin": "p",
                         "version": "1.0.0", "installed_at": now,
-                        "source_hash": "feedface", "installed_hash": "feedface",
+                        "source_hash": "blake3:0000000000000000000000000000000000000000000000000000000000000000", "installed_hash": "blake3:0000000000000000000000000000000000000000000000000000000000000000",
                         "source_scan_root": "steering",
                     }
                 }
@@ -6154,13 +6155,13 @@ mod tests {
                     "a.md": {
                         "marketplace": "mp-a", "plugin": "p",
                         "version": "1.0.0", "installed_at": now,
-                        "source_hash": "1", "installed_hash": "1",
+                        "source_hash": "blake3:0000000000000000000000000000000000000000000000000000000000000000", "installed_hash": "blake3:0000000000000000000000000000000000000000000000000000000000000000",
                         "source_scan_root": "steering",
                     },
                     "b.md": {
                         "marketplace": "mp-b", "plugin": "p",
                         "version": "1.0.0", "installed_at": now,
-                        "source_hash": "2", "installed_hash": "2",
+                        "source_hash": "blake3:0000000000000000000000000000000000000000000000000000000000000000", "installed_hash": "blake3:0000000000000000000000000000000000000000000000000000000000000000",
                         "source_scan_root": "steering",
                     }
                 }
@@ -6214,8 +6215,8 @@ mod tests {
                     "orphan": {
                         "marketplace": "mp", "plugin": "p",
                         "version": "1.0.0", "installed_at": now,
-                        "source_hash": "deadbeef",
-                        "installed_hash": "deadbeef",
+                        "source_hash": "blake3:0000000000000000000000000000000000000000000000000000000000000000",
+                        "installed_hash": "blake3:0000000000000000000000000000000000000000000000000000000000000000",
                         "source_scan_root": "skills",
                     }
                 }
@@ -6288,8 +6289,8 @@ mod tests {
                     plugin: pn("p"),
                     version: Some("1.0.0".into()),
                     installed_at: Utc::now(),
-                    source_hash: "deadbeef".into(),
-                    installed_hash: "deadbeef".into(),
+                    source_hash: crate::hash::BlakeHash::placeholder(),
+                    installed_hash: crate::hash::BlakeHash::placeholder(),
                     source_scan_root: RelativePath::new("skills").expect("valid"),
                 },
             )
@@ -6309,8 +6310,8 @@ mod tests {
                         "plugin": "p",
                         "version": "1.0.0",
                         "installed_at": now,
-                        "source_hash": "x",
-                        "installed_hash": "x",
+                        "source_hash": "blake3:0000000000000000000000000000000000000000000000000000000000000000",
+                        "installed_hash": "blake3:0000000000000000000000000000000000000000000000000000000000000000",
                         "source_scan_root": "steering",
                     }
                 }
@@ -6402,7 +6403,7 @@ mod tests {
                     "../../etc/passwd": {
                         "marketplace": "mp", "plugin": "p",
                         "version": "1.0.0", "installed_at": now,
-                        "source_hash": "x", "installed_hash": "x",
+                        "source_hash": "blake3:0000000000000000000000000000000000000000000000000000000000000000", "installed_hash": "blake3:0000000000000000000000000000000000000000000000000000000000000000",
                         "source_scan_root": "steering",
                     }
                 }
@@ -6445,8 +6446,8 @@ mod tests {
                         "version": null,
                         "installed_at": now,
                         "files": [],
-                        "source_hash": "x",
-                        "installed_hash": "x",
+                        "source_hash": "blake3:0000000000000000000000000000000000000000000000000000000000000000",
+                        "installed_hash": "blake3:0000000000000000000000000000000000000000000000000000000000000000",
                         "source_scan_root": "agents",
                     }
                 }
@@ -6949,8 +6950,8 @@ mod tests {
                 std::path::PathBuf::from("prompts/a.md"),
                 std::path::PathBuf::from("prompts/b.md"),
             ],
-            source_hash: "blake3:abc".into(),
-            installed_hash: "blake3:abc".into(),
+            source_hash: crate::hash::BlakeHash::placeholder(),
+            installed_hash: crate::hash::BlakeHash::placeholder(),
             source_scan_root: RelativePath::new("agents").expect("valid"),
         };
         let bytes = serde_json::to_vec(&meta).unwrap();
@@ -7052,8 +7053,8 @@ mod tests {
                     "plugin": "p",
                     "version": "1.0",
                     "installed_at": "2026-01-01T00:00:00Z",
-                    "source_hash": "blake3:0000",
-                    "installed_hash": "blake3:0000"
+                    "source_hash": "blake3:0000000000000000000000000000000000000000000000000000000000000000",
+                    "installed_hash": "blake3:0000000000000000000000000000000000000000000000000000000000000000"
                 }
             }
         }"#;
@@ -7188,8 +7189,8 @@ mod tests {
                     "version": "1.0",
                     "installed_at": "2026-01-01T00:00:00Z",
                     "files": ["prompts/reviewer.md"],
-                    "source_hash": "blake3:0000",
-                    "installed_hash": "blake3:0000"
+                    "source_hash": "blake3:0000000000000000000000000000000000000000000000000000000000000000",
+                    "installed_hash": "blake3:0000000000000000000000000000000000000000000000000000000000000000"
                 }
             }
         }"#;
@@ -7237,8 +7238,8 @@ mod tests {
             plugin: pn("p"),
             version: Some("1.0.0".into()),
             installed_at: chrono::Utc::now(),
-            source_hash: String::new(),
-            installed_hash: String::new(),
+            source_hash: crate::hash::BlakeHash::placeholder(),
+            installed_hash: crate::hash::BlakeHash::placeholder(),
             source_scan_root: RelativePath::new("skills").expect("valid"),
         };
 
@@ -7252,8 +7253,8 @@ mod tests {
         let src_hash = &entry.source_hash;
         let inst_hash = &entry.installed_hash;
 
-        assert!(src_hash.starts_with("blake3:"));
-        assert!(inst_hash.starts_with("blake3:"));
+        assert!(src_hash.as_str().starts_with("blake3:"));
+        assert!(inst_hash.as_str().starts_with("blake3:"));
         // Source and installed contents are identical (we just copied), so the
         // hashes match.
         assert_eq!(src_hash, inst_hash);
@@ -7276,8 +7277,8 @@ mod tests {
         };
         let mapped: Vec<crate::agent::tools::MappedTool> = vec![];
         let mut meta = sample_agent_meta();
-        meta.source_hash = String::new();
-        meta.installed_hash = String::new();
+        meta.source_hash = crate::hash::BlakeHash::placeholder();
+        meta.installed_hash = crate::hash::BlakeHash::placeholder();
         let plugin_name = meta.plugin.clone();
 
         project
@@ -7289,8 +7290,8 @@ mod tests {
 
         let src = &entry.source_hash;
         let inst = &entry.installed_hash;
-        assert!(src.starts_with("blake3:"));
-        assert!(inst.starts_with("blake3:"));
+        assert!(src.as_str().starts_with("blake3:"));
+        assert!(inst.as_str().starts_with("blake3:"));
         // Translated path: source bytes (raw .md) differ from installed bytes
         // (emitted .json + prompt body), so the two hashes ARE different here.
         assert_ne!(src, inst);
@@ -7317,7 +7318,7 @@ mod tests {
             "prompt file must be tracked under native_companions: {:?}",
             companion.files
         );
-        assert!(companion.source_hash.starts_with("blake3:"));
+        assert!(companion.source_hash.as_str().starts_with("blake3:"));
         assert_eq!(companion.source_hash, companion.installed_hash);
     }
 
@@ -7341,8 +7342,8 @@ mod tests {
                 dialect: crate::agent::AgentDialect::Claude,
             };
             let mut meta = sample_agent_meta();
-            meta.source_hash = String::new();
-            meta.installed_hash = String::new();
+            meta.source_hash = crate::hash::BlakeHash::placeholder();
+            meta.installed_hash = crate::hash::BlakeHash::placeholder();
             project
                 .install_agent(&def, &[], meta, Some(&source_md))
                 .expect("install succeeds");
@@ -7395,8 +7396,8 @@ mod tests {
         };
         let mut meta_alpha = sample_agent_meta();
         meta_alpha.source_path = RelativePath::new("agents/alpha.md").expect("valid");
-        meta_alpha.source_hash = String::new();
-        meta_alpha.installed_hash = String::new();
+        meta_alpha.source_hash = crate::hash::BlakeHash::placeholder();
+        meta_alpha.installed_hash = crate::hash::BlakeHash::placeholder();
         project
             .install_agent(&alpha_def, &[], meta_alpha, Some(&alpha_md))
             .expect("install alpha");
@@ -7429,8 +7430,8 @@ mod tests {
         };
         let mut meta_beta = sample_agent_meta();
         meta_beta.source_path = RelativePath::new("prompts/beta.md").expect("valid");
-        meta_beta.source_hash = String::new();
-        meta_beta.installed_hash = String::new();
+        meta_beta.source_hash = crate::hash::BlakeHash::placeholder();
+        meta_beta.installed_hash = crate::hash::BlakeHash::placeholder();
         project
             .install_agent(&beta_def, &[], meta_beta, Some(&beta_md))
             .expect("install beta");
@@ -7469,7 +7470,7 @@ mod tests {
         bundle: crate::agent::NativeAgentBundle,
         src_dir: std::path::PathBuf,
         src_json: std::path::PathBuf,
-        source_hash: String,
+        source_hash: crate::hash::BlakeHash,
     }
 
     impl NativeRev {
@@ -7584,7 +7585,7 @@ mod tests {
         assert!(outcome.json_path.ends_with("rev.json"));
         assert_eq!(outcome.kind, InstallOutcomeKind::Installed);
         assert_eq!(outcome.source_hash, source_hash);
-        assert!(outcome.installed_hash.starts_with("blake3:"));
+        assert!(outcome.installed_hash.as_str().starts_with("blake3:"));
         assert!(outcome.json_path.exists());
 
         let tracking = project.load_installed_agents().expect("load tracking");
@@ -7925,7 +7926,7 @@ mod tests {
     fn stage_companion_source(
         scratch: &Path,
         bodies: &[(&str, &[u8])],
-    ) -> (PathBuf, Vec<PathBuf>, String) {
+    ) -> (PathBuf, Vec<PathBuf>, crate::hash::BlakeHash) {
         let scan_root = scratch.join("companions-src");
         let prompts = scan_root.join("prompts");
         fs::create_dir_all(&prompts).expect("create prompts dir");
@@ -7965,7 +7966,7 @@ mod tests {
         assert_eq!(outcome.files.len(), 2);
         assert_eq!(outcome.kind, InstallOutcomeKind::Installed);
         assert_eq!(outcome.source_hash, source_hash);
-        assert!(outcome.installed_hash.starts_with("blake3:"));
+        assert!(outcome.installed_hash.as_str().starts_with("blake3:"));
 
         // Files landed at the right destinations with original content.
         let dest_a = project.kiro_dir().join("agents/prompts/a.md");
@@ -8004,7 +8005,7 @@ mod tests {
                 marketplace: &mp("m"),
                 plugin: &pn("p"),
                 version: None,
-                source_hash: "blake3:empty",
+                source_hash: &crate::hash::BlakeHash::placeholder(),
                 mode: crate::service::InstallMode::New,
                 plugin_dir: std::path::Path::new("/tmp"),
             })
@@ -8217,7 +8218,7 @@ mod tests {
         project: KiroProject,
         scan_root: PathBuf,
         rel_paths: Vec<PathBuf>,
-        source_hash: String,
+        source_hash: crate::hash::BlakeHash,
     }
 
     impl CompanionBundle {
