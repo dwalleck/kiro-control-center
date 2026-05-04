@@ -192,6 +192,24 @@ export const commands = {
 
 /* Types */
 /**
+ *  Canonical content hash for installed artifacts.
+ * 
+ *  Stored on disk as the string `"blake3:" + 64 ASCII hex chars`. The
+ *  type wraps a `String` with a private inner field so the only ways
+ *  to construct one are (a) `BlakeHash::new` (validates the format),
+ *  (b) the artifact-hash producers in this module ([`hash_artifact`]
+ *  / [`hash_dir_tree`], which build the canonical form by
+ *  construction), or (c) the [`BlakeHash::placeholder`] constructor used
+ *  during install scaffolding (and in test fixtures that don't care about
+ *  the actual content).
+ * 
+ *  The `Deserialize` impl routes through `new`, so a tracking file
+ *  containing `"source_hash": ""` (or any other malformed value) fails
+ *  to load instead of being silently accepted as a sentinel.
+ */
+export type BlakeHash = string;
+
+/**
  *  Result of a marketplace-wide skill listing. The bulk path continues
  *  past per-plugin errors (missing directory, malformed manifest) to
  *  preserve the partial listing; `skipped` records plugin-level drops
@@ -727,8 +745,8 @@ export type InstalledNativeAgentOutcome = {
 	name: string,
 	json_path: string,
 	kind: InstallOutcomeKind,
-	source_hash: string,
-	installed_hash: string,
+	source_hash: BlakeHash,
+	installed_hash: BlakeHash,
 };
 
 /**
@@ -743,8 +761,8 @@ export type InstalledNativeCompanionsOutcome = {
 	plugin: string,
 	files: string[],
 	kind: InstallOutcomeKind,
-	source_hash: string,
-	installed_hash: string,
+	source_hash: BlakeHash,
+	installed_hash: BlakeHash,
 };
 
 /**
@@ -836,8 +854,8 @@ export type InstalledSteeringOutcome = {
 	source: string,
 	destination: string,
 	kind: InstallOutcomeKind,
-	source_hash: string,
-	installed_hash: string,
+	source_hash: BlakeHash,
+	installed_hash: BlakeHash,
 };
 
 // Result of adding a new marketplace.

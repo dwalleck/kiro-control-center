@@ -181,8 +181,8 @@ pub struct InstalledSteeringOutcome {
     pub source: PathBuf,
     pub destination: PathBuf,
     pub kind: InstallOutcomeKind,
-    pub source_hash: String,
-    pub installed_hash: String,
+    pub source_hash: crate::hash::BlakeHash,
+    pub installed_hash: crate::hash::BlakeHash,
 }
 
 /// Per-file failure entry in a steering install batch.

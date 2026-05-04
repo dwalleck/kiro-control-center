@@ -1302,8 +1302,8 @@ impl MarketplaceService {
                 // `install_skill_from_dir` overwrites both with the
                 // staging-time + post-rename hashes before the entry
                 // is committed to tracking.
-                source_hash: String::new(),
-                installed_hash: String::new(),
+                source_hash: crate::hash::BlakeHash::placeholder(),
+                installed_hash: crate::hash::BlakeHash::placeholder(),
                 source_scan_root,
             };
 
@@ -1705,8 +1705,8 @@ impl MarketplaceService {
                 // `install_agent_inner` overwrites both with the
                 // hash_translated_source / staging-time hashes before
                 // the entry is committed to tracking.
-                source_hash: String::new(),
-                installed_hash: String::new(),
+                source_hash: crate::hash::BlakeHash::placeholder(),
+                installed_hash: crate::hash::BlakeHash::placeholder(),
             };
             let install_result = if ctx.mode.is_force() {
                 project.install_agent_force(&def, &mapped, meta, Some(&path))
@@ -2704,7 +2704,6 @@ fn read_and_parse_skill_md(
     }
 }
 
-/// Compute the install-time `source_scan_root` for a discovered skill
 /// Build a synthetic `io::Error` describing a structural validation
 /// failure on a path that should have been expressible as a
 /// [`crate::validation::RelativePath`] under `plugin_dir`.
@@ -2737,6 +2736,7 @@ fn scan_root_invalid_io_err(
     )
 }
 
+/// Compute the install-time `source_scan_root` for a discovered skill,
 /// or build a [`FailedSkill`] entry if the discovered `scan_root`
 /// can't be expressed as a `RelativePath` under `plugin_dir`.
 /// Discovery yields paths under `plugin_dir` in practice, so the
@@ -6094,8 +6094,8 @@ mod tests {
                     plugin: pn("structured-p"),
                     version: Some("1.0".into()),
                     installed_at: chrono::Utc::now(),
-                    source_hash: String::new(),
-                    installed_hash: String::new(),
+                    source_hash: crate::hash::BlakeHash::placeholder(),
+                    installed_hash: crate::hash::BlakeHash::placeholder(),
                     source_scan_root: crate::validation::RelativePath::new("skills")
                         .expect("valid"),
                 },
@@ -6390,12 +6390,16 @@ mod tests {
         );
     }
 
-    /// P2a-4 finding: agents have the same `Option<String>` `source_hash` shape
-    /// as skills and must follow the same legacy fallback path. Uses a
-    /// native-format agent to avoid the translated-agent companion-files
+    /// A version bump on a plugin whose tracked agent has a content-mismatched
+    /// `source_hash` must surface as an update. The original test simulated
+    /// the legacy `Option<String>` "no hash recorded" case via empty-string;
+    /// post-`BlakeHash` newtype that shape is structurally impossible, so this
+    /// substitutes [`BlakeHash::placeholder`] which round-trips through
+    /// `Deserialize` but won't match any real content hash. Uses a native-
+    /// format agent to avoid the translated-agent companion-files
     /// path-reconstruction complexity (C7).
     #[test]
-    fn detect_plugin_updates_agent_legacy_fallback_source_hash_none() {
+    fn detect_plugin_updates_agent_version_bump_with_mismatched_hash_surfaces_update() {
         use crate::project::KiroProject;
         use crate::service::test_support::{
             make_plugin_with_skills, relative_path_entry, seed_marketplace_with_registry,
@@ -6433,10 +6437,13 @@ mod tests {
             "agent must be installed before test mutation"
         );
 
-        // Set agent source_hash: None in tracking file
+        // Replace the recorded source_hash with a deliberate placeholder
+        // that won't match the on-disk content. Combined with the version
+        // bump below, this exercises the drift-detection path that
+        // surfaces an update.
         let mut tracking = project.load_installed_agents().unwrap();
         for meta in tracking.agents.values_mut() {
-            meta.source_hash = String::new();
+            meta.source_hash = crate::hash::BlakeHash::placeholder();
         }
         let tracking_path = project_tmp.path().join(".kiro/installed-agents.json");
         fs::write(
@@ -6974,7 +6981,7 @@ mod tests {
                 dialect: crate::agent::AgentDialect::Copilot,
                 source_path: RelativePath::new("agents/reviewer.agent.md").expect("valid rel"),
                 source_hash: expected_hash,
-                installed_hash: String::new(),
+                installed_hash: crate::hash::BlakeHash::placeholder(),
             },
         );
         let installed = InstalledAgents {

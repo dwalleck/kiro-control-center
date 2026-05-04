@@ -395,12 +395,11 @@ const SKILL_MD: &str = "SKILL.md";
 /// install path uses `skill_dir.strip_prefix(scan_root)` to derive the
 /// install-time relative name; a mismatched pair would produce a
 /// nonsense `RelativePath`. Construction goes through
-/// [`Self::new_unchecked`] (in-crate only — the discover sites
+/// [`Self::new_internal`] (in-crate only — the discover sites
 /// guarantee the invariant by construction) which `debug_assert!`s the
 /// prefix relationship; fields are `pub(crate)` so external crates
 /// must read through the [`Self::scan_root`] / [`Self::skill_dir`]
 /// accessors and cannot bypass the invariant with a struct literal.
-/// Per PR #100 review S4.
 #[derive(Debug, Clone)]
 pub struct DiscoveredSkill {
     /// Absolute path to the scan root that contains `skill_dir`,
@@ -422,7 +421,13 @@ impl DiscoveredSkill {
     /// construction. The `debug_assert!` catches contract violations in
     /// tests rather than allowing a silent wrong-prefix that would
     /// later derail `strip_prefix(...)` at the install boundary.
-    pub(crate) fn new_unchecked(scan_root: PathBuf, skill_dir: PathBuf) -> Self {
+    ///
+    /// Named `new_internal` rather than `new_unchecked` because there's
+    /// no `new() -> Result` sibling for the suffix to contrast with:
+    /// the only callers are in-crate construction sites, not external
+    /// validation paths. `unchecked` would falsely imply a checked
+    /// alternative exists.
+    pub(crate) fn new_internal(scan_root: PathBuf, skill_dir: PathBuf) -> Self {
         debug_assert!(
             skill_dir.starts_with(&scan_root),
             "DiscoveredSkill invariant violated: skill_dir `{}` is not under scan_root `{}`",
@@ -496,10 +501,8 @@ pub fn discover_skill_dirs(plugin_root: &Path, skill_paths: &[&str]) -> Vec<Disc
                         };
                         let entry_path = entry.path();
                         if entry_path.is_dir() && entry_path.join(SKILL_MD).exists() {
-                            found.push(DiscoveredSkill::new_unchecked(
-                                candidate.clone(),
-                                entry_path,
-                            ));
+                            found
+                                .push(DiscoveredSkill::new_internal(candidate.clone(), entry_path));
                         }
                     }
                 }
@@ -518,7 +521,7 @@ pub fn discover_skill_dirs(plugin_root: &Path, skill_paths: &[&str]) -> Vec<Disc
             let scan_root = candidate
                 .parent()
                 .map_or_else(|| plugin_root.to_path_buf(), Path::to_path_buf);
-            found.push(DiscoveredSkill::new_unchecked(scan_root, candidate));
+            found.push(DiscoveredSkill::new_internal(scan_root, candidate));
         } else {
             debug!(
                 path = %candidate.display(),
