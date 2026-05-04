@@ -118,7 +118,8 @@ fn print_skills(plugin_dir: &Path) {
     println!();
     println!("  {}", "Skills:".bold());
 
-    for skill_dir in &skill_dirs {
+    for discovered in &skill_dirs {
+        let skill_dir = discovered.skill_dir();
         let skill_md_path = skill_dir.join("SKILL.md");
         let content = match fs::read_to_string(&skill_md_path) {
             Ok(c) => c,

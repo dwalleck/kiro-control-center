@@ -60,6 +60,7 @@ fn install_plugin_steering_impl(
         marketplace: &marketplace,
         plugin: &plugin,
         version: ctx.version.as_deref(),
+        plugin_dir: &ctx.plugin_dir,
     };
 
     Ok(MarketplaceService::install_plugin_steering(

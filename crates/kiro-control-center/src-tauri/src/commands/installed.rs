@@ -85,8 +85,10 @@ mod tests {
             plugin: PluginName::new("test-plugin").expect("valid plugin"),
             version: Some("1.0.0".into()),
             installed_at: Utc::now(),
-            source_hash: None,
-            installed_hash: None,
+            source_hash: String::new(),
+            installed_hash: String::new(),
+            source_scan_root: kiro_market_core::validation::RelativePath::new("skills")
+                .expect("valid"),
         };
         let skill_src = tempfile::tempdir().expect("skill src");
         std::fs::write(
@@ -113,8 +115,10 @@ mod tests {
                 plugin: PluginName::new("test-plugin").expect("valid plugin"),
                 version: Some("1.0.0".into()),
                 installed_at: Utc::now(),
-                source_hash: None,
-                installed_hash: None,
+                source_hash: String::new(),
+                installed_hash: String::new(),
+                source_scan_root: kiro_market_core::validation::RelativePath::new("skills")
+                    .expect("valid"),
             };
             let skill_src = tempfile::tempdir().expect("skill src");
             std::fs::write(skill_src.path().join("SKILL.md"), "# Skill\nBody")

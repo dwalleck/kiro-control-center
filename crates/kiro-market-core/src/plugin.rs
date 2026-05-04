@@ -385,19 +385,85 @@ fn scan_for_plugins(
 /// Name of the skill definition file.
 const SKILL_MD: &str = "SKILL.md";
 
+/// One skill directory discovered under a plugin's manifest-declared
+/// skill scan paths. Carries both the scan root and the resolved skill
+/// directory so install can record `scan_root` on
+/// [`crate::project::InstalledSkillMeta::source_scan_root`] for later
+/// drift detection.
+///
+/// **Invariant:** `skill_dir.starts_with(scan_root)`. The downstream
+/// install path uses `skill_dir.strip_prefix(scan_root)` to derive the
+/// install-time relative name; a mismatched pair would produce a
+/// nonsense `RelativePath`. Construction goes through
+/// [`Self::new_unchecked`] (in-crate only — the discover sites
+/// guarantee the invariant by construction) which `debug_assert!`s the
+/// prefix relationship; fields are `pub(crate)` so external crates
+/// must read through the [`Self::scan_root`] / [`Self::skill_dir`]
+/// accessors and cannot bypass the invariant with a struct literal.
+/// Per PR #100 review S4.
+#[derive(Debug, Clone)]
+pub struct DiscoveredSkill {
+    /// Absolute path to the scan root that contains `skill_dir`,
+    /// e.g. `<plugin_dir>/skills/` or `<plugin_dir>/packs/`.
+    /// Recorded on tracking after `strip_prefix(plugin_dir)` so
+    /// detection knows where to look without probing.
+    pub(crate) scan_root: PathBuf,
+    /// Absolute path to the skill directory itself,
+    /// e.g. `<plugin_dir>/skills/alpha/`. Contains a `SKILL.md`.
+    pub(crate) skill_dir: PathBuf,
+}
+
+impl DiscoveredSkill {
+    /// Construct a `DiscoveredSkill`, asserting the
+    /// `skill_dir.starts_with(scan_root)` invariant. `pub(crate)`
+    /// because the only sound producers of a `DiscoveredSkill` are the
+    /// two construction sites in [`discover_skill_dirs`] which compose
+    /// `scan_root` and `skill_dir` such that the invariant holds by
+    /// construction. The `debug_assert!` catches contract violations in
+    /// tests rather than allowing a silent wrong-prefix that would
+    /// later derail `strip_prefix(...)` at the install boundary.
+    pub(crate) fn new_unchecked(scan_root: PathBuf, skill_dir: PathBuf) -> Self {
+        debug_assert!(
+            skill_dir.starts_with(&scan_root),
+            "DiscoveredSkill invariant violated: skill_dir `{}` is not under scan_root `{}`",
+            skill_dir.display(),
+            scan_root.display(),
+        );
+        Self {
+            scan_root,
+            skill_dir,
+        }
+    }
+
+    /// The scan root that contains [`Self::skill_dir`].
+    #[must_use]
+    pub fn scan_root(&self) -> &Path {
+        &self.scan_root
+    }
+
+    /// The skill directory containing `SKILL.md`.
+    #[must_use]
+    pub fn skill_dir(&self) -> &Path {
+        &self.skill_dir
+    }
+}
+
 /// Discover skill directories within a plugin root given a list of paths.
 ///
 /// Each entry in `skill_paths` is interpreted relative to `plugin_root`:
 ///
 /// - If it ends with `/`, it is treated as a directory to scan: every
 ///   immediate subdirectory that contains a `SKILL.md` is included.
-/// - Otherwise it is treated as a specific directory; it is included only
-///   if it contains a `SKILL.md`.
+///   The candidate path itself is the scan root for those skills.
+/// - Otherwise it is treated as a specific directory; it is included
+///   only if it contains a `SKILL.md`. The scan root is the candidate's
+///   parent (or `plugin_root` if there's no parent under it).
 ///
-/// The returned paths are sorted for deterministic ordering.
+/// The returned records are sorted on `skill_dir` for deterministic
+/// ordering.
 #[must_use]
-pub fn discover_skill_dirs(plugin_root: &Path, skill_paths: &[&str]) -> Vec<PathBuf> {
-    let mut dirs = Vec::new();
+pub fn discover_skill_dirs(plugin_root: &Path, skill_paths: &[&str]) -> Vec<DiscoveredSkill> {
+    let mut found = Vec::new();
 
     for &path_str in skill_paths {
         if let Err(e) = crate::validation::validate_relative_path(path_str) {
@@ -413,6 +479,7 @@ pub fn discover_skill_dirs(plugin_root: &Path, skill_paths: &[&str]) -> Vec<Path
 
         if path_str.ends_with('/') || path_str.ends_with('\\') {
             // Scan subdirectories for those containing SKILL.md.
+            // The candidate path IS the scan root for this branch.
             match fs::read_dir(&candidate) {
                 Ok(entries) => {
                     for entry in entries {
@@ -429,7 +496,10 @@ pub fn discover_skill_dirs(plugin_root: &Path, skill_paths: &[&str]) -> Vec<Path
                         };
                         let entry_path = entry.path();
                         if entry_path.is_dir() && entry_path.join(SKILL_MD).exists() {
-                            dirs.push(entry_path);
+                            found.push(DiscoveredSkill::new_unchecked(
+                                candidate.clone(),
+                                entry_path,
+                            ));
                         }
                     }
                 }
@@ -442,7 +512,13 @@ pub fn discover_skill_dirs(plugin_root: &Path, skill_paths: &[&str]) -> Vec<Path
                 }
             }
         } else if candidate.is_dir() && candidate.join(SKILL_MD).exists() {
-            dirs.push(candidate);
+            // Bare-path branch: the scan root is the candidate's
+            // parent (or plugin_root if no parent under it). The
+            // skill dir IS the candidate.
+            let scan_root = candidate
+                .parent()
+                .map_or_else(|| plugin_root.to_path_buf(), Path::to_path_buf);
+            found.push(DiscoveredSkill::new_unchecked(scan_root, candidate));
         } else {
             debug!(
                 path = %candidate.display(),
@@ -451,8 +527,8 @@ pub fn discover_skill_dirs(plugin_root: &Path, skill_paths: &[&str]) -> Vec<Path
         }
     }
 
-    dirs.sort();
-    dirs
+    found.sort_by(|a, b| a.skill_dir.cmp(&b.skill_dir));
+    found
 }
 
 #[cfg(test)]
@@ -564,17 +640,21 @@ mod tests {
         let dirs = discover_skill_dirs(root, &["./skills/"]);
 
         assert_eq!(dirs.len(), 2);
-        // Results should be sorted, so efcore comes before tunit.
+        // Results should be sorted on skill_dir, so efcore comes
+        // before tunit.
         assert!(
-            dirs[0].ends_with("efcore"),
+            dirs[0].skill_dir.ends_with("efcore"),
             "first should be efcore, got {:?}",
             dirs[0]
         );
         assert!(
-            dirs[1].ends_with("tunit"),
+            dirs[1].skill_dir.ends_with("tunit"),
             "second should be tunit, got {:?}",
             dirs[1]
         );
+        // Both skills came from the same scan root.
+        assert_eq!(dirs[0].scan_root, root.join("skills/"));
+        assert_eq!(dirs[1].scan_root, root.join("skills/"));
     }
 
     #[test]
@@ -590,9 +670,88 @@ mod tests {
 
         assert_eq!(dirs.len(), 1);
         assert!(
-            dirs[0].ends_with("tunit"),
+            dirs[0].skill_dir.ends_with("tunit"),
             "should find tunit, got {:?}",
             dirs[0]
+        );
+    }
+
+    /// PR #100 review C2: a manifest declaring `skills: ["my-skill"]`
+    /// (bare path with NO `./skills/` parent — i.e. the skill lives at
+    /// the plugin root) makes the bare-path branch set
+    /// `scan_root = candidate.parent() = plugin_root`. Pre-fix this
+    /// resulted in install pushing `FailedSkill` because
+    /// `RelativePath::from_path_under(plugin_root, plugin_root)` errored
+    /// on empty rel. Post-fix `from_path_under` returns
+    /// `RelativePath(".")` so install + detection round-trip cleanly.
+    /// This test asserts only that `discover_skill_dirs` produces the
+    /// `scan_root == plugin_root` case the install code now handles.
+    #[test]
+    fn discover_skills_bare_path_at_plugin_root_uses_root_as_scan_root() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+
+        create_skill_md(&root.join("my-skill"));
+
+        let dirs = discover_skill_dirs(root, &["my-skill"]);
+        assert_eq!(dirs.len(), 1);
+        assert_eq!(
+            dirs[0].skill_dir,
+            root.join("my-skill"),
+            "skill_dir is the candidate path itself for bare-path branch"
+        );
+        assert_eq!(
+            dirs[0].scan_root,
+            root.to_path_buf(),
+            "bare-path branch sets scan_root to the candidate's parent, \
+             which equals plugin_root for skills at the plugin root"
+        );
+    }
+
+    /// PR #100 review S6: a manifest declaring TWO scan roots
+    /// (`["./packs/", "./extras/"]`) with skills under each must
+    /// produce one `DiscoveredSkill` per skill, each carrying its OWN
+    /// scan root — not the most-recently-seen root for all of them.
+    /// Catches a future "optimize the discover loop" refactor that
+    /// might collapse `scan_root` to a single value across iterations
+    /// (since none of the existing tests exercised the multi-root case
+    /// they wouldn't have caught it).
+    #[test]
+    fn discover_skills_with_multiple_scan_roots_records_each_skills_own_root() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path();
+
+        create_skill_md(&root.join("packs/alpha"));
+        create_skill_md(&root.join("packs/beta"));
+        create_skill_md(&root.join("extras/gamma"));
+
+        let dirs = discover_skill_dirs(root, &["./packs/", "./extras/"]);
+        assert_eq!(dirs.len(), 3);
+
+        let by_dir: std::collections::HashMap<_, _> = dirs
+            .iter()
+            .map(|d| (d.skill_dir(), d.scan_root()))
+            .collect();
+
+        let alpha = root.join("packs/alpha");
+        let beta = root.join("packs/beta");
+        let gamma = root.join("extras/gamma");
+        assert_eq!(
+            by_dir.get(alpha.as_path()),
+            Some(&root.join("./packs/").as_path()),
+            "alpha must record packs/ as its scan_root"
+        );
+        assert_eq!(
+            by_dir.get(beta.as_path()),
+            Some(&root.join("./packs/").as_path()),
+            "beta must record packs/ as its scan_root"
+        );
+        assert_eq!(
+            by_dir.get(gamma.as_path()),
+            Some(&root.join("./extras/").as_path()),
+            "gamma must record extras/ as its scan_root, NOT packs/ — \
+             a refactor that hoisted scan_root out of the loop would \
+             produce extras for everything (last write wins)"
         );
     }
 
@@ -630,7 +789,7 @@ mod tests {
 
         assert_eq!(dirs.len(), 1, "traversal path should be skipped");
         assert!(
-            dirs[0].ends_with("legit"),
+            dirs[0].skill_dir.ends_with("legit"),
             "only the valid skill should be returned, got {:?}",
             dirs[0]
         );
@@ -647,7 +806,7 @@ mod tests {
 
         assert_eq!(dirs.len(), 1, "absolute path should be skipped");
         assert!(
-            dirs[0].ends_with("safe"),
+            dirs[0].skill_dir.ends_with("safe"),
             "only the valid skill should be returned, got {:?}",
             dirs[0]
         );

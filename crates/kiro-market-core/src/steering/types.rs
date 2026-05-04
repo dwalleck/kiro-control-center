@@ -14,6 +14,7 @@ use std::path::{Path, PathBuf};
 use serde::Serialize;
 use thiserror::Error;
 
+use crate::error::ValidationError;
 use crate::project::InstallOutcomeKind;
 use crate::service::InstallMode;
 use crate::validation::{MarketplaceName, PluginName};
@@ -30,6 +31,13 @@ pub struct SteeringInstallContext<'a> {
     pub marketplace: &'a MarketplaceName,
     pub plugin: &'a PluginName,
     pub version: Option<&'a str>,
+    /// Plugin root directory; used to compute the per-file
+    /// `source_scan_root` populated on
+    /// [`crate::project::InstalledSteeringMeta`] at install time.
+    /// Required after the install↔detect symmetry pass — drift
+    /// detection consults the recorded scan root directly instead of
+    /// probing manifest paths.
+    pub plugin_dir: &'a std::path::Path,
 }
 
 /// Errors that can occur during steering install.
@@ -42,6 +50,24 @@ pub enum SteeringError {
         path: PathBuf,
         #[source]
         source: io::Error,
+    },
+
+    /// Manifest-supplied `scan_root` is structurally invalid for the
+    /// install↔detect symmetry contract: it isn't located under
+    /// `plugin_dir`, so the per-file `source_scan_root` newtype on
+    /// [`crate::project::InstalledSteeringMeta`] cannot be materialised.
+    /// Distinct from [`SteeringError::SourceReadFailed`], which models
+    /// I/O failures on a *file* — this variant models a structural
+    /// validation failure on the *scan root path* and never carries an
+    /// `io::Error`. PR #100 review I1 split these so the wire-format
+    /// reason is precise instead of impersonating a missing-file error.
+    #[non_exhaustive]
+    #[error("steering scan_root `{path}` is not under plugin_dir `{plugin_dir}`")]
+    ScanRootInvalid {
+        path: PathBuf,
+        plugin_dir: PathBuf,
+        #[source]
+        source: ValidationError,
     },
 
     /// Source file is a hardlink (Unix `nlink > 1`). See

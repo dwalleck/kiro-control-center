@@ -61,6 +61,95 @@ impl RelativePath {
         Self(value)
     }
 
+    /// The conventional `agents/` scan-root used by the translated
+    /// agent install path when the source-side scan root cannot be
+    /// recovered from `meta.source_path` (legacy `agent.md` discovered
+    /// without a configured scan path, hand-synthesised test fixtures,
+    /// etc.). Replaces the previous `from_internal_unchecked("agents".to_owned())`
+    /// site at `KiroProject::install_agent_inner` per PR #100 review S2:
+    /// the unchecked-constructor pattern was sound but anonymous —
+    /// every reader had to re-derive that `"agents"` is a constant
+    /// string. A named `agents_root()` makes the intent explicit and
+    /// removes one audited-by-convention site.
+    #[must_use]
+    pub fn agents_root() -> Self {
+        Self::from_internal_unchecked("agents".to_owned())
+    }
+
+    /// Convert a `Path` to a [`RelativePath`] by stripping `base` and
+    /// normalising path separators to forward-slash. Returns `Err` if
+    /// `path` is not under `base` or the resulting relative path fails
+    /// [`validate_relative_path`].
+    ///
+    /// Forward-slash conversion is required because [`RelativePath::new`]
+    /// rejects backslashes for cross-platform portability of the wire
+    /// format. On Windows, `Path::strip_prefix(...).to_string_lossy()`
+    /// returns backslashes; without normalisation, `RelativePath::new`
+    /// fails. The recipe (`Components::Normal` + `join("/")`) drops any
+    /// platform-specific prefix or root components, producing a
+    /// purely-forward-slash representation regardless of the host OS.
+    ///
+    /// Used by install-side code to record where in the plugin tree an
+    /// artifact came from, so detection can look it up directly without
+    /// probing each configured manifest scan path.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ValidationError::InvalidRelativePath`] if `path` is
+    /// not under `base`, or whatever [`validate_relative_path`] returns
+    /// if the normalised string fails its checks.
+    pub fn from_path_under(path: &Path, base: &Path) -> Result<Self, ValidationError> {
+        let rel = path
+            .strip_prefix(base)
+            .map_err(|_| ValidationError::InvalidRelativePath {
+                path: path.display().to_string(),
+                reason: format!("path is not under base directory `{}`", base.display()),
+            })?;
+        // Two-pass normalisation. On Windows-native paths, `Components`
+        // already splits on `\` and `Normal` strings have no embedded
+        // backslashes — `join("/")` is enough. On Unix interpreting a
+        // Windows-shaped path (or any synthetic input), `\` is NOT a
+        // path separator, so a string like `"agents\reviewer.md"` lands
+        // as ONE `Normal` component and we'd hand `RelativePath::new` a
+        // backslash it rejects. The explicit `.replace('\\', '/')`
+        // closes that gap; harmless when components already split.
+        //
+        // PR #100 review I4: components are converted via `to_str()`,
+        // not `to_string_lossy()`. Lossy conversion silently substitutes
+        // `U+FFFD` for invalid UTF-8 sequences, so a non-UTF-8 OsStr
+        // component would round-trip as a valid-looking `RelativePath`
+        // that doesn't correspond to anything on disk — detection-side
+        // hashing later misses with `NotFound` and the user sees a
+        // misleading "missing file" error. Failing the construction
+        // here surfaces the real cause at the parse boundary.
+        let parts: Vec<&str> = rel
+            .components()
+            .filter_map(|c| match c {
+                std::path::Component::Normal(s) => Some(s),
+                _ => None,
+            })
+            .map(|s| {
+                s.to_str()
+                    .ok_or_else(|| ValidationError::InvalidRelativePath {
+                        path: path.display().to_string(),
+                        reason: "path contains a non-UTF-8 component".to_owned(),
+                    })
+            })
+            .collect::<Result<_, _>>()?;
+        let rel_str = parts.join("/").replace('\\', "/");
+        // `path == base` produces an empty rel string (Components yields
+        // zero Normal entries), which `RelativePath::new` rejects.
+        // Substitute "." so the call still succeeds and downstream
+        // `plugin_dir.join(".").join(name)` resolves correctly. Closes
+        // PR #100 review C2 (bare-path skill at plugin root regression).
+        let normalised = if rel_str.is_empty() {
+            ".".to_owned()
+        } else {
+            rel_str
+        };
+        Self::new(normalised)
+    }
+
     /// View the validated path as a `&str`.
     #[must_use]
     pub fn as_str(&self) -> &str {
@@ -1156,5 +1245,94 @@ mod tests {
             a.as_str().cmp(b.as_str()),
             "PluginName::cmp must match inner String::cmp byte-for-byte"
         );
+    }
+
+    // -----------------------------------------------------------------
+    // RelativePath::from_path_under (install↔detect symmetry foundation)
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn from_path_under_normalizes_backslashes() {
+        use std::path::PathBuf;
+        // Synthesise a path with backslash components. PathBuf is just
+        // bytes underneath, so this works on any platform — tests the
+        // Windows-native input shape without requiring Windows CI.
+        let plugin_dir = PathBuf::from("/tmp/plugin");
+        let source = PathBuf::from("/tmp/plugin/agents\\reviewer.md");
+        let rel = RelativePath::from_path_under(&source, &plugin_dir)
+            .expect("backslash path under plugin_dir should normalize");
+        assert_eq!(rel.as_str(), "agents/reviewer.md");
+    }
+
+    #[test]
+    fn from_path_under_rejects_path_outside_base() {
+        use std::path::PathBuf;
+        let plugin_dir = PathBuf::from("/tmp/plugin");
+        let outside = PathBuf::from("/etc/passwd");
+        assert!(
+            RelativePath::from_path_under(&outside, &plugin_dir).is_err(),
+            "path not under plugin_dir must error, not silently produce a bogus rel"
+        );
+    }
+
+    #[test]
+    fn from_path_under_round_trips_simple_unix_path() {
+        use std::path::PathBuf;
+        let plugin_dir = PathBuf::from("/tmp/plugin");
+        let source = PathBuf::from("/tmp/plugin/agents/reviewer.md");
+        let rel = RelativePath::from_path_under(&source, &plugin_dir).expect("valid input");
+        assert_eq!(rel.as_str(), "agents/reviewer.md");
+    }
+
+    /// PR #100 review C2: a manifest declaring `skills: ["my-skill"]`
+    /// (bare path, no `./skills/` directory) makes `discover_skill_dirs`
+    /// set `scan_root = candidate.parent() = plugin_root`, then install
+    /// calls `from_path_under(scan_root=plugin_root, plugin_dir=plugin_root)`.
+    /// Pre-fix this errored with empty-rel; install pushed `FailedSkill`
+    /// for a skill that pre-PR would have installed cleanly. Post-fix
+    /// returns `RelativePath("." )` so detection can use
+    /// `plugin_dir.join(".").join(name)` to resolve back to the right
+    /// directory.
+    #[test]
+    fn from_path_under_returns_dot_when_path_equals_base() {
+        use std::path::PathBuf;
+        let plugin_dir = PathBuf::from("/tmp/plugin");
+        let rel = RelativePath::from_path_under(&plugin_dir, &plugin_dir)
+            .expect("path == base must produce a valid sentinel, not error");
+        assert_eq!(rel.as_str(), ".");
+    }
+
+    /// PR #100 review I4: a path component containing invalid UTF-8 must
+    /// produce `ValidationError::InvalidRelativePath { reason: "...non-UTF-8..." }`,
+    /// not a `to_string_lossy`-substituted U+FFFD that round-trips
+    /// through validation but doesn't match anything on disk. Unix-only
+    /// because Windows `OsStr` is WTF-16 and constructing an invalid
+    /// component takes a different path; the production code is
+    /// platform-agnostic — a Unix-only regression test is sufficient
+    /// since it pins the same `to_str()` call site on every target.
+    #[cfg(unix)]
+    #[test]
+    fn from_path_under_rejects_non_utf8_component() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+        use std::path::{Path, PathBuf};
+
+        // 0xFF is invalid as a UTF-8 start byte; the resulting OsStr is
+        // a valid Unix filename but has no UTF-8 representation.
+        let bad_component = OsStr::from_bytes(&[b'a', 0xFF, b'b']);
+        let base = PathBuf::from("/plugins/foo");
+        let path = base.join(Path::new(bad_component));
+
+        let err = RelativePath::from_path_under(&path, &base)
+            .expect_err("non-UTF-8 component must error, not lossy-substitute");
+        match err {
+            crate::error::ValidationError::InvalidRelativePath { reason, .. } => {
+                assert!(
+                    reason.contains("non-UTF-8"),
+                    "reason should call out non-UTF-8, got: {reason}"
+                );
+            }
+            other => panic!("expected InvalidRelativePath, got {other:?}"),
+        }
     }
 }

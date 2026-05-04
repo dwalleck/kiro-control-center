@@ -140,7 +140,8 @@ fn search_plugin(
 
     let mut matches = 0u32;
 
-    for skill_dir in &skill_dirs {
+    for discovered in &skill_dirs {
+        let skill_dir = discovered.skill_dir();
         if let Some(fm) = read_skill_frontmatter(skill_dir) {
             let name_lower = fm.name.to_lowercase();
             let desc_lower = fm.description.to_lowercase();

@@ -248,6 +248,7 @@ fn install_skills_impl(
     let project = KiroProject::new(project_root);
     Ok(svc.install_skills(
         &project,
+        &ctx.plugin_dir,
         &ctx.skill_dirs,
         &InstallFilter::Names(skills),
         mode,
