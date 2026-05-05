@@ -24,6 +24,7 @@
     SkillInfo,
     SkippedSkill,
   } from "$lib/bindings";
+  import BannerStack from "./BannerStack.svelte";
   import SkillCard from "./SkillCard.svelte";
   import PluginCard from "./PluginCard.svelte";
 
@@ -1063,73 +1064,17 @@
     </div>
   {/if}
 
-  <!-- Banners render newest-first (reverse insertion order) and cap at 3 so
-       a storm of broken plugins doesn't push the grid off-screen. Dismissing
-       a banner or resolving its source surfaces the next-newest below. -->
-  {#each [...fetchErrors].reverse().slice(0, 3) as [key, message] (key)}
-    <div
-      data-testid="fetch-error"
-      class="mx-4 mt-3 px-4 py-3 rounded-md bg-kiro-error/10 border border-kiro-error/30 flex items-start gap-3"
-    >
-      <p class="text-sm text-kiro-error flex-1">{message}</p>
-      <button
-        type="button"
-        onclick={() => fetchErrors.delete(key)}
-        aria-label={errLabel(key)}
-        class="text-kiro-error/70 hover:text-kiro-error text-lg leading-none flex-shrink-0 focus:outline-none focus:ring-2 focus:ring-kiro-accent-500 rounded"
-      >
-        ×
-      </button>
-    </div>
-  {/each}
-  {#if fetchErrors.size > 3}
-    <div
-      data-testid="fetch-error-overflow"
-      class="mx-4 mt-3 px-4 py-2 text-xs text-kiro-subtle text-center border border-kiro-muted/50 rounded-md bg-kiro-surface/30"
-    >
-      +{fetchErrors.size - 3} more {fetchErrors.size - 3 === 1 ? "error" : "errors"} — dismiss or resolve above to see the rest
-    </div>
-  {/if}
-
-  {#if installError}
-    <div
-      data-testid="install-error"
-      class="mx-4 mt-3 px-4 py-3 rounded-md bg-kiro-error/10 border border-kiro-error/30 flex items-start gap-3"
-    >
-      <p class="text-sm text-kiro-error flex-1">{installError}</p>
-      <button
-        type="button"
-        onclick={() => (installError = null)}
-        aria-label="Dismiss install error"
-        class="text-kiro-error/70 hover:text-kiro-error text-lg leading-none flex-shrink-0 focus:outline-none focus:ring-2 focus:ring-kiro-accent-500 rounded"
-      >
-        ×
-      </button>
-    </div>
-  {/if}
-
-  {#if installMessage}
-    <div class="mx-4 mt-3 px-4 py-3 rounded-md bg-kiro-success/10 border border-kiro-success/30">
-      <p class="text-sm text-kiro-success">{installMessage}</p>
-    </div>
-  {/if}
-
-  {#if installWarning}
-    <div
-      data-testid="install-warning"
-      class="mx-4 mt-3 px-4 py-3 rounded-md bg-kiro-warning/10 border border-kiro-warning/30 flex items-start gap-3"
-    >
-      <p class="text-sm text-kiro-warning flex-1">{installWarning}</p>
-      <button
-        type="button"
-        onclick={() => (installWarning = null)}
-        aria-label="Dismiss install warning"
-        class="text-kiro-warning/70 hover:text-kiro-warning text-lg leading-none flex-shrink-0 focus:outline-none focus:ring-2 focus:ring-kiro-accent-500 rounded"
-      >
-        ×
-      </button>
-    </div>
-  {/if}
+  <BannerStack
+    errors={fetchErrors}
+    message={installMessage}
+    warning={installWarning}
+    fatalError={installError}
+    errLabel={errLabel}
+    ondismiss={(key) => fetchErrors.delete(key)}
+    onmessageDismiss={() => (installMessage = null)}
+    onwarningDismiss={() => (installWarning = null)}
+    onfatalErrorDismiss={() => (installError = null)}
+  />
 
   <div class="flex items-center gap-1 px-4 py-2 border-b border-kiro-muted bg-kiro-surface/30">
     <div class="inline-flex rounded-md border border-kiro-muted bg-kiro-overlay overflow-hidden">
