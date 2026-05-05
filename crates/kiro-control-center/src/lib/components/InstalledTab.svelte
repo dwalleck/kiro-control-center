@@ -1,49 +1,94 @@
 <script lang="ts">
   import { onMount } from "svelte";
+  import { SvelteMap } from "svelte/reactivity";
   import { commands } from "$lib/bindings";
   import type {
     InstalledSkillInfo,
     InstalledPluginInfo,
+    PluginUpdateInfo,
+    PluginUpdateFailure,
+    RemovePluginResult,
   } from "$lib/bindings";
-  import { pluginKey } from "$lib/keys";
+  import { DELIM, pluginKey } from "$lib/keys";
+  import { pluginUpdates } from "$lib/stores/plugin-updates.svelte";
+  import { kindLabel } from "$lib/stores/plugin-updates";
+  import type { PluginAction } from "$lib/stores/plugin-updates";
+  import { formatInstallPluginResult, formatRemovePluginResult } from "$lib/format";
+  import BannerStack from "./BannerStack.svelte";
 
   let { projectPath }: { projectPath: string } = $props();
 
   let plugins: InstalledPluginInfo[] = $state([]);
   let skills: InstalledSkillInfo[] = $state([]);
   let loading: boolean = $state(true);
+  // `loadError` narrows in 2b: only fetch/refresh failures land here.
+  // Remove-action failures route to `installError` (matching BrowseTab).
   let loadError: string | null = $state(null);
-  // Non-fatal partial-load detail (one or more `installed-*.json` tracking
-  // files failed to parse; the others loaded). Distinct from `loadError`
-  // (red, fatal) — the table still has rows from the files that DID load.
-  let loadWarning: string | null = $state(null);
-  // Single removal in flight at a time — `remove_plugin` reads/writes the
-  // installed-skills/steering/agents tracking files, so racing two removes
-  // could clobber each other. Disabling all Remove buttons while one is
-  // pending is the simplest correctness-preserving UI.
-  let removingKey: string | null = $state(null);
+
+  // 3-banner pattern mirrored from BrowseTab. installError = red fatal,
+  // installMessage = green success, installWarning = amber non-fatal.
+  let installError: string | null = $state(null);
+  let installMessage: string | null = $state(null);
+  let installWarning: string | null = $state(null);
+
+  // Per-plugin in-flight tracker, keyed by pluginKey(marketplace, plugin).
+  // Narrows the shared PluginAction union to the actions InstalledTab
+  // performs (Remove + Update — never Install, that's BrowseTab's surface).
+  let pendingPluginActions = new SvelteMap<string, Extract<PluginAction, "remove" | "update">>();
+
+  // The most recent RemovePluginResult — drives the inline <details>
+  // block below the BannerStack. Stays set until the next Remove or
+  // a project change clears it.
+  let removeResult: RemovePluginResult | null = $state(null);
+  let removeResultPlugin: string | null = $state(null);
+  let removeResultHasFailures: boolean = $state(false);
+
+  // Banner-stack typing — InstalledTab's ErrorSource union is small for
+  // 2b: only the new update-check + update-fetch keys plus a single
+  // installed-plugins key for partial-load warnings (existing).
+  const ERR_INSTALLED_PLUGINS = "installed-plugins" as const;
+  const ERR_UPDATE_FETCH = "update-fetch" as const;
+  const UPDATE_CHECK_PREFIX = "update-check" as const;
+  type ErrorSource =
+    | typeof ERR_INSTALLED_PLUGINS
+    | typeof ERR_UPDATE_FETCH
+    | `${typeof UPDATE_CHECK_PREFIX}${typeof DELIM}${string}${typeof DELIM}${string}`;
+  let fetchErrors = new SvelteMap<ErrorSource, string>();
+
+  function errLabel(key: ErrorSource): string {
+    if (key === ERR_INSTALLED_PLUGINS) return "Dismiss installed-plugins warning";
+    if (key === ERR_UPDATE_FETCH) return "Dismiss update-check error";
+    if (key.startsWith(UPDATE_CHECK_PREFIX + DELIM)) {
+      const parts = key.split(DELIM);
+      if (parts.length === 3) {
+        return `Dismiss update-check banner for ${parts[2]}`;
+      }
+      return "Dismiss update-check banner";
+    }
+    return "Dismiss banner";
+  }
 
   async function refresh() {
     loading = true;
     loadError = null;
-    loadWarning = null;
     try {
       const [pluginsResult, skillsResult] = await Promise.all([
         commands.listInstalledPlugins(projectPath),
         commands.listInstalledSkills(projectPath),
       ]);
       if (pluginsResult.status === "ok") {
-        // Wire format is `InstalledPluginsView` (I13): `.plugins` carries
-        // the rows, `.partial_load_warnings` carries per-tracking-file
-        // load failures (corrupt installed-*.json) so the table renders
-        // the partial state instead of a misleading empty list.
         plugins = pluginsResult.data.plugins;
         const warnings = pluginsResult.data.partial_load_warnings ?? [];
         if (warnings.length > 0) {
           const summary = warnings
             .map((w) => `${w.tracking_file}: ${w.error}`)
             .join("; ");
-          loadWarning = `Installed plugins partially loaded — ${summary}`;
+          fetchErrors.set(
+            ERR_INSTALLED_PLUGINS,
+            `Installed plugins partially loaded — ${summary}`,
+          );
+        } else {
+          fetchErrors.delete(ERR_INSTALLED_PLUGINS);
         }
       } else {
         loadError = pluginsResult.error.message;
@@ -63,20 +108,80 @@
 
   async function removePlugin(marketplace: string, plugin: string) {
     const key = pluginKey(marketplace, plugin);
-    if (removingKey !== null) return;
-    removingKey = key;
+    if (pendingPluginActions.has(key)) return;
+    pendingPluginActions.set(key, "remove");
+    installError = null;
+    installMessage = null;
+    installWarning = null;
+    removeResult = null;
+    removeResultPlugin = null;
+    removeResultHasFailures = false;
     try {
       const result = await commands.removePlugin(marketplace, plugin, projectPath);
       if (result.status === "ok") {
+        const { summary, hasItems, hasFailures } =
+          formatRemovePluginResult(result.data, plugin);
+        if (hasItems || hasFailures) {
+          removeResult = result.data;
+          removeResultPlugin = plugin;
+          removeResultHasFailures = hasFailures;
+        }
+        if (hasFailures) {
+          installWarning = `Removed plugin ${plugin}: ${summary}`;
+        } else {
+          installMessage = `Removed plugin ${plugin}: ${summary}`;
+        }
+        // Order: pluginUpdates.refresh first, local refresh second.
+        await pluginUpdates.refresh(projectPath);
         await refresh();
       } else {
-        loadError = `Remove failed for ${plugin}: ${result.error.message}`;
+        installError = `Remove failed for ${plugin}: ${result.error.message}`;
       }
     } catch (e) {
       const reason = e instanceof Error ? e.message : String(e);
-      loadError = `Remove failed for ${plugin}: ${reason}`;
+      installError = `Remove failed for ${plugin}: ${reason}`;
     } finally {
-      removingKey = null;
+      pendingPluginActions.delete(key);
+    }
+  }
+
+  async function updatePlugin(marketplace: string, plugin: string) {
+    const key = pluginKey(marketplace, plugin);
+    if (pendingPluginActions.has(key)) return;
+    pendingPluginActions.set(key, "update");
+    installError = null;
+    installMessage = null;
+    installWarning = null;
+    removeResult = null;
+    try {
+      const result = await commands.installPlugin(
+        marketplace,
+        plugin,
+        /*force=*/ true,
+        /*acceptMcp=*/ false,
+        projectPath,
+      );
+      if (result.status === "ok") {
+        const { summary, warnings, anyInstalled, anyFailed } =
+          formatInstallPluginResult(result.data, plugin);
+        if (anyFailed && !anyInstalled) {
+          installError = `Update failed for ${plugin}: ${summary}`;
+        } else {
+          installMessage = `Updated ${plugin}: ${summary}`;
+        }
+        if (warnings) {
+          installWarning = `Updated ${plugin}: ${warnings}`;
+        }
+        await pluginUpdates.refresh(projectPath);
+        await refresh();
+      } else {
+        installError = `Update failed for ${plugin}: ${result.error.message}`;
+      }
+    } catch (e) {
+      const reason = e instanceof Error ? e.message : String(e);
+      installError = `Update failed for ${plugin}: ${reason}`;
+    } finally {
+      pendingPluginActions.delete(key);
     }
   }
 
@@ -101,6 +206,70 @@
     void projectPath;
     refresh();
   });
+
+  // Eager scan on project mount + on every projectPath change.
+  $effect(() => {
+    void projectPath;
+    pluginUpdates.refresh(projectPath);
+  });
+
+  // Project per-marketplace failure groups into the fetchErrors map.
+  $effect(() => {
+    const seen = new Set<ErrorSource>();
+    for (const group of pluginUpdates.failureGroups) {
+      const key: ErrorSource =
+        `${UPDATE_CHECK_PREFIX}${DELIM}${group.remediation}${DELIM}${group.marketplace}` as ErrorSource;
+      seen.add(key);
+      const noun = group.plugins.length === 1 ? "plugin" : "plugins";
+      const list = group.plugins.join(", ");
+      fetchErrors.set(
+        key,
+        `${group.plugins.length} ${noun} from ${group.marketplace}: ${group.remediationHint} (${list})`,
+      );
+    }
+    for (const k of fetchErrors.keys()) {
+      if (k.startsWith(UPDATE_CHECK_PREFIX + DELIM) && !seen.has(k)) {
+        fetchErrors.delete(k);
+      }
+    }
+  });
+
+  // Surface the toplevel pluginUpdates.fetchError as its own banner.
+  $effect(() => {
+    if (pluginUpdates.fetchError) {
+      fetchErrors.set(
+        ERR_UPDATE_FETCH,
+        `Couldn't check for updates: ${pluginUpdates.fetchError}`,
+      );
+    } else {
+      fetchErrors.delete(ERR_UPDATE_FETCH);
+    }
+  });
+
+  // Helpers used by the table render block.
+  function statusUpdateLabel(u: PluginUpdateInfo): string {
+    // ContentChanged: phrased as a status (full sentence) rather than the
+    // PluginCard button's action label ("Update (content changed)").
+    // The two surfaces intentionally differ — column = state; button = action.
+    if (u.change_signal.kind === "content_changed") return "Content changed since install";
+    // VersionBumped: prefer the explicit "v_old → v_new" form when both
+    // versions are known; fall back to "vN available" for legacy installs
+    // (installed_version: None) and to a bare "Update available" when the
+    // marketplace manifest declares no version.
+    if (u.installed_version && u.available_version) {
+      return `v${u.installed_version} → v${u.available_version}`;
+    }
+    if (u.available_version) return `v${u.available_version} available`;
+    return "Update available";
+  }
+
+  function updateInfoFor(p: InstalledPluginInfo): PluginUpdateInfo | undefined {
+    return pluginUpdates.updateFor(p.marketplace, p.plugin);
+  }
+
+  function failureFor(p: InstalledPluginInfo): PluginUpdateFailure | undefined {
+    return pluginUpdates.failureFor(p.marketplace, p.plugin);
+  }
 </script>
 
 <div class="flex flex-col h-full">
@@ -118,15 +287,15 @@
         <p class="text-sm text-kiro-error">{loadError}</p>
       </div>
     {:else}
-      {#if loadWarning}
+      {#if fetchErrors.get(ERR_INSTALLED_PLUGINS)}
         <div
           data-testid="installed-load-warning"
           class="mb-4 px-4 py-3 rounded-md bg-kiro-warning/10 border border-kiro-warning/30 flex items-start gap-3"
         >
-          <p class="text-sm text-kiro-warning flex-1">{loadWarning}</p>
+          <p class="text-sm text-kiro-warning flex-1">{fetchErrors.get(ERR_INSTALLED_PLUGINS)}</p>
           <button
             type="button"
-            onclick={() => (loadWarning = null)}
+            onclick={() => fetchErrors.delete(ERR_INSTALLED_PLUGINS)}
             aria-label="Dismiss installed-plugins warning"
             class="text-kiro-warning/70 hover:text-kiro-warning text-lg leading-none flex-shrink-0 focus:outline-none focus:ring-2 focus:ring-kiro-accent-500 rounded"
           >
@@ -163,11 +332,11 @@
                     <button
                       type="button"
                       onclick={() => removePlugin(p.marketplace, p.plugin)}
-                      disabled={removingKey !== null}
-                      aria-busy={removingKey === key}
+                      disabled={pendingPluginActions.size > 0}
+                      aria-busy={pendingPluginActions.get(key) === "remove"}
                       class="px-2 py-0.5 text-[11px] text-kiro-subtle hover:text-kiro-error disabled:cursor-not-allowed"
                     >
-                      {removingKey === key ? "Removing…" : "Remove"}
+                      {pendingPluginActions.get(key) === "remove" ? "Removing…" : "Remove"}
                     </button>
                   </td>
                 </tr>
