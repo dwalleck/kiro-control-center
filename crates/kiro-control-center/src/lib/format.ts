@@ -2,6 +2,7 @@ import type {
   InstallPluginResult_Serialize,
   InstallWarning,
   ParseFailure,
+  RemovePluginResult,
   SkillCount,
   SkippedReason,
   SkippedSkill,
@@ -272,4 +273,73 @@ export function formatInstallPluginResult(
   const warnings = warningParts.length > 0 ? warningParts.join(" | ") : null;
 
   return { summary, warnings, anyInstalled, anyFailed };
+}
+
+/**
+ *  Summarized view of a `RemovePluginResult` for banner + `<details>`
+ *  rendering on the InstalledTab.
+ *
+ *  - `summary`: human-readable mid-dot-separated count phrase
+ *    (mirrors `formatInstallPluginResult`'s shape — "3 skills · 1
+ *    steering · 2 agents" for happy path; appends "N <type> failed"
+ *    for partial failure). Reads "nothing to remove" on empty.
+ *  - `hasItems`: at least one removed-list is non-empty. Drives the
+ *    decision whether to render the `<details>` block at all.
+ *  - `hasFailures`: at least one failures-list is non-empty. Drives
+ *    the choice of banner channel (amber vs. green) and the `<details
+ *    open>` auto-expand.
+ */
+export type FormattedRemovePluginResult = {
+  summary: string;
+  hasItems: boolean;
+  hasFailures: boolean;
+};
+
+export function formatRemovePluginResult(
+  r: RemovePluginResult,
+  _plugin: string,
+): FormattedRemovePluginResult {
+  // Sub-result fields are optional per the wire format
+  // (RemoveSkillsResult.removed?: string[], etc.). Default to empty
+  // arrays so the rest of this function can do plain `.length` reads.
+  const skillsRemoved = r.skills.removed ?? [];
+  const skillsFailures = r.skills.failures ?? [];
+  const steeringRemoved = r.steering.removed ?? [];
+  const steeringFailures = r.steering.failures ?? [];
+  const agentsRemoved = r.agents.removed ?? [];
+  const agentsFailures = r.agents.failures ?? [];
+
+  const summaryParts: string[] = [];
+
+  if (skillsRemoved.length > 0) {
+    const noun = skillsRemoved.length === 1 ? "skill" : "skills";
+    summaryParts.push(`${skillsRemoved.length} ${noun}`);
+  }
+  if (steeringRemoved.length > 0) {
+    const noun = steeringRemoved.length === 1 ? "file" : "files";
+    summaryParts.push(`${steeringRemoved.length} steering ${noun}`);
+  }
+  if (agentsRemoved.length > 0) {
+    const noun = agentsRemoved.length === 1 ? "agent" : "agents";
+    summaryParts.push(`${agentsRemoved.length} ${noun}`);
+  }
+  if (skillsFailures.length > 0) {
+    const noun = skillsFailures.length === 1 ? "skill" : "skills";
+    summaryParts.push(`${skillsFailures.length} ${noun} failed`);
+  }
+  if (steeringFailures.length > 0) {
+    summaryParts.push(`${steeringFailures.length} steering failed`);
+  }
+  if (agentsFailures.length > 0) {
+    const noun = agentsFailures.length === 1 ? "agent" : "agents";
+    summaryParts.push(`${agentsFailures.length} ${noun} failed`);
+  }
+
+  const hasItems =
+    skillsRemoved.length + steeringRemoved.length + agentsRemoved.length > 0;
+  const hasFailures =
+    skillsFailures.length + steeringFailures.length + agentsFailures.length > 0;
+  const summary = summaryParts.length > 0 ? summaryParts.join(" · ") : "nothing to remove";
+
+  return { summary, hasItems, hasFailures };
 }

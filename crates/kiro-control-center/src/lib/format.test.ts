@@ -3,8 +3,9 @@ import type {
   InstallPluginResult_Serialize,
   MarketplaceName,
   PluginName,
+  RemovePluginResult,
 } from "$lib/bindings";
-import { formatInstallPluginResult } from "./format";
+import { formatInstallPluginResult, formatRemovePluginResult } from "./format";
 
 // Field names + structure tracked from bindings.ts (see plan
 // "Source-of-truth references"):
@@ -88,5 +89,62 @@ describe("formatInstallPluginResult", () => {
     r.skills.skipped = ["a", "b"];
     const out = formatInstallPluginResult(r, "p");
     expect(out.summary).toContain("2 skills already installed");
+  });
+});
+
+// Field names + structure tracked from bindings.ts:
+//  - RemovePluginResult:  bindings.ts:1171-1175
+//  - RemoveSkillsResult:  bindings.ts:1181-1184
+//  - RemoveSteeringResult: bindings.ts:1190-1193
+//  - RemoveAgentsResult:  bindings.ts:1134-1137
+//  - RemoveItemFailure:   bindings.ts:1145-1156
+function emptyRemoveResult(): RemovePluginResult {
+  return {
+    skills: { removed: [], failures: [] },
+    steering: { removed: [], failures: [] },
+    agents: { removed: [], failures: [] },
+  };
+}
+
+describe("formatRemovePluginResult", () => {
+  it("happy path: counts all 3 sub-results", () => {
+    const r = emptyRemoveResult();
+    r.skills.removed = ["a", "b", "c"];
+    r.steering.removed = ["s.md"];
+    r.agents.removed = ["g1", "g2"];
+    const out = formatRemovePluginResult(r, "p");
+    expect(out.summary).toContain("3 skill");
+    expect(out.summary).toContain("1 steering");
+    expect(out.summary).toContain("2 agent");
+    expect(out.hasItems).toBe(true);
+    expect(out.hasFailures).toBe(false);
+  });
+
+  it("steering failure lands in summary (failed count) and hasFailures=true", () => {
+    const r = emptyRemoveResult();
+    r.steering.failures = [{ item: "broken.md", error: "permission denied" }];
+    const out = formatRemovePluginResult(r, "p");
+    expect(out.hasFailures).toBe(true);
+    expect(out.summary).toContain("1 steering failed");
+  });
+
+  it("empty (zero items, zero failures): hasItems=false, hasFailures=false", () => {
+    const r = emptyRemoveResult();
+    const out = formatRemovePluginResult(r, "p");
+    expect(out.hasItems).toBe(false);
+    expect(out.hasFailures).toBe(false);
+    expect(out.summary).toBe("nothing to remove");
+  });
+
+  it("treats undefined removed/failures as empty arrays", () => {
+    // The wire format makes both fields optional (#[serde(default)]).
+    const r: RemovePluginResult = {
+      skills: {},
+      steering: {},
+      agents: {},
+    };
+    const out = formatRemovePluginResult(r, "p");
+    expect(out.hasItems).toBe(false);
+    expect(out.hasFailures).toBe(false);
   });
 });
