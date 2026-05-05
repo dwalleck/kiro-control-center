@@ -61,3 +61,65 @@ export function kindLabel(kind: PluginUpdateFailureKind): string {
       return "Update check failed — see console";
   }
 }
+
+/**
+ *  A grouped failure surface. One per `(remediation, marketplace)` —
+ *  the natural unit for banner copy, since plugins sharing the same
+ *  remediation from the same marketplace want a single combined
+ *  "N plugins from acme couldn't be checked" banner instead of N.
+ */
+export type FailureGroup = {
+  remediation: RemediationClass;
+  marketplace: MarketplaceName;
+  // Plugin names ordered as the scan returned them.
+  plugins: PluginName[];
+  // Human-readable remediation hint (e.g. "Run `kiro-market update`...").
+  remediationHint: string;
+};
+
+/**
+ *  Collapse a flat `failures: PluginUpdateFailure[]` into per-group
+ *  rows. Order of groups in the returned array reflects first-seen
+ *  ordering of group keys; plugin order within a group is input order.
+ */
+export function groupFailures(failures: PluginUpdateFailure[]): FailureGroup[] {
+  const map = new Map<string, FailureGroup>();
+  for (const f of failures) {
+    const cls = remediationClass(f.kind);
+    // Composite key — a literal "<remediation>:<marketplace>" suffices
+    // because remediationClass values never contain ":" and marketplace
+    // names go through a backend newtype that forbids control chars.
+    const groupKey = `${cls}:${f.marketplace}`;
+    let g = map.get(groupKey);
+    if (!g) {
+      g = {
+        remediation: cls,
+        marketplace: f.marketplace,
+        plugins: [],
+        remediationHint: hintFor(cls, f.marketplace),
+      };
+      map.set(groupKey, g);
+    }
+    g.plugins.push(f.plugin);
+  }
+  return Array.from(map.values());
+}
+
+function hintFor(cls: RemediationClass, marketplace: MarketplaceName): string {
+  switch (cls) {
+    case "stale_cache":
+      return `Run \`kiro-market update\` to refresh ${marketplace}.`;
+    case "manifest_invalid":
+      return "Contact the marketplace owner — `plugin.json` failed to parse.";
+    case "unknown":
+      return "Update check failed — see browser console for the error chain.";
+  }
+}
+
+/**
+ *  Per-plugin in-flight action discriminator. Each tab narrows this
+ *  to the actions it actually performs (BrowseTab: install/update,
+ *  InstalledTab: remove/update) but the union is exported so the
+ *  Map shapes stay nameable from one place.
+ */
+export type PluginAction = "install" | "update" | "remove";
