@@ -114,7 +114,10 @@
         disabled={!projectPicked}
         title="Update will replace local edits to plugin files"
         aria-label="Update {plugin.name}"
-        class="px-3 py-1.5 text-xs font-medium rounded-md bg-kiro-warning/10 border border-kiro-warning/40 text-kiro-warning hover:bg-kiro-warning/15 transition-colors"
+        class="px-3 py-1.5 text-xs font-medium rounded-md transition-colors
+          {projectPicked
+            ? 'bg-kiro-warning/10 border border-kiro-warning/40 text-kiro-warning hover:bg-kiro-warning/15'
+            : 'bg-kiro-muted text-kiro-subtle border border-transparent cursor-not-allowed'}"
       >
         {updateLabel}
       </button>
@@ -129,7 +132,6 @@
         type="button"
         onclick={onInstall}
         disabled={!projectPicked}
-        aria-busy={installing}
         title={installTitle}
         aria-label="Install {plugin.name}"
         class="px-3 py-1.5 text-xs font-medium rounded-md transition-colors
