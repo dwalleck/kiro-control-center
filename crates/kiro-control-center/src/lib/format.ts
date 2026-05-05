@@ -1,4 +1,5 @@
 import type {
+  InstallPluginResult_Serialize,
   InstallWarning,
   ParseFailure,
   SkillCount,
@@ -174,8 +175,6 @@ export function formatSkippedSkillsForPlugin(list: readonly SkippedSkill[]): str
     ? `${list.length} skill(s) failed to load — ${joined}; +${overflow} more`
     : `${list.length} skill(s) failed to load — ${joined}`;
 }
-
-import type { InstallPluginResult_Serialize } from "$lib/bindings";
 
 /**
  *  Summarized view of an `InstallPluginResult_Serialize` for banner
