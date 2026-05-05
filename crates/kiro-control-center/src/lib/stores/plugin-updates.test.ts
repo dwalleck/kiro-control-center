@@ -121,6 +121,15 @@ describe("groupFailures", () => {
     expect(groups[0].plugins).toEqual(["z-plugin", "a-plugin", "m-plugin"]);
   });
 
+  it("returns groups in first-seen key order", () => {
+    const groups = groupFailures([
+      failure("beta", "p1", { kind: "marketplace_unavailable" }),
+      failure("acme", "p2", { kind: "marketplace_unavailable" }),
+    ]);
+    expect(groups[0].marketplace).toBe("beta");
+    expect(groups[1].marketplace).toBe("acme");
+  });
+
   it("each group carries a non-empty remediationHint", () => {
     const groups: FailureGroup[] = groupFailures([
       failure("acme", "p1", { kind: "marketplace_unavailable" }),
