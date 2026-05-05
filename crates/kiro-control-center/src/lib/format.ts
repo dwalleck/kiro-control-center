@@ -174,3 +174,103 @@ export function formatSkippedSkillsForPlugin(list: readonly SkippedSkill[]): str
     ? `${list.length} skill(s) failed to load — ${joined}; +${overflow} more`
     : `${list.length} skill(s) failed to load — ${joined}`;
 }
+
+import type { InstallPluginResult_Serialize } from "$lib/bindings";
+
+/**
+ *  Summarized view of an `InstallPluginResult_Serialize` for banner
+ *  rendering. Extracted from `BrowseTab.installWholePlugin` so the new
+ *  Update flow (which also calls `installPlugin`, just with `force=true`)
+ *  reuses the same summarization rather than duplicating it.
+ *
+ *  - `summary`: human-readable mid-dot-separated count phrase
+ *    (e.g. "2 skills · 1 steering · 1 agent"). Reads "nothing to install"
+ *    when nothing happened.
+ *  - `warnings`: pipe-separated warning lines (steering-scan warnings,
+ *    MCP-gated agents, per-skill skipped_skills) or `null` when empty.
+ *  - `anyInstalled` / `anyFailed`: caller uses these to decide which
+ *    banner channel (success vs. error vs. warning) to route to.
+ */
+export type FormattedInstallPluginResult = {
+  summary: string;
+  warnings: string | null;
+  anyInstalled: boolean;
+  anyFailed: boolean;
+};
+
+export function formatInstallPluginResult(
+  r: InstallPluginResult_Serialize,
+  _plugin: string,
+): FormattedInstallPluginResult {
+  const summaryParts: string[] = [];
+  const warningParts: string[] = [];
+
+  // Skills sub-result.
+  {
+    const skills = r.skills;
+    if (skills.installed.length > 0) {
+      const noun = skills.installed.length === 1 ? "skill" : "skills";
+      summaryParts.push(`${skills.installed.length} ${noun}`);
+    }
+    if (skills.failed.length > 0) {
+      const noun = skills.failed.length === 1 ? "skill" : "skills";
+      summaryParts.push(`${skills.failed.length} ${noun} failed`);
+    }
+    if (skills.skipped.length > 0) {
+      const noun = skills.skipped.length === 1 ? "skill" : "skills";
+      summaryParts.push(`${skills.skipped.length} ${noun} already installed`);
+    }
+    if (skills.skipped_skills.length > 0) {
+      warningParts.push(formatSkippedSkillsForPlugin(skills.skipped_skills));
+    }
+  }
+
+  // Steering sub-result. Idempotent reinstalls land in `installed` with
+  // `kind: idempotent` (not a separate field) — the current banner shape
+  // counts them as installed; per-content breakdown is future scope.
+  {
+    const steering = r.steering;
+    if (steering.installed.length > 0) {
+      const noun = steering.installed.length === 1 ? "file" : "files";
+      summaryParts.push(`${steering.installed.length} steering ${noun}`);
+    }
+    if (steering.failed.length > 0) {
+      summaryParts.push(`${steering.failed.length} steering failed`);
+    }
+    for (const w of steering.warnings) {
+      warningParts.push(formatSteeringWarning(w));
+    }
+  }
+
+  // Agents sub-result.
+  {
+    const agents = r.agents;
+    if (agents.installed.length > 0) {
+      const noun = agents.installed.length === 1 ? "agent" : "agents";
+      summaryParts.push(`${agents.installed.length} ${noun}`);
+    }
+    if (agents.failed.length > 0) {
+      const noun = agents.failed.length === 1 ? "agent" : "agents";
+      summaryParts.push(`${agents.failed.length} ${noun} failed`);
+    }
+    if (agents.skipped.length > 0) {
+      const noun = agents.skipped.length === 1 ? "agent" : "agents";
+      summaryParts.push(`${agents.skipped.length} ${noun} already installed`);
+    }
+    for (const w of agents.warnings) {
+      warningParts.push(formatInstallWarning(w));
+    }
+  }
+
+  const anyFailed =
+    r.skills.failed.length + r.steering.failed.length + r.agents.failed.length > 0;
+  const anyInstalled =
+    r.skills.installed.length +
+      r.steering.installed.length +
+      r.agents.installed.length >
+    0;
+  const summary = summaryParts.length > 0 ? summaryParts.join(" · ") : "nothing to install";
+  const warnings = warningParts.length > 0 ? warningParts.join(" | ") : null;
+
+  return { summary, warnings, anyInstalled, anyFailed };
+}
