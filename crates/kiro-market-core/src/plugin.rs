@@ -1021,7 +1021,7 @@ mod tests {
 
     #[test]
     fn manifest_format_absent_defaults_to_translated() {
-        // I8: omitted `format` field deserializes to
+        // Omitted `format` field deserializes to
         // `PluginFormat::Translated` via `#[serde(default)]` +
         // `#[derive(Default)]`. Encodes "no format = translated" in
         // the type instead of `Option<...>::None`.
