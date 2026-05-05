@@ -30,6 +30,16 @@ Run all three before committing — CI enforces each:
 - `cargo test --workspace`
 - `cargo clippy --workspace --tests -- -D warnings`
 
+For changes under `crates/kiro-control-center/` also run:
+- `cd crates/kiro-control-center && npm run check`
+- `cd crates/kiro-control-center && npm run test:unit`
+
+Vitest covers pure-logic helpers only (no jsdom, no `@testing-library/svelte`,
+no Tauri-IPC mocks). Component-level testing is intentionally future scope.
+If you find yourself wanting to test a `.svelte` file or a reactive store's
+`$state`/`$derived`, factor the testable logic out into a non-`.svelte.ts`
+module and test the helper instead.
+
 ## xtask
 - `cargo xtask hook-post-edit` — wired into Claude Code `PostToolUse` for `.rs` edits. Runs `rustfmt` then `cargo clippy --package <derived> -- -D warnings`. The package is derived by walking up ancestors for the nearest `Cargo.toml` with a `[package]` table (`xtask::derive_package`), so new workspace crates are picked up automatically. Read/parse failures log to stderr; loop exhaust emits a "no usable Cargo.toml" diagnostic.
 - `cargo xtask hook-block-cargo-lock` — blocks direct `Cargo.lock` edits. Override for one session via `KIRO_ALLOW_LOCKFILE_EDIT=1`.
