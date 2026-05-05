@@ -51,22 +51,32 @@ class PluginUpdatesStore {
       this.result = null;
       this.fetchError = null;
       this.lastProjectPath = null;
+      this.loading = false;
       return;
     }
     this.loading = true;
     this.lastProjectPath = projectPath;
     try {
       const r = await commands.detectPluginUpdates(projectPath);
+      // Race guard: a newer refresh may have been started while we awaited.
+      // Tauri commands don't support cancellation, so we compare paths and
+      // discard our result if a newer call has already taken over.
+      if (this.lastProjectPath !== projectPath) return;
       if (r.status === "ok") {
         this.result = r.data;
         this.fetchError = null;
       } else {
+        this.result = null;
         this.fetchError = r.error.message;
       }
     } catch (e) {
+      if (this.lastProjectPath !== projectPath) return;
+      this.result = null;
       this.fetchError = e instanceof Error ? e.message : String(e);
     } finally {
-      this.loading = false;
+      // Only clear loading if we're still the active call; a superseding
+      // call has its own `loading = true` and will manage its own clear.
+      if (this.lastProjectPath === projectPath) this.loading = false;
     }
   }
 }
