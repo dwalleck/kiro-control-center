@@ -153,6 +153,7 @@
     installMessage = null;
     installWarning = null;
     removeResult = null;
+    removeResultPlugin = null;
     try {
       const result = await commands.installPlugin(
         marketplace,
@@ -259,6 +260,16 @@
       installError = null;
       installMessage = null;
       installWarning = null;
+      // Clear in-flight tracker — actions clear themselves via finally{}
+      // under normal operation, but a project change while a Remove or
+      // Update is mid-flight would leave a stale entry that disables the
+      // row's buttons indefinitely.
+      pendingPluginActions.clear();
+      // Clear per-project banner keys (update-check<DELIM> family +
+      // installed-plugins partial-load). The pluginUpdates.refresh and
+      // local refresh that follow on the same projectPath change will
+      // repopulate from fresh state.
+      fetchErrors.clear();
     }
     priorProjectPath = projectPath;
   });

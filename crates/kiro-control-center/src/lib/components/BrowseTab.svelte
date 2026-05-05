@@ -533,13 +533,27 @@
     if (priorProjectPath !== null && priorProjectPath !== projectPath) {
       skillsByPluginPair = {};
       selectedSkills.clear();
+      // Phase 2b I-1: also clear banner channels and the pending-action
+      // tracker on project transitions. The 3 banners reflect the prior
+      // project's actions; pending actions clear themselves via finally{}
+      // under normal operation but a project switch mid-flight would
+      // leave a stale entry that disables PluginCard buttons.
+      installError = null;
+      installMessage = null;
+      installWarning = null;
+      pendingPluginActions.clear();
       // Snapshot first — deleting during `for (const key of fetchErrors.keys())`
-      // would re-trigger the effect on each delete.
+      // would re-trigger the effect on each delete. Per Phase 2b also
+      // sweep update-check<DELIM> + update-fetch keys (project-scoped
+      // banners that the next pluginUpdates.refresh will repopulate).
       const stale: ErrorSource[] = [];
       for (const key of fetchErrors.keys()) {
         if (
           key.startsWith(SKILLS_ERR_PREFIX) ||
-          key.startsWith(BULK_SKILLS_ERR_PREFIX)
+          key.startsWith(BULK_SKILLS_ERR_PREFIX) ||
+          key.startsWith(UPDATE_CHECK_PREFIX + DELIM) ||
+          key === ERR_UPDATE_FETCH ||
+          key === ERR_INSTALLED_PLUGINS
         ) {
           stale.push(key);
         }
