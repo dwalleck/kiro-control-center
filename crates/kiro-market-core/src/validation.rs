@@ -66,8 +66,8 @@ impl RelativePath {
     /// recovered from `meta.source_path` (legacy `agent.md` discovered
     /// without a configured scan path, hand-synthesised test fixtures,
     /// etc.). Replaces the previous `from_internal_unchecked("agents".to_owned())`
-    /// site at `KiroProject::install_agent_inner` per PR #100 review S2:
-    /// the unchecked-constructor pattern was sound but anonymous —
+    /// site at `KiroProject::install_agent_inner`: the
+    /// unchecked-constructor pattern was sound but anonymous —
     /// every reader had to re-derive that `"agents"` is a constant
     /// string. A named `agents_root()` makes the intent explicit and
     /// removes one audited-by-convention site.
@@ -114,7 +114,7 @@ impl RelativePath {
         // backslash it rejects. The explicit `.replace('\\', '/')`
         // closes that gap; harmless when components already split.
         //
-        // PR #100 review I4: components are converted via `to_str()`,
+        // Components are converted via `to_str()`,
         // not `to_string_lossy()`. Lossy conversion silently substitutes
         // `U+FFFD` for invalid UTF-8 sequences, so a non-UTF-8 OsStr
         // component would round-trip as a valid-looking `RelativePath`
@@ -165,7 +165,7 @@ impl RelativePath {
         // zero Normal entries), which `RelativePath::new` rejects.
         // Substitute "." so the call still succeeds and downstream
         // `plugin_dir.join(".").join(name)` resolves correctly. Closes
-        // PR #100 review C2 (bare-path skill at plugin root regression).
+        // the bare-path skill at plugin root regression.
         let normalised = if rel_str.is_empty() {
             ".".to_owned()
         } else {
@@ -1222,8 +1222,7 @@ mod tests {
     }
 
     // The five tests below mirror the corresponding `marketplace_name_*`
-    // tests at lines 991, 1018, 1031, 1039, 1046. PR #95's review
-    // (finding I4) flagged the asymmetry: PluginName lacked parallel
+    // tests. PluginName previously lacked parallel
     // accessor / empty-deserialize / round-trip / Ord coverage, which
     // would let a regression slip through one type but not the other.
     // The Ord lock in particular is load-bearing: if `PluginName` ever
@@ -1308,12 +1307,12 @@ mod tests {
         assert_eq!(rel.as_str(), "agents/reviewer.md");
     }
 
-    /// PR #100 review C2: a manifest declaring `skills: ["my-skill"]`
+    /// A manifest declaring `skills: ["my-skill"]`
     /// (bare path, no `./skills/` directory) makes `discover_skill_dirs`
     /// set `scan_root = candidate.parent() = plugin_root`, then install
     /// calls `from_path_under(scan_root=plugin_root, plugin_dir=plugin_root)`.
-    /// Pre-fix this errored with empty-rel; install pushed `FailedSkill`
-    /// for a skill that pre-PR would have installed cleanly. Post-fix
+    /// Previously this errored with empty-rel; install pushed `FailedSkill`
+    /// for a skill that pre-PR would have installed cleanly. Now
     /// returns `RelativePath("." )` so detection can use
     /// `plugin_dir.join(".").join(name)` to resolve back to the right
     /// directory.
@@ -1326,7 +1325,7 @@ mod tests {
         assert_eq!(rel.as_str(), ".");
     }
 
-    /// PR #100 review I4: a path component containing invalid UTF-8 must
+    /// A path component containing invalid UTF-8 must
     /// produce `ValidationError::InvalidRelativePath { reason: "...non-UTF-8..." }`,
     /// not a `to_string_lossy`-substituted U+FFFD that round-trips
     /// through validation but doesn't match anything on disk. Unix-only

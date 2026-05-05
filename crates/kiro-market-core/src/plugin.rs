@@ -679,10 +679,10 @@ mod tests {
         );
     }
 
-    /// PR #100 review C2: a manifest declaring `skills: ["my-skill"]`
+    /// A manifest declaring `skills: ["my-skill"]`
     /// (bare path with NO `./skills/` parent — i.e. the skill lives at
     /// the plugin root) makes the bare-path branch set
-    /// `scan_root = candidate.parent() = plugin_root`. Pre-fix this
+    /// `scan_root = candidate.parent() = plugin_root`. Previously this
     /// resulted in install pushing `FailedSkill` because
     /// `RelativePath::from_path_under(plugin_root, plugin_root)` errored
     /// on empty rel. Post-fix `from_path_under` returns
@@ -711,7 +711,7 @@ mod tests {
         );
     }
 
-    /// PR #100 review S6: a manifest declaring TWO scan roots
+    /// A manifest declaring TWO scan roots
     /// (`["./packs/", "./extras/"]`) with skills under each must
     /// produce one `DiscoveredSkill` per skill, each carrying its OWN
     /// scan root — not the most-recently-seen root for all of them.
@@ -1021,7 +1021,7 @@ mod tests {
 
     #[test]
     fn manifest_format_absent_defaults_to_translated() {
-        // I8: omitted `format` field deserializes to
+        // Omitted `format` field deserializes to
         // `PluginFormat::Translated` via `#[serde(default)]` +
         // `#[derive(Default)]`. Encodes "no format = translated" in
         // the type instead of `Option<...>::None`.
