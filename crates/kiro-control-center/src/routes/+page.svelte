@@ -2,6 +2,7 @@
   import { onMount } from "svelte";
   import { SvelteMap } from "svelte/reactivity";
   import { store, initialize } from "$lib/stores/project.svelte";
+  import { pluginUpdates } from "$lib/stores/plugin-updates.svelte";
   import { commands } from "$lib/bindings";
   import type { SettingEntry } from "$lib/bindings";
   import type { Tab, SettingCategory } from "$lib/types";
@@ -103,7 +104,13 @@
         {:else if activeTab === "Installed"}
           <InstalledTab projectPath={store.projectPath} />
         {:else if activeTab === "Marketplaces"}
-          <MarketplacesTab />
+          <MarketplacesTab
+            onUpdated={() => {
+              if (store.projectPath) {
+                pluginUpdates.refresh(store.projectPath);
+              }
+            }}
+          />
         {:else if activeTab === "Kiro Settings"}
           <SettingsView
             {allEntries}
