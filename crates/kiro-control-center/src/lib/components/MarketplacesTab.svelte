@@ -2,6 +2,14 @@
   import { commands } from "$lib/bindings";
   import type { MarketplaceInfo, GitProtocol } from "$lib/bindings";
 
+  // Phase 2b: parent (`+page.svelte`) wires this to
+  // `pluginUpdates.refresh(store.projectPath)` so a successful marketplace
+  // update invalidates the cached update-detection scan.
+  type Props = {
+    onUpdated?: (marketplaceName: string) => void;
+  };
+  let { onUpdated }: Props = $props();
+
   let marketplaces: MarketplaceInfo[] = $state([]);
   let newSource: string = $state("");
   let protocol: GitProtocol = $state("https");
@@ -59,6 +67,7 @@
       if (failed.length > 0) parts.push(`Failed: ${failed.map((f) => `${f.name} (${f.error})`).join(", ")}`);
       successMessage = parts.join(" | ");
       await loadMarketplaces();
+      onUpdated?.(name);
     } else {
       error = result.error.message;
     }
