@@ -178,3 +178,22 @@ test.describe("Marketplace workflow", () => {
     await expect(errorBanner).not.toBeVisible();
   });
 });
+
+test.describe("Phase 2b — update detection UI", () => {
+  test("Status column appears on Installed tab", async ({ page }) => {
+    await page.goto("/");
+
+    const fixturePath = process.env.FIXTURE_MARKETPLACE_PATH;
+    if (!fixturePath) {
+      test.skip(true, "FIXTURE_MARKETPLACE_PATH not set");
+      return;
+    }
+
+    await page.getByRole("button", { name: "Installed", exact: true }).click();
+
+    // Status column appears in the header even when there are zero
+    // installed plugins (its presence is a static UI guarantee).
+    await expect(page.getByRole("columnheader", { name: "Status" })).toBeVisible();
+    await expect(page.getByRole("columnheader", { name: "Installed at" })).toBeVisible();
+  });
+});
