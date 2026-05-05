@@ -38,3 +38,26 @@ export function remediationClass(kind: PluginUpdateFailureKind): RemediationClas
       return "unknown";
   }
 }
+
+/**
+ *  Per-kind human-readable tooltip copy for "Update check failed" pills.
+ *  Lives on hover, not in the banner — the banner uses the remediation
+ *  hint (`hintFor`) instead so 10 failures with the same remediation
+ *  produce one banner.
+ *
+ *  No `default:` arm — same exhaustiveness contract as `remediationClass`.
+ */
+export function kindLabel(kind: PluginUpdateFailureKind): string {
+  switch (kind.kind) {
+    case "marketplace_unavailable":
+      return "Marketplace cache missing or plugin removed from manifest";
+    case "manifest_unreadable":
+      return "plugin.json missing in marketplace cache";
+    case "manifest_invalid":
+      return "plugin.json failed to parse";
+    case "hash_failed":
+      return "Failed to hash installed file";
+    case "other":
+      return "Update check failed — see console";
+  }
+}
