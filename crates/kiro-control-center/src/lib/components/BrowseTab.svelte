@@ -3,6 +3,7 @@
   import { SvelteMap, SvelteSet } from "svelte/reactivity";
   import { commands } from "$lib/bindings";
   import {
+    formatInstallPluginResult,
     formatInstallWarning,
     formatSkippedSkill,
     formatSkippedSkillsForPlugin,
@@ -17,6 +18,8 @@
     parsePluginKey,
     parseSkillKey,
   } from "$lib/keys";
+  import { pluginUpdates } from "$lib/stores/plugin-updates.svelte";
+  import type { PluginAction } from "$lib/stores/plugin-updates";
   import type {
     InstalledPluginInfo,
     MarketplaceInfo,
@@ -44,9 +47,13 @@
   // (marketplace, plugin) tuple. Adding more standalone keys later means
   // extending the union in `ErrorSource` and the dispatch in `errLabel`.
   const ERR_INSTALLED_PLUGINS = "installed-plugins" as const;
+  const ERR_UPDATE_FETCH = "update-fetch" as const;
+  const UPDATE_CHECK_PREFIX = "update-check" as const;
   type ErrorSource =
     | typeof ERR_MARKETPLACES
     | typeof ERR_INSTALLED_PLUGINS
+    | typeof ERR_UPDATE_FETCH
+    | `${typeof UPDATE_CHECK_PREFIX}${typeof DELIM}${string}${typeof DELIM}${string}`
     | `${typeof PLUGINS_ERR_PREFIX}${string}`
     | `${typeof SKILLS_ERR_PREFIX}${string}${typeof DELIM}${string}`
     | `${typeof BULK_SKILLS_ERR_PREFIX}${string}`;
@@ -65,6 +72,15 @@
   function errLabel(key: ErrorSource): string {
     if (key === ERR_MARKETPLACES) return "Dismiss marketplaces error";
     if (key === ERR_INSTALLED_PLUGINS) return "Dismiss installed-plugins error";
+    if (key === ERR_UPDATE_FETCH) return "Dismiss update-check error";
+    if (key.startsWith(UPDATE_CHECK_PREFIX + DELIM)) {
+      const parts = key.split(DELIM);
+      // parts: ["update-check", "<remediation>", "<marketplace>"]
+      if (parts.length === 3) {
+        return `Dismiss update-check banner for ${parts[2]}`;
+      }
+      return "Dismiss update-check banner";
+    }
     if (key.startsWith(PLUGINS_ERR_PREFIX)) {
       return `Dismiss error for ${key.slice(PLUGINS_ERR_PREFIX.length)}`;
     }
@@ -89,10 +105,10 @@
   let popRef: HTMLDivElement | undefined = $state();
   let browseView: BrowseView = $state("plugins");
 
-  // Per-plugin in-flight tracker — pluginKey(marketplace, plugin) so two
-  // plugins can install in parallel without colliding (mirrors the shape
-  // of `pendingSteeringInstalls`).
-  let pendingPluginInstalls = new SvelteSet<string>();
+  // Per-plugin in-flight tracker keyed by pluginKey(marketplace, plugin).
+  // Narrows the shared PluginAction union to the actions BrowseTab actually
+  // performs (Install + Update — never Remove, that's InstalledTab's surface).
+  let pendingPluginActions = new SvelteMap<string, Extract<PluginAction, "install" | "update">>();
 
   let installedPlugins: InstalledPluginInfo[] = $state([]);
   let installedPluginKeys = $derived(
@@ -437,6 +453,52 @@
     fetchInstalledPlugins();
   });
 
+  // Phase 2b: re-run update-scan whenever projectPath changes. The
+  // store tracks `lastProjectPath` itself so a no-op call (same path
+  // repeatedly) is harmless. Re-runs after a marketplace fetch are
+  // triggered by `+page.svelte` via `MarketplacesTab.onUpdated`, not
+  // here.
+  $effect(() => {
+    void projectPath;
+    pluginUpdates.refresh(projectPath);
+  });
+
+  // Project per-marketplace failure groups into the fetchErrors banner
+  // map. Re-runs whenever pluginUpdates.failureGroups changes; clears
+  // any previously-projected `update-check<...>` keys not in the
+  // new group set so a recovered marketplace's banner disappears.
+  $effect(() => {
+    const seen = new Set<ErrorSource>();
+    for (const group of pluginUpdates.failureGroups) {
+      const key: ErrorSource =
+        `${UPDATE_CHECK_PREFIX}${DELIM}${group.remediation}${DELIM}${group.marketplace}` as ErrorSource;
+      seen.add(key);
+      const noun = group.plugins.length === 1 ? "plugin" : "plugins";
+      const list = group.plugins.join(", ");
+      fetchErrors.set(
+        key,
+        `${group.plugins.length} ${noun} from ${group.marketplace}: ${group.remediationHint} (${list})`,
+      );
+    }
+    for (const k of fetchErrors.keys()) {
+      if (k.startsWith(UPDATE_CHECK_PREFIX + DELIM) && !seen.has(k)) {
+        fetchErrors.delete(k);
+      }
+    }
+  });
+
+  // Surface the toplevel pluginUpdates.fetchError as its own banner.
+  $effect(() => {
+    if (pluginUpdates.fetchError) {
+      fetchErrors.set(
+        ERR_UPDATE_FETCH,
+        `Couldn't check for updates: ${pluginUpdates.fetchError}`,
+      );
+    } else {
+      fetchErrors.delete(ERR_UPDATE_FETCH);
+    }
+  });
+
   $effect(() => {
     for (const mp of selectedMarketplaces) fetchPluginsFor(mp);
   });
@@ -734,8 +796,8 @@
   // can re-run with the opt-in if they want it.
   async function installWholePlugin(marketplace: string, plugin: string) {
     const key = pluginKey(marketplace, plugin);
-    if (pendingPluginInstalls.has(key)) return;
-    pendingPluginInstalls.add(key);
+    if (pendingPluginActions.has(key)) return;
+    pendingPluginActions.set(key, "install");
     installError = null;
     installMessage = null;
     installWarning = null;
@@ -848,7 +910,52 @@
       const reason = e instanceof Error ? e.message : String(e);
       installError = `Plugin install failed for ${plugin}: ${reason}`;
     } finally {
-      pendingPluginInstalls.delete(key);
+      pendingPluginActions.delete(key);
+    }
+  }
+
+  // Update an installed plugin. Calls the same `installPlugin` command
+  // used by Install but with `force=true` hard-coded — the existing
+  // global `forceInstall` checkbox stays bound to the Install button
+  // path. `pluginUpdates.refresh` re-runs the scan after the update so
+  // the indicator clears; `fetchInstalledPlugins` refreshes the
+  // installed-set so any new content type the update added shows up.
+  async function updatePlugin(marketplace: string, plugin: string) {
+    const key = pluginKey(marketplace, plugin);
+    if (pendingPluginActions.has(key)) return;
+    pendingPluginActions.set(key, "update");
+    installError = null;
+    installMessage = null;
+    installWarning = null;
+    try {
+      const result = await commands.installPlugin(
+        marketplace,
+        plugin,
+        /*force=*/ true,
+        /*acceptMcp=*/ false,
+        projectPath,
+      );
+      if (result.status === "ok") {
+        const { summary, warnings, anyInstalled, anyFailed } =
+          formatInstallPluginResult(result.data, plugin);
+        if (anyFailed && !anyInstalled) {
+          installError = `Update failed for ${plugin}: ${summary}`;
+        } else {
+          installMessage = `Updated ${plugin}: ${summary}`;
+        }
+        if (warnings) {
+          installWarning = `Updated ${plugin}: ${warnings}`;
+        }
+        await pluginUpdates.refresh(projectPath);
+        await fetchInstalledPlugins();
+      } else {
+        installError = `Update failed for ${plugin}: ${result.error.message}`;
+      }
+    } catch (e) {
+      const reason = e instanceof Error ? e.message : String(e);
+      installError = `Update failed for ${plugin}: ${reason}`;
+    } finally {
+      pendingPluginActions.delete(key);
     }
   }
 
@@ -1163,9 +1270,13 @@
               plugin={ap.plugin}
               marketplace={ap.marketplace}
               installed={installedPluginKeys.has(key)}
-              installing={pendingPluginInstalls.has(key)}
+              installing={pendingPluginActions.get(key) === "install"}
+              updating={pendingPluginActions.get(key) === "update"}
+              update={pluginUpdates.updateFor(ap.marketplace, ap.plugin.name)}
+              failure={pluginUpdates.failureFor(ap.marketplace, ap.plugin.name)}
               projectPicked={!!projectPath}
               onInstall={() => installWholePlugin(ap.marketplace, ap.plugin.name)}
+              onUpdate={() => updatePlugin(ap.marketplace, ap.plugin.name)}
             />
           {/each}
         </div>
