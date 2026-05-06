@@ -5,6 +5,7 @@ import type {
   PluginUpdateFailureKind,
   PluginUpdateInfo,
 } from "$lib/bindings";
+import { DELIM } from "$lib/keys";
 
 export type RemediationClass = "stale_cache" | "manifest_invalid" | "unknown";
 
@@ -47,8 +48,10 @@ export function groupFailures(failures: PluginUpdateFailure[]): FailureGroup[] {
   const map = new Map<string, FailureGroup>();
   for (const f of failures) {
     const cls = remediationClass(f.kind);
-    // Composite key safe: remediation is enum, marketplace forbids ":" via newtype.
-    const groupKey = `${cls}:${f.marketplace}`;
+    // Use DELIM for consistency with ErrorSource keys; `:` is permitted in
+    // marketplace names by `validate_name` (only control chars + path
+    // separators are rejected).
+    const groupKey = `${cls}${DELIM}${f.marketplace}`;
     let g = map.get(groupKey);
     if (!g) {
       g = {

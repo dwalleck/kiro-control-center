@@ -249,6 +249,18 @@ describe("groupFailures", () => {
     expect(groups[1].marketplace).toBe("acme");
   });
 
+  it("does not collide on marketplace names containing ':'", () => {
+    // `validate_name` permits ':' in marketplace names; the group key
+    // must use a separator that can never appear in either side.
+    const groups = groupFailures([
+      failure("time:zones", "p1", { kind: "marketplace_unavailable" }),
+      failure("time", "p2", { kind: "marketplace_unavailable" }),
+    ]);
+    expect(groups).toHaveLength(2);
+    const marketplaces = new Set(groups.map((g) => g.marketplace));
+    expect(marketplaces).toEqual(new Set(["time:zones", "time"]));
+  });
+
   it("each group carries a non-empty remediationHint", () => {
     const groups: FailureGroup[] = groupFailures([
       failure("acme", "p1", { kind: "marketplace_unavailable" }),
