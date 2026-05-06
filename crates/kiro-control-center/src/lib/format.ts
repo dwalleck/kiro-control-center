@@ -1,6 +1,8 @@
 import type {
+  InstallPluginResult_Serialize,
   InstallWarning,
   ParseFailure,
+  RemovePluginResult,
   SkillCount,
   SkippedReason,
   SkippedSkill,
@@ -173,4 +175,133 @@ export function formatSkippedSkillsForPlugin(list: readonly SkippedSkill[]): str
   return overflow > 0
     ? `${list.length} skill(s) failed to load — ${joined}; +${overflow} more`
     : `${list.length} skill(s) failed to load — ${joined}`;
+}
+
+export type FormattedInstallPluginResult = {
+  summary: string;
+  warnings: string | null;
+  anyInstalled: boolean;
+  anyFailed: boolean;
+};
+
+export function formatInstallPluginResult(
+  r: InstallPluginResult_Serialize,
+): FormattedInstallPluginResult {
+  const summaryParts: string[] = [];
+  const warningParts: string[] = [];
+
+  {
+    const skills = r.skills;
+    if (skills.installed.length > 0) {
+      const noun = skills.installed.length === 1 ? "skill" : "skills";
+      summaryParts.push(`${skills.installed.length} ${noun}`);
+    }
+    if (skills.failed.length > 0) {
+      const noun = skills.failed.length === 1 ? "skill" : "skills";
+      summaryParts.push(`${skills.failed.length} ${noun} failed`);
+    }
+    if (skills.skipped.length > 0) {
+      const noun = skills.skipped.length === 1 ? "skill" : "skills";
+      summaryParts.push(`${skills.skipped.length} ${noun} already installed`);
+    }
+    if (skills.skipped_skills.length > 0) {
+      warningParts.push(formatSkippedSkillsForPlugin(skills.skipped_skills));
+    }
+  }
+
+  {
+    const steering = r.steering;
+    if (steering.installed.length > 0) {
+      const noun = steering.installed.length === 1 ? "file" : "files";
+      summaryParts.push(`${steering.installed.length} steering ${noun}`);
+    }
+    if (steering.failed.length > 0) {
+      summaryParts.push(`${steering.failed.length} steering failed`);
+    }
+    for (const w of steering.warnings) {
+      warningParts.push(formatSteeringWarning(w));
+    }
+  }
+
+  {
+    const agents = r.agents;
+    if (agents.installed.length > 0) {
+      const noun = agents.installed.length === 1 ? "agent" : "agents";
+      summaryParts.push(`${agents.installed.length} ${noun}`);
+    }
+    if (agents.failed.length > 0) {
+      const noun = agents.failed.length === 1 ? "agent" : "agents";
+      summaryParts.push(`${agents.failed.length} ${noun} failed`);
+    }
+    if (agents.skipped.length > 0) {
+      const noun = agents.skipped.length === 1 ? "agent" : "agents";
+      summaryParts.push(`${agents.skipped.length} ${noun} already installed`);
+    }
+    for (const w of agents.warnings) {
+      warningParts.push(formatInstallWarning(w));
+    }
+  }
+
+  const anyFailed =
+    r.skills.failed.length + r.steering.failed.length + r.agents.failed.length > 0;
+  const anyInstalled =
+    r.skills.installed.length +
+      r.steering.installed.length +
+      r.agents.installed.length >
+    0;
+  const summary = summaryParts.length > 0 ? summaryParts.join(" · ") : "nothing to install";
+  const warnings = warningParts.length > 0 ? warningParts.join(" | ") : null;
+
+  return { summary, warnings, anyInstalled, anyFailed };
+}
+
+export type FormattedRemovePluginResult = {
+  summary: string;
+  hasItems: boolean;
+  hasFailures: boolean;
+};
+
+export function formatRemovePluginResult(
+  r: RemovePluginResult,
+): FormattedRemovePluginResult {
+  const skillsRemoved = r.skills.removed ?? [];
+  const skillsFailures = r.skills.failures ?? [];
+  const steeringRemoved = r.steering.removed ?? [];
+  const steeringFailures = r.steering.failures ?? [];
+  const agentsRemoved = r.agents.removed ?? [];
+  const agentsFailures = r.agents.failures ?? [];
+
+  const summaryParts: string[] = [];
+
+  if (skillsRemoved.length > 0) {
+    const noun = skillsRemoved.length === 1 ? "skill" : "skills";
+    summaryParts.push(`${skillsRemoved.length} ${noun}`);
+  }
+  if (steeringRemoved.length > 0) {
+    const noun = steeringRemoved.length === 1 ? "file" : "files";
+    summaryParts.push(`${steeringRemoved.length} steering ${noun}`);
+  }
+  if (agentsRemoved.length > 0) {
+    const noun = agentsRemoved.length === 1 ? "agent" : "agents";
+    summaryParts.push(`${agentsRemoved.length} ${noun}`);
+  }
+  if (skillsFailures.length > 0) {
+    const noun = skillsFailures.length === 1 ? "skill" : "skills";
+    summaryParts.push(`${skillsFailures.length} ${noun} failed`);
+  }
+  if (steeringFailures.length > 0) {
+    summaryParts.push(`${steeringFailures.length} steering failed`);
+  }
+  if (agentsFailures.length > 0) {
+    const noun = agentsFailures.length === 1 ? "agent" : "agents";
+    summaryParts.push(`${agentsFailures.length} ${noun} failed`);
+  }
+
+  const hasItems =
+    skillsRemoved.length + steeringRemoved.length + agentsRemoved.length > 0;
+  const hasFailures =
+    skillsFailures.length + steeringFailures.length + agentsFailures.length > 0;
+  const summary = summaryParts.length > 0 ? summaryParts.join(" · ") : "nothing to remove";
+
+  return { summary, hasItems, hasFailures };
 }

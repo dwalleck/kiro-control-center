@@ -2,6 +2,11 @@
   import { commands } from "$lib/bindings";
   import type { MarketplaceInfo, GitProtocol } from "$lib/bindings";
 
+  type Props = {
+    onUpdated?: (marketplaceName: string) => void;
+  };
+  let { onUpdated }: Props = $props();
+
   let marketplaces: MarketplaceInfo[] = $state([]);
   let newSource: string = $state("");
   let protocol: GitProtocol = $state("https");
@@ -14,16 +19,26 @@
   let error: string | null = $state(null);
   let successMessage: string | null = $state(null);
 
+  function errorMessage(e: unknown): string {
+    return e instanceof Error ? e.message : String(e);
+  }
+
   async function loadMarketplaces() {
     loading = true;
     error = null;
-    const result = await commands.listMarketplaces();
-    if (result.status === "ok") {
-      marketplaces = result.data;
-    } else {
-      error = result.error.message;
+    try {
+      const result = await commands.listMarketplaces();
+      if (result.status === "ok") {
+        marketplaces = result.data;
+      } else {
+        error = result.error.message;
+      }
+    } catch (e) {
+      console.error("[MarketplacesTab] listMarketplaces threw", e);
+      error = errorMessage(e);
+    } finally {
+      loading = false;
     }
-    loading = false;
   }
 
   async function addMarketplace() {
@@ -32,37 +47,48 @@
     adding = true;
     error = null;
     successMessage = null;
-
-    const result = await commands.addMarketplace(source, protocol);
-    if (result.status === "ok") {
-      const { name, plugins } = result.data;
-      successMessage = `Added "${name}" with ${plugins.length} plugin${plugins.length === 1 ? "" : "s"}`;
-      newSource = "";
-      await loadMarketplaces();
-    } else {
-      error = result.error.message;
+    try {
+      const result = await commands.addMarketplace(source, protocol);
+      if (result.status === "ok") {
+        const { name, plugins } = result.data;
+        successMessage = `Added "${name}" with ${plugins.length} plugin${plugins.length === 1 ? "" : "s"}`;
+        newSource = "";
+        await loadMarketplaces();
+      } else {
+        error = result.error.message;
+      }
+    } catch (e) {
+      console.error("[MarketplacesTab] addMarketplace threw", e);
+      error = errorMessage(e);
+    } finally {
+      adding = false;
     }
-    adding = false;
   }
 
   async function updateMarketplace(name: string) {
     updatingName = name;
     error = null;
     successMessage = null;
-
-    const result = await commands.updateMarketplace(name);
-    if (result.status === "ok") {
-      const { updated, failed, skipped } = result.data;
-      const parts: string[] = [];
-      if (updated.length > 0) parts.push(`Updated: ${updated.join(", ")}`);
-      if (skipped.length > 0) parts.push(`Skipped: ${skipped.join(", ")}`);
-      if (failed.length > 0) parts.push(`Failed: ${failed.map((f) => `${f.name} (${f.error})`).join(", ")}`);
-      successMessage = parts.join(" | ");
-      await loadMarketplaces();
-    } else {
-      error = result.error.message;
+    try {
+      const result = await commands.updateMarketplace(name);
+      if (result.status === "ok") {
+        const { updated, failed, skipped } = result.data;
+        const parts: string[] = [];
+        if (updated.length > 0) parts.push(`Updated: ${updated.join(", ")}`);
+        if (skipped.length > 0) parts.push(`Skipped: ${skipped.join(", ")}`);
+        if (failed.length > 0) parts.push(`Failed: ${failed.map((f) => `${f.name} (${f.error})`).join(", ")}`);
+        successMessage = parts.join(" | ");
+        await loadMarketplaces();
+        onUpdated?.(name);
+      } else {
+        error = result.error.message;
+      }
+    } catch (e) {
+      console.error("[MarketplacesTab] updateMarketplace threw", e);
+      error = errorMessage(e);
+    } finally {
+      updatingName = null;
     }
-    updatingName = null;
   }
 
   async function removeMarketplace(name: string) {
@@ -73,15 +99,20 @@
     removingName = name;
     error = null;
     successMessage = null;
-
-    const result = await commands.removeMarketplace(name);
-    if (result.status === "ok") {
-      successMessage = `Removed "${name}"`;
-      await loadMarketplaces();
-    } else {
-      error = result.error.message;
+    try {
+      const result = await commands.removeMarketplace(name);
+      if (result.status === "ok") {
+        successMessage = `Removed "${name}"`;
+        await loadMarketplaces();
+      } else {
+        error = result.error.message;
+      }
+    } catch (e) {
+      console.error("[MarketplacesTab] removeMarketplace threw", e);
+      error = errorMessage(e);
+    } finally {
+      removingName = null;
     }
-    removingName = null;
   }
 
   function sourceTypeBadgeClass(sourceType: string): string {

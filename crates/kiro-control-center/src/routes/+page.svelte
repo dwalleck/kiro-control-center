@@ -2,6 +2,7 @@
   import { onMount } from "svelte";
   import { SvelteMap } from "svelte/reactivity";
   import { store, initialize } from "$lib/stores/project.svelte";
+  import { pluginUpdates } from "$lib/stores/plugin-updates.svelte";
   import { commands } from "$lib/bindings";
   import type { SettingEntry } from "$lib/bindings";
   import type { Tab, SettingCategory } from "$lib/types";
@@ -56,6 +57,7 @@
         settingsLoadError = result.error.message;
       }
     } catch (e) {
+      console.error("[+page] getKiroSettings rejected", e);
       settingsLoadError = e instanceof Error
         ? `Failed to load settings: ${e.message}`
         : "Failed to load settings due to an unexpected error.";
@@ -103,7 +105,15 @@
         {:else if activeTab === "Installed"}
           <InstalledTab projectPath={store.projectPath} />
         {:else if activeTab === "Marketplaces"}
-          <MarketplacesTab />
+          <MarketplacesTab
+            onUpdated={() => {
+              if (store.projectPath) {
+                pluginUpdates
+                  .refresh(store.projectPath)
+                  .catch((e) => console.error("[+page] post-update refresh failed", e));
+              }
+            }}
+          />
         {:else if activeTab === "Kiro Settings"}
           <SettingsView
             {allEntries}

@@ -3,7 +3,7 @@
   import { SvelteMap, SvelteSet } from "svelte/reactivity";
   import { commands } from "$lib/bindings";
   import {
-    formatInstallWarning,
+    formatInstallPluginResult,
     formatSkippedSkill,
     formatSkippedSkillsForPlugin,
     formatSteeringWarning,
@@ -17,6 +17,8 @@
     parsePluginKey,
     parseSkillKey,
   } from "$lib/keys";
+  import { pluginUpdates } from "$lib/stores/plugin-updates.svelte";
+  import type { PluginAction } from "$lib/stores/plugin-updates";
   import type {
     InstalledPluginInfo,
     MarketplaceInfo,
@@ -24,6 +26,7 @@
     SkillInfo,
     SkippedSkill,
   } from "$lib/bindings";
+  import BannerStack from "./BannerStack.svelte";
   import SkillCard from "./SkillCard.svelte";
   import PluginCard from "./PluginCard.svelte";
 
@@ -43,9 +46,13 @@
   // (marketplace, plugin) tuple. Adding more standalone keys later means
   // extending the union in `ErrorSource` and the dispatch in `errLabel`.
   const ERR_INSTALLED_PLUGINS = "installed-plugins" as const;
+  const ERR_UPDATE_FETCH = "update-fetch" as const;
+  const UPDATE_CHECK_PREFIX = "update-check" as const;
   type ErrorSource =
     | typeof ERR_MARKETPLACES
     | typeof ERR_INSTALLED_PLUGINS
+    | typeof ERR_UPDATE_FETCH
+    | `${typeof UPDATE_CHECK_PREFIX}${typeof DELIM}${string}${typeof DELIM}${string}`
     | `${typeof PLUGINS_ERR_PREFIX}${string}`
     | `${typeof SKILLS_ERR_PREFIX}${string}${typeof DELIM}${string}`
     | `${typeof BULK_SKILLS_ERR_PREFIX}${string}`;
@@ -64,6 +71,12 @@
   function errLabel(key: ErrorSource): string {
     if (key === ERR_MARKETPLACES) return "Dismiss marketplaces error";
     if (key === ERR_INSTALLED_PLUGINS) return "Dismiss installed-plugins error";
+    if (key === ERR_UPDATE_FETCH) return "Dismiss update-check error";
+    if (key.startsWith(UPDATE_CHECK_PREFIX + DELIM)) {
+      // Type-literal guarantees ["update-check", "<remediation>", "<marketplace>"].
+      const [, , marketplace] = key.split(DELIM);
+      return `Dismiss update-check banner for ${marketplace}`;
+    }
     if (key.startsWith(PLUGINS_ERR_PREFIX)) {
       return `Dismiss error for ${key.slice(PLUGINS_ERR_PREFIX.length)}`;
     }
@@ -88,10 +101,7 @@
   let popRef: HTMLDivElement | undefined = $state();
   let browseView: BrowseView = $state("plugins");
 
-  // Per-plugin in-flight tracker — pluginKey(marketplace, plugin) so two
-  // plugins can install in parallel without colliding (mirrors the shape
-  // of `pendingSteeringInstalls`).
-  let pendingPluginInstalls = new SvelteSet<string>();
+  let pendingPluginActions = new SvelteMap<string, Extract<PluginAction, "install" | "update">>();
 
   let installedPlugins: InstalledPluginInfo[] = $state([]);
   let installedPluginKeys = $derived(
@@ -437,6 +447,44 @@
   });
 
   $effect(() => {
+    void projectPath;
+    pluginUpdates
+      .refresh(projectPath)
+      .catch((e) => console.error("[BrowseTab] pluginUpdates.refresh threw", e));
+  });
+
+  $effect(() => {
+    const seen = new Set<ErrorSource>();
+    for (const group of pluginUpdates.failureGroups) {
+      const key: ErrorSource =
+        `${UPDATE_CHECK_PREFIX}${DELIM}${group.remediation}${DELIM}${group.marketplace}` as ErrorSource;
+      seen.add(key);
+      const noun = group.plugins.length === 1 ? "plugin" : "plugins";
+      const list = group.plugins.join(", ");
+      fetchErrors.set(
+        key,
+        `${group.plugins.length} ${noun} from ${group.marketplace}: ${group.remediationHint} (${list})`,
+      );
+    }
+    for (const k of fetchErrors.keys()) {
+      if (k.startsWith(UPDATE_CHECK_PREFIX + DELIM) && !seen.has(k)) {
+        fetchErrors.delete(k);
+      }
+    }
+  });
+
+  $effect(() => {
+    if (pluginUpdates.fetchError) {
+      fetchErrors.set(
+        ERR_UPDATE_FETCH,
+        `Couldn't check for updates: ${pluginUpdates.fetchError}`,
+      );
+    } else {
+      fetchErrors.delete(ERR_UPDATE_FETCH);
+    }
+  });
+
+  $effect(() => {
     for (const mp of selectedMarketplaces) fetchPluginsFor(mp);
   });
 
@@ -470,13 +518,19 @@
     if (priorProjectPath !== null && priorProjectPath !== projectPath) {
       skillsByPluginPair = {};
       selectedSkills.clear();
-      // Snapshot first — deleting during `for (const key of fetchErrors.keys())`
-      // would re-trigger the effect on each delete.
+      installError = null;
+      installMessage = null;
+      installWarning = null;
+      pendingPluginActions.clear();
+      // Snapshot first — deleting during keys() iteration re-triggers the effect.
       const stale: ErrorSource[] = [];
       for (const key of fetchErrors.keys()) {
         if (
           key.startsWith(SKILLS_ERR_PREFIX) ||
-          key.startsWith(BULK_SKILLS_ERR_PREFIX)
+          key.startsWith(BULK_SKILLS_ERR_PREFIX) ||
+          key.startsWith(UPDATE_CHECK_PREFIX + DELIM) ||
+          key === ERR_UPDATE_FETCH ||
+          key === ERR_INSTALLED_PLUGINS
         ) {
           stale.push(key);
         }
@@ -731,123 +785,59 @@
   // silently disappear ("1 of 2 agents installed" with no explanation); the
   // new warning banner names the agent and lists its transports so the user
   // can re-run with the opt-in if they want it.
-  async function installWholePlugin(marketplace: string, plugin: string) {
+  async function refreshAfterPluginAction(verbForBanner: string, plugin: string) {
+    try {
+      await pluginUpdates.refresh(projectPath);
+      await fetchInstalledPlugins();
+    } catch (e) {
+      console.error(`[BrowseTab] post-${verbForBanner} refresh threw`, e);
+      const reason = e instanceof Error ? e.message : String(e);
+      installError = `${plugin} ${verbForBanner} succeeded but refresh failed: ${reason}`;
+    }
+  }
+
+  // 4th arg of installPlugin is `acceptMcp` — Phase 1 hardcodes false. Phase 2
+  // will wire a UI toggle so a user can opt into installing agents that declare
+  // MCP servers (subprocesses / network connections).
+  async function runPluginInstall(
+    marketplace: string,
+    plugin: string,
+    mode: Extract<PluginAction, "install" | "update">,
+  ) {
     const key = pluginKey(marketplace, plugin);
-    if (pendingPluginInstalls.has(key)) return;
-    pendingPluginInstalls.add(key);
+    if (pendingPluginActions.has(key)) return;
+    pendingPluginActions.set(key, mode);
     installError = null;
     installMessage = null;
     installWarning = null;
 
+    const force = mode === "update" ? true : forceInstall;
+    const failPrefix =
+      mode === "update" ? `Update failed for ${plugin}` : `Plugin install failed for ${plugin}`;
+    const successPrefix = mode === "update" ? `Updated ${plugin}` : `Plugin ${plugin}`;
+
     try {
-      // 4th arg is `acceptMcp` — Phase 1 hardcodes false. Phase 2 will
-      // wire a UI toggle so a user can opt into installing agents that
-      // declare MCP servers (subprocesses / network connections).
-      const result = await commands.installPlugin(
-        marketplace,
-        plugin,
-        forceInstall,
-        false,
-        projectPath,
-      );
+      const result = await commands.installPlugin(marketplace, plugin, force, false, projectPath);
       if (result.status === "ok") {
-        const r = result.data;
-        const summaryParts: string[] = [];
-        const warningParts: string[] = [];
-
-        // Skills: installed / failed / skipped (idempotent) / skipped_skills
-        // (per-file read or parse failures). `skipped_skills` is the
-        // structurally-distinct "couldn't even attempt to install" bucket.
-        {
-          const skills = r.skills;
-          if (skills.installed.length > 0) {
-            const noun = skills.installed.length === 1 ? "skill" : "skills";
-            summaryParts.push(`${skills.installed.length} ${noun}`);
-          }
-          if (skills.failed.length > 0) {
-            const noun = skills.failed.length === 1 ? "skill" : "skills";
-            summaryParts.push(`${skills.failed.length} ${noun} failed`);
-          }
-          if (skills.skipped.length > 0) {
-            const noun = skills.skipped.length === 1 ? "skill" : "skills";
-            summaryParts.push(`${skills.skipped.length} ${noun} already installed`);
-          }
-          if (skills.skipped_skills.length > 0) {
-            warningParts.push(formatSkippedSkillsForPlugin(skills.skipped_skills));
-          }
-        }
-
-        // Steering: idempotent reinstalls land in `installed` with
-        // `kind = idempotent` (not a separate `skipped` field — see
-        // `InstalledSteeringOutcome.kind`). Surfacing the breakdown is
-        // a Phase 2 follow-up; for now the count is the lump sum.
-        {
-          const steering = r.steering;
-          if (steering.installed.length > 0) {
-            const noun = steering.installed.length === 1 ? "file" : "files";
-            summaryParts.push(`${steering.installed.length} steering ${noun}`);
-          }
-          if (steering.failed.length > 0) {
-            summaryParts.push(`${steering.failed.length} steering failed`);
-          }
-          if (steering.warnings.length > 0) {
-            for (const w of steering.warnings) {
-              warningParts.push(formatSteeringWarning(w));
-            }
-          }
-        }
-
-        // Agents: includes `skipped` (idempotent native reinstalls) and
-        // `warnings` (MCP-gated, unmapped tools, parse failures on
-        // non-agent files in the scan dir). Without surfacing warnings
-        // here, `McpServersRequireOptIn` would silently drop agents.
-        {
-          const agents = r.agents;
-          if (agents.installed.length > 0) {
-            const noun = agents.installed.length === 1 ? "agent" : "agents";
-            summaryParts.push(`${agents.installed.length} ${noun}`);
-          }
-          if (agents.failed.length > 0) {
-            const noun = agents.failed.length === 1 ? "agent" : "agents";
-            summaryParts.push(`${agents.failed.length} ${noun} failed`);
-          }
-          if (agents.skipped.length > 0) {
-            const noun = agents.skipped.length === 1 ? "agent" : "agents";
-            summaryParts.push(`${agents.skipped.length} ${noun} already installed`);
-          }
-          if (agents.warnings.length > 0) {
-            for (const w of agents.warnings) {
-              warningParts.push(formatInstallWarning(w));
-            }
-          }
-        }
-
-        const anyFailed =
-          r.skills.failed.length + r.steering.failed.length + r.agents.failed.length > 0;
-        const anyInstalled =
-          r.skills.installed.length +
-            r.steering.installed.length +
-            r.agents.installed.length >
-          0;
-        const summary = summaryParts.length > 0 ? summaryParts.join(" · ") : "nothing to install";
-
+        const { summary, warnings, anyInstalled, anyFailed } =
+          formatInstallPluginResult(result.data);
         if (anyFailed && !anyInstalled) {
-          installError = `Plugin install failed for ${plugin}: ${summary}`;
+          installError = `${failPrefix}: ${summary}`;
         } else {
-          installMessage = `Plugin ${plugin}: ${summary}`;
+          installMessage = `${successPrefix}: ${summary}`;
         }
-        if (warningParts.length > 0) {
-          installWarning = `Plugin ${plugin}: ${warningParts.join(" | ")}`;
+        if (warnings) {
+          installWarning = `${successPrefix}: ${warnings}`;
         }
-        await fetchInstalledPlugins();
+        await refreshAfterPluginAction(mode, plugin);
       } else {
-        installError = `Plugin install failed for ${plugin}: ${result.error.message}`;
+        installError = `${failPrefix}: ${result.error.message}`;
       }
     } catch (e) {
       const reason = e instanceof Error ? e.message : String(e);
-      installError = `Plugin install failed for ${plugin}: ${reason}`;
+      installError = `${failPrefix}: ${reason}`;
     } finally {
-      pendingPluginInstalls.delete(key);
+      pendingPluginActions.delete(key);
     }
   }
 
@@ -1063,73 +1053,17 @@
     </div>
   {/if}
 
-  <!-- Banners render newest-first (reverse insertion order) and cap at 3 so
-       a storm of broken plugins doesn't push the grid off-screen. Dismissing
-       a banner or resolving its source surfaces the next-newest below. -->
-  {#each [...fetchErrors].reverse().slice(0, 3) as [key, message] (key)}
-    <div
-      data-testid="fetch-error"
-      class="mx-4 mt-3 px-4 py-3 rounded-md bg-kiro-error/10 border border-kiro-error/30 flex items-start gap-3"
-    >
-      <p class="text-sm text-kiro-error flex-1">{message}</p>
-      <button
-        type="button"
-        onclick={() => fetchErrors.delete(key)}
-        aria-label={errLabel(key)}
-        class="text-kiro-error/70 hover:text-kiro-error text-lg leading-none flex-shrink-0 focus:outline-none focus:ring-2 focus:ring-kiro-accent-500 rounded"
-      >
-        ×
-      </button>
-    </div>
-  {/each}
-  {#if fetchErrors.size > 3}
-    <div
-      data-testid="fetch-error-overflow"
-      class="mx-4 mt-3 px-4 py-2 text-xs text-kiro-subtle text-center border border-kiro-muted/50 rounded-md bg-kiro-surface/30"
-    >
-      +{fetchErrors.size - 3} more {fetchErrors.size - 3 === 1 ? "error" : "errors"} — dismiss or resolve above to see the rest
-    </div>
-  {/if}
-
-  {#if installError}
-    <div
-      data-testid="install-error"
-      class="mx-4 mt-3 px-4 py-3 rounded-md bg-kiro-error/10 border border-kiro-error/30 flex items-start gap-3"
-    >
-      <p class="text-sm text-kiro-error flex-1">{installError}</p>
-      <button
-        type="button"
-        onclick={() => (installError = null)}
-        aria-label="Dismiss install error"
-        class="text-kiro-error/70 hover:text-kiro-error text-lg leading-none flex-shrink-0 focus:outline-none focus:ring-2 focus:ring-kiro-accent-500 rounded"
-      >
-        ×
-      </button>
-    </div>
-  {/if}
-
-  {#if installMessage}
-    <div class="mx-4 mt-3 px-4 py-3 rounded-md bg-kiro-success/10 border border-kiro-success/30">
-      <p class="text-sm text-kiro-success">{installMessage}</p>
-    </div>
-  {/if}
-
-  {#if installWarning}
-    <div
-      data-testid="install-warning"
-      class="mx-4 mt-3 px-4 py-3 rounded-md bg-kiro-warning/10 border border-kiro-warning/30 flex items-start gap-3"
-    >
-      <p class="text-sm text-kiro-warning flex-1">{installWarning}</p>
-      <button
-        type="button"
-        onclick={() => (installWarning = null)}
-        aria-label="Dismiss install warning"
-        class="text-kiro-warning/70 hover:text-kiro-warning text-lg leading-none flex-shrink-0 focus:outline-none focus:ring-2 focus:ring-kiro-accent-500 rounded"
-      >
-        ×
-      </button>
-    </div>
-  {/if}
+  <BannerStack
+    errors={fetchErrors}
+    message={installMessage}
+    warning={installWarning}
+    fatalError={installError}
+    errLabel={errLabel}
+    ondismiss={(key) => fetchErrors.delete(key)}
+    onmessageDismiss={() => (installMessage = null)}
+    onwarningDismiss={() => (installWarning = null)}
+    onfatalErrorDismiss={() => (installError = null)}
+  />
 
   <div class="flex items-center gap-1 px-4 py-2 border-b border-kiro-muted bg-kiro-surface/30">
     <div class="inline-flex rounded-md border border-kiro-muted bg-kiro-overlay overflow-hidden">
@@ -1218,9 +1152,13 @@
               plugin={ap.plugin}
               marketplace={ap.marketplace}
               installed={installedPluginKeys.has(key)}
-              installing={pendingPluginInstalls.has(key)}
+              installing={pendingPluginActions.get(key) === "install"}
+              updating={pendingPluginActions.get(key) === "update"}
+              update={pluginUpdates.updateFor(ap.marketplace, ap.plugin.name)}
+              failure={pluginUpdates.failureFor(ap.marketplace, ap.plugin.name)}
               projectPicked={!!projectPath}
-              onInstall={() => installWholePlugin(ap.marketplace, ap.plugin.name)}
+              onInstall={() => runPluginInstall(ap.marketplace, ap.plugin.name, "install")}
+              onUpdate={() => runPluginInstall(ap.marketplace, ap.plugin.name, "update")}
             />
           {/each}
         </div>

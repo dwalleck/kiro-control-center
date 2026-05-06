@@ -13,3 +13,6 @@ __pycache__/
 
 # Git worktrees for isolated feature branches
 .worktrees/
+
+# Brainstorming session mockups (persisted via --project-dir)
+.superpowers/

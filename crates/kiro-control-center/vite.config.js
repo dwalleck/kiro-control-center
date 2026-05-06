@@ -28,4 +28,14 @@ export default defineConfig(async () => ({
       ignored: ["**/src-tauri/**"],
     },
   },
+
+  // Vitest config — pure-logic tests only (no jsdom, no @testing-library/svelte).
+  // `environment: 'node'` keeps DOM concerns out of scope. Test files colocated
+  // next to the source they exercise (`*.test.ts`); component-level testing is
+  // intentionally future scope (see docs/plans/2026-05-05-phase-2b-...-design.md).
+  test: {
+    include: ["src/**/*.test.ts"],
+    environment: "node",
+    passWithNoTests: true,
+  },
 }));
