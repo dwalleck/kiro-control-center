@@ -1312,7 +1312,7 @@ mod tests {
     /// set `scan_root = candidate.parent() = plugin_root`, then install
     /// calls `from_path_under(scan_root=plugin_root, plugin_dir=plugin_root)`.
     /// Previously this errored with empty-rel; install pushed `FailedSkill`
-    /// for a skill that pre-PR would have installed cleanly. Now
+    /// for a skill that previously would have installed cleanly. Now
     /// returns `RelativePath("." )` so detection can use
     /// `plugin_dir.join(".").join(name)` to resolve back to the right
     /// directory.

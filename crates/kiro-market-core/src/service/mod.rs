@@ -2711,8 +2711,9 @@ fn read_and_parse_skill_md(
 /// Note the asymmetry with `required_steering_scan_root`: the steering
 /// path uses the typed `SteeringError::ScanRootInvalid` variant
 /// and does NOT funnel through this helper.
-/// helper. `SkillError` and `AgentError` don't yet have an analogous
-/// typed variant; a future cleanup mirroring I1 across all three
+/// `SkillError` and `AgentError` don't yet have an analogous
+/// typed variant; a future cleanup propagating the same typed-variant
+/// approach across all three
 /// error enums would let this synthetic-`io::Error` helper retire.
 fn scan_root_invalid_io_err(
     label: &str,

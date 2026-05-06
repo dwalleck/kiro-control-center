@@ -685,7 +685,7 @@ mod tests {
     /// `scan_root = candidate.parent() = plugin_root`. Previously this
     /// resulted in install pushing `FailedSkill` because
     /// `RelativePath::from_path_under(plugin_root, plugin_root)` errored
-    /// on empty rel. Post-fix `from_path_under` returns
+    /// on empty rel. Now `from_path_under` returns
     /// `RelativePath(".")` so install + detection round-trip cleanly.
     /// This test asserts only that `discover_skill_dirs` produces the
     /// `scan_root == plugin_root` case the install code now handles.
