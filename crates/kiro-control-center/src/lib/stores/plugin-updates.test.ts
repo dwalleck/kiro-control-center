@@ -275,7 +275,7 @@ describe("groupFailures", () => {
 });
 
 describe("projectUpdateCheckBanners", () => {
-  it("returns empty upserts and no staleKeys for empty groups", () => {
+  it("returns empty upserts and no staleKeys for empty failures", () => {
     const { upserts, staleKeys } = projectUpdateCheckBanners([], []);
     expect(upserts.size).toBe(0);
     expect(staleKeys).toEqual([]);
@@ -283,10 +283,10 @@ describe("projectUpdateCheckBanners", () => {
 
   it("produces one upsert per failure group", () => {
     const { upserts, staleKeys } = projectUpdateCheckBanners(
-      groupFailures([
+      [
         failure("acme", "p1", { kind: "marketplace_unavailable" }),
         failure("acme", "p2", { kind: "manifest_unreadable" }),
-      ]),
+      ],
       [],
     );
     expect(upserts.size).toBe(1);
@@ -316,7 +316,7 @@ describe("projectUpdateCheckBanners", () => {
       updateCheckErrKey("stale_cache", "beta"),
     ];
     const { staleKeys } = projectUpdateCheckBanners(
-      groupFailures([failure("acme", "p1", { kind: "marketplace_unavailable" })]),
+      [failure("acme", "p1", { kind: "marketplace_unavailable" })],
       existing,
     );
     expect(staleKeys).toEqual([updateCheckErrKey("stale_cache", "beta")]);
@@ -324,10 +324,10 @@ describe("projectUpdateCheckBanners", () => {
 
   it("upsert messages include plugin count and list", () => {
     const { upserts } = projectUpdateCheckBanners(
-      groupFailures([
+      [
         failure("acme", "p1", { kind: "marketplace_unavailable" }),
         failure("acme", "p2", { kind: "marketplace_unavailable" }),
-      ]),
+      ],
       [],
     );
     const msg = [...upserts.values()][0];
@@ -337,9 +337,9 @@ describe("projectUpdateCheckBanners", () => {
 
   it("singular noun: 1 plugin reads '1 plugin' not '1 plugins'", () => {
     const { upserts } = projectUpdateCheckBanners(
-      groupFailures([
+      [
         failure("acme", "p1", { kind: "marketplace_unavailable" }),
-      ]),
+      ],
       [],
     );
     const msg = [...upserts.values()][0];

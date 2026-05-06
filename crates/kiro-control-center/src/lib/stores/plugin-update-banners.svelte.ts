@@ -48,10 +48,10 @@ export function usePluginUpdateBanners(args: {
     // the set/delete calls below would mutate the keyset the effect just
     // depended on, triggering re-runs that rely on Svelte's idempotent-write
     // optimization to terminate. The real signal that should drive banner
-    // updates is `pluginUpdates.failureGroups` (read above).
+    // updates is `pluginUpdates.result?.failures` (read inside the call).
     const existingKeys = untrack(() => Array.from(args.fetchErrors.keys()));
     const { upserts, staleKeys } = projectUpdateCheckBanners(
-      pluginUpdates.failureGroups,
+      pluginUpdates.result?.failures ?? [],
       existingKeys,
     );
     for (const [key, msg] of upserts) {

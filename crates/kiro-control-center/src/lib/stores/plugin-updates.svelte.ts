@@ -4,7 +4,6 @@ import type {
   PluginUpdateFailure,
   PluginUpdateInfo,
 } from "$lib/bindings";
-import { groupFailures } from "./plugin-updates";
 
 class PluginUpdatesStore {
   result = $state<DetectUpdatesResult | null>(null);
@@ -15,10 +14,6 @@ class PluginUpdatesStore {
   // Monotonic generation. Path equality alone lets A→B→A overwrite a
   // still-resolving newer A (same path, different generations).
   #latestRequestId = 0;
-
-  failureGroups = $derived(
-    this.result?.failures ? groupFailures(this.result.failures) : [],
-  );
 
   updateFor(marketplace: string, plugin: string): PluginUpdateInfo | undefined {
     return this.result?.updates?.find(

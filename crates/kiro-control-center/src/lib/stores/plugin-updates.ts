@@ -43,13 +43,12 @@ export function kindLabel(kind: PluginUpdateFailureKind): string {
   }
 }
 
-// Unexported on purpose — `remediationHint` is derivable from
+// Unexported on purpose. `remediationHint` is derivable from
 // `(remediation, marketplace)` via `hintFor` below, but this type doesn't
-// encode that derivation. Hiding the name discourages hand-constructed
-// literals with a mismatched hint, but isn't a hard barrier: consumers
-// can still reconstruct the shape via `ReturnType<typeof groupFailures>[number]`
-// and pass it through `projectUpdateCheckBanners`. Convention: always go
-// through `groupFailures` to construct.
+// encode that derivation. By exposing only `groupFailures` as the public
+// constructor and folding the group-step into `projectUpdateCheckBanners`
+// (which now takes raw failures), no public API accepts `FailureGroup[]`
+// — the derivation invariant can't drift via a hand-built literal.
 type FailureGroup = {
   remediation: RemediationClass;
   marketplace: MarketplaceName;
@@ -131,17 +130,19 @@ export function actionUpdateLabel(u: PluginUpdateInfo): string {
 }
 
 /**
- * Pure projection of failureGroups into an upsert+stale-delete pair.
- * Keys are branded as UpdateCheckKey so consumers know the namespace
- * they operate in.
+ * Pure projection of raw failures into an upsert+stale-delete pair.
+ * Calls `groupFailures` internally so callers never handle `FailureGroup[]`
+ * directly — closes the seam where a hand-built literal could drift the
+ * `remediationHint` derivation. Keys are branded as UpdateCheckKey so
+ * consumers know the namespace they operate in.
  */
 export function projectUpdateCheckBanners(
-  groups: FailureGroup[],
+  failures: PluginUpdateFailure[],
   existingKeys: Iterable<string>,
 ): { upserts: Map<UpdateCheckKey, string>; staleKeys: UpdateCheckKey[] } {
   const upserts = new Map<UpdateCheckKey, string>();
   const seen = new Set<UpdateCheckKey>();
-  for (const group of groups) {
+  for (const group of groupFailures(failures)) {
     const key = updateCheckErrKey(group.remediation, group.marketplace);
     seen.add(key);
     const noun = group.plugins.length === 1 ? "plugin" : "plugins";
