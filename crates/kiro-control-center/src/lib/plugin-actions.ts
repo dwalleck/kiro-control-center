@@ -28,13 +28,19 @@ export type RemovePluginFn = (
   projectPath: string,
 ) => Promise<IpcResult<RemovePluginResult>>;
 
-export type PluginActionMode = "install" | "update";
+// Discriminated mode: `force` lives on the install arm because update mode
+// always implies force (see body below). Encoding the per-arm field at the
+// type level eliminates the dead `{mode: "update", forceInstall: false}`
+// state the prior shape allowed, and lets the `mode.force` lookup type-check
+// without a `?:` fallback.
+export type PluginActionMode =
+  | { kind: "install"; force: boolean }
+  | { kind: "update" };
 
 export type PluginActionContext = {
   marketplace: string;
   plugin: string;
   projectPath: string;
-  forceInstall: boolean;
   // Security-critical: agents declaring mcp_servers are refused unless
   // acceptMcp is true. With acceptMcp = false the agent produces
   // InstallWarning::McpServersRequireOptIn and never lands in installed or
@@ -79,13 +85,13 @@ export async function runPluginInstall(
   ctx: PluginActionContext,
   mode: PluginActionMode,
 ): Promise<PluginActionOutcome> {
-  const force = mode === "update" ? true : ctx.forceInstall;
+  const force = mode.kind === "install" ? mode.force : true;
   const failPrefix =
-    mode === "update"
+    mode.kind === "update"
       ? `Update failed for ${ctx.plugin}`
       : `Plugin install failed for ${ctx.plugin}`;
   const successPrefix =
-    mode === "update" ? `Updated ${ctx.plugin}` : `Plugin ${ctx.plugin}`;
+    mode.kind === "update" ? `Updated ${ctx.plugin}` : `Plugin ${ctx.plugin}`;
 
   try {
     const result = await ctx.installPlugin(
@@ -122,22 +128,22 @@ export async function runPluginInstall(
         await ctx.storeRefresh(ctx.projectPath);
       } catch (e) {
         console.error(
-          `[plugin-actions] pluginUpdates.refresh threw after ${mode}`,
+          `[plugin-actions] pluginUpdates.refresh threw after ${mode.kind}`,
           e,
         );
         const reason = e instanceof Error ? e.message : String(e);
-        staleParts.push(`Plugin-update state is stale after ${mode}: ${reason}`);
+        staleParts.push(`Plugin-update state is stale after ${mode.kind}: ${reason}`);
       }
 
       try {
         await ctx.refresh();
       } catch (e) {
         console.error(
-          `[plugin-actions] tab refresh threw after ${mode}`,
+          `[plugin-actions] tab refresh threw after ${mode.kind}`,
           e,
         );
         const reason = e instanceof Error ? e.message : String(e);
-        staleParts.push(`Installed-plugins list is stale after ${mode}: ${reason}`);
+        staleParts.push(`Installed-plugins list is stale after ${mode.kind}: ${reason}`);
       }
 
       const staleRefresh = staleParts.length > 0 ? staleParts.join(" — ") : null;

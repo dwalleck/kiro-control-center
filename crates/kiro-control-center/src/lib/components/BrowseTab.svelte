@@ -759,13 +759,12 @@
           marketplace,
           plugin,
           projectPath,
-          forceInstall,
           acceptMcp: false,
           refresh: () => fetchInstalledPlugins(),
           installPlugin: commands.installPlugin,
           storeRefresh: (p) => pluginUpdates.refresh(p),
         },
-        mode,
+        mode === "install" ? { kind: "install", force: forceInstall } : { kind: "update" },
       );
 
       if (outcome.kind === "ok") {
