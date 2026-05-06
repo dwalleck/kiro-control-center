@@ -10,3 +10,6 @@ __pycache__/
 # Tethys index built by `cargo xtask plan-lint` (and direct `tethys index`).
 # Never committed — recreated on demand from source.
 /.rivets/
+
+# Git worktrees for isolated feature branches
+.worktrees/

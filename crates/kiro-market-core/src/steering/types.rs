@@ -59,8 +59,8 @@ pub enum SteeringError {
     /// Distinct from [`SteeringError::SourceReadFailed`], which models
     /// I/O failures on a *file* — this variant models a structural
     /// validation failure on the *scan root path* and never carries an
-    /// `io::Error`. PR #100 review I1 split these so the wire-format
-    /// reason is precise instead of impersonating a missing-file error.
+    /// `io::Error`. The wire-format reason is precise instead of
+    /// impersonating a missing-file error.
     #[non_exhaustive]
     #[error("steering scan_root `{path}` is not under plugin_dir `{plugin_dir}`")]
     ScanRootInvalid {
