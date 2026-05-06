@@ -1,7 +1,32 @@
-import { commands } from "$lib/bindings";
-import type { RemovePluginResult } from "$lib/bindings";
+import type {
+  CommandError,
+  InstallPluginResult_Serialize,
+  RemovePluginResult,
+} from "$lib/bindings";
 import { formatInstallPluginResult, formatRemovePluginResult } from "$lib/format";
-import { pluginUpdates } from "$lib/stores/plugin-updates.svelte";
+
+// Mirrors the shape produced by `typedError<T, CommandError>` in bindings.ts.
+// Re-declared here so this module stays pure-logic — no runtime import of
+// `commands` or any Tauri IPC machinery; callers inject the IPC functions
+// via context (CLAUDE.md "no Tauri-IPC mocks" — tests construct fakes
+// directly without `vi.mock`).
+type IpcResult<T> =
+  | { status: "ok"; data: T }
+  | { status: "error"; error: CommandError };
+
+export type InstallPluginFn = (
+  marketplace: string,
+  plugin: string,
+  force: boolean,
+  acceptMcp: boolean,
+  projectPath: string,
+) => Promise<IpcResult<InstallPluginResult_Serialize>>;
+
+export type RemovePluginFn = (
+  marketplace: string,
+  plugin: string,
+  projectPath: string,
+) => Promise<IpcResult<RemovePluginResult>>;
 
 export type PluginActionMode = "install" | "update";
 
@@ -17,6 +42,9 @@ export type PluginActionContext = {
   // can re-run with the opt-in.
   acceptMcp: boolean;
   refresh: () => Promise<void>;
+  // Injected dependencies — see IpcResult comment above.
+  installPlugin: InstallPluginFn;
+  storeRefresh: (projectPath: string) => Promise<void>;
 };
 
 export type PluginRemoveContext = {
@@ -24,6 +52,9 @@ export type PluginRemoveContext = {
   plugin: string;
   projectPath: string;
   refresh: () => Promise<void>;
+  // Injected dependencies — see IpcResult comment above.
+  removePlugin: RemovePluginFn;
+  storeRefresh: (projectPath: string) => Promise<void>;
 };
 
 export type PluginBanner = {
@@ -57,7 +88,7 @@ export async function runPluginInstall(
     mode === "update" ? `Updated ${ctx.plugin}` : `Plugin ${ctx.plugin}`;
 
   try {
-    const result = await commands.installPlugin(
+    const result = await ctx.installPlugin(
       ctx.marketplace,
       ctx.plugin,
       force,
@@ -88,7 +119,7 @@ export async function runPluginInstall(
       // installed-plugins list, briefly showing "update available" badges
       // for plugins that were just installed.
       try {
-        await pluginUpdates.refresh(ctx.projectPath);
+        await ctx.storeRefresh(ctx.projectPath);
       } catch (e) {
         console.error(
           `[plugin-actions] pluginUpdates.refresh threw after ${mode}`,
@@ -129,7 +160,7 @@ export async function runPluginRemove(
   ctx: PluginRemoveContext,
 ): Promise<PluginRemoveOutcome> {
   try {
-    const result = await commands.removePlugin(
+    const result = await ctx.removePlugin(
       ctx.marketplace,
       ctx.plugin,
       ctx.projectPath,
@@ -144,14 +175,25 @@ export async function runPluginRemove(
 
       // Always emit a banner — even "nothing to remove" gives the user
       // feedback that the action completed instead of feeling inert.
-      if (hasFailures) {
+      // Three cases: total-fail (everything failed, nothing removed) →
+      // red error banner because "Removed plugin X" would lie. Partial-fail
+      // (some items removed, some failed) → amber warning. Clean success →
+      // green message. The total-fail branch keeps `kind: "ok-removed"` so
+      // the per-failure details panel still renders, giving the user
+      // actionable context about which items failed and why.
+      if (hasFailures && !hasItems) {
+        primary = {
+          kind: "error",
+          text: `Remove failed for ${ctx.plugin}: ${summary}`,
+        };
+      } else if (hasFailures) {
         warning = `Removed plugin ${ctx.plugin}: ${summary}`;
       } else {
         primary = { kind: "message", text: `Removed plugin ${ctx.plugin}: ${summary}` };
       }
 
       try {
-        await pluginUpdates.refresh(ctx.projectPath);
+        await ctx.storeRefresh(ctx.projectPath);
       } catch (e) {
         console.error(
           "[plugin-actions] pluginUpdates.refresh threw after remove",

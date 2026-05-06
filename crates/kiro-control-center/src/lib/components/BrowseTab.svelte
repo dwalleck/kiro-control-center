@@ -762,6 +762,8 @@
           forceInstall,
           acceptMcp: false,
           refresh: () => fetchInstalledPlugins(),
+          installPlugin: commands.installPlugin,
+          storeRefresh: (p) => pluginUpdates.refresh(p),
         },
         mode,
       );

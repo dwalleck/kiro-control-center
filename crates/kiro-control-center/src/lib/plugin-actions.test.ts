@@ -1,34 +1,18 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type {
+  ErrorType,
   InstallPluginResult_Serialize,
   MarketplaceName,
   PluginName,
   RemovePluginResult,
-  ErrorType,
 } from "$lib/bindings";
 
-const { mockRefresh, mockInstallPlugin, mockRemovePlugin } = vi.hoisted(() => ({
-  mockRefresh: vi.fn<(projectPath: string) => Promise<void>>().mockResolvedValue(
-    undefined,
-  ),
-  mockInstallPlugin: vi.fn(),
-  mockRemovePlugin: vi.fn(),
-}));
-
-vi.mock("$lib/stores/plugin-updates.svelte", () => ({
-  pluginUpdates: {
-    refresh: mockRefresh,
-  },
-}));
-
-vi.mock("$lib/bindings", () => ({
-  commands: {
-    installPlugin: (...args: unknown[]) => mockInstallPlugin(...args),
-    removePlugin: (...args: unknown[]) => mockRemovePlugin(...args),
-  },
-}));
-
-import { runPluginInstall, runPluginRemove } from "./plugin-actions";
+import {
+  runPluginInstall,
+  runPluginRemove,
+  type PluginActionContext,
+  type PluginRemoveContext,
+} from "./plugin-actions";
 
 function emptyInstallResult(): InstallPluginResult_Serialize {
   return {
@@ -56,27 +40,53 @@ function emptyRemoveResult(): RemovePluginResult {
   };
 }
 
-const defaultCtx = {
-  marketplace: "acme",
-  plugin: "demo-plugin",
-  projectPath: "/test/project",
-  forceInstall: false,
-  acceptMcp: false,
-  refresh: () => Promise.resolve(),
-};
+function makeInstallCtx(
+  overrides: Partial<PluginActionContext> = {},
+): PluginActionContext {
+  return {
+    marketplace: "acme",
+    plugin: "demo-plugin",
+    projectPath: "/test/project",
+    forceInstall: false,
+    acceptMcp: false,
+    refresh: () => Promise.resolve(),
+    storeRefresh: () => Promise.resolve(),
+    installPlugin: vi.fn(),
+    ...overrides,
+  };
+}
+
+function makeRemoveCtx(
+  overrides: Partial<PluginRemoveContext> = {},
+): PluginRemoveContext {
+  return {
+    marketplace: "acme",
+    plugin: "demo-plugin",
+    projectPath: "/test/project",
+    refresh: () => Promise.resolve(),
+    storeRefresh: () => Promise.resolve(),
+    removePlugin: vi.fn(),
+    ...overrides,
+  };
+}
 
 beforeEach(() => {
   vi.clearAllMocks();
-  mockRefresh.mockResolvedValue(undefined);
 });
 
 describe("runPluginInstall", () => {
   it("install success: kind=ok, banner.message populated, no errors, force=forceInstall", async () => {
     const r = emptyInstallResult();
     r.skills.installed = ["a", "b"];
-    mockInstallPlugin.mockResolvedValue({ status: "ok", data: r });
+    const installPlugin: PluginActionContext["installPlugin"] = vi
+      .fn()
+      .mockResolvedValue({ status: "ok", data: r });
+    const storeRefresh = vi.fn().mockResolvedValue(undefined);
 
-    const outcome = await runPluginInstall(defaultCtx, "install");
+    const outcome = await runPluginInstall(
+      makeInstallCtx({ installPlugin, storeRefresh }),
+      "install",
+    );
 
     expect(outcome.kind).toBe("ok");
     if (outcome.kind === "ok") {
@@ -87,25 +97,29 @@ describe("runPluginInstall", () => {
       expect(outcome.banner.warning).toBeNull();
       expect(outcome.banner.staleRefresh).toBeNull();
     }
-    expect(mockInstallPlugin).toHaveBeenCalledWith(
+    expect(installPlugin).toHaveBeenCalledWith(
       "acme",
       "demo-plugin",
       false,
       false,
       "/test/project",
     );
-    expect(mockRefresh).toHaveBeenCalledOnce();
+    expect(storeRefresh).toHaveBeenCalledOnce();
   });
 
   it("update mode: force=true regardless of forceInstall setting", async () => {
     const r = emptyInstallResult();
     r.skills.installed = ["a"];
-    mockInstallPlugin.mockResolvedValue({ status: "ok", data: r });
+    const installPlugin: PluginActionContext["installPlugin"] = vi
+      .fn()
+      .mockResolvedValue({ status: "ok", data: r });
 
-    const ctx = { ...defaultCtx, forceInstall: false };
-    await runPluginInstall(ctx, "update");
+    await runPluginInstall(
+      makeInstallCtx({ installPlugin, forceInstall: false }),
+      "update",
+    );
 
-    expect(mockInstallPlugin).toHaveBeenCalledWith(
+    expect(installPlugin).toHaveBeenCalledWith(
       "acme",
       "demo-plugin",
       true,
@@ -119,9 +133,14 @@ describe("runPluginInstall", () => {
     r.skills.failed = [
       { name: "broken", error: "oops", kind: { kind: "install_failed" } },
     ];
-    mockInstallPlugin.mockResolvedValue({ status: "ok", data: r });
+    const installPlugin: PluginActionContext["installPlugin"] = vi
+      .fn()
+      .mockResolvedValue({ status: "ok", data: r });
 
-    const outcome = await runPluginInstall(defaultCtx, "install");
+    const outcome = await runPluginInstall(
+      makeInstallCtx({ installPlugin }),
+      "install",
+    );
 
     expect(outcome.kind).toBe("ok");
     if (outcome.kind === "ok") {
@@ -139,9 +158,14 @@ describe("runPluginInstall", () => {
     r.skills.failed = [
       { name: "broken", error: "oops", kind: { kind: "install_failed" } },
     ];
-    mockInstallPlugin.mockResolvedValue({ status: "ok", data: r });
+    const installPlugin: PluginActionContext["installPlugin"] = vi
+      .fn()
+      .mockResolvedValue({ status: "ok", data: r });
 
-    const outcome = await runPluginInstall(defaultCtx, "install");
+    const outcome = await runPluginInstall(
+      makeInstallCtx({ installPlugin }),
+      "install",
+    );
 
     expect(outcome.kind).toBe("ok");
     if (outcome.kind === "ok") {
@@ -163,9 +187,14 @@ describe("runPluginInstall", () => {
         transports: ["stdio"],
       },
     ];
-    mockInstallPlugin.mockResolvedValue({ status: "ok", data: r });
+    const installPlugin: PluginActionContext["installPlugin"] = vi
+      .fn()
+      .mockResolvedValue({ status: "ok", data: r });
 
-    const outcome = await runPluginInstall(defaultCtx, "install");
+    const outcome = await runPluginInstall(
+      makeInstallCtx({ installPlugin }),
+      "install",
+    );
 
     expect(outcome.kind).toBe("ok");
     if (outcome.kind === "ok") {
@@ -180,12 +209,17 @@ describe("runPluginInstall", () => {
   });
 
   it("Tauri command returns error: kind=fail", async () => {
-    mockInstallPlugin.mockResolvedValue({
-      status: "error",
-      error: { message: "network unreachable", error_type: "internal" as ErrorType },
-    });
+    const installPlugin: PluginActionContext["installPlugin"] = vi
+      .fn()
+      .mockResolvedValue({
+        status: "error",
+        error: { message: "network unreachable", error_type: "internal" as ErrorType },
+      });
 
-    const outcome = await runPluginInstall(defaultCtx, "install");
+    const outcome = await runPluginInstall(
+      makeInstallCtx({ installPlugin }),
+      "install",
+    );
 
     expect(outcome.kind).toBe("fail");
     if (outcome.kind === "fail") {
@@ -196,12 +230,17 @@ describe("runPluginInstall", () => {
   });
 
   it("Tauri command returns undefined message: falls back to 'Unknown error'", async () => {
-    mockInstallPlugin.mockResolvedValue({
-      status: "error",
-      error: { message: undefined, error_type: "internal" as ErrorType },
-    });
+    const installPlugin: PluginActionContext["installPlugin"] = vi
+      .fn()
+      .mockResolvedValue({
+        status: "error",
+        error: { message: undefined, error_type: "internal" as ErrorType },
+      });
 
-    const outcome = await runPluginInstall(defaultCtx, "install");
+    const outcome = await runPluginInstall(
+      makeInstallCtx({ installPlugin }),
+      "install",
+    );
 
     expect(outcome.kind).toBe("fail");
     if (outcome.kind === "fail") {
@@ -212,9 +251,14 @@ describe("runPluginInstall", () => {
   });
 
   it("Tauri command throws: kind=fail with error message from throw", async () => {
-    mockInstallPlugin.mockRejectedValue(new Error("connection reset"));
+    const installPlugin: PluginActionContext["installPlugin"] = vi
+      .fn()
+      .mockRejectedValue(new Error("connection reset"));
 
-    const outcome = await runPluginInstall(defaultCtx, "install");
+    const outcome = await runPluginInstall(
+      makeInstallCtx({ installPlugin }),
+      "install",
+    );
 
     expect(outcome.kind).toBe("fail");
     if (outcome.kind === "fail") {
@@ -225,12 +269,17 @@ describe("runPluginInstall", () => {
   });
 
   it("update mode fail prefix uses 'Update failed'", async () => {
-    mockInstallPlugin.mockResolvedValue({
-      status: "error",
-      error: { message: "disk full", error_type: "io_error" as ErrorType },
-    });
+    const installPlugin: PluginActionContext["installPlugin"] = vi
+      .fn()
+      .mockResolvedValue({
+        status: "error",
+        error: { message: "disk full", error_type: "io_error" as ErrorType },
+      });
 
-    const outcome = await runPluginInstall(defaultCtx, "update");
+    const outcome = await runPluginInstall(
+      makeInstallCtx({ installPlugin }),
+      "update",
+    );
 
     expect(outcome.kind).toBe("fail");
     if (outcome.kind === "fail") {
@@ -239,9 +288,14 @@ describe("runPluginInstall", () => {
   });
 
   it("update mode throw uses 'Update failed' prefix", async () => {
-    mockInstallPlugin.mockRejectedValue(new Error("crash"));
+    const installPlugin: PluginActionContext["installPlugin"] = vi
+      .fn()
+      .mockRejectedValue(new Error("crash"));
 
-    const outcome = await runPluginInstall(defaultCtx, "update");
+    const outcome = await runPluginInstall(
+      makeInstallCtx({ installPlugin }),
+      "update",
+    );
 
     expect(outcome.kind).toBe("fail");
     if (outcome.kind === "fail") {
@@ -252,18 +306,22 @@ describe("runPluginInstall", () => {
   it("post-action store refresh throws: staleRefresh names store subsystem, tab refresh still runs", async () => {
     const r = emptyInstallResult();
     r.skills.installed = ["a"];
-    mockInstallPlugin.mockResolvedValue({ status: "ok", data: r });
+    const installPlugin: PluginActionContext["installPlugin"] = vi
+      .fn()
+      .mockResolvedValue({ status: "ok", data: r });
+    const storeRefresh = vi.fn().mockRejectedValue(new Error("store boom"));
 
     let tabRan = false;
-    mockRefresh.mockRejectedValue(new Error("store boom"));
-    const ctx = {
-      ...defaultCtx,
-      refresh: async () => {
-        tabRan = true;
-      },
-    };
-
-    const outcome = await runPluginInstall(ctx, "install");
+    const outcome = await runPluginInstall(
+      makeInstallCtx({
+        installPlugin,
+        storeRefresh,
+        refresh: async () => {
+          tabRan = true;
+        },
+      }),
+      "install",
+    );
 
     expect(tabRan).toBe(true);
     expect(outcome.kind).toBe("ok");
@@ -281,17 +339,19 @@ describe("runPluginInstall", () => {
   it("post-action tab refresh throws: staleRefresh names list subsystem, message preserved", async () => {
     const r = emptyInstallResult();
     r.skills.installed = ["a"];
-    mockInstallPlugin.mockResolvedValue({ status: "ok", data: r });
+    const installPlugin: PluginActionContext["installPlugin"] = vi
+      .fn()
+      .mockResolvedValue({ status: "ok", data: r });
 
-    mockRefresh.mockResolvedValue(undefined);
-    const ctx = {
-      ...defaultCtx,
-      refresh: async () => {
-        throw new Error("tab boom");
-      },
-    };
-
-    const outcome = await runPluginInstall(ctx, "install");
+    const outcome = await runPluginInstall(
+      makeInstallCtx({
+        installPlugin,
+        refresh: async () => {
+          throw new Error("tab boom");
+        },
+      }),
+      "install",
+    );
 
     expect(outcome.kind).toBe("ok");
     if (outcome.kind === "ok") {
@@ -305,54 +365,76 @@ describe("runPluginInstall", () => {
     }
   });
 
-  it("cascade ordering: pluginUpdates.refresh called before ctx.refresh", async () => {
+  it("cascade ordering: storeRefresh called before ctx.refresh", async () => {
     const r = emptyInstallResult();
     r.skills.installed = ["a"];
-    mockInstallPlugin.mockResolvedValue({ status: "ok", data: r });
+    const installPlugin: PluginActionContext["installPlugin"] = vi
+      .fn()
+      .mockResolvedValue({ status: "ok", data: r });
 
     const calls: string[] = [];
-    mockRefresh.mockImplementation(async () => {
+    const storeRefresh = vi.fn().mockImplementation(async () => {
       calls.push("store-refresh");
     });
-    const ctx = {
-      ...defaultCtx,
-      refresh: async () => {
-        calls.push("tab-refresh");
-      },
-    };
 
-    await runPluginInstall(ctx, "install");
+    await runPluginInstall(
+      makeInstallCtx({
+        installPlugin,
+        storeRefresh,
+        refresh: async () => {
+          calls.push("tab-refresh");
+        },
+      }),
+      "install",
+    );
 
     expect(calls).toEqual(["store-refresh", "tab-refresh"]);
   });
 
   it("Tauri error: refresh is NOT called (store + tab)", async () => {
-    mockInstallPlugin.mockResolvedValue({
-      status: "error",
-      error: { message: "network unreachable", error_type: "internal" as ErrorType },
-    });
+    const installPlugin: PluginActionContext["installPlugin"] = vi
+      .fn()
+      .mockResolvedValue({
+        status: "error",
+        error: { message: "network unreachable", error_type: "internal" as ErrorType },
+      });
+    const storeRefresh = vi.fn().mockResolvedValue(undefined);
 
-    await runPluginInstall(defaultCtx, "install");
+    await runPluginInstall(
+      makeInstallCtx({ installPlugin, storeRefresh }),
+      "install",
+    );
 
-    expect(mockRefresh).not.toHaveBeenCalled();
+    expect(storeRefresh).not.toHaveBeenCalled();
   });
 
   it("Tauri throw: refresh is NOT called (store + tab)", async () => {
-    mockInstallPlugin.mockRejectedValue(new Error("connection reset"));
+    const installPlugin: PluginActionContext["installPlugin"] = vi
+      .fn()
+      .mockRejectedValue(new Error("connection reset"));
+    const storeRefresh = vi.fn().mockResolvedValue(undefined);
 
-    await runPluginInstall(defaultCtx, "install");
+    await runPluginInstall(
+      makeInstallCtx({ installPlugin, storeRefresh }),
+      "install",
+    );
 
-    expect(mockRefresh).not.toHaveBeenCalled();
+    expect(storeRefresh).not.toHaveBeenCalled();
   });
 
   it("acceptMcp: true propagates to Tauri command", async () => {
     const r = emptyInstallResult();
     r.skills.installed = ["a"];
-    mockInstallPlugin.mockResolvedValue({ status: "ok", data: r });
+    const installPlugin: PluginActionContext["installPlugin"] = vi
+      .fn()
+      .mockResolvedValue({ status: "ok", data: r });
 
-    await runPluginInstall({ ...defaultCtx, acceptMcp: true }, "install");
+    await runPluginInstall(
+      makeInstallCtx({ installPlugin, acceptMcp: true }),
+      "install",
+    );
 
-    expect(mockInstallPlugin).toHaveBeenCalledWith(
+    expect(installPlugin).toHaveBeenCalledWith(
       "acme",
       "demo-plugin",
       false,
@@ -366,14 +448,11 @@ describe("runPluginRemove", () => {
   it("remove success: kind=ok-removed, banner.message, removeResult present", async () => {
     const r = emptyRemoveResult();
     r.skills.removed = ["a", "b"];
-    mockRemovePlugin.mockResolvedValue({ status: "ok", data: r });
+    const removePlugin: PluginRemoveContext["removePlugin"] = vi
+      .fn()
+      .mockResolvedValue({ status: "ok", data: r });
 
-    const outcome = await runPluginRemove({
-      marketplace: "acme",
-      plugin: "demo-plugin",
-      projectPath: "/test/project",
-      refresh: () => Promise.resolve(),
-    });
+    const outcome = await runPluginRemove(makeRemoveCtx({ removePlugin }));
 
     expect(outcome.kind).toBe("ok-removed");
     if (outcome.kind === "ok-removed") {
@@ -385,20 +464,17 @@ describe("runPluginRemove", () => {
     }
   });
 
-  it("remove with failures: kind=ok-removed, banner.warning", async () => {
+  it("remove with partial failures: kind=ok-removed, banner.warning", async () => {
     const r = emptyRemoveResult();
     r.skills.removed = ["a"];
     r.steering.failures = [
       { item: "broken.md", error: "permission denied" },
     ];
-    mockRemovePlugin.mockResolvedValue({ status: "ok", data: r });
+    const removePlugin: PluginRemoveContext["removePlugin"] = vi
+      .fn()
+      .mockResolvedValue({ status: "ok", data: r });
 
-    const outcome = await runPluginRemove({
-      marketplace: "acme",
-      plugin: "demo-plugin",
-      projectPath: "/test/project",
-      refresh: () => Promise.resolve(),
-    });
+    const outcome = await runPluginRemove(makeRemoveCtx({ removePlugin }));
 
     expect(outcome.kind).toBe("ok-removed");
     if (outcome.kind === "ok-removed") {
@@ -409,16 +485,41 @@ describe("runPluginRemove", () => {
     }
   });
 
+  it("hasFailures && !hasItems: primary error 'Remove failed', no misleading 'Removed plugin' prefix, removeResult populated", async () => {
+    // Total-fail: every removal attempt failed, nothing was actually removed.
+    // Banner must be a red error ("Remove failed for X: ...") not an amber
+    // "Removed plugin X: ..." (which would lie). removeResult stays populated
+    // so the per-failure details panel can render — useful context for the
+    // user about which items failed and why.
+    const r = emptyRemoveResult();
+    r.skills.failures = [
+      { item: "a", error: "permission denied" },
+      { item: "b", error: "locked file" },
+    ];
+    const removePlugin: PluginRemoveContext["removePlugin"] = vi
+      .fn()
+      .mockResolvedValue({ status: "ok", data: r });
+
+    const outcome = await runPluginRemove(makeRemoveCtx({ removePlugin }));
+
+    expect(outcome.kind).toBe("ok-removed");
+    if (outcome.kind === "ok-removed") {
+      expect(outcome.banner.primary).toEqual({
+        kind: "error",
+        text: "Remove failed for demo-plugin: 2 skills failed",
+      });
+      expect(outcome.banner.warning).toBeNull();
+      expect(outcome.removeResult).toBe(r);
+    }
+  });
+
   it("empty remove: kind=ok-noop, banner shows 'nothing to remove'", async () => {
     const r = emptyRemoveResult();
-    mockRemovePlugin.mockResolvedValue({ status: "ok", data: r });
+    const removePlugin: PluginRemoveContext["removePlugin"] = vi
+      .fn()
+      .mockResolvedValue({ status: "ok", data: r });
 
-    const outcome = await runPluginRemove({
-      marketplace: "acme",
-      plugin: "demo-plugin",
-      projectPath: "/test/project",
-      refresh: () => Promise.resolve(),
-    });
+    const outcome = await runPluginRemove(makeRemoveCtx({ removePlugin }));
 
     expect(outcome.kind).toBe("ok-noop");
     if (outcome.kind === "ok-noop") {
@@ -430,17 +531,14 @@ describe("runPluginRemove", () => {
   });
 
   it("Tauri command returns error: kind=fail", async () => {
-    mockRemovePlugin.mockResolvedValue({
-      status: "error",
-      error: { message: "project not found", error_type: "not_found" as ErrorType },
-    });
+    const removePlugin: PluginRemoveContext["removePlugin"] = vi
+      .fn()
+      .mockResolvedValue({
+        status: "error",
+        error: { message: "project not found", error_type: "not_found" as ErrorType },
+      });
 
-    const outcome = await runPluginRemove({
-      marketplace: "acme",
-      plugin: "demo-plugin",
-      projectPath: "/test/project",
-      refresh: () => Promise.resolve(),
-    });
+    const outcome = await runPluginRemove(makeRemoveCtx({ removePlugin }));
 
     expect(outcome.kind).toBe("fail");
     if (outcome.kind === "fail") {
@@ -451,14 +549,11 @@ describe("runPluginRemove", () => {
   });
 
   it("Tauri command throws: kind=fail with error message", async () => {
-    mockRemovePlugin.mockRejectedValue(new Error("disk full"));
+    const removePlugin: PluginRemoveContext["removePlugin"] = vi
+      .fn()
+      .mockRejectedValue(new Error("disk full"));
 
-    const outcome = await runPluginRemove({
-      marketplace: "acme",
-      plugin: "demo-plugin",
-      projectPath: "/test/project",
-      refresh: () => Promise.resolve(),
-    });
+    const outcome = await runPluginRemove(makeRemoveCtx({ removePlugin }));
 
     expect(outcome.kind).toBe("fail");
     if (outcome.kind === "fail") {
@@ -469,19 +564,20 @@ describe("runPluginRemove", () => {
   it("post-action refresh throws: staleRefresh joins both subsystem messages, removeResult still correct", async () => {
     const r = emptyRemoveResult();
     r.skills.removed = ["a"];
-    mockRemovePlugin.mockResolvedValue({ status: "ok", data: r });
+    const removePlugin: PluginRemoveContext["removePlugin"] = vi
+      .fn()
+      .mockResolvedValue({ status: "ok", data: r });
+    const storeRefresh = vi.fn().mockRejectedValue(new Error("store boom"));
 
-    mockRefresh.mockRejectedValue(new Error("store boom"));
-    const ctx = {
-      marketplace: "acme",
-      plugin: "demo-plugin",
-      projectPath: "/test/project",
-      refresh: async () => {
-        throw new Error("tab boom");
-      },
-    };
-
-    const outcome = await runPluginRemove(ctx);
+    const outcome = await runPluginRemove(
+      makeRemoveCtx({
+        removePlugin,
+        storeRefresh,
+        refresh: async () => {
+          throw new Error("tab boom");
+        },
+      }),
+    );
 
     expect(outcome.kind).toBe("ok-removed");
     if (outcome.kind === "ok-removed") {
@@ -499,20 +595,21 @@ describe("runPluginRemove", () => {
   it("post-action store refresh throws: staleRefresh names store subsystem, tab refresh still runs", async () => {
     const r = emptyRemoveResult();
     r.skills.removed = ["a"];
-    mockRemovePlugin.mockResolvedValue({ status: "ok", data: r });
+    const removePlugin: PluginRemoveContext["removePlugin"] = vi
+      .fn()
+      .mockResolvedValue({ status: "ok", data: r });
+    const storeRefresh = vi.fn().mockRejectedValue(new Error("store boom"));
 
     let tabRan = false;
-    mockRefresh.mockRejectedValue(new Error("store boom"));
-    const ctx = {
-      marketplace: "acme",
-      plugin: "demo-plugin",
-      projectPath: "/test/project",
-      refresh: async () => {
-        tabRan = true;
-      },
-    };
-
-    const outcome = await runPluginRemove(ctx);
+    const outcome = await runPluginRemove(
+      makeRemoveCtx({
+        removePlugin,
+        storeRefresh,
+        refresh: async () => {
+          tabRan = true;
+        },
+      }),
+    );
 
     expect(tabRan).toBe(true);
     expect(outcome.kind).toBe("ok-removed");
@@ -526,19 +623,18 @@ describe("runPluginRemove", () => {
   it("post-action tab refresh throws: staleRefresh names list subsystem", async () => {
     const r = emptyRemoveResult();
     r.skills.removed = ["a"];
-    mockRemovePlugin.mockResolvedValue({ status: "ok", data: r });
+    const removePlugin: PluginRemoveContext["removePlugin"] = vi
+      .fn()
+      .mockResolvedValue({ status: "ok", data: r });
 
-    mockRefresh.mockResolvedValue(undefined);
-    const ctx = {
-      marketplace: "acme",
-      plugin: "demo-plugin",
-      projectPath: "/test/project",
-      refresh: async () => {
-        throw new Error("tab boom");
-      },
-    };
-
-    const outcome = await runPluginRemove(ctx);
+    const outcome = await runPluginRemove(
+      makeRemoveCtx({
+        removePlugin,
+        refresh: async () => {
+          throw new Error("tab boom");
+        },
+      }),
+    );
 
     expect(outcome.kind).toBe("ok-removed");
     if (outcome.kind === "ok-removed") {
@@ -548,55 +644,53 @@ describe("runPluginRemove", () => {
     }
   });
 
-  it("cascade ordering: pluginUpdates.refresh called before ctx.refresh", async () => {
+  it("cascade ordering: storeRefresh called before ctx.refresh", async () => {
     const r = emptyRemoveResult();
     r.skills.removed = ["a"];
-    mockRemovePlugin.mockResolvedValue({ status: "ok", data: r });
+    const removePlugin: PluginRemoveContext["removePlugin"] = vi
+      .fn()
+      .mockResolvedValue({ status: "ok", data: r });
 
     const calls: string[] = [];
-    mockRefresh.mockImplementation(async () => {
+    const storeRefresh = vi.fn().mockImplementation(async () => {
       calls.push("store-refresh");
     });
-    const ctx = {
-      marketplace: "acme",
-      plugin: "demo-plugin",
-      projectPath: "/test/project",
-      refresh: async () => {
-        calls.push("tab-refresh");
-      },
-    };
 
-    await runPluginRemove(ctx);
+    await runPluginRemove(
+      makeRemoveCtx({
+        removePlugin,
+        storeRefresh,
+        refresh: async () => {
+          calls.push("tab-refresh");
+        },
+      }),
+    );
 
     expect(calls).toEqual(["store-refresh", "tab-refresh"]);
   });
 
   it("Tauri error: refresh is NOT called (store + tab)", async () => {
-    mockRemovePlugin.mockResolvedValue({
-      status: "error",
-      error: { message: "project not found", error_type: "not_found" as ErrorType },
-    });
+    const removePlugin: PluginRemoveContext["removePlugin"] = vi
+      .fn()
+      .mockResolvedValue({
+        status: "error",
+        error: { message: "project not found", error_type: "not_found" as ErrorType },
+      });
+    const storeRefresh = vi.fn().mockResolvedValue(undefined);
 
-    await runPluginRemove({
-      marketplace: "acme",
-      plugin: "demo-plugin",
-      projectPath: "/test/project",
-      refresh: () => Promise.resolve(),
-    });
+    await runPluginRemove(makeRemoveCtx({ removePlugin, storeRefresh }));
 
-    expect(mockRefresh).not.toHaveBeenCalled();
+    expect(storeRefresh).not.toHaveBeenCalled();
   });
 
   it("Tauri throw: refresh is NOT called (store + tab)", async () => {
-    mockRemovePlugin.mockRejectedValue(new Error("disk full"));
+    const removePlugin: PluginRemoveContext["removePlugin"] = vi
+      .fn()
+      .mockRejectedValue(new Error("disk full"));
+    const storeRefresh = vi.fn().mockResolvedValue(undefined);
 
-    await runPluginRemove({
-      marketplace: "acme",
-      plugin: "demo-plugin",
-      projectPath: "/test/project",
-      refresh: () => Promise.resolve(),
-    });
+    await runPluginRemove(makeRemoveCtx({ removePlugin, storeRefresh }));
 
-    expect(mockRefresh).not.toHaveBeenCalled();
+    expect(storeRefresh).not.toHaveBeenCalled();
   });
 });

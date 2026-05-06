@@ -123,6 +123,8 @@
         plugin,
         projectPath,
         refresh: () => refresh(),
+        removePlugin: commands.removePlugin,
+        storeRefresh: (p) => pluginUpdates.refresh(p),
       });
 
       if (outcome.kind === "ok-removed" || outcome.kind === "ok-noop") {
@@ -163,6 +165,8 @@
           forceInstall: false,
           acceptMcp: false,
           refresh: () => refresh(),
+          installPlugin: commands.installPlugin,
+          storeRefresh: (p) => pluginUpdates.refresh(p),
         },
         "update",
       );
