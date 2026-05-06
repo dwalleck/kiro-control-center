@@ -43,7 +43,12 @@ export function kindLabel(kind: PluginUpdateFailureKind): string {
   }
 }
 
-export type FailureGroup = {
+// Unexported on purpose — `remediationHint` is derivable from
+// `(remediation, marketplace)` via `hintFor` below, but this type doesn't
+// encode that derivation. Forcing consumers to receive the type via
+// inference (`ReturnType<typeof groupFailures>[number]`) prevents
+// hand-constructed instances with a mismatched hint.
+type FailureGroup = {
   remediation: RemediationClass;
   marketplace: MarketplaceName;
   plugins: PluginName[];
@@ -84,7 +89,21 @@ function hintFor(cls: RemediationClass, marketplace: MarketplaceName): string {
   }
 }
 
+// String union, not a tagged-object union. The BrowseAction / InstalledAction
+// Extract<> aliases below filter by literal type — if this ever grows object
+// payloads (e.g. { kind: "install"; force: boolean }), Extract<> silently
+// changes meaning and the narrowings break in non-obvious ways. Switch to
+// Exclude<> of the other arms in that case.
 export type PluginAction = "install" | "update" | "remove";
+
+export type BrowseAction = Extract<PluginAction, "install" | "update">;
+export type InstalledAction = Extract<PluginAction, "remove" | "update">;
+
+// Compile-time guard: fails if PluginAction grows non-string arms (per the
+// comment above). Pairs with the `_AssertNarrow` pattern in error-source.ts.
+type _AssertStringUnion = Extract<PluginAction, "install"> extends string
+  ? PluginAction
+  : never;
 
 // Column = state sentence; companion `actionUpdateLabel` = button action.
 export function statusUpdateLabel(u: PluginUpdateInfo): string {

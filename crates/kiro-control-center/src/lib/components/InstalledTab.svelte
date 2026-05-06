@@ -10,7 +10,7 @@
   import { DELIM, pluginKey } from "$lib/keys";
   import { pluginUpdates } from "$lib/stores/plugin-updates.svelte";
   import { kindLabel, statusUpdateLabel } from "$lib/stores/plugin-updates";
-  import type { PluginAction } from "$lib/stores/plugin-updates";
+  import type { InstalledAction } from "$lib/stores/plugin-updates";
   import {
     ERR_INSTALLED_PLUGINS,
     ERR_UPDATE_FETCH,
@@ -34,7 +34,7 @@
   let installWarning: string | null = $state(null);
   let installStaleRefresh: string | null = $state(null);
 
-  let pendingPluginActions = new SvelteMap<string, Extract<PluginAction, "remove" | "update">>();
+  let pendingPluginActions = new SvelteMap<string, InstalledAction>();
 
   let removeResult: RemovePluginResult | null = $state(null);
   let removeResultPlugin: string | null = $state(null);
