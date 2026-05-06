@@ -693,8 +693,8 @@ pub fn set_nested(value: &mut JsonValue, path: &str, val: JsonValue) {
 
 /// A dotted path like `"chat.defaultModel"` is well-formed iff every
 /// `.`-delimited segment is non-empty. Rejects `""`, `"."`, `".key"`,
-/// `"key."`, `"a..b"`, and `".."` — the previously-silent corruption
-/// shapes flagged by the silent-failure hunter on PR #73.
+/// `"key."`, `"a..b"`, and `".."` — the shapes of previously-silent
+/// corruption.
 fn is_well_formed_dotted_path(path: &str) -> bool {
     !path.is_empty() && path.split('.').all(|s| !s.is_empty())
 }
