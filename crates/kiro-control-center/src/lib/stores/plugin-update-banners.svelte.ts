@@ -1,8 +1,5 @@
-import {
-  ERR_UPDATE_FETCH,
-  UPDATE_CHECK_PREFIX,
-  updateCheckErrKey,
-} from "$lib/error-source";
+import { untrack } from "svelte";
+import { ERR_UPDATE_FETCH } from "$lib/error-source";
 import type { UpdateCheckKey } from "$lib/error-source";
 import { pluginUpdates } from "./plugin-updates.svelte";
 import { projectUpdateCheckBanners } from "./plugin-updates";
@@ -46,9 +43,16 @@ export function usePluginUpdateBanners(args: {
   });
 
   $effect(() => {
+    // Snapshot keys via `untrack` so this effect doesn't re-fire on its own
+    // writes. `SvelteMap.keys()` is reactive in Svelte 5; without untrack,
+    // the set/delete calls below would mutate the keyset the effect just
+    // depended on, triggering re-runs that rely on Svelte's idempotent-write
+    // optimization to terminate. The real signal that should drive banner
+    // updates is `pluginUpdates.failureGroups` (read above).
+    const existingKeys = untrack(() => Array.from(args.fetchErrors.keys()));
     const { upserts, staleKeys } = projectUpdateCheckBanners(
       pluginUpdates.failureGroups,
-      args.fetchErrors.keys(),
+      existingKeys,
     );
     for (const [key, msg] of upserts) {
       args.fetchErrors.set(key, msg);
