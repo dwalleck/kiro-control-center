@@ -11,8 +11,13 @@
     plugin: PluginInfo;
     marketplace: string;
     installed: boolean;
-    installing: boolean;
-    updating: boolean;
+    // Single discriminator carried through from the producer's
+    // `pendingPluginActions.get(key)` (a `BrowseAction | undefined`). The
+    // prior `installing: boolean + updating: boolean` shape allowed the
+    // unreachable `installing && updating` state and forced the producer
+    // to flatten its own discriminator into two booleans, which the
+    // template then re-discriminated.
+    pending: "install" | "update" | undefined;
     update: PluginUpdateInfo | undefined;
     failure: PluginUpdateFailure | undefined;
     projectPicked: boolean;
@@ -24,8 +29,7 @@
     plugin,
     marketplace,
     installed,
-    installing,
-    updating,
+    pending,
     update,
     failure,
     projectPicked,
@@ -70,8 +74,8 @@
   </div>
 
   <div class="flex flex-col items-end gap-1.5 flex-shrink-0">
-    {#if installing || updating}
-      {@const label = installing ? "Installing" : "Updating"}
+    {#if pending}
+      {@const label = pending === "install" ? "Installing" : "Updating"}
       <button
         type="button"
         disabled

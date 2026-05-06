@@ -1095,8 +1095,7 @@
               plugin={ap.plugin}
               marketplace={ap.marketplace}
               installed={installedPluginKeys.has(key)}
-              installing={pendingPluginActions.get(key) === "install"}
-              updating={pendingPluginActions.get(key) === "update"}
+              pending={pendingPluginActions.get(key)}
               update={pluginUpdates.updateFor(ap.marketplace, ap.plugin.name)}
               failure={pluginUpdates.failureFor(ap.marketplace, ap.plugin.name)}
               projectPicked={!!projectPath}
