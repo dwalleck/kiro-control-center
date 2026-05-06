@@ -43,7 +43,14 @@ export function kindLabel(kind: PluginUpdateFailureKind): string {
   }
 }
 
-export type FailureGroup = {
+// Unexported on purpose — `remediationHint` is derivable from
+// `(remediation, marketplace)` via `hintFor` below, but this type doesn't
+// encode that derivation. Hiding the name discourages hand-constructed
+// literals with a mismatched hint, but isn't a hard barrier: consumers
+// can still reconstruct the shape via `ReturnType<typeof groupFailures>[number]`
+// and pass it through `projectUpdateCheckBanners`. Convention: always go
+// through `groupFailures` to construct.
+type FailureGroup = {
   remediation: RemediationClass;
   marketplace: MarketplaceName;
   plugins: PluginName[];
@@ -84,7 +91,28 @@ function hintFor(cls: RemediationClass, marketplace: MarketplaceName): string {
   }
 }
 
+// String union, not a tagged-object union. The BrowseAction / InstalledAction
+// Extract<> aliases below filter by literal type — if this ever grows object
+// payloads (e.g. { kind: "install"; force: boolean }), Extract<> silently
+// changes meaning and the narrowings break in non-obvious ways. Switch to
+// Exclude<> of the other arms in that case. Mixed unions (some literal arms
+// remain alongside new object arms) need re-thinking the alias strategy
+// entirely — neither Extract<> nor Exclude<> rescues per-tab subsets.
 export type PluginAction = "install" | "update" | "remove";
+
+export type BrowseAction = Extract<PluginAction, "install" | "update">;
+export type InstalledAction = Extract<PluginAction, "remove" | "update">;
+
+// Compile-time guard: lists the canonical values once and `satisfies` fails
+// the moment any arm becomes non-string-literal — `"install"` won't satisfy
+// `{ kind: "install"; ... }`. Also catches arm removal (an absent value
+// fails to satisfy the narrower union). The `const _assertStringUnion = true`
+// at the bottom forces type-check evaluation: an unused type alias resolving
+// to `never` is valid TS, so a value-position assignment is what makes the
+// tripwire actually fire. Pairs with `_AssertNarrow` in error-source.ts.
+const _PLUGIN_ACTION_VALUES = ["install", "update", "remove"] as const satisfies readonly PluginAction[];
+type _AssertStringUnion = (typeof _PLUGIN_ACTION_VALUES)[number] extends string ? true : never;
+const _assertStringUnion: _AssertStringUnion = true;
 
 // Column = state sentence; companion `actionUpdateLabel` = button action.
 export function statusUpdateLabel(u: PluginUpdateInfo): string {

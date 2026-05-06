@@ -11,8 +11,12 @@ export type UpdateCheckKey =
 
 // Compile-time guard: fails if UPDATE_CHECK_PREFIX loses `as const` and
 // UpdateCheckKey silently widens to `string` (defeating typo protection
-// on `fetchErrors.get/set/delete` with zero compile errors).
-type _AssertNarrow = string extends UpdateCheckKey ? never : UpdateCheckKey;
+// on `fetchErrors.get/set/delete` with zero compile errors). The
+// `const _assertNarrow = true` below forces evaluation — an unused type
+// alias resolving to `never` is valid TS, so the value-position assignment
+// is what makes the tripwire actually fire.
+type _AssertNarrow = string extends UpdateCheckKey ? never : true;
+const _assertNarrow: _AssertNarrow = true;
 
 export const updateCheckErrKey = (
   remediation: RemediationClass,

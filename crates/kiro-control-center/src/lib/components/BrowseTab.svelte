@@ -17,7 +17,7 @@
     parseSkillKey,
   } from "$lib/keys";
   import { pluginUpdates } from "$lib/stores/plugin-updates.svelte";
-  import type { PluginAction } from "$lib/stores/plugin-updates";
+  import type { BrowseAction } from "$lib/stores/plugin-updates";
   import {
     ERR_INSTALLED_PLUGINS,
     ERR_UPDATE_FETCH,
@@ -103,7 +103,7 @@
   let popRef: HTMLDivElement | undefined = $state();
   let browseView: BrowseView = $state("plugins");
 
-  let pendingPluginActions = new SvelteMap<string, Extract<PluginAction, "install" | "update">>();
+  let pendingPluginActions = new SvelteMap<string, BrowseAction>();
 
   let installedPlugins: InstalledPluginInfo[] = $state([]);
   let installedPluginKeys = $derived(
@@ -743,7 +743,7 @@
   async function runPluginInstall(
     marketplace: string,
     plugin: string,
-    mode: Extract<PluginAction, "install" | "update">,
+    mode: BrowseAction,
   ) {
     const key = pluginKey(marketplace, plugin);
     if (pendingPluginActions.has(key)) return;

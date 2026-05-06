@@ -15,7 +15,6 @@ import {
   statusUpdateLabel,
 } from "./plugin-updates";
 import { updateCheckErrKey } from "../error-source";
-import type { FailureGroup } from "./plugin-updates";
 
 describe("remediationClass", () => {
   it("maps marketplace_unavailable to stale_cache", () => {
@@ -264,7 +263,7 @@ describe("groupFailures", () => {
   });
 
   it("each group carries a non-empty remediationHint", () => {
-    const groups: FailureGroup[] = groupFailures([
+    const groups = groupFailures([
       failure("acme", "p1", { kind: "marketplace_unavailable" }),
       failure("acme", "p2", { kind: "manifest_invalid" }),
       failure("acme", "p3", { kind: "other" }),

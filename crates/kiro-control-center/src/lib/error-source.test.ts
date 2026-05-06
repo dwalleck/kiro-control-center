@@ -89,5 +89,7 @@ describe("shared constants", () => {
 });
 
 // Compile-time guard: mirrors the _AssertNarrow pattern in error-source.ts.
-// If either constant widens to string, this line fails type-check.
-type _AssertNarrow = string extends typeof UPDATE_CHECK_PREFIX ? never : typeof UPDATE_CHECK_PREFIX;
+// If UPDATE_CHECK_PREFIX widens to `string`, _AssertNarrow becomes `never`
+// and the value-position `const _assertNarrow = true` fails to compile.
+type _AssertNarrow = string extends typeof UPDATE_CHECK_PREFIX ? never : true;
+const _assertNarrow: _AssertNarrow = true;
