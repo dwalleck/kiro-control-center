@@ -70,25 +70,16 @@
   </div>
 
   <div class="flex flex-col items-end gap-1.5 flex-shrink-0">
-    {#if installing}
+    {#if installing || updating}
+      {@const label = installing ? "Installing" : "Updating"}
       <button
         type="button"
         disabled
         aria-busy="true"
-        aria-label="Installing {plugin.name}"
+        aria-label="{label} {plugin.name}"
         class="px-3 py-1.5 text-xs font-medium rounded-md bg-kiro-muted text-kiro-subtle border border-transparent cursor-not-allowed"
       >
-        Installing…
-      </button>
-    {:else if updating}
-      <button
-        type="button"
-        disabled
-        aria-busy="true"
-        aria-label="Updating {plugin.name}"
-        class="px-3 py-1.5 text-xs font-medium rounded-md bg-kiro-muted text-kiro-subtle border border-transparent cursor-not-allowed"
-      >
-        Updating…
+        {label}…
       </button>
     {:else if failure && installed}
       <span
