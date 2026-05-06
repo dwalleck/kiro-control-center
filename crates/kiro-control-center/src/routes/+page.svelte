@@ -57,6 +57,7 @@
         settingsLoadError = result.error.message;
       }
     } catch (e) {
+      console.error("[+page] getKiroSettings rejected", e);
       settingsLoadError = e instanceof Error
         ? `Failed to load settings: ${e.message}`
         : "Failed to load settings due to an unexpected error.";
@@ -107,7 +108,9 @@
           <MarketplacesTab
             onUpdated={() => {
               if (store.projectPath) {
-                pluginUpdates.refresh(store.projectPath);
+                pluginUpdates
+                  .refresh(store.projectPath)
+                  .catch((e) => console.error("[+page] post-update refresh failed", e));
               }
             }}
           />

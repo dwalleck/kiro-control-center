@@ -5,13 +5,11 @@
   import type {
     InstalledSkillInfo,
     InstalledPluginInfo,
-    PluginUpdateInfo,
-    PluginUpdateFailure,
     RemovePluginResult,
   } from "$lib/bindings";
   import { DELIM, pluginKey } from "$lib/keys";
   import { pluginUpdates } from "$lib/stores/plugin-updates.svelte";
-  import { kindLabel } from "$lib/stores/plugin-updates";
+  import { kindLabel, statusUpdateLabel } from "$lib/stores/plugin-updates";
   import type { PluginAction } from "$lib/stores/plugin-updates";
   import { formatInstallPluginResult, formatRemovePluginResult } from "$lib/format";
   import BannerStack from "./BannerStack.svelte";
@@ -21,31 +19,18 @@
   let plugins: InstalledPluginInfo[] = $state([]);
   let skills: InstalledSkillInfo[] = $state([]);
   let loading: boolean = $state(true);
-  // `loadError` narrows in 2b: only fetch/refresh failures land here.
-  // Remove-action failures route to `installError` (matching BrowseTab).
   let loadError: string | null = $state(null);
 
-  // 3-banner pattern mirrored from BrowseTab. installError = red fatal,
-  // installMessage = green success, installWarning = amber non-fatal.
   let installError: string | null = $state(null);
   let installMessage: string | null = $state(null);
   let installWarning: string | null = $state(null);
 
-  // Per-plugin in-flight tracker, keyed by pluginKey(marketplace, plugin).
-  // Narrows the shared PluginAction union to the actions InstalledTab
-  // performs (Remove + Update — never Install, that's BrowseTab's surface).
   let pendingPluginActions = new SvelteMap<string, Extract<PluginAction, "remove" | "update">>();
 
-  // The most recent RemovePluginResult — drives the inline <details>
-  // block below the BannerStack. Stays set until the next Remove or
-  // a project change clears it.
   let removeResult: RemovePluginResult | null = $state(null);
   let removeResultPlugin: string | null = $state(null);
   let removeResultHasFailures: boolean = $state(false);
 
-  // Banner-stack typing — InstalledTab's ErrorSource union is small for
-  // 2b: only the new update-check + update-fetch keys plus a single
-  // installed-plugins key for partial-load warnings (existing).
   const ERR_INSTALLED_PLUGINS = "installed-plugins" as const;
   const ERR_UPDATE_FETCH = "update-fetch" as const;
   const UPDATE_CHECK_PREFIX = "update-check" as const;
@@ -59,11 +44,8 @@
     if (key === ERR_INSTALLED_PLUGINS) return "Dismiss installed-plugins warning";
     if (key === ERR_UPDATE_FETCH) return "Dismiss update-check error";
     if (key.startsWith(UPDATE_CHECK_PREFIX + DELIM)) {
-      const parts = key.split(DELIM);
-      if (parts.length === 3) {
-        return `Dismiss update-check banner for ${parts[2]}`;
-      }
-      return "Dismiss update-check banner";
+      const [, , marketplace] = key.split(DELIM);
+      return `Dismiss update-check banner for ${marketplace}`;
     }
     return "Dismiss banner";
   }
@@ -97,12 +79,25 @@
         skills = skillsResult.data;
       } else if (loadError === null) {
         loadError = skillsResult.error.message;
+      } else {
+        console.error("[InstalledTab] skills load also failed", skillsResult.error);
       }
     } catch (e) {
       const reason = e instanceof Error ? e.message : String(e);
       loadError = `Failed to load installed state: ${reason}`;
     } finally {
       loading = false;
+    }
+  }
+
+  async function refreshAfterPluginAction(verbForBanner: string, plugin: string) {
+    try {
+      await pluginUpdates.refresh(projectPath);
+      await refresh();
+    } catch (e) {
+      console.error(`[InstalledTab] post-${verbForBanner} refresh threw`, e);
+      const reason = e instanceof Error ? e.message : String(e);
+      installError = `${plugin} ${verbForBanner} succeeded but refresh failed: ${reason}`;
     }
   }
 
@@ -120,7 +115,7 @@
       const result = await commands.removePlugin(marketplace, plugin, projectPath);
       if (result.status === "ok") {
         const { summary, hasItems, hasFailures } =
-          formatRemovePluginResult(result.data, plugin);
+          formatRemovePluginResult(result.data);
         if (hasItems || hasFailures) {
           removeResult = result.data;
           removeResultPlugin = plugin;
@@ -131,9 +126,7 @@
         } else {
           installMessage = `Removed plugin ${plugin}: ${summary}`;
         }
-        // Order: pluginUpdates.refresh first, local refresh second.
-        await pluginUpdates.refresh(projectPath);
-        await refresh();
+        await refreshAfterPluginAction("remove", plugin);
       } else {
         installError = `Remove failed for ${plugin}: ${result.error.message}`;
       }
@@ -164,7 +157,7 @@
       );
       if (result.status === "ok") {
         const { summary, warnings, anyInstalled, anyFailed } =
-          formatInstallPluginResult(result.data, plugin);
+          formatInstallPluginResult(result.data);
         if (anyFailed && !anyInstalled) {
           installError = `Update failed for ${plugin}: ${summary}`;
         } else {
@@ -173,8 +166,7 @@
         if (warnings) {
           installWarning = `Updated ${plugin}: ${warnings}`;
         }
-        await pluginUpdates.refresh(projectPath);
-        await refresh();
+        await refreshAfterPluginAction("update", plugin);
       } else {
         installError = `Update failed for ${plugin}: ${result.error.message}`;
       }
@@ -208,13 +200,13 @@
     refresh();
   });
 
-  // Eager scan on project mount + on every projectPath change.
   $effect(() => {
     void projectPath;
-    pluginUpdates.refresh(projectPath);
+    pluginUpdates
+      .refresh(projectPath)
+      .catch((e) => console.error("[InstalledTab] pluginUpdates.refresh threw", e));
   });
 
-  // Project per-marketplace failure groups into the fetchErrors map.
   $effect(() => {
     const seen = new Set<ErrorSource>();
     for (const group of pluginUpdates.failureGroups) {
@@ -235,7 +227,6 @@
     }
   });
 
-  // Surface the toplevel pluginUpdates.fetchError as its own banner.
   $effect(() => {
     if (pluginUpdates.fetchError) {
       fetchErrors.set(
@@ -247,10 +238,6 @@
     }
   });
 
-  // Phase 2b I-1: clear stale action-result state on project change so the
-  // <details> block, banners, and pending-action map don't leak across
-  // project switches. The store's race-condition guard already handles
-  // pluginUpdates.result; this effect handles InstalledTab-local state.
   let priorProjectPath: string | null = null;
   $effect(() => {
     if (priorProjectPath !== null && priorProjectPath !== projectPath) {
@@ -260,44 +247,12 @@
       installError = null;
       installMessage = null;
       installWarning = null;
-      // Clear in-flight tracker — actions clear themselves via finally{}
-      // under normal operation, but a project change while a Remove or
-      // Update is mid-flight would leave a stale entry that disables the
-      // row's buttons indefinitely.
       pendingPluginActions.clear();
-      // Clear per-project banner keys (update-check<DELIM> family +
-      // installed-plugins partial-load). The pluginUpdates.refresh and
-      // local refresh that follow on the same projectPath change will
-      // repopulate from fresh state.
       fetchErrors.clear();
     }
     priorProjectPath = projectPath;
   });
 
-  // Helpers used by the table render block.
-  function statusUpdateLabel(u: PluginUpdateInfo): string {
-    // ContentChanged: phrased as a status (full sentence) rather than the
-    // PluginCard button's action label ("Update (content changed)").
-    // The two surfaces intentionally differ — column = state; button = action.
-    if (u.change_signal.kind === "content_changed") return "Content changed since install";
-    // VersionBumped: prefer the explicit "v_old → v_new" form when both
-    // versions are known; fall back to "vN available" for legacy installs
-    // (installed_version: None) and to a bare "Update available" when the
-    // marketplace manifest declares no version.
-    if (u.installed_version && u.available_version) {
-      return `v${u.installed_version} → v${u.available_version}`;
-    }
-    if (u.available_version) return `v${u.available_version} available`;
-    return "Update available";
-  }
-
-  function updateInfoFor(p: InstalledPluginInfo): PluginUpdateInfo | undefined {
-    return pluginUpdates.updateFor(p.marketplace, p.plugin);
-  }
-
-  function failureFor(p: InstalledPluginInfo): PluginUpdateFailure | undefined {
-    return pluginUpdates.failureFor(p.marketplace, p.plugin);
-  }
 </script>
 
 <div class="flex flex-col h-full">
@@ -393,8 +348,8 @@
             <tbody>
               {#each plugins as p (pluginKey(p.marketplace, p.plugin))}
                 {@const key = pluginKey(p.marketplace, p.plugin)}
-                {@const updateInfo = updateInfoFor(p)}
-                {@const failure = failureFor(p)}
+                {@const updateInfo = pluginUpdates.updateFor(p.marketplace, p.plugin)}
+                {@const failure = pluginUpdates.failureFor(p.marketplace, p.plugin)}
                 {@const action = pendingPluginActions.get(key)}
                 <tr class="border-b border-kiro-muted/50">
                   <td class="px-4 py-3 font-medium text-kiro-text">{p.plugin}</td>

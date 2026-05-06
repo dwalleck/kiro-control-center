@@ -4,7 +4,7 @@
     PluginUpdateFailure,
     PluginUpdateInfo,
   } from "$lib/bindings";
-  import { kindLabel } from "$lib/stores/plugin-updates";
+  import { actionUpdateLabel, kindLabel } from "$lib/stores/plugin-updates";
   import { skillCountLabel, skillCountTitle } from "$lib/format";
 
   type Props = {
@@ -41,17 +41,7 @@
         : `Install ${plugin.name} (skills + steering + agents) into the active project`,
   );
 
-  // Update button label per Phase 2b design decision #6:
-  //   - VersionBumped + both versions known      → "Update → vN"
-  //   - VersionBumped + installed_version null   → "Update → vN" (legacy install; → reads as "to vN")
-  //   - VersionBumped + available_version null   → "Update"      (manifest declares no version)
-  //   - ContentChanged                            → "Update (content changed)"
-  const updateLabel = $derived.by(() => {
-    if (!update) return "Update";
-    if (update.change_signal.kind === "content_changed") return "Update (content changed)";
-    if (update.available_version) return `Update → v${update.available_version}`;
-    return "Update";
-  });
+  const updateLabel = $derived(update ? actionUpdateLabel(update) : "Update");
 </script>
 
 <div class="flex items-start gap-3 px-3 py-3 rounded-md border border-kiro-muted bg-kiro-overlay">

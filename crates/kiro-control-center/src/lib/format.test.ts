@@ -4,8 +4,13 @@ import type {
   MarketplaceName,
   PluginName,
   RemovePluginResult,
+  SkippedSkill,
 } from "$lib/bindings";
-import { formatInstallPluginResult, formatRemovePluginResult } from "./format";
+import {
+  formatInstallPluginResult,
+  formatRemovePluginResult,
+  formatSkippedSkillsForPlugin,
+} from "./format";
 
 // Field names + structure tracked from bindings.ts (see plan
 // "Source-of-truth references"):
@@ -37,32 +42,39 @@ function emptyInstallResult(): InstallPluginResult_Serialize {
 }
 
 describe("formatInstallPluginResult", () => {
-  it("happy path: counts all 3 sub-results", () => {
+  it("happy path: counts all 3 sub-results joined by mid-dot", () => {
     const r = emptyInstallResult();
     r.skills.installed = ["a", "b"];
     r.steering.installed = [
       { source: "s.md", destination: "s.md", kind: "installed", source_hash: "h", installed_hash: "h" },
     ];
-    // installed: string[] (bindings.ts:527), not an object array.
     r.agents.installed = ["g"];
-    const out = formatInstallPluginResult(r, "p");
-    expect(out.summary).toContain("2 skill");
-    expect(out.summary).toContain("1 steering");
-    expect(out.summary).toContain("1 agent");
+    const out = formatInstallPluginResult(r);
+    expect(out.summary).toBe("2 skills · 1 steering file · 1 agent");
     expect(out.anyInstalled).toBe(true);
     expect(out.anyFailed).toBe(false);
   });
 
-  it("failures-only: anyInstalled=false, anyFailed=true", () => {
+  it("singular nouns: 1 skill / 1 steering file / 1 agent", () => {
     const r = emptyInstallResult();
-    // FailedSkill requires `kind: FailedSkillReason` (bindings.ts:352-356).
+    r.skills.installed = ["a"];
+    r.steering.installed = [
+      { source: "s.md", destination: "s.md", kind: "installed", source_hash: "h", installed_hash: "h" },
+    ];
+    r.agents.installed = ["g"];
+    const out = formatInstallPluginResult(r);
+    expect(out.summary).toBe("1 skill · 1 steering file · 1 agent");
+  });
+
+  it("failures-only: anyInstalled=false, anyFailed=true, exact summary", () => {
+    const r = emptyInstallResult();
     r.skills.failed = [
       { name: "broken", error: "oops", kind: { kind: "install_failed" } },
     ];
-    const out = formatInstallPluginResult(r, "p");
+    const out = formatInstallPluginResult(r);
     expect(out.anyInstalled).toBe(false);
     expect(out.anyFailed).toBe(true);
-    expect(out.summary).toContain("1 skill failed");
+    expect(out.summary).toBe("1 skill failed");
   });
 
   it("warnings-only (e.g. MCP-gated agent): warnings string present, no failure flag", () => {
@@ -70,25 +82,54 @@ describe("formatInstallPluginResult", () => {
     r.agents.warnings = [
       { kind: "mcp_servers_require_opt_in", agent: "scary", transports: ["stdio"] },
     ];
-    const out = formatInstallPluginResult(r, "p");
-    expect(out.warnings).not.toBeNull();
-    expect(out.warnings).toContain("scary");
+    const out = formatInstallPluginResult(r);
+    expect(out.warnings).toBe(
+      "agent 'scary' declares MCP servers [stdio] — re-run with --accept-mcp to install",
+    );
     expect(out.anyFailed).toBe(false);
+  });
+
+  it("multiple warnings from different sub-results join with ' | '", () => {
+    const r = emptyInstallResult();
+    r.steering.warnings = [
+      { kind: "scan_path_invalid", path: "/bad", reason: "not absolute" },
+    ];
+    r.agents.warnings = [
+      { kind: "mcp_servers_require_opt_in", agent: "scary", transports: ["stdio"] },
+    ];
+    const out = formatInstallPluginResult(r);
+    expect(out.warnings).toBe(
+      "invalid scan path '/bad': not absolute" +
+        " | " +
+        "agent 'scary' declares MCP servers [stdio] — re-run with --accept-mcp to install",
+    );
   });
 
   it("empty: summary reads 'nothing to install'", () => {
     const r = emptyInstallResult();
-    const out = formatInstallPluginResult(r, "p");
+    const out = formatInstallPluginResult(r);
     expect(out.summary).toBe("nothing to install");
     expect(out.anyInstalled).toBe(false);
     expect(out.anyFailed).toBe(false);
   });
 
-  it("skipped (idempotent skill): counted as 'already installed'", () => {
+  it("skipped (idempotent skills): counted as 'already installed'", () => {
     const r = emptyInstallResult();
     r.skills.skipped = ["a", "b"];
-    const out = formatInstallPluginResult(r, "p");
-    expect(out.summary).toContain("2 skills already installed");
+    const out = formatInstallPluginResult(r);
+    expect(out.summary).toBe("2 skills already installed");
+  });
+
+  it("does not interpolate plugin metadata (marketplace, version, plugin name) into summary", () => {
+    const r = emptyInstallResult();
+    r.marketplace = "verysecret-marketplace" as MarketplaceName;
+    r.plugin = "verysecret-plugin" as PluginName;
+    r.version = "9.9.9";
+    r.skills.installed = ["a"];
+    const out = formatInstallPluginResult(r);
+    expect(out.summary).not.toContain("verysecret");
+    expect(out.summary).not.toContain("9.9.9");
+    expect(out.warnings).toBeNull();
   });
 });
 
@@ -107,44 +148,111 @@ function emptyRemoveResult(): RemovePluginResult {
 }
 
 describe("formatRemovePluginResult", () => {
-  it("happy path: counts all 3 sub-results", () => {
+  it("happy path: counts all 3 sub-results joined by mid-dot", () => {
     const r = emptyRemoveResult();
     r.skills.removed = ["a", "b", "c"];
     r.steering.removed = ["s.md"];
     r.agents.removed = ["g1", "g2"];
-    const out = formatRemovePluginResult(r, "p");
-    expect(out.summary).toContain("3 skill");
-    expect(out.summary).toContain("1 steering");
-    expect(out.summary).toContain("2 agent");
+    const out = formatRemovePluginResult(r);
+    expect(out.summary).toBe("3 skills · 1 steering file · 2 agents");
     expect(out.hasItems).toBe(true);
     expect(out.hasFailures).toBe(false);
+  });
+
+  it("singular nouns: 1 skill / 1 steering file / 1 agent removed", () => {
+    const r = emptyRemoveResult();
+    r.skills.removed = ["a"];
+    r.steering.removed = ["s.md"];
+    r.agents.removed = ["g"];
+    const out = formatRemovePluginResult(r);
+    expect(out.summary).toBe("1 skill · 1 steering file · 1 agent");
+  });
+
+  it("singular failure nouns: 1 skill / steering / 1 agent failed", () => {
+    const r = emptyRemoveResult();
+    r.skills.failures = [{ item: "x", error: "oops" }];
+    r.steering.failures = [{ item: "s.md", error: "denied" }];
+    r.agents.failures = [{ item: "g", error: "boom" }];
+    const out = formatRemovePluginResult(r);
+    expect(out.summary).toBe("1 skill failed · 1 steering failed · 1 agent failed");
   });
 
   it("steering failure lands in summary (failed count) and hasFailures=true", () => {
     const r = emptyRemoveResult();
     r.steering.failures = [{ item: "broken.md", error: "permission denied" }];
-    const out = formatRemovePluginResult(r, "p");
+    const out = formatRemovePluginResult(r);
     expect(out.hasFailures).toBe(true);
-    expect(out.summary).toContain("1 steering failed");
+    expect(out.summary).toBe("1 steering failed");
+  });
+
+  it("mixed removed + failures within one sub-result: both flags true", () => {
+    const r = emptyRemoveResult();
+    r.skills.removed = ["a"];
+    r.skills.failures = [{ item: "broken", error: "oops" }];
+    const out = formatRemovePluginResult(r);
+    expect(out.hasItems).toBe(true);
+    expect(out.hasFailures).toBe(true);
+    expect(out.summary).toBe("1 skill · 1 skill failed");
   });
 
   it("empty (zero items, zero failures): hasItems=false, hasFailures=false", () => {
     const r = emptyRemoveResult();
-    const out = formatRemovePluginResult(r, "p");
+    const out = formatRemovePluginResult(r);
     expect(out.hasItems).toBe(false);
     expect(out.hasFailures).toBe(false);
     expect(out.summary).toBe("nothing to remove");
   });
 
   it("treats undefined removed/failures as empty arrays", () => {
-    // The wire format makes both fields optional (#[serde(default)]).
     const r: RemovePluginResult = {
       skills: {},
       steering: {},
       agents: {},
     };
-    const out = formatRemovePluginResult(r, "p");
+    const out = formatRemovePluginResult(r);
     expect(out.hasItems).toBe(false);
     expect(out.hasFailures).toBe(false);
+  });
+});
+
+function frontmatterFailure(name: string): SkippedSkill {
+  return {
+    plugin: "p",
+    name_hint: name,
+    path: `/p/${name}/SKILL.md`,
+    reason: { kind: "frontmatter_invalid", reason: "missing name field" },
+  };
+}
+
+describe("formatSkippedSkillsForPlugin", () => {
+  it("empty list reads as 0 skill(s) failed with no body", () => {
+    expect(formatSkippedSkillsForPlugin([])).toBe("0 skill(s) failed to load — ");
+  });
+
+  it("under-cap (3 entries): all listed inline, no overflow suffix", () => {
+    const list = [frontmatterFailure("a"), frontmatterFailure("b"), frontmatterFailure("c")];
+    const out = formatSkippedSkillsForPlugin(list);
+    expect(out).toBe(
+      "3 skill(s) failed to load — " +
+        "a: malformed frontmatter: missing name field; " +
+        "b: malformed frontmatter: missing name field; " +
+        "c: malformed frontmatter: missing name field",
+    );
+  });
+
+  it("at-cap (5 entries): all listed, no overflow suffix", () => {
+    const list = ["a", "b", "c", "d", "e"].map(frontmatterFailure);
+    const out = formatSkippedSkillsForPlugin(list);
+    expect(out.startsWith("5 skill(s) failed to load — ")).toBe(true);
+    expect(out).not.toContain("more");
+  });
+
+  it("over-cap (6 entries): first 5 listed, '+1 more' suffix", () => {
+    const list = ["a", "b", "c", "d", "e", "f"].map(frontmatterFailure);
+    const out = formatSkippedSkillsForPlugin(list);
+    expect(out.endsWith("; +1 more")).toBe(true);
+    expect(out.startsWith("6 skill(s) failed to load — ")).toBe(true);
+    expect(out).toContain("e: malformed frontmatter");
+    expect(out).not.toContain("f: malformed frontmatter");
   });
 });

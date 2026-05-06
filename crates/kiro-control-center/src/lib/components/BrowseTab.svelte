@@ -4,7 +4,6 @@
   import { commands } from "$lib/bindings";
   import {
     formatInstallPluginResult,
-    formatInstallWarning,
     formatSkippedSkill,
     formatSkippedSkillsForPlugin,
     formatSteeringWarning,
@@ -74,12 +73,9 @@
     if (key === ERR_INSTALLED_PLUGINS) return "Dismiss installed-plugins error";
     if (key === ERR_UPDATE_FETCH) return "Dismiss update-check error";
     if (key.startsWith(UPDATE_CHECK_PREFIX + DELIM)) {
-      const parts = key.split(DELIM);
-      // parts: ["update-check", "<remediation>", "<marketplace>"]
-      if (parts.length === 3) {
-        return `Dismiss update-check banner for ${parts[2]}`;
-      }
-      return "Dismiss update-check banner";
+      // Type-literal guarantees ["update-check", "<remediation>", "<marketplace>"].
+      const [, , marketplace] = key.split(DELIM);
+      return `Dismiss update-check banner for ${marketplace}`;
     }
     if (key.startsWith(PLUGINS_ERR_PREFIX)) {
       return `Dismiss error for ${key.slice(PLUGINS_ERR_PREFIX.length)}`;
@@ -105,9 +101,6 @@
   let popRef: HTMLDivElement | undefined = $state();
   let browseView: BrowseView = $state("plugins");
 
-  // Per-plugin in-flight tracker keyed by pluginKey(marketplace, plugin).
-  // Narrows the shared PluginAction union to the actions BrowseTab actually
-  // performs (Install + Update — never Remove, that's InstalledTab's surface).
   let pendingPluginActions = new SvelteMap<string, Extract<PluginAction, "install" | "update">>();
 
   let installedPlugins: InstalledPluginInfo[] = $state([]);
@@ -453,20 +446,13 @@
     fetchInstalledPlugins();
   });
 
-  // Phase 2b: re-run update-scan whenever projectPath changes. The
-  // store tracks `lastProjectPath` itself so a no-op call (same path
-  // repeatedly) is harmless. Re-runs after a marketplace fetch are
-  // triggered by `+page.svelte` via `MarketplacesTab.onUpdated`, not
-  // here.
   $effect(() => {
     void projectPath;
-    pluginUpdates.refresh(projectPath);
+    pluginUpdates
+      .refresh(projectPath)
+      .catch((e) => console.error("[BrowseTab] pluginUpdates.refresh threw", e));
   });
 
-  // Project per-marketplace failure groups into the fetchErrors banner
-  // map. Re-runs whenever pluginUpdates.failureGroups changes; clears
-  // any previously-projected `update-check<...>` keys not in the
-  // new group set so a recovered marketplace's banner disappears.
   $effect(() => {
     const seen = new Set<ErrorSource>();
     for (const group of pluginUpdates.failureGroups) {
@@ -487,7 +473,6 @@
     }
   });
 
-  // Surface the toplevel pluginUpdates.fetchError as its own banner.
   $effect(() => {
     if (pluginUpdates.fetchError) {
       fetchErrors.set(
@@ -533,19 +518,11 @@
     if (priorProjectPath !== null && priorProjectPath !== projectPath) {
       skillsByPluginPair = {};
       selectedSkills.clear();
-      // Phase 2b I-1: also clear banner channels and the pending-action
-      // tracker on project transitions. The 3 banners reflect the prior
-      // project's actions; pending actions clear themselves via finally{}
-      // under normal operation but a project switch mid-flight would
-      // leave a stale entry that disables PluginCard buttons.
       installError = null;
       installMessage = null;
       installWarning = null;
       pendingPluginActions.clear();
-      // Snapshot first — deleting during `for (const key of fetchErrors.keys())`
-      // would re-trigger the effect on each delete. Per Phase 2b also
-      // sweep update-check<DELIM> + update-fetch keys (project-scoped
-      // banners that the next pluginUpdates.refresh will repopulate).
+      // Snapshot first — deleting during keys() iteration re-triggers the effect.
       const stale: ErrorSource[] = [];
       for (const key of fetchErrors.keys()) {
         if (
@@ -808,166 +785,57 @@
   // silently disappear ("1 of 2 agents installed" with no explanation); the
   // new warning banner names the agent and lists its transports so the user
   // can re-run with the opt-in if they want it.
-  async function installWholePlugin(marketplace: string, plugin: string) {
-    const key = pluginKey(marketplace, plugin);
-    if (pendingPluginActions.has(key)) return;
-    pendingPluginActions.set(key, "install");
-    installError = null;
-    installMessage = null;
-    installWarning = null;
-
+  async function refreshAfterPluginAction(verbForBanner: string, plugin: string) {
     try {
-      // 4th arg is `acceptMcp` — Phase 1 hardcodes false. Phase 2 will
-      // wire a UI toggle so a user can opt into installing agents that
-      // declare MCP servers (subprocesses / network connections).
-      const result = await commands.installPlugin(
-        marketplace,
-        plugin,
-        forceInstall,
-        false,
-        projectPath,
-      );
-      if (result.status === "ok") {
-        const r = result.data;
-        const summaryParts: string[] = [];
-        const warningParts: string[] = [];
-
-        // Skills: installed / failed / skipped (idempotent) / skipped_skills
-        // (per-file read or parse failures). `skipped_skills` is the
-        // structurally-distinct "couldn't even attempt to install" bucket.
-        {
-          const skills = r.skills;
-          if (skills.installed.length > 0) {
-            const noun = skills.installed.length === 1 ? "skill" : "skills";
-            summaryParts.push(`${skills.installed.length} ${noun}`);
-          }
-          if (skills.failed.length > 0) {
-            const noun = skills.failed.length === 1 ? "skill" : "skills";
-            summaryParts.push(`${skills.failed.length} ${noun} failed`);
-          }
-          if (skills.skipped.length > 0) {
-            const noun = skills.skipped.length === 1 ? "skill" : "skills";
-            summaryParts.push(`${skills.skipped.length} ${noun} already installed`);
-          }
-          if (skills.skipped_skills.length > 0) {
-            warningParts.push(formatSkippedSkillsForPlugin(skills.skipped_skills));
-          }
-        }
-
-        // Steering: idempotent reinstalls land in `installed` with
-        // `kind = idempotent` (not a separate `skipped` field — see
-        // `InstalledSteeringOutcome.kind`). Surfacing the breakdown is
-        // a Phase 2 follow-up; for now the count is the lump sum.
-        {
-          const steering = r.steering;
-          if (steering.installed.length > 0) {
-            const noun = steering.installed.length === 1 ? "file" : "files";
-            summaryParts.push(`${steering.installed.length} steering ${noun}`);
-          }
-          if (steering.failed.length > 0) {
-            summaryParts.push(`${steering.failed.length} steering failed`);
-          }
-          if (steering.warnings.length > 0) {
-            for (const w of steering.warnings) {
-              warningParts.push(formatSteeringWarning(w));
-            }
-          }
-        }
-
-        // Agents: includes `skipped` (idempotent native reinstalls) and
-        // `warnings` (MCP-gated, unmapped tools, parse failures on
-        // non-agent files in the scan dir). Without surfacing warnings
-        // here, `McpServersRequireOptIn` would silently drop agents.
-        {
-          const agents = r.agents;
-          if (agents.installed.length > 0) {
-            const noun = agents.installed.length === 1 ? "agent" : "agents";
-            summaryParts.push(`${agents.installed.length} ${noun}`);
-          }
-          if (agents.failed.length > 0) {
-            const noun = agents.failed.length === 1 ? "agent" : "agents";
-            summaryParts.push(`${agents.failed.length} ${noun} failed`);
-          }
-          if (agents.skipped.length > 0) {
-            const noun = agents.skipped.length === 1 ? "agent" : "agents";
-            summaryParts.push(`${agents.skipped.length} ${noun} already installed`);
-          }
-          if (agents.warnings.length > 0) {
-            for (const w of agents.warnings) {
-              warningParts.push(formatInstallWarning(w));
-            }
-          }
-        }
-
-        const anyFailed =
-          r.skills.failed.length + r.steering.failed.length + r.agents.failed.length > 0;
-        const anyInstalled =
-          r.skills.installed.length +
-            r.steering.installed.length +
-            r.agents.installed.length >
-          0;
-        const summary = summaryParts.length > 0 ? summaryParts.join(" · ") : "nothing to install";
-
-        if (anyFailed && !anyInstalled) {
-          installError = `Plugin install failed for ${plugin}: ${summary}`;
-        } else {
-          installMessage = `Plugin ${plugin}: ${summary}`;
-        }
-        if (warningParts.length > 0) {
-          installWarning = `Plugin ${plugin}: ${warningParts.join(" | ")}`;
-        }
-        await fetchInstalledPlugins();
-      } else {
-        installError = `Plugin install failed for ${plugin}: ${result.error.message}`;
-      }
+      await pluginUpdates.refresh(projectPath);
+      await fetchInstalledPlugins();
     } catch (e) {
+      console.error(`[BrowseTab] post-${verbForBanner} refresh threw`, e);
       const reason = e instanceof Error ? e.message : String(e);
-      installError = `Plugin install failed for ${plugin}: ${reason}`;
-    } finally {
-      pendingPluginActions.delete(key);
+      installError = `${plugin} ${verbForBanner} succeeded but refresh failed: ${reason}`;
     }
   }
 
-  // Update an installed plugin. Calls the same `installPlugin` command
-  // used by Install but with `force=true` hard-coded — the existing
-  // global `forceInstall` checkbox stays bound to the Install button
-  // path. `pluginUpdates.refresh` re-runs the scan after the update so
-  // the indicator clears; `fetchInstalledPlugins` refreshes the
-  // installed-set so any new content type the update added shows up.
-  async function updatePlugin(marketplace: string, plugin: string) {
+  // 4th arg of installPlugin is `acceptMcp` — Phase 1 hardcodes false. Phase 2
+  // will wire a UI toggle so a user can opt into installing agents that declare
+  // MCP servers (subprocesses / network connections).
+  async function runPluginInstall(
+    marketplace: string,
+    plugin: string,
+    mode: Extract<PluginAction, "install" | "update">,
+  ) {
     const key = pluginKey(marketplace, plugin);
     if (pendingPluginActions.has(key)) return;
-    pendingPluginActions.set(key, "update");
+    pendingPluginActions.set(key, mode);
     installError = null;
     installMessage = null;
     installWarning = null;
+
+    const force = mode === "update" ? true : forceInstall;
+    const failPrefix =
+      mode === "update" ? `Update failed for ${plugin}` : `Plugin install failed for ${plugin}`;
+    const successPrefix = mode === "update" ? `Updated ${plugin}` : `Plugin ${plugin}`;
+
     try {
-      const result = await commands.installPlugin(
-        marketplace,
-        plugin,
-        /*force=*/ true,
-        /*acceptMcp=*/ false,
-        projectPath,
-      );
+      const result = await commands.installPlugin(marketplace, plugin, force, false, projectPath);
       if (result.status === "ok") {
         const { summary, warnings, anyInstalled, anyFailed } =
-          formatInstallPluginResult(result.data, plugin);
+          formatInstallPluginResult(result.data);
         if (anyFailed && !anyInstalled) {
-          installError = `Update failed for ${plugin}: ${summary}`;
+          installError = `${failPrefix}: ${summary}`;
         } else {
-          installMessage = `Updated ${plugin}: ${summary}`;
+          installMessage = `${successPrefix}: ${summary}`;
         }
         if (warnings) {
-          installWarning = `Updated ${plugin}: ${warnings}`;
+          installWarning = `${successPrefix}: ${warnings}`;
         }
-        await pluginUpdates.refresh(projectPath);
-        await fetchInstalledPlugins();
+        await refreshAfterPluginAction(mode, plugin);
       } else {
-        installError = `Update failed for ${plugin}: ${result.error.message}`;
+        installError = `${failPrefix}: ${result.error.message}`;
       }
     } catch (e) {
       const reason = e instanceof Error ? e.message : String(e);
-      installError = `Update failed for ${plugin}: ${reason}`;
+      installError = `${failPrefix}: ${reason}`;
     } finally {
       pendingPluginActions.delete(key);
     }
@@ -1289,8 +1157,8 @@
               update={pluginUpdates.updateFor(ap.marketplace, ap.plugin.name)}
               failure={pluginUpdates.failureFor(ap.marketplace, ap.plugin.name)}
               projectPicked={!!projectPath}
-              onInstall={() => installWholePlugin(ap.marketplace, ap.plugin.name)}
-              onUpdate={() => updatePlugin(ap.marketplace, ap.plugin.name)}
+              onInstall={() => runPluginInstall(ap.marketplace, ap.plugin.name, "install")}
+              onUpdate={() => runPluginInstall(ap.marketplace, ap.plugin.name, "update")}
             />
           {/each}
         </div>

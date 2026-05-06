@@ -4,33 +4,19 @@ import type {
   PluginUpdateFailure,
   PluginUpdateInfo,
 } from "$lib/bindings";
-import { groupFailures, type FailureGroup } from "./plugin-updates";
+import { groupFailures } from "./plugin-updates";
 
-/**
- *  Module-scoped reactive store wrapping `detectPluginUpdates`.
- *  Consumed by `BrowseTab` and `InstalledTab` — both `$effect` on
- *  `projectPath` and call `pluginUpdates.refresh(projectPath)`. The
- *  parent `+page.svelte` also wires `MarketplacesTab.onUpdated` to
- *  this store's `refresh` so a successful `kiro-market update`
- *  invalidates the cached scan.
- *
- *  Per Phase 2b design decision #2, the only re-fire triggers are:
- *  (1) projectPath change (each tab's existing $effect),
- *  (2) marketplace update (MarketplacesTab callback).
- *  No background polling, no manual rescan button.
- */
 class PluginUpdatesStore {
   result = $state<DetectUpdatesResult | null>(null);
   loading = $state(false);
-  // Toplevel error from `detectPluginUpdates` Result::Err — used when
-  // the command itself failed (couldn't read tracking files at all).
-  // Per-plugin failures live on `result.failures`, not here.
   fetchError = $state<string | null>(null);
-  // Last project path the store refreshed against. Lets the consumer
-  // tabs distinguish "not yet refreshed" from "refreshed and empty".
   lastProjectPath = $state<string | null>(null);
 
-  failureGroups = $derived.by((): FailureGroup[] =>
+  // Monotonic generation. Path equality alone lets A→B→A overwrite a
+  // still-resolving newer A (same path, different generations).
+  #latestRequestId = 0;
+
+  failureGroups = $derived(
     this.result?.failures ? groupFailures(this.result.failures) : [],
   );
 
@@ -54,14 +40,15 @@ class PluginUpdatesStore {
       this.loading = false;
       return;
     }
+    const reqId = ++this.#latestRequestId;
     this.loading = true;
     this.lastProjectPath = projectPath;
     try {
       const r = await commands.detectPluginUpdates(projectPath);
-      // Race guard: a newer refresh may have been started while we awaited.
-      // Tauri commands don't support cancellation, so we compare paths and
-      // discard our result if a newer call has already taken over.
-      if (this.lastProjectPath !== projectPath) return;
+      if (this.#latestRequestId !== reqId) {
+        console.warn("[pluginUpdates] discarding stale refresh result", { projectPath });
+        return;
+      }
       if (r.status === "ok") {
         this.result = r.data;
         this.fetchError = null;
@@ -70,13 +57,14 @@ class PluginUpdatesStore {
         this.fetchError = r.error.message;
       }
     } catch (e) {
-      if (this.lastProjectPath !== projectPath) return;
+      if (this.#latestRequestId !== reqId) {
+        console.warn("[pluginUpdates] discarding stale refresh rejection", { projectPath, e });
+        return;
+      }
       this.result = null;
       this.fetchError = e instanceof Error ? e.message : String(e);
     } finally {
-      // Only clear loading if we're still the active call; a superseding
-      // call has its own `loading = true` and will manage its own clear.
-      if (this.lastProjectPath === projectPath) this.loading = false;
+      if (this.#latestRequestId === reqId) this.loading = false;
     }
   }
 }

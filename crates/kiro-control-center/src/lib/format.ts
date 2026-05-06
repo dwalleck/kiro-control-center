@@ -177,20 +177,6 @@ export function formatSkippedSkillsForPlugin(list: readonly SkippedSkill[]): str
     : `${list.length} skill(s) failed to load — ${joined}`;
 }
 
-/**
- *  Summarized view of an `InstallPluginResult_Serialize` for banner
- *  rendering. Extracted from `BrowseTab.installWholePlugin` so the new
- *  Update flow (which also calls `installPlugin`, just with `force=true`)
- *  reuses the same summarization rather than duplicating it.
- *
- *  - `summary`: human-readable mid-dot-separated count phrase
- *    (e.g. "2 skills · 1 steering · 1 agent"). Reads "nothing to install"
- *    when nothing happened.
- *  - `warnings`: pipe-separated warning lines (steering-scan warnings,
- *    MCP-gated agents, per-skill skipped_skills) or `null` when empty.
- *  - `anyInstalled` / `anyFailed`: caller uses these to decide which
- *    banner channel (success vs. error vs. warning) to route to.
- */
 export type FormattedInstallPluginResult = {
   summary: string;
   warnings: string | null;
@@ -200,12 +186,10 @@ export type FormattedInstallPluginResult = {
 
 export function formatInstallPluginResult(
   r: InstallPluginResult_Serialize,
-  _plugin: string,
 ): FormattedInstallPluginResult {
   const summaryParts: string[] = [];
   const warningParts: string[] = [];
 
-  // Skills sub-result.
   {
     const skills = r.skills;
     if (skills.installed.length > 0) {
@@ -225,9 +209,6 @@ export function formatInstallPluginResult(
     }
   }
 
-  // Steering sub-result. Idempotent reinstalls land in `installed` with
-  // `kind: idempotent` (not a separate field) — the current banner shape
-  // counts them as installed; per-content breakdown is future scope.
   {
     const steering = r.steering;
     if (steering.installed.length > 0) {
@@ -242,7 +223,6 @@ export function formatInstallPluginResult(
     }
   }
 
-  // Agents sub-result.
   {
     const agents = r.agents;
     if (agents.installed.length > 0) {
@@ -275,20 +255,6 @@ export function formatInstallPluginResult(
   return { summary, warnings, anyInstalled, anyFailed };
 }
 
-/**
- *  Summarized view of a `RemovePluginResult` for banner + `<details>`
- *  rendering on the InstalledTab.
- *
- *  - `summary`: human-readable mid-dot-separated count phrase
- *    (mirrors `formatInstallPluginResult`'s shape — "3 skills · 1
- *    steering · 2 agents" for happy path; appends "N <type> failed"
- *    for partial failure). Reads "nothing to remove" on empty.
- *  - `hasItems`: at least one removed-list is non-empty. Drives the
- *    decision whether to render the `<details>` block at all.
- *  - `hasFailures`: at least one failures-list is non-empty. Drives
- *    the choice of banner channel (amber vs. green) and the `<details
- *    open>` auto-expand.
- */
 export type FormattedRemovePluginResult = {
   summary: string;
   hasItems: boolean;
@@ -297,11 +263,7 @@ export type FormattedRemovePluginResult = {
 
 export function formatRemovePluginResult(
   r: RemovePluginResult,
-  _plugin: string,
 ): FormattedRemovePluginResult {
-  // Sub-result fields are optional per the wire format
-  // (RemoveSkillsResult.removed?: string[], etc.). Default to empty
-  // arrays so the rest of this function can do plain `.length` reads.
   const skillsRemoved = r.skills.removed ?? [];
   const skillsFailures = r.skills.failures ?? [];
   const steeringRemoved = r.steering.removed ?? [];

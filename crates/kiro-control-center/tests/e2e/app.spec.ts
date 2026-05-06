@@ -196,4 +196,46 @@ test.describe("Phase 2b — update detection UI", () => {
     await expect(page.getByRole("columnheader", { name: "Status" })).toBeVisible();
     await expect(page.getByRole("columnheader", { name: "Installed at" })).toBeVisible();
   });
+
+  test("freshly-installed plugin shows 'Up to date' status after scan", async ({ page }) => {
+    const fixturePath = process.env.FIXTURE_MARKETPLACE_PATH;
+    test.skip(!fixturePath, "FIXTURE_MARKETPLACE_PATH not set");
+
+    await page.goto("/");
+    await page.getByRole("button", { name: "Installed", exact: true }).click();
+
+    // The earlier "install plugin from browse tab" test seeds an installed
+    // plugin. If a plugin row is present, its update-scan should resolve to
+    // "Up to date" because the manifest version matches what was just
+    // installed. The 10s timeout covers detectPluginUpdates' eager scan.
+    const pluginRow = page.locator("tbody tr").first();
+    if (!(await pluginRow.isVisible({ timeout: 5_000 }).catch(() => false))) {
+      test.skip(true, "No installed plugin available — install test must run first");
+    }
+    await expect(page.getByText("Up to date").first()).toBeVisible({ timeout: 10_000 });
+  });
+
+  test("Remove plugin shows inline <details> summary with removed items", async ({ page }) => {
+    const fixturePath = process.env.FIXTURE_MARKETPLACE_PATH;
+    test.skip(!fixturePath, "FIXTURE_MARKETPLACE_PATH not set");
+
+    await page.goto("/");
+    await page.getByRole("button", { name: "Installed", exact: true }).click();
+
+    const removeButton = page.getByRole("button", { name: /^Remove$/ }).first();
+    if (!(await removeButton.isVisible({ timeout: 5_000 }).catch(() => false))) {
+      test.skip(true, "No installed plugin available to remove");
+    }
+
+    // The Remove button in InstalledTab has plain text "Remove" (no aria-label
+    // discriminator across multiple rows yet), so first-row Remove is the
+    // target. Confirm-dialog is suppressed because Remove on InstalledTab
+    // doesn't use confirm() — that's MarketplacesTab's flow.
+    await removeButton.click();
+
+    // The success/warning banner reads "Removed plugin <name>: <summary>".
+    // The inline <details> block lives in InstalledTab and contains a
+    // <summary> with "Show items" or "Show items + failures" copy.
+    await expect(page.getByText(/^Show items/)).toBeVisible({ timeout: 15_000 });
+  });
 });

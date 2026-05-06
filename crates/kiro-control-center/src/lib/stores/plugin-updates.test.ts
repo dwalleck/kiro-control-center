@@ -4,8 +4,15 @@ import type {
   PluginName,
   PluginUpdateFailure,
   PluginUpdateFailureKind,
+  PluginUpdateInfo,
 } from "$lib/bindings";
-import { remediationClass, kindLabel, groupFailures } from "./plugin-updates";
+import {
+  actionUpdateLabel,
+  groupFailures,
+  kindLabel,
+  remediationClass,
+  statusUpdateLabel,
+} from "./plugin-updates";
 import type { FailureGroup } from "./plugin-updates";
 
 describe("remediationClass", () => {
@@ -59,6 +66,118 @@ describe("kindLabel", () => {
       kindLabel({ kind: "other" }),
     ]);
     expect(labels.size).toBe(5);
+  });
+
+  it("manifest_unreadable label covers read failure modes beyond 'missing'", () => {
+    expect(kindLabel({ kind: "manifest_unreadable" })).toBe(
+      "plugin.json couldn't be read from marketplace cache",
+    );
+  });
+});
+
+function update(
+  partial: Partial<PluginUpdateInfo> & { change_signal: PluginUpdateInfo["change_signal"] },
+): PluginUpdateInfo {
+  return {
+    marketplace: "acme" as MarketplaceName,
+    plugin: "p" as PluginName,
+    installed_version: null,
+    available_version: null,
+    ...partial,
+  };
+}
+
+describe("statusUpdateLabel", () => {
+  it("content_changed renders as a status sentence", () => {
+    expect(
+      statusUpdateLabel(update({ change_signal: { kind: "content_changed" } })),
+    ).toBe("Content changed since install");
+  });
+
+  it("version_bumped with both versions known renders as 'vX → vY'", () => {
+    expect(
+      statusUpdateLabel(
+        update({
+          change_signal: { kind: "version_bumped" },
+          installed_version: "1.0",
+          available_version: "1.1",
+        }),
+      ),
+    ).toBe("v1.0 → v1.1");
+  });
+
+  it("version_bumped with legacy install (installed_version null) renders as 'vN available'", () => {
+    expect(
+      statusUpdateLabel(
+        update({
+          change_signal: { kind: "version_bumped" },
+          available_version: "1.1",
+        }),
+      ),
+    ).toBe("v1.1 available");
+  });
+
+  it("version_bumped with neither version declared falls back to 'Update available'", () => {
+    expect(
+      statusUpdateLabel(update({ change_signal: { kind: "version_bumped" } })),
+    ).toBe("Update available");
+  });
+});
+
+describe("actionUpdateLabel", () => {
+  it("content_changed renders as 'Update (content changed)'", () => {
+    expect(
+      actionUpdateLabel(update({ change_signal: { kind: "content_changed" } })),
+    ).toBe("Update (content changed)");
+  });
+
+  it("version_bumped with available_version renders as 'Update → vN'", () => {
+    expect(
+      actionUpdateLabel(
+        update({
+          change_signal: { kind: "version_bumped" },
+          installed_version: "1.0",
+          available_version: "1.1",
+        }),
+      ),
+    ).toBe("Update → v1.1");
+  });
+
+  it("version_bumped legacy install (installed_version null) still renders as 'Update → vN'", () => {
+    expect(
+      actionUpdateLabel(
+        update({
+          change_signal: { kind: "version_bumped" },
+          available_version: "1.1",
+        }),
+      ),
+    ).toBe("Update → v1.1");
+  });
+
+  it("version_bumped with no available_version falls back to 'Update'", () => {
+    expect(
+      actionUpdateLabel(update({ change_signal: { kind: "version_bumped" } })),
+    ).toBe("Update");
+  });
+});
+
+describe("status vs action label contract", () => {
+  it("the column phrases state, the button phrases an action — they must differ", () => {
+    const u = update({
+      change_signal: { kind: "version_bumped" },
+      installed_version: "1.0",
+      available_version: "1.1",
+    });
+    expect(statusUpdateLabel(u)).toBe("v1.0 → v1.1");
+    expect(actionUpdateLabel(u)).toBe("Update → v1.1");
+    expect(statusUpdateLabel(u)).not.toBe(actionUpdateLabel(u));
+  });
+
+  it("content_changed: column reads as full sentence, button reads as parenthetical action", () => {
+    const u = update({ change_signal: { kind: "content_changed" } });
+    expect(statusUpdateLabel(u)).toBe("Content changed since install");
+    expect(actionUpdateLabel(u)).toBe("Update (content changed)");
+    expect(statusUpdateLabel(u)).not.toBe(actionUpdateLabel(u));
   });
 });
 
