@@ -10,9 +10,11 @@ import {
   actionUpdateLabel,
   groupFailures,
   kindLabel,
+  projectUpdateCheckBanners,
   remediationClass,
   statusUpdateLabel,
 } from "./plugin-updates";
+import { updateCheckErrKey } from "../error-source";
 import type { FailureGroup } from "./plugin-updates";
 
 describe("remediationClass", () => {
@@ -270,5 +272,80 @@ describe("groupFailures", () => {
     for (const g of groups) {
       expect(g.remediationHint.length).toBeGreaterThan(0);
     }
+  });
+});
+
+describe("projectUpdateCheckBanners", () => {
+  it("returns empty upserts and no staleKeys for empty groups", () => {
+    const { upserts, staleKeys } = projectUpdateCheckBanners([], []);
+    expect(upserts.size).toBe(0);
+    expect(staleKeys).toEqual([]);
+  });
+
+  it("produces one upsert per failure group", () => {
+    const { upserts, staleKeys } = projectUpdateCheckBanners(
+      groupFailures([
+        failure("acme", "p1", { kind: "marketplace_unavailable" }),
+        failure("acme", "p2", { kind: "manifest_unreadable" }),
+      ]),
+      [],
+    );
+    expect(upserts.size).toBe(1);
+    expect(staleKeys).toEqual([]);
+    expect([...upserts.keys()][0]).toBe(updateCheckErrKey("stale_cache", "acme"));
+  });
+
+  it("returns staleKeys for existing update-check keys not in the groups", () => {
+    const { staleKeys } = projectUpdateCheckBanners(
+      [],
+      [updateCheckErrKey("stale_cache", "acme"), updateCheckErrKey("manifest_invalid", "beta")],
+    );
+    expect(staleKeys).toEqual([
+      updateCheckErrKey("stale_cache", "acme"),
+      updateCheckErrKey("manifest_invalid", "beta"),
+    ]);
+  });
+
+  it("does NOT flag non-update-check keys as stale", () => {
+    const { staleKeys } = projectUpdateCheckBanners([], ["some-other-key", "installed-plugins"]);
+    expect(staleKeys).toEqual([]);
+  });
+
+  it("excludes keys that match a live group", () => {
+    const existing = [
+      updateCheckErrKey("stale_cache", "acme"),
+      updateCheckErrKey("stale_cache", "beta"),
+    ];
+    const { staleKeys } = projectUpdateCheckBanners(
+      groupFailures([failure("acme", "p1", { kind: "marketplace_unavailable" })]),
+      existing,
+    );
+    expect(staleKeys).toEqual([updateCheckErrKey("stale_cache", "beta")]);
+  });
+
+  it("upsert messages include plugin count and list", () => {
+    const { upserts } = projectUpdateCheckBanners(
+      groupFailures([
+        failure("acme", "p1", { kind: "marketplace_unavailable" }),
+        failure("acme", "p2", { kind: "marketplace_unavailable" }),
+      ]),
+      [],
+    );
+    const msg = [...upserts.values()][0];
+    expect(msg).toContain("2 plugins");
+    expect(msg).toContain("(p1, p2)");
+  });
+
+  it("singular noun: 1 plugin reads '1 plugin' not '1 plugins'", () => {
+    const { upserts } = projectUpdateCheckBanners(
+      groupFailures([
+        failure("acme", "p1", { kind: "marketplace_unavailable" }),
+      ]),
+      [],
+    );
+    const msg = [...upserts.values()][0];
+    expect(msg).toContain("1 plugin");
+    expect(msg).not.toContain("1 plugins");
+    expect(msg).toContain("(p1)");
   });
 });

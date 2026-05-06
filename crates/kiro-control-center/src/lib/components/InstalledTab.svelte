@@ -11,7 +11,15 @@
   import { pluginUpdates } from "$lib/stores/plugin-updates.svelte";
   import { kindLabel, statusUpdateLabel } from "$lib/stores/plugin-updates";
   import type { PluginAction } from "$lib/stores/plugin-updates";
-  import { formatInstallPluginResult, formatRemovePluginResult } from "$lib/format";
+  import {
+    ERR_INSTALLED_PLUGINS,
+    ERR_UPDATE_FETCH,
+    UPDATE_CHECK_PREFIX,
+    parseUpdateCheckKey,
+  } from "$lib/error-source";
+  import type { UpdateCheckKey } from "$lib/error-source";
+  import { runPluginInstall, runPluginRemove } from "$lib/plugin-actions";
+  import { usePluginUpdateBanners } from "$lib/stores/plugin-update-banners.svelte";
   import BannerStack from "./BannerStack.svelte";
 
   let { projectPath }: { projectPath: string } = $props();
@@ -24,27 +32,35 @@
   let installError: string | null = $state(null);
   let installMessage: string | null = $state(null);
   let installWarning: string | null = $state(null);
+  let installStaleRefresh: string | null = $state(null);
 
   let pendingPluginActions = new SvelteMap<string, Extract<PluginAction, "remove" | "update">>();
 
   let removeResult: RemovePluginResult | null = $state(null);
   let removeResultPlugin: string | null = $state(null);
-  let removeResultHasFailures: boolean = $state(false);
+  let removeResultHasFailures = $derived.by(() => {
+    if (removeResult === null) return false;
+    return (
+      (removeResult.skills.failures ?? []).length +
+        (removeResult.steering.failures ?? []).length +
+        (removeResult.agents.failures ?? []).length >
+      0
+    );
+  });
 
-  const ERR_INSTALLED_PLUGINS = "installed-plugins" as const;
-  const ERR_UPDATE_FETCH = "update-fetch" as const;
-  const UPDATE_CHECK_PREFIX = "update-check" as const;
   type ErrorSource =
     | typeof ERR_INSTALLED_PLUGINS
     | typeof ERR_UPDATE_FETCH
-    | `${typeof UPDATE_CHECK_PREFIX}${typeof DELIM}${string}${typeof DELIM}${string}`;
+    | UpdateCheckKey;
+  const _ = null as unknown as (string extends ErrorSource ? never : 0);
+  void _;
   let fetchErrors = new SvelteMap<ErrorSource, string>();
 
   function errLabel(key: ErrorSource): string {
     if (key === ERR_INSTALLED_PLUGINS) return "Dismiss installed-plugins warning";
     if (key === ERR_UPDATE_FETCH) return "Dismiss update-check error";
     if (key.startsWith(UPDATE_CHECK_PREFIX + DELIM)) {
-      const [, , marketplace] = key.split(DELIM);
+      const { marketplace } = parseUpdateCheckKey(key);
       return `Dismiss update-check banner for ${marketplace}`;
     }
     return "Dismiss banner";
@@ -90,17 +106,6 @@
     }
   }
 
-  async function refreshAfterPluginAction(verbForBanner: string, plugin: string) {
-    try {
-      await pluginUpdates.refresh(projectPath);
-      await refresh();
-    } catch (e) {
-      console.error(`[InstalledTab] post-${verbForBanner} refresh threw`, e);
-      const reason = e instanceof Error ? e.message : String(e);
-      installError = `${plugin} ${verbForBanner} succeeded but refresh failed: ${reason}`;
-    }
-  }
-
   async function removePlugin(marketplace: string, plugin: string) {
     const key = pluginKey(marketplace, plugin);
     if (pendingPluginActions.has(key)) return;
@@ -108,31 +113,31 @@
     installError = null;
     installMessage = null;
     installWarning = null;
+    installStaleRefresh = null;
     removeResult = null;
     removeResultPlugin = null;
-    removeResultHasFailures = false;
+
     try {
-      const result = await commands.removePlugin(marketplace, plugin, projectPath);
-      if (result.status === "ok") {
-        const { summary, hasItems, hasFailures } =
-          formatRemovePluginResult(result.data);
-        if (hasItems || hasFailures) {
-          removeResult = result.data;
+      const outcome = await runPluginRemove({
+        marketplace,
+        plugin,
+        projectPath,
+        refresh: () => refresh(),
+      });
+
+      if (outcome.kind === "ok-removed" || outcome.kind === "ok-noop") {
+        const p = outcome.banner.primary;
+        installError = p?.kind === "error" ? p.text : null;
+        installMessage = p?.kind === "message" ? p.text : null;
+        installWarning = outcome.banner.warning;
+        installStaleRefresh = outcome.banner.staleRefresh;
+        if (outcome.kind === "ok-removed") {
+          removeResult = outcome.removeResult;
           removeResultPlugin = plugin;
-          removeResultHasFailures = hasFailures;
         }
-        if (hasFailures) {
-          installWarning = `Removed plugin ${plugin}: ${summary}`;
-        } else {
-          installMessage = `Removed plugin ${plugin}: ${summary}`;
-        }
-        await refreshAfterPluginAction("remove", plugin);
       } else {
-        installError = `Remove failed for ${plugin}: ${result.error.message}`;
+        installError = outcome.error;
       }
-    } catch (e) {
-      const reason = e instanceof Error ? e.message : String(e);
-      installError = `Remove failed for ${plugin}: ${reason}`;
     } finally {
       pendingPluginActions.delete(key);
     }
@@ -145,34 +150,32 @@
     installError = null;
     installMessage = null;
     installWarning = null;
+    installStaleRefresh = null;
     removeResult = null;
     removeResultPlugin = null;
+
     try {
-      const result = await commands.installPlugin(
-        marketplace,
-        plugin,
-        /*force=*/ true,
-        /*acceptMcp=*/ false,
-        projectPath,
+      const outcome = await runPluginInstall(
+        {
+          marketplace,
+          plugin,
+          projectPath,
+          forceInstall: false,
+          acceptMcp: false,
+          refresh: () => refresh(),
+        },
+        "update",
       );
-      if (result.status === "ok") {
-        const { summary, warnings, anyInstalled, anyFailed } =
-          formatInstallPluginResult(result.data);
-        if (anyFailed && !anyInstalled) {
-          installError = `Update failed for ${plugin}: ${summary}`;
-        } else {
-          installMessage = `Updated ${plugin}: ${summary}`;
-        }
-        if (warnings) {
-          installWarning = `Updated ${plugin}: ${warnings}`;
-        }
-        await refreshAfterPluginAction("update", plugin);
+
+      if (outcome.kind === "ok") {
+        const p = outcome.banner.primary;
+        installError = p?.kind === "error" ? p.text : null;
+        installMessage = p?.kind === "message" ? p.text : null;
+        installWarning = outcome.banner.warning;
+        installStaleRefresh = outcome.banner.staleRefresh;
       } else {
-        installError = `Update failed for ${plugin}: ${result.error.message}`;
+        installError = outcome.error;
       }
-    } catch (e) {
-      const reason = e instanceof Error ? e.message : String(e);
-      installError = `Update failed for ${plugin}: ${reason}`;
     } finally {
       pendingPluginActions.delete(key);
     }
@@ -200,42 +203,10 @@
     refresh();
   });
 
-  $effect(() => {
-    void projectPath;
-    pluginUpdates
-      .refresh(projectPath)
-      .catch((e) => console.error("[InstalledTab] pluginUpdates.refresh threw", e));
-  });
-
-  $effect(() => {
-    const seen = new Set<ErrorSource>();
-    for (const group of pluginUpdates.failureGroups) {
-      const key: ErrorSource =
-        `${UPDATE_CHECK_PREFIX}${DELIM}${group.remediation}${DELIM}${group.marketplace}` as ErrorSource;
-      seen.add(key);
-      const noun = group.plugins.length === 1 ? "plugin" : "plugins";
-      const list = group.plugins.join(", ");
-      fetchErrors.set(
-        key,
-        `${group.plugins.length} ${noun} from ${group.marketplace}: ${group.remediationHint} (${list})`,
-      );
-    }
-    for (const k of fetchErrors.keys()) {
-      if (k.startsWith(UPDATE_CHECK_PREFIX + DELIM) && !seen.has(k)) {
-        fetchErrors.delete(k);
-      }
-    }
-  });
-
-  $effect(() => {
-    if (pluginUpdates.fetchError) {
-      fetchErrors.set(
-        ERR_UPDATE_FETCH,
-        `Couldn't check for updates: ${pluginUpdates.fetchError}`,
-      );
-    } else {
-      fetchErrors.delete(ERR_UPDATE_FETCH);
-    }
+  usePluginUpdateBanners({
+    projectPath: () => projectPath,
+    fetchErrors,
+    logPrefix: "InstalledTab",
   });
 
   let priorProjectPath: string | null = null;
@@ -243,10 +214,10 @@
     if (priorProjectPath !== null && priorProjectPath !== projectPath) {
       removeResult = null;
       removeResultPlugin = null;
-      removeResultHasFailures = false;
       installError = null;
       installMessage = null;
       installWarning = null;
+      installStaleRefresh = null;
       pendingPluginActions.clear();
       fetchErrors.clear();
     }
@@ -260,11 +231,13 @@
     errors={fetchErrors}
     message={installMessage}
     warning={installWarning}
+    staleRefresh={installStaleRefresh}
     fatalError={installError}
     errLabel={errLabel}
     ondismiss={(key) => fetchErrors.delete(key)}
     onmessageDismiss={() => (installMessage = null)}
     onwarningDismiss={() => (installWarning = null)}
+    onstaleRefreshDismiss={() => (installStaleRefresh = null)}
     onfatalErrorDismiss={() => (installError = null)}
   />
 

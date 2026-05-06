@@ -6,8 +6,14 @@ import type {
   PluginUpdateInfo,
 } from "$lib/bindings";
 import { DELIM } from "$lib/keys";
-
-export type RemediationClass = "stale_cache" | "manifest_invalid" | "unknown";
+import {
+  isUpdateCheckKey,
+  updateCheckErrKey,
+} from "$lib/error-source";
+import type {
+  RemediationClass,
+  UpdateCheckKey,
+} from "$lib/error-source";
 
 export function remediationClass(kind: PluginUpdateFailureKind): RemediationClass {
   switch (kind.kind) {
@@ -94,4 +100,34 @@ export function actionUpdateLabel(u: PluginUpdateInfo): string {
   if (u.change_signal.kind === "content_changed") return "Update (content changed)";
   if (u.available_version) return `Update → v${u.available_version}`;
   return "Update";
+}
+
+/**
+ * Pure projection of failureGroups into an upsert+stale-delete pair.
+ * Keys are branded as UpdateCheckKey so consumers know the namespace
+ * they operate in.
+ */
+export function projectUpdateCheckBanners(
+  groups: FailureGroup[],
+  existingKeys: Iterable<string>,
+): { upserts: Map<UpdateCheckKey, string>; staleKeys: UpdateCheckKey[] } {
+  const upserts = new Map<UpdateCheckKey, string>();
+  const seen = new Set<UpdateCheckKey>();
+  for (const group of groups) {
+    const key = updateCheckErrKey(group.remediation, group.marketplace);
+    seen.add(key);
+    const noun = group.plugins.length === 1 ? "plugin" : "plugins";
+    const list = group.plugins.join(", ");
+    upserts.set(
+      key,
+      `${group.plugins.length} ${noun} from ${group.marketplace}: ${group.remediationHint} (${list})`,
+    );
+  }
+  const staleKeys: UpdateCheckKey[] = [];
+  for (const k of existingKeys) {
+    if (isUpdateCheckKey(k) && !seen.has(k)) {
+      staleKeys.push(k);
+    }
+  }
+  return { upserts, staleKeys };
 }

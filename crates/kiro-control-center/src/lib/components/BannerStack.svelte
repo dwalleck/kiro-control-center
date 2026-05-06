@@ -5,11 +5,13 @@
     errors: SvelteMap<K, string>;
     message: string | null;
     warning: string | null;
+    staleRefresh: string | null;
     fatalError: string | null;
     errLabel: (key: K) => string;
     ondismiss: (key: K) => void;
     onmessageDismiss?: () => void;
     onwarningDismiss?: () => void;
+    onstaleRefreshDismiss?: () => void;
     onfatalErrorDismiss?: () => void;
   };
 
@@ -17,11 +19,13 @@
     errors,
     message,
     warning,
+    staleRefresh,
     fatalError,
     errLabel,
     ondismiss,
     onmessageDismiss,
     onwarningDismiss,
+    onstaleRefreshDismiss,
     onfatalErrorDismiss,
   }: Props = $props();
 </script>
@@ -95,6 +99,26 @@
       type="button"
       onclick={() => onwarningDismiss?.()}
       aria-label="Dismiss install warning"
+      class="text-kiro-warning/70 hover:text-kiro-warning text-lg leading-none flex-shrink-0 focus:outline-none focus:ring-2 focus:ring-kiro-accent-500 rounded"
+    >
+      ×
+    </button>
+  </div>
+{/if}
+
+<!-- Distinct from `warning`: post-action refresh failures are infrastructure
+     state, not domain warnings — separate slot so dismissing one doesn't
+     dismiss the other. -->
+{#if staleRefresh}
+  <div
+    data-testid="stale-refresh"
+    class="mx-4 mt-3 px-4 py-3 rounded-md bg-kiro-warning/10 border border-kiro-warning/30 flex items-start gap-3"
+  >
+    <p class="text-sm text-kiro-warning flex-1">{staleRefresh}</p>
+    <button
+      type="button"
+      onclick={() => onstaleRefreshDismiss?.()}
+      aria-label="Dismiss stale-refresh notice"
       class="text-kiro-warning/70 hover:text-kiro-warning text-lg leading-none flex-shrink-0 focus:outline-none focus:ring-2 focus:ring-kiro-accent-500 rounded"
     >
       ×

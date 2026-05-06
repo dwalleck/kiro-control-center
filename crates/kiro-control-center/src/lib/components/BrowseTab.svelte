@@ -3,7 +3,6 @@
   import { SvelteMap, SvelteSet } from "svelte/reactivity";
   import { commands } from "$lib/bindings";
   import {
-    formatInstallPluginResult,
     formatSkippedSkill,
     formatSkippedSkillsForPlugin,
     formatSteeringWarning,
@@ -19,6 +18,15 @@
   } from "$lib/keys";
   import { pluginUpdates } from "$lib/stores/plugin-updates.svelte";
   import type { PluginAction } from "$lib/stores/plugin-updates";
+  import {
+    ERR_INSTALLED_PLUGINS,
+    ERR_UPDATE_FETCH,
+    UPDATE_CHECK_PREFIX,
+    parseUpdateCheckKey,
+  } from "$lib/error-source";
+  import type { UpdateCheckKey } from "$lib/error-source";
+  import { runPluginInstall as doPluginInstall } from "$lib/plugin-actions";
+  import { usePluginUpdateBanners } from "$lib/stores/plugin-update-banners.svelte";
   import type {
     InstalledPluginInfo,
     MarketplaceInfo,
@@ -42,24 +50,19 @@
   const SKILLS_ERR_PREFIX = `skills${DELIM}` as const;
   const BULK_SKILLS_ERR_PREFIX = `bulk-skills${DELIM}` as const;
   const ERR_MARKETPLACES = "marketplaces" as const;
-  // Standalone (non-prefixed) keys for top-level fetches that have no
-  // (marketplace, plugin) tuple. Adding more standalone keys later means
-  // extending the union in `ErrorSource` and the dispatch in `errLabel`.
-  const ERR_INSTALLED_PLUGINS = "installed-plugins" as const;
-  const ERR_UPDATE_FETCH = "update-fetch" as const;
-  const UPDATE_CHECK_PREFIX = "update-check" as const;
   type ErrorSource =
     | typeof ERR_MARKETPLACES
     | typeof ERR_INSTALLED_PLUGINS
     | typeof ERR_UPDATE_FETCH
-    | `${typeof UPDATE_CHECK_PREFIX}${typeof DELIM}${string}${typeof DELIM}${string}`
+    | UpdateCheckKey
     | `${typeof PLUGINS_ERR_PREFIX}${string}`
     | `${typeof SKILLS_ERR_PREFIX}${string}${typeof DELIM}${string}`
     | `${typeof BULK_SKILLS_ERR_PREFIX}${string}`;
   // Compile-time guard: fails if any `as const` above is removed and the
   // union silently widens back to `string` (which would defeat typo
   // protection on `fetchErrors.get/set/delete` with zero compile errors).
-  type _AssertNarrow = string extends ErrorSource ? never : ErrorSource;
+  const _ = null as unknown as (string extends ErrorSource ? never : 0);
+  void _;
   const pluginsErrKey = (mp: string): ErrorSource => `${PLUGINS_ERR_PREFIX}${mp}`;
   const skillsErrKey = (mp: string, plugin: string): ErrorSource =>
     `${SKILLS_ERR_PREFIX}${mp}${DELIM}${plugin}`;
@@ -73,8 +76,7 @@
     if (key === ERR_INSTALLED_PLUGINS) return "Dismiss installed-plugins error";
     if (key === ERR_UPDATE_FETCH) return "Dismiss update-check error";
     if (key.startsWith(UPDATE_CHECK_PREFIX + DELIM)) {
-      // Type-literal guarantees ["update-check", "<remediation>", "<marketplace>"].
-      const [, , marketplace] = key.split(DELIM);
+      const { marketplace } = parseUpdateCheckKey(key);
       return `Dismiss update-check banner for ${marketplace}`;
     }
     if (key.startsWith(PLUGINS_ERR_PREFIX)) {
@@ -122,12 +124,8 @@
   let fetchErrors = new SvelteMap<ErrorSource, string>();
   let installError: string | null = $state(null);
   let installMessage: string | null = $state(null);
-  // Non-fatal install detail (skipped idempotent items, MCP-gated agents,
-  // unmapped tools, per-skill read failures, steering scan-path warnings).
-  // Distinct from `installError` (red, fatal) and `installMessage` (green,
-  // success summary) so the user sees BOTH "installed N items" AND "agent
-  // X requires --accept-mcp" simultaneously.
   let installWarning: string | null = $state(null);
+  let installStaleRefresh: string | null = $state(null);
 
   let availablePlugins = $derived.by(() => {
     const out: { marketplace: string; plugin: PluginInfo }[] = [];
@@ -446,42 +444,10 @@
     fetchInstalledPlugins();
   });
 
-  $effect(() => {
-    void projectPath;
-    pluginUpdates
-      .refresh(projectPath)
-      .catch((e) => console.error("[BrowseTab] pluginUpdates.refresh threw", e));
-  });
-
-  $effect(() => {
-    const seen = new Set<ErrorSource>();
-    for (const group of pluginUpdates.failureGroups) {
-      const key: ErrorSource =
-        `${UPDATE_CHECK_PREFIX}${DELIM}${group.remediation}${DELIM}${group.marketplace}` as ErrorSource;
-      seen.add(key);
-      const noun = group.plugins.length === 1 ? "plugin" : "plugins";
-      const list = group.plugins.join(", ");
-      fetchErrors.set(
-        key,
-        `${group.plugins.length} ${noun} from ${group.marketplace}: ${group.remediationHint} (${list})`,
-      );
-    }
-    for (const k of fetchErrors.keys()) {
-      if (k.startsWith(UPDATE_CHECK_PREFIX + DELIM) && !seen.has(k)) {
-        fetchErrors.delete(k);
-      }
-    }
-  });
-
-  $effect(() => {
-    if (pluginUpdates.fetchError) {
-      fetchErrors.set(
-        ERR_UPDATE_FETCH,
-        `Couldn't check for updates: ${pluginUpdates.fetchError}`,
-      );
-    } else {
-      fetchErrors.delete(ERR_UPDATE_FETCH);
-    }
+  usePluginUpdateBanners({
+    projectPath: () => projectPath,
+    fetchErrors,
+    logPrefix: "BrowseTab",
   });
 
   $effect(() => {
@@ -521,6 +487,7 @@
       installError = null;
       installMessage = null;
       installWarning = null;
+      installStaleRefresh = null;
       pendingPluginActions.clear();
       // Snapshot first — deleting during keys() iteration re-triggers the effect.
       const stale: ErrorSource[] = [];
@@ -599,6 +566,7 @@
     installError = null;
     installMessage = null;
     installWarning = null;
+    installStaleRefresh = null;
 
     type Group = { marketplace: string; plugin: string; names: string[] };
     const groups = new Map<string, Group>();
@@ -714,6 +682,7 @@
     installError = null;
     installMessage = null;
     installWarning = null;
+    installStaleRefresh = null;
 
     try {
       const result = await commands.installPluginSteering(
@@ -769,36 +738,8 @@
     }
   }
 
-  // Whole-plugin install — runs every install path the plugin declares
-  // (skills + steering + agents) in one coordinated call. Surfaces the
-  // aggregated outcome across THREE banner states:
-  //   - `installMessage` (green): success summary including idempotent skips
-  //   - `installError`   (red):   fatal — at least one failure and zero installs
-  //   - `installWarning` (amber): non-fatal detail (skipped_skills, steering
-  //                               scan warnings, MCP-gated agents, unmapped
-  //                               tools). Mirrors `installSelected`'s
-  //                               accumulation pattern.
-  //
-  // The MCP-gated path is the security-critical one: with `accept_mcp = false`
-  // an agent declaring `mcp_servers` produces `InstallWarning::McpServersRequireOptIn`
-  // and never lands in `installed` or `failed`. Previously the count would
-  // silently disappear ("1 of 2 agents installed" with no explanation); the
-  // new warning banner names the agent and lists its transports so the user
-  // can re-run with the opt-in if they want it.
-  async function refreshAfterPluginAction(verbForBanner: string, plugin: string) {
-    try {
-      await pluginUpdates.refresh(projectPath);
-      await fetchInstalledPlugins();
-    } catch (e) {
-      console.error(`[BrowseTab] post-${verbForBanner} refresh threw`, e);
-      const reason = e instanceof Error ? e.message : String(e);
-      installError = `${plugin} ${verbForBanner} succeeded but refresh failed: ${reason}`;
-    }
-  }
-
-  // 4th arg of installPlugin is `acceptMcp` — Phase 1 hardcodes false. Phase 2
-  // will wire a UI toggle so a user can opt into installing agents that declare
-  // MCP servers (subprocesses / network connections).
+  // Plugin install/update delegated to lib/plugin-actions.ts — see PluginActionContext
+  // doc-comment for the banner contract and MCP-gating rationale.
   async function runPluginInstall(
     marketplace: string,
     plugin: string,
@@ -810,32 +751,30 @@
     installError = null;
     installMessage = null;
     installWarning = null;
-
-    const force = mode === "update" ? true : forceInstall;
-    const failPrefix =
-      mode === "update" ? `Update failed for ${plugin}` : `Plugin install failed for ${plugin}`;
-    const successPrefix = mode === "update" ? `Updated ${plugin}` : `Plugin ${plugin}`;
+    installStaleRefresh = null;
 
     try {
-      const result = await commands.installPlugin(marketplace, plugin, force, false, projectPath);
-      if (result.status === "ok") {
-        const { summary, warnings, anyInstalled, anyFailed } =
-          formatInstallPluginResult(result.data);
-        if (anyFailed && !anyInstalled) {
-          installError = `${failPrefix}: ${summary}`;
-        } else {
-          installMessage = `${successPrefix}: ${summary}`;
-        }
-        if (warnings) {
-          installWarning = `${successPrefix}: ${warnings}`;
-        }
-        await refreshAfterPluginAction(mode, plugin);
+      const outcome = await doPluginInstall(
+        {
+          marketplace,
+          plugin,
+          projectPath,
+          forceInstall,
+          acceptMcp: false,
+          refresh: () => fetchInstalledPlugins(),
+        },
+        mode,
+      );
+
+      if (outcome.kind === "ok") {
+        const p = outcome.banner.primary;
+        installError = p?.kind === "error" ? p.text : null;
+        installMessage = p?.kind === "message" ? p.text : null;
+        installWarning = outcome.banner.warning;
+        installStaleRefresh = outcome.banner.staleRefresh;
       } else {
-        installError = `${failPrefix}: ${result.error.message}`;
+        installError = outcome.error;
       }
-    } catch (e) {
-      const reason = e instanceof Error ? e.message : String(e);
-      installError = `${failPrefix}: ${reason}`;
     } finally {
       pendingPluginActions.delete(key);
     }
@@ -1057,11 +996,13 @@
     errors={fetchErrors}
     message={installMessage}
     warning={installWarning}
+    staleRefresh={installStaleRefresh}
     fatalError={installError}
     errLabel={errLabel}
     ondismiss={(key) => fetchErrors.delete(key)}
     onmessageDismiss={() => (installMessage = null)}
     onwarningDismiss={() => (installWarning = null)}
+    onstaleRefreshDismiss={() => (installStaleRefresh = null)}
     onfatalErrorDismiss={() => (installError = null)}
   />
 
