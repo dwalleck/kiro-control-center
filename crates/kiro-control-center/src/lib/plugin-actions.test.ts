@@ -47,7 +47,6 @@ function makeInstallCtx(
     marketplace: "acme",
     plugin: "demo-plugin",
     projectPath: "/test/project",
-    forceInstall: false,
     acceptMcp: false,
     refresh: () => Promise.resolve(),
     storeRefresh: () => Promise.resolve(),
@@ -85,7 +84,7 @@ describe("runPluginInstall", () => {
 
     const outcome = await runPluginInstall(
       makeInstallCtx({ installPlugin, storeRefresh }),
-      "install",
+      { kind: "install", force: false },
     );
 
     expect(outcome.kind).toBe("ok");
@@ -107,16 +106,16 @@ describe("runPluginInstall", () => {
     expect(storeRefresh).toHaveBeenCalledOnce();
   });
 
-  it("update mode: force=true regardless of forceInstall setting", async () => {
+  it("update mode: force=true and successPrefix='Updated' regardless of context", async () => {
     const r = emptyInstallResult();
     r.skills.installed = ["a"];
     const installPlugin: PluginActionContext["installPlugin"] = vi
       .fn()
       .mockResolvedValue({ status: "ok", data: r });
 
-    await runPluginInstall(
-      makeInstallCtx({ installPlugin, forceInstall: false }),
-      "update",
+    const outcome = await runPluginInstall(
+      makeInstallCtx({ installPlugin }),
+      { kind: "update" },
     );
 
     expect(installPlugin).toHaveBeenCalledWith(
@@ -126,6 +125,68 @@ describe("runPluginInstall", () => {
       false,
       "/test/project",
     );
+    expect(outcome.kind).toBe("ok");
+    if (outcome.kind === "ok") {
+      // Pin the per-arm successPrefix — guards against an inverted ternary
+      // that the install-side `force=true` test wouldn't catch.
+      expect(outcome.banner.primary).toEqual({
+        kind: "message",
+        text: "Updated demo-plugin: 1 skill",
+      });
+    }
+  });
+
+  it("install mode: mode.force=true propagates to installPlugin and uses 'Plugin' prefix", async () => {
+    const r = emptyInstallResult();
+    r.skills.installed = ["a"];
+    const installPlugin: PluginActionContext["installPlugin"] = vi
+      .fn()
+      .mockResolvedValue({ status: "ok", data: r });
+
+    const outcome = await runPluginInstall(
+      makeInstallCtx({ installPlugin }),
+      { kind: "install", force: true },
+    );
+
+    expect(installPlugin).toHaveBeenCalledWith(
+      "acme",
+      "demo-plugin",
+      true,
+      false,
+      "/test/project",
+    );
+    expect(outcome.kind).toBe("ok");
+    if (outcome.kind === "ok") {
+      // Pin the install-arm successPrefix — together with the update test
+      // above, locks the per-arm prefix mapping at the call boundary.
+      expect(outcome.banner.primary).toEqual({
+        kind: "message",
+        text: "Plugin demo-plugin: 1 skill",
+      });
+    }
+  });
+
+  it("update mode + anyFailed && !anyInstalled: banner.error uses 'Update failed' prefix", async () => {
+    const r = emptyInstallResult();
+    r.skills.failed = [
+      { name: "broken", error: "oops", kind: { kind: "install_failed" } },
+    ];
+    const installPlugin: PluginActionContext["installPlugin"] = vi
+      .fn()
+      .mockResolvedValue({ status: "ok", data: r });
+
+    const outcome = await runPluginInstall(
+      makeInstallCtx({ installPlugin }),
+      { kind: "update" },
+    );
+
+    expect(outcome.kind).toBe("ok");
+    if (outcome.kind === "ok") {
+      expect(outcome.banner.primary).toEqual({
+        kind: "error",
+        text: "Update failed for demo-plugin: 1 skill failed",
+      });
+    }
   });
 
   it("anyFailed && !anyInstalled: banner.error populated", async () => {
@@ -139,7 +200,7 @@ describe("runPluginInstall", () => {
 
     const outcome = await runPluginInstall(
       makeInstallCtx({ installPlugin }),
-      "install",
+      { kind: "install", force: false },
     );
 
     expect(outcome.kind).toBe("ok");
@@ -164,7 +225,7 @@ describe("runPluginInstall", () => {
 
     const outcome = await runPluginInstall(
       makeInstallCtx({ installPlugin }),
-      "install",
+      { kind: "install", force: false },
     );
 
     expect(outcome.kind).toBe("ok");
@@ -193,7 +254,7 @@ describe("runPluginInstall", () => {
 
     const outcome = await runPluginInstall(
       makeInstallCtx({ installPlugin }),
-      "install",
+      { kind: "install", force: false },
     );
 
     expect(outcome.kind).toBe("ok");
@@ -218,7 +279,7 @@ describe("runPluginInstall", () => {
 
     const outcome = await runPluginInstall(
       makeInstallCtx({ installPlugin }),
-      "install",
+      { kind: "install", force: false },
     );
 
     expect(outcome.kind).toBe("fail");
@@ -239,7 +300,7 @@ describe("runPluginInstall", () => {
 
     const outcome = await runPluginInstall(
       makeInstallCtx({ installPlugin }),
-      "install",
+      { kind: "install", force: false },
     );
 
     expect(outcome.kind).toBe("fail");
@@ -257,7 +318,7 @@ describe("runPluginInstall", () => {
 
     const outcome = await runPluginInstall(
       makeInstallCtx({ installPlugin }),
-      "install",
+      { kind: "install", force: false },
     );
 
     expect(outcome.kind).toBe("fail");
@@ -278,7 +339,7 @@ describe("runPluginInstall", () => {
 
     const outcome = await runPluginInstall(
       makeInstallCtx({ installPlugin }),
-      "update",
+      { kind: "update" },
     );
 
     expect(outcome.kind).toBe("fail");
@@ -294,7 +355,7 @@ describe("runPluginInstall", () => {
 
     const outcome = await runPluginInstall(
       makeInstallCtx({ installPlugin }),
-      "update",
+      { kind: "update" },
     );
 
     expect(outcome.kind).toBe("fail");
@@ -320,7 +381,7 @@ describe("runPluginInstall", () => {
           tabRan = true;
         },
       }),
-      "install",
+      { kind: "install", force: false },
     );
 
     expect(tabRan).toBe(true);
@@ -350,7 +411,7 @@ describe("runPluginInstall", () => {
           throw new Error("tab boom");
         },
       }),
-      "install",
+      { kind: "install", force: false },
     );
 
     expect(outcome.kind).toBe("ok");
@@ -385,7 +446,7 @@ describe("runPluginInstall", () => {
           calls.push("tab-refresh");
         },
       }),
-      "install",
+      { kind: "install", force: false },
     );
 
     expect(calls).toEqual(["store-refresh", "tab-refresh"]);
@@ -402,7 +463,7 @@ describe("runPluginInstall", () => {
 
     await runPluginInstall(
       makeInstallCtx({ installPlugin, storeRefresh }),
-      "install",
+      { kind: "install", force: false },
     );
 
     expect(storeRefresh).not.toHaveBeenCalled();
@@ -416,7 +477,7 @@ describe("runPluginInstall", () => {
 
     await runPluginInstall(
       makeInstallCtx({ installPlugin, storeRefresh }),
-      "install",
+      { kind: "install", force: false },
     );
 
     expect(storeRefresh).not.toHaveBeenCalled();
@@ -431,7 +492,7 @@ describe("runPluginInstall", () => {
 
     await runPluginInstall(
       makeInstallCtx({ installPlugin, acceptMcp: true }),
-      "install",
+      { kind: "install", force: false },
     );
 
     expect(installPlugin).toHaveBeenCalledWith(

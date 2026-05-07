@@ -40,6 +40,23 @@ If you find yourself wanting to test a `.svelte` file or a reactive store's
 `$state`/`$derived`, factor the testable logic out into a non-`.svelte.ts`
 module and test the helper instead.
 
+For helpers that *call* Tauri commands or runes-based stores, inject those
+dependencies via the context type rather than `vi.mock`-ing `$lib/bindings`
+or `$lib/stores/*.svelte.ts`. Tests construct `vi.fn()` fakes directly and
+pass them through the context — no module mocks needed. Canonical pattern:
+the `installPlugin` / `removePlugin` / `storeRefresh` injection on
+`PluginActionContext` and `PluginRemoveContext`.
+
+## Commit messages
+CI's `Validate Commits` step enforces this regex on every commit since
+`origin/main`:
+`^(feat|fix|docs|style|refactor|perf|test|build|ci|chore|review)(\([a-z][a-z0-9-]*\))?!?: .{3,}`
+
+The scope must start with a **lowercase letter** — `fix(2b): ...` fails
+(digit-first). Use `(ui)`, `(phase-2b)`, or no scope. Existing commits on
+`main` aren't re-checked, so prior `(2b)`-scoped history doesn't trip the
+gate; new commits do.
+
 ## xtask
 - `cargo xtask hook-post-edit` — wired into Claude Code `PostToolUse` for `.rs` edits. Runs `rustfmt` then `cargo clippy --package <derived> -- -D warnings`. The package is derived by walking up ancestors for the nearest `Cargo.toml` with a `[package]` table (`xtask::derive_package`), so new workspace crates are picked up automatically. Read/parse failures log to stderr; loop exhaust emits a "no usable Cargo.toml" diagnostic.
 - `cargo xtask hook-block-cargo-lock` — blocks direct `Cargo.lock` edits. Override for one session via `KIRO_ALLOW_LOCKFILE_EDIT=1`.
@@ -84,6 +101,7 @@ Pattern: `git worktree add /home/dwalleck/repos/kiro-marketplace-cli-<topic> -b 
 - `unsafe_code` is forbidden
 - **Zero-tolerance in production code** (tests are exempt): no `.unwrap()`, no `.expect()`, no `let _ = ...` discarding a `Result`, no `#[allow(...)]` directives. If a lint or warning is wrong, fix the code or the lint config — don't suppress at the call site. **Enforced by `cargo xtask plan-lint --gate no-unwrap-in-production`**. Deliberate exceptions (idiomatic Tauri/Specta startup panics, etc.) are registered in `xtask/src/plan_lint.rs`'s `ALLOWED_SITES` const with a written-down reason — that's the audit trail. Adding to the allowlist requires a code change reviewed in PR; there is no inline `#[allow(...)]` escape hatch.
 - **Map external errors at the adapter boundary.** `gix`, `serde_json`, `toml`, `reqwest` errors get translated into typed `ErrorKind` variants inside the module that calls them (e.g. `git.rs`, `cache.rs`, `agent/parse_native.rs`) — they never appear in the public API of `kiro-market-core`. (`io::Error` is std-library and exempted; it can carry through `#[source]`.) Recipe when the variant *would* carry an external error: `#[non_exhaustive]` enum + variant field `reason: String` (not `#[source]`) + a `pub(crate) fn` constructor that calls `error_full_chain(&err)`. Canonical examples: `parse_native::NativeParseFailure::invalid_json` (for `serde_json::Error`), `steering::tracking_malformed` (for `serde_json::Error` in `SteeringError::TrackingMalformed`). Tests should assert `err.source().is_none()` to lock the contract. **Enforced by `cargo xtask plan-lint --gate gate-4-external-error-boundary`** — a SQL query against the tethys index that flags any `pub` enum variant carrying an external crate's error type via `#[source]`.
+- **Discriminated unions: `switch` with exhaustiveness, never chained ternaries (TS).** When branching on a tagged-union discriminator (`mode.kind`, `result.kind`, etc.), use `switch (x.kind)` with `default: { const _exhaustive: never = x; throw new Error(...); }` so a future arm becomes a compile error rather than silently falling through. Canonical examples: `formatSkippedSkill`, `formatSteeringWarning`, `runPluginInstall`. Chained `x.kind === "A" ? ... : ...` ternaries fail this discipline — the else-branch doesn't narrow, and a third arm silently maps to whichever branch the ternary defaults to. Pair the runtime switch with a type-level guard at the definition site: a `satisfies`-anchored values list + `Exclude<U, (typeof _VALUES)[number]> extends never ? true : never` (canonical: `_PLUGIN_ACTION_VALUES` + `_AssertPluginActionExhaustive`). The `satisfies` catches arm-shape changes (literal becomes object); the `Exclude<>` catches arm additions; **both need a value-position `const _assert: T = true`** to actually fire — an unused type alias resolving to `never` is valid TS, so the const assignment is what makes the tripwire active. The PR #112 review pass established this as the full discriminator-pushdown discipline; partial application (type definition without consumer-side switches, or guards without value-position) leaves silent-failure surfaces.
 
 ## Architecture
 The tool reads Claude Code `marketplace.json` catalogs, discovers plugins and skills,

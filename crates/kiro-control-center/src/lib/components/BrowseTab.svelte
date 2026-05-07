@@ -26,6 +26,7 @@
   } from "$lib/error-source";
   import type { UpdateCheckKey } from "$lib/error-source";
   import { runPluginInstall as doPluginInstall } from "$lib/plugin-actions";
+  import type { PluginActionMode } from "$lib/plugin-actions";
   import { usePluginUpdateBanners } from "$lib/stores/plugin-update-banners.svelte";
   import type {
     InstalledPluginInfo,
@@ -754,18 +755,36 @@
     installStaleRefresh = null;
 
     try {
+      // Switch over BrowseAction so a future arm becomes a compile error
+      // here rather than silently constructing `{kind: "update"}`. Matches
+      // the exhaustiveness convention used in plugin-actions.ts and format.ts.
+      let modeArg: PluginActionMode;
+      switch (mode) {
+        case "install":
+          modeArg = { kind: "install", force: forceInstall };
+          break;
+        case "update":
+          modeArg = { kind: "update" };
+          break;
+        default: {
+          const _exhaustive: never = mode;
+          throw new Error(
+            `unhandled BrowseAction in runPluginInstall: ${JSON.stringify(_exhaustive)}`,
+          );
+        }
+      }
+
       const outcome = await doPluginInstall(
         {
           marketplace,
           plugin,
           projectPath,
-          forceInstall,
           acceptMcp: false,
           refresh: () => fetchInstalledPlugins(),
           installPlugin: commands.installPlugin,
           storeRefresh: (p) => pluginUpdates.refresh(p),
         },
-        mode,
+        modeArg,
       );
 
       if (outcome.kind === "ok") {
@@ -1095,8 +1114,7 @@
               plugin={ap.plugin}
               marketplace={ap.marketplace}
               installed={installedPluginKeys.has(key)}
-              installing={pendingPluginActions.get(key) === "install"}
-              updating={pendingPluginActions.get(key) === "update"}
+              pending={pendingPluginActions.get(key)}
               update={pluginUpdates.updateFor(ap.marketplace, ap.plugin.name)}
               failure={pluginUpdates.failureFor(ap.marketplace, ap.plugin.name)}
               projectPicked={!!projectPath}
