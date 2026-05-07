@@ -212,6 +212,39 @@
     logPrefix: "InstalledTab",
   });
 
+  // Exhaustive button-label helpers for the in-flight `action` discriminator.
+  // A future `InstalledAction` arm becomes a compile error here rather than
+  // silently falling through to the idle label. Each helper is paired with
+  // its button: `updateButtonLabel` is on the Update button (so "Updating…"
+  // shows when action === "update"; "Update" otherwise — including when
+  // action === "remove", which means the *Remove* button is in flight).
+  function updateButtonLabel(action: InstalledAction | undefined): string {
+    if (action === undefined) return "Update";
+    switch (action) {
+      case "update":
+        return "Updating…";
+      case "remove":
+        return "Update";
+      default: {
+        const _exhaustive: never = action;
+        throw new Error(`unhandled InstalledAction: ${JSON.stringify(_exhaustive)}`);
+      }
+    }
+  }
+  function removeButtonLabel(action: InstalledAction | undefined): string {
+    if (action === undefined) return "Remove";
+    switch (action) {
+      case "remove":
+        return "Removing…";
+      case "update":
+        return "Remove";
+      default: {
+        const _exhaustive: never = action;
+        throw new Error(`unhandled InstalledAction: ${JSON.stringify(_exhaustive)}`);
+      }
+    }
+  }
+
   let priorProjectPath: string | null = null;
   $effect(() => {
     if (priorProjectPath !== null && priorProjectPath !== projectPath) {
@@ -362,7 +395,7 @@
                           title="Update will replace local edits to plugin files"
                           class="px-2 py-0.5 text-[11px] text-kiro-warning hover:text-kiro-warning/80 disabled:cursor-not-allowed disabled:opacity-50"
                         >
-                          {action === "update" ? "Updating…" : "Update"}
+                          {updateButtonLabel(action)}
                         </button>
                       {/if}
                       <button
@@ -372,7 +405,7 @@
                         aria-busy={action === "remove"}
                         class="px-2 py-0.5 text-[11px] text-kiro-subtle hover:text-kiro-error disabled:cursor-not-allowed disabled:opacity-50"
                       >
-                        {action === "remove" ? "Removing…" : "Remove"}
+                        {removeButtonLabel(action)}
                       </button>
                     </div>
                   </td>

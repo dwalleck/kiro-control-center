@@ -29,10 +29,13 @@ export type RemovePluginFn = (
 ) => Promise<IpcResult<RemovePluginResult>>;
 
 // Discriminated mode: `force` lives on the install arm because update mode
-// always implies force (see body below). Encoding the per-arm field at the
-// type level eliminates the dead `{mode: "update", forceInstall: false}`
-// state the prior shape allowed, and lets the `mode.force` lookup type-check
-// without a `?:` fallback.
+// always implies force (see the switch in runPluginInstall below). Before
+// this refactor, `mode` was a bare string and `forceInstall` lived on the
+// context — letting a caller pass `mode: "update"` together with a
+// meaningless `forceInstall: false` that the body silently overrode.
+// Encoding the per-arm field at the type level removes that dead state and
+// lets the body discriminate on `mode.kind` with a compile-time
+// exhaustiveness check.
 export type PluginActionMode =
   | { kind: "install"; force: boolean }
   | { kind: "update" };
@@ -45,7 +48,9 @@ export type PluginActionContext = {
   // acceptMcp is true. With acceptMcp = false the agent produces
   // InstallWarning::McpServersRequireOptIn and never lands in installed or
   // failed — the warning names the agent and its transports so the user
-  // can re-run with the opt-in.
+  // can re-run with the opt-in. Unlike `mode.force` (install-only), this
+  // applies to both install and update modes — the FFI surface gates MCP
+  // unconditionally (verified at crates/kiro-control-center/src-tauri/src/commands/plugins.rs).
   acceptMcp: boolean;
   refresh: () => Promise<void>;
   // Injected dependencies — see IpcResult comment above.
@@ -85,13 +90,30 @@ export async function runPluginInstall(
   ctx: PluginActionContext,
   mode: PluginActionMode,
 ): Promise<PluginActionOutcome> {
-  const force = mode.kind === "install" ? mode.force : true;
-  const failPrefix =
-    mode.kind === "update"
-      ? `Update failed for ${ctx.plugin}`
-      : `Plugin install failed for ${ctx.plugin}`;
-  const successPrefix =
-    mode.kind === "update" ? `Updated ${ctx.plugin}` : `Plugin ${ctx.plugin}`;
+  // Single switch makes a future `PluginActionMode` arm a compile error here
+  // rather than silently falling through. Matches the project pattern used
+  // in `format.ts` (formatSkippedSkill, formatSteeringWarning, etc.).
+  let force: boolean;
+  let failPrefix: string;
+  let successPrefix: string;
+  switch (mode.kind) {
+    case "install":
+      force = mode.force;
+      failPrefix = `Plugin install failed for ${ctx.plugin}`;
+      successPrefix = `Plugin ${ctx.plugin}`;
+      break;
+    case "update":
+      force = true;
+      failPrefix = `Update failed for ${ctx.plugin}`;
+      successPrefix = `Updated ${ctx.plugin}`;
+      break;
+    default: {
+      const _exhaustive: never = mode;
+      throw new Error(
+        `unhandled PluginActionMode: ${JSON.stringify(_exhaustive)}`,
+      );
+    }
+  }
 
   try {
     const result = await ctx.installPlugin(

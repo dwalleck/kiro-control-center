@@ -5,6 +5,7 @@
     PluginUpdateInfo,
   } from "$lib/bindings";
   import { actionUpdateLabel, kindLabel } from "$lib/stores/plugin-updates";
+  import type { BrowseAction } from "$lib/stores/plugin-updates";
   import { skillCountLabel, skillCountTitle } from "$lib/format";
 
   type Props = {
@@ -12,12 +13,13 @@
     marketplace: string;
     installed: boolean;
     // Single discriminator carried through from the producer's
-    // `pendingPluginActions.get(key)` (a `BrowseAction | undefined`). The
-    // prior `installing: boolean + updating: boolean` shape allowed the
-    // unreachable `installing && updating` state and forced the producer
-    // to flatten its own discriminator into two booleans, which the
-    // template then re-discriminated.
-    pending: "install" | "update" | undefined;
+    // `pendingPluginActions.get(key)` (a `BrowseAction | undefined`).
+    // Importing `BrowseAction` couples this card to the per-tab vocabulary,
+    // but the alternative — a duplicated `"install" | "update"` literal
+    // — drifts silently if `BrowseAction` ever widens. The single producer
+    // today is BrowseTab; if a second consumer with a different action
+    // vocabulary materializes, widen this prop to a shared union.
+    pending: BrowseAction | undefined;
     update: PluginUpdateInfo | undefined;
     failure: PluginUpdateFailure | undefined;
     projectPicked: boolean;
@@ -46,6 +48,22 @@
   );
 
   const updateLabel = $derived(update ? actionUpdateLabel(update) : "Update");
+
+  // Exhaustive label helper for the `pending` discriminator. A future
+  // BrowseAction arm becomes a compile error in the default branch
+  // rather than silently rendering "Updating".
+  function pendingLabel(p: BrowseAction): string {
+    switch (p) {
+      case "install":
+        return "Installing";
+      case "update":
+        return "Updating";
+      default: {
+        const _exhaustive: never = p;
+        throw new Error(`unhandled BrowseAction: ${JSON.stringify(_exhaustive)}`);
+      }
+    }
+  }
 </script>
 
 <div class="flex items-start gap-3 px-3 py-3 rounded-md border border-kiro-muted bg-kiro-overlay">
@@ -75,7 +93,7 @@
 
   <div class="flex flex-col items-end gap-1.5 flex-shrink-0">
     {#if pending}
-      {@const label = pending === "install" ? "Installing" : "Updating"}
+      {@const label = pendingLabel(pending)}
       <button
         type="button"
         disabled

@@ -335,6 +335,26 @@ describe("projectUpdateCheckBanners", () => {
     expect(msg).toContain("(p1, p2)");
   });
 
+  it("multi-marketplace: produces independent upserts per marketplace", () => {
+    // Now that groupFailures is internalized inside projectUpdateCheckBanners,
+    // a regression like `groupFailures(failures).slice(0, 1)` would silently
+    // drop marketplaces past the first. groupFailures' own multi-marketplace
+    // test runs the loop independently; this test pins the contract through
+    // the projection helper's public surface.
+    const { upserts, staleKeys } = projectUpdateCheckBanners(
+      [
+        failure("acme", "p1", { kind: "marketplace_unavailable" }),
+        failure("beta", "p2", { kind: "marketplace_unavailable" }),
+      ],
+      [],
+    );
+    expect(upserts.size).toBe(2);
+    expect(staleKeys).toEqual([]);
+    const keys = [...upserts.keys()];
+    expect(keys).toContain(updateCheckErrKey("stale_cache", "acme"));
+    expect(keys).toContain(updateCheckErrKey("stale_cache", "beta"));
+  });
+
   it("singular noun: 1 plugin reads '1 plugin' not '1 plugins'", () => {
     const { upserts } = projectUpdateCheckBanners(
       [

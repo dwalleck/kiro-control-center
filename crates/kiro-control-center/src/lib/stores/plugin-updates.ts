@@ -45,19 +45,34 @@ export function kindLabel(kind: PluginUpdateFailureKind): string {
 
 // Unexported on purpose. `remediationHint` is derivable from
 // `(remediation, marketplace)` via `hintFor` below, but this type doesn't
-// encode that derivation. By exposing only `groupFailures` as the public
-// constructor and folding the group-step into `projectUpdateCheckBanners`
-// (which now takes raw failures), no public API accepts `FailureGroup[]`
-// — the derivation invariant can't drift via a hand-built literal.
+// encode that derivation. Currently no public API accepts `FailureGroup[]`
+// — `groupFailures` is the only exported constructor and
+// `projectUpdateCheckBanners` takes raw failures. If a future public
+// function accepts `ReturnType<typeof groupFailures>[number][]`, restore
+// the invariant by re-deriving `remediationHint` at the seam.
+//
+// All fields are `readonly` so callers can't mutate the returned array's
+// hint or plugins list after construction — preserves the derivation
+// invariant against in-place edits.
 type FailureGroup = {
-  remediation: RemediationClass;
-  marketplace: MarketplaceName;
-  plugins: PluginName[];
-  remediationHint: string;
+  readonly remediation: RemediationClass;
+  readonly marketplace: MarketplaceName;
+  readonly plugins: readonly PluginName[];
+  readonly remediationHint: string;
 };
 
 export function groupFailures(failures: PluginUpdateFailure[]): FailureGroup[] {
-  const map = new Map<string, FailureGroup>();
+  // Internal builder shape with mutable `plugins` so we can `push` during
+  // the grouping loop. Returns as `FailureGroup[]` (readonly fields)
+  // because TS's structural readonly is contravariant on input — mutable
+  // arrays are assignable to readonly array slots.
+  type Builder = {
+    remediation: RemediationClass;
+    marketplace: MarketplaceName;
+    plugins: PluginName[];
+    remediationHint: string;
+  };
+  const map = new Map<string, Builder>();
   for (const f of failures) {
     const cls = remediationClass(f.kind);
     // Use DELIM for consistency with ErrorSource keys; `:` is permitted in
@@ -102,16 +117,32 @@ export type PluginAction = "install" | "update" | "remove";
 export type BrowseAction = Extract<PluginAction, "install" | "update">;
 export type InstalledAction = Extract<PluginAction, "remove" | "update">;
 
-// Compile-time guard: lists the canonical values once and `satisfies` fails
-// the moment any arm becomes non-string-literal — `"install"` won't satisfy
-// `{ kind: "install"; ... }`. Also catches arm removal (an absent value
-// fails to satisfy the narrower union). The `const _assertStringUnion = true`
-// at the bottom forces type-check evaluation: an unused type alias resolving
-// to `never` is valid TS, so a value-position assignment is what makes the
-// tripwire actually fire. Pairs with `_AssertNarrow` in error-source.ts.
+// Compile-time exhaustiveness guards. Each pair (values list + Exclude<>
+// check) catches two distinct mutations:
+//   - `satisfies readonly PluginAction[]` fails if an arm becomes non-string
+//     -literal — e.g. `"install"` no longer satisfies `{kind:"install"; ...}`.
+//   - `Exclude<PluginAction, _PLUGIN_ACTION_VALUES[number]> extends never`
+//     fails if `PluginAction` grows a new arm not enumerated in the array.
+// Without the second check, adding `"validate"` to PluginAction would slip
+// past the satisfies (which only checks each *element* is a PluginAction —
+// not that every PluginAction is in the array) and silently fall through
+// the downstream `mode.kind === "install" ? ... : ...` ternaries.
+// Same pattern applied to BrowseAction / InstalledAction — narrower unions
+// derived via Extract<> from PluginAction. Pairs with `_AssertNarrow` in
+// error-source.ts. The trailing `const _assert*` value-position
+// assignments force type-check evaluation; an unused type alias resolving
+// to `never` is valid TS, so the const is what makes the tripwire fire.
 const _PLUGIN_ACTION_VALUES = ["install", "update", "remove"] as const satisfies readonly PluginAction[];
-type _AssertStringUnion = (typeof _PLUGIN_ACTION_VALUES)[number] extends string ? true : never;
-const _assertStringUnion: _AssertStringUnion = true;
+type _AssertPluginActionExhaustive = Exclude<PluginAction, (typeof _PLUGIN_ACTION_VALUES)[number]> extends never ? true : never;
+const _assertPluginActionExhaustive: _AssertPluginActionExhaustive = true;
+
+const _BROWSE_ACTION_VALUES = ["install", "update"] as const satisfies readonly BrowseAction[];
+type _AssertBrowseActionExhaustive = Exclude<BrowseAction, (typeof _BROWSE_ACTION_VALUES)[number]> extends never ? true : never;
+const _assertBrowseActionExhaustive: _AssertBrowseActionExhaustive = true;
+
+const _INSTALLED_ACTION_VALUES = ["update", "remove"] as const satisfies readonly InstalledAction[];
+type _AssertInstalledActionExhaustive = Exclude<InstalledAction, (typeof _INSTALLED_ACTION_VALUES)[number]> extends never ? true : never;
+const _assertInstalledActionExhaustive: _AssertInstalledActionExhaustive = true;
 
 // Column = state sentence; companion `actionUpdateLabel` = button action.
 export function statusUpdateLabel(u: PluginUpdateInfo): string {

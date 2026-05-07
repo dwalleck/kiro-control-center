@@ -26,6 +26,7 @@
   } from "$lib/error-source";
   import type { UpdateCheckKey } from "$lib/error-source";
   import { runPluginInstall as doPluginInstall } from "$lib/plugin-actions";
+  import type { PluginActionMode } from "$lib/plugin-actions";
   import { usePluginUpdateBanners } from "$lib/stores/plugin-update-banners.svelte";
   import type {
     InstalledPluginInfo,
@@ -754,6 +755,25 @@
     installStaleRefresh = null;
 
     try {
+      // Switch over BrowseAction so a future arm becomes a compile error
+      // here rather than silently constructing `{kind: "update"}`. Matches
+      // the exhaustiveness convention used in plugin-actions.ts and format.ts.
+      let modeArg: PluginActionMode;
+      switch (mode) {
+        case "install":
+          modeArg = { kind: "install", force: forceInstall };
+          break;
+        case "update":
+          modeArg = { kind: "update" };
+          break;
+        default: {
+          const _exhaustive: never = mode;
+          throw new Error(
+            `unhandled BrowseAction in runPluginInstall: ${JSON.stringify(_exhaustive)}`,
+          );
+        }
+      }
+
       const outcome = await doPluginInstall(
         {
           marketplace,
@@ -764,7 +784,7 @@
           installPlugin: commands.installPlugin,
           storeRefresh: (p) => pluginUpdates.refresh(p),
         },
-        mode === "install" ? { kind: "install", force: forceInstall } : { kind: "update" },
+        modeArg,
       );
 
       if (outcome.kind === "ok") {
