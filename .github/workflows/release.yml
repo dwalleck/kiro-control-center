@@ -9,6 +9,9 @@ env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
 
+permissions:
+  contents: write
+
 jobs:
   # Build CLI binaries for all platforms
   release-cli:
@@ -44,7 +47,7 @@ jobs:
         run: cargo build --release -p kiro-market
 
       - name: Upload to GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v2.3.3
         with:
           files: ${{ matrix.binary }}
           draft: true
@@ -119,7 +122,7 @@ jobs:
           echo "Found: ${files[@]}"
 
       - name: Upload to GitHub Release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v2.3.3
         with:
           files: ${{ matrix.artifact_path }}
           draft: true
