@@ -123,6 +123,31 @@ your-project/
 - Git (for cloning marketplace repositories)
 - SSH agent or git credential helpers (for private repos)
 
+### Tauri CLI
+
+```bash
+cargo install tauri-cli --version "^2"
+```
+
+### Linux system dependencies
+
+**Ubuntu/Debian:**
+```bash
+sudo apt update
+sudo apt install libwebkit2gtk-4.1-dev \
+  build-essential curl wget file \
+  libxdo-dev libssl-dev \
+  libayatana-appindicator3-dev librsvg2-dev
+```
+
+**Arch Linux:**
+```bash
+sudo pacman -S --needed \
+  webkit2gtk-4.1 base-devel curl wget file \
+  openssl appmenu-gtk-module \
+  libappindicator-gtk3 librsvg xdotool
+```
+
 ## Development
 
 ```bash

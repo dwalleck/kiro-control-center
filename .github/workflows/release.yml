@@ -26,6 +26,9 @@ jobs:
           - os: windows-latest
             artifact_name: kiro-market-windows-x86_64
             binary: target/release/kiro-market.exe
+          - os: windows-11-arm
+            artifact_name: kiro-market-windows-aarch64
+            binary: target/release/kiro-market.exe
 
     runs-on: ${{ matrix.os }}
     steps:
@@ -57,10 +60,12 @@ jobs:
       matrix:
         include:
           - platform: ubuntu-latest
-            artifact_path: target/release/bundle/deb/*.deb
+            artifact_path: target/release/bundle/{deb/*.deb,appimage/*.AppImage,rpm/*.rpm}
           - platform: macos-latest
             artifact_path: target/release/bundle/dmg/*.dmg
           - platform: windows-latest
+            artifact_path: target/release/bundle/msi/*.msi
+          - platform: windows-11-arm
             artifact_path: target/release/bundle/msi/*.msi
 
     runs-on: ${{ matrix.platform }}
