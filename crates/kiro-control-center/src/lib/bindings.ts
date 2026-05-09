@@ -1023,13 +1023,12 @@ export type PluginUpdateFailure = {
 };
 
 /**
- *  Why an update-detection scan couldn't check a plugin. Tagged enum
- *  for FFI per the `ffi-enum-serde-tag` plan-lint gate (PR #91):
+ *  Why an update-detection scan couldn't check a plugin.
  *  `#[serde(tag = "kind", rename_all = "snake_case")]` produces
  *  `{ "kind": "manifest_unreadable" }` in JSON, which `tauri-specta`
  *  emits as a discriminated TS union.
  * 
- *  Closes original-review I4: `PluginUpdateFailure` was opaque
+ *  `PluginUpdateFailure` was previously opaque
  *  (substring matching `reason` to differentiate failure types
  *  violated CLAUDE.md Rule 42). The classifier
  *  [`PluginUpdateFailureKind::from_error`] is exhaustive per the
@@ -1088,7 +1087,7 @@ export type PluginUpdateInfo = {
 	installed_version: string | null,
 	/**
 	 *  `None` means the marketplace plugin manifest exists but lacks
-	 *  a `version` field. After NC1's `ManifestState` 3-state
+	 *  a `version` field. The `ManifestState` 3-state
 	 *  split, cases where the manifest is missing or unreadable
 	 *  (symlinked, `NotFound`) surface as a [`PluginUpdateFailure`] —
 	 *  they no longer collapse into `Some(None)` here. So
@@ -1192,8 +1191,19 @@ export type RemoveSteeringResult = {
 	failures?: RemoveItemFailure[],
 };
 
-// Top-level category for a Kiro CLI setting.
-export type SettingCategory = "telemetry" | "chat" | "knowledge" | "key_bindings" | "features" | "api" | "mcp" | "environment";
+/**
+ *  Top-level category for a Kiro CLI setting.
+ * 
+ *  Categories are a **UI grouping** used by the settings UI to organize
+ *  related entries. They are **not** a key prefix: the serde-renamed name
+ *  (e.g. `tool_search`) does not need to match the leading segment of
+ *  registry keys (e.g. `toolSearch.enabled`). This matches existing
+ *  conventions — `KeyBindings` serializes as `key_bindings` but its keys
+ *  live under `chat.*`; `App` serializes as `app` with a single key
+ *  `app.disableAutoupdates`; `ToolSearch` serializes as `tool_search`
+ *  with keys `toolSearch.*`.
+ */
+export type SettingCategory = "telemetry" | "chat" | "knowledge" | "key_bindings" | "features" | "api" | "mcp" | "app" | "tool_search" | "environment";
 
 // A fully-resolved setting entry suitable for serialisation to a frontend.
 export type SettingEntry = {
@@ -1515,8 +1525,7 @@ export type UnmappedReason =
 "BareCopilotName";
 
 /**
- *  Why an update is being surfaced. Tagged enum for FFI per the
- *  `ffi-enum-serde-tag` plan-lint gate (PR #91): `#[serde(tag = "kind",
+ *  Why an update is being surfaced. `#[serde(tag = "kind",
  *  rename_all = "snake_case")]` produces `{ "kind": "version_bumped" }`
  *  in JSON, which `tauri-specta` emits as a discriminated TS union.
  */

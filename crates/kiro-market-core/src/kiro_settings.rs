@@ -12,6 +12,15 @@ use tracing::{debug, warn};
 // ---------------------------------------------------------------------------
 
 /// Top-level category for a Kiro CLI setting.
+///
+/// Categories are a **UI grouping** used by the settings UI to organize
+/// related entries. They are **not** a key prefix: the serde-renamed name
+/// (e.g. `tool_search`) does not need to match the leading segment of
+/// registry keys (e.g. `toolSearch.enabled`). This matches existing
+/// conventions — `KeyBindings` serializes as `key_bindings` but its keys
+/// live under `chat.*`; `App` serializes as `app` with a single key
+/// `app.disableAutoupdates`; `ToolSearch` serializes as `tool_search`
+/// with keys `toolSearch.*`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[cfg_attr(feature = "specta", derive(specta::Type))]
 #[serde(rename_all = "snake_case")]
@@ -23,6 +32,8 @@ pub enum SettingCategory {
     Features,
     Api,
     Mcp,
+    App,
+    ToolSearch,
     Environment,
 }
 
@@ -38,6 +49,8 @@ impl SettingCategory {
             Self::Features => "Feature Toggles",
             Self::Api => "API & Service",
             Self::Mcp => "MCP",
+            Self::App => "App",
+            Self::ToolSearch => "Tool Search",
             Self::Environment => "Environment Variables",
         }
     }
@@ -365,6 +378,86 @@ pub fn registry() -> &'static [SettingDef] {
                 default: None,
             },
             SettingDef {
+                key: "chat.notificationMethod",
+                label: "Notification Method",
+                description: "Notification method used when chat.enableNotifications is true: 'auto', 'bel', or 'osc9'",
+                category: SettingCategory::Chat,
+                value_type: SettingType::Enum(vec!["auto", "bel", "osc9"]),
+                default: Some(JsonValue::String("auto".into())),
+            },
+            SettingDef {
+                key: "chat.ui",
+                label: "Chat UI",
+                description: "UI engine: 'tui' (default) or 'classic'",
+                category: SettingCategory::Chat,
+                value_type: SettingType::Enum(vec!["tui", "classic"]),
+                default: Some(JsonValue::String("tui".into())),
+            },
+            SettingDef {
+                key: "chat.enableCodeIntelligence",
+                label: "Enable Code Intelligence",
+                description: "Enable code intelligence with LSP integration",
+                category: SettingCategory::Chat,
+                value_type: SettingType::Bool,
+                default: None,
+            },
+            SettingDef {
+                key: "chat.enableSubagent",
+                label: "Enable Subagent",
+                description: "Enable subagent feature",
+                category: SettingCategory::Chat,
+                value_type: SettingType::Bool,
+                default: None,
+            },
+            SettingDef {
+                key: "chat.disableGranularTrust",
+                label: "Disable Granular Trust",
+                description: "Disable granular trust options for tool permissions",
+                category: SettingCategory::Chat,
+                value_type: SettingType::Bool,
+                default: None,
+            },
+            SettingDef {
+                key: "chat.autoExpandToolOutput",
+                label: "Auto Expand Tool Output",
+                description: "Always show full tool output inline without truncation",
+                category: SettingCategory::Chat,
+                value_type: SettingType::Bool,
+                default: None,
+            },
+            SettingDef {
+                key: "chat.disableTrustAllConfirmation",
+                label: "Disable Trust All Confirmation",
+                description: "Skip the trust-all-tools confirmation gate on startup",
+                category: SettingCategory::Chat,
+                value_type: SettingType::Bool,
+                default: None,
+            },
+            SettingDef {
+                key: "chat.disableWrap",
+                label: "Disable Wrap",
+                description: "Disable line wrapping in chat output",
+                category: SettingCategory::Chat,
+                value_type: SettingType::Bool,
+                default: None,
+            },
+            SettingDef {
+                key: "hooks.showStatus",
+                label: "Show Hook Status",
+                description: "Show hook execution status messages in chat",
+                category: SettingCategory::Chat,
+                value_type: SettingType::Bool,
+                default: Some(JsonValue::Bool(true)),
+            },
+            SettingDef {
+                key: "cleanup.periodDays",
+                label: "Cleanup Period (Days)",
+                description: "Positive integer number of days after which old conversations and data are deleted",
+                category: SettingCategory::Chat,
+                value_type: SettingType::Number,
+                default: None,
+            },
+            SettingDef {
                 key: "compaction.excludeMessages",
                 label: "Compaction Exclude Messages",
                 description: "Minimum message pairs to retain during compaction",
@@ -504,6 +597,14 @@ pub fn registry() -> &'static [SettingDef] {
                 default: None,
             },
             SettingDef {
+                key: "introspect.progressiveMode",
+                label: "Introspect Progressive Mode",
+                description: "Use progressive loading instead of semantic search for introspect",
+                category: SettingCategory::Features,
+                value_type: SettingType::Bool,
+                default: None,
+            },
+            SettingDef {
                 key: "chat.enableTodoList",
                 label: "Enable Todo List",
                 description: "Enable todo list feature",
@@ -538,6 +639,30 @@ pub fn registry() -> &'static [SettingDef] {
                 value_type: SettingType::Number,
                 default: None,
             },
+            SettingDef {
+                key: "api.oidc.scopePrefix",
+                label: "OIDC Scope Prefix",
+                description: "OIDC scope prefix for authentication",
+                category: SettingCategory::Api,
+                value_type: SettingType::String,
+                default: None,
+            },
+            SettingDef {
+                key: "api.q.service",
+                label: "Q Service URL",
+                description: "Q service endpoint URL",
+                category: SettingCategory::Api,
+                value_type: SettingType::String,
+                default: None,
+            },
+            SettingDef {
+                key: "api.kiroauth.service",
+                label: "Kiro Auth Service URL",
+                description: "Kiro auth service endpoint URL",
+                category: SettingCategory::Api,
+                value_type: SettingType::String,
+                default: None,
+            },
             // ----------------------------------------------------------------
             // MCP
             // ----------------------------------------------------------------
@@ -564,6 +689,46 @@ pub fn registry() -> &'static [SettingDef] {
                 category: SettingCategory::Mcp,
                 value_type: SettingType::Bool,
                 default: None,
+            },
+            // ----------------------------------------------------------------
+            // App
+            // ----------------------------------------------------------------
+            SettingDef {
+                key: "app.disableAutoupdates",
+                label: "Disable Auto-Updates",
+                description: "Disable automatic updates on startup",
+                category: SettingCategory::App,
+                value_type: SettingType::Bool,
+                default: None,
+            },
+            // ----------------------------------------------------------------
+            // Tool Search
+            // ----------------------------------------------------------------
+            // Tool Search activates when EITHER `toolSearch.minPct` OR
+            // `toolSearch.minTokens` threshold is exceeded (not both).
+            SettingDef {
+                key: "toolSearch.enabled",
+                label: "Enable Tool Search",
+                description: "Enable Tool Search for on-demand MCP tool discovery",
+                category: SettingCategory::ToolSearch,
+                value_type: SettingType::Bool,
+                default: Some(JsonValue::Bool(false)),
+            },
+            SettingDef {
+                key: "toolSearch.minPct",
+                label: "Tool Search Min Context %",
+                description: "Activate Tool Search when MCP tool specs exceed this percentage (0-100) of the context window",
+                category: SettingCategory::ToolSearch,
+                value_type: SettingType::Number,
+                default: Some(JsonValue::from(5)),
+            },
+            SettingDef {
+                key: "toolSearch.minTokens",
+                label: "Tool Search Min Tokens",
+                description: "Activate Tool Search when MCP tool specs exceed this token count",
+                category: SettingCategory::ToolSearch,
+                value_type: SettingType::Number,
+                default: Some(JsonValue::from(50_000)),
             },
             // ----------------------------------------------------------------
             // Environment Variables
@@ -1064,6 +1229,8 @@ mod tests {
             SettingCategory::Features,
             SettingCategory::Api,
             SettingCategory::Mcp,
+            SettingCategory::App,
+            SettingCategory::ToolSearch,
             SettingCategory::Environment,
         ];
 
@@ -1087,6 +1254,8 @@ mod tests {
             SettingCategory::Features,
             SettingCategory::Api,
             SettingCategory::Mcp,
+            SettingCategory::App,
+            SettingCategory::ToolSearch,
             SettingCategory::Environment,
         ];
 
