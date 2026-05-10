@@ -157,6 +157,35 @@ Body text.
         assert!(parse_copilot_agent(src).is_err());
     }
 
+    /// Mirrors `parse_claude::tests::parse_rejects_path_traversal_in_name`.
+    /// Both parsers route through `AgentName::new`, but the integration
+    /// path through Copilot frontmatter needs its own behavioral test —
+    /// a future refactor that skipped `AgentName::new` on this branch
+    /// (e.g. introducing a Copilot-specific naming convention) would
+    /// silently regress against the Claude-only test alone.
+    #[test]
+    fn parse_rejects_path_traversal_in_name() {
+        let src = "---\nname: ../escape\ntools: []\n---\nbody\n";
+        let err = parse_copilot_agent(src).unwrap_err();
+        assert!(
+            matches!(err, ParseFailure::InvalidName { .. }),
+            "expected InvalidName for traversal, got {err:?}"
+        );
+    }
+
+    /// Mirrors `parse_claude::tests::parse_rejects_empty_name`. Locks
+    /// the empty-string rejection path through Copilot frontmatter
+    /// independently of Claude.
+    #[test]
+    fn parse_rejects_empty_name() {
+        let src = "---\nname: \"\"\ntools: []\n---\nbody\n";
+        let err = parse_copilot_agent(src).unwrap_err();
+        assert!(
+            matches!(err, ParseFailure::InvalidName { .. }),
+            "expected InvalidName for empty name, got {err:?}"
+        );
+    }
+
     #[test]
     fn parse_dialect_set_to_copilot() {
         let def = parse_copilot_agent(TERRAFORM).expect("parse");

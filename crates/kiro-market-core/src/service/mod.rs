@@ -704,6 +704,26 @@ pub enum FailedAgent {
     },
 }
 
+impl FailedAgent {
+    /// Borrow the typed `AgentError` that every variant carries.
+    ///
+    /// Common-payload accessor so a `#[non_exhaustive]` consumer fallback
+    /// (`other => …`) can render the chain-preserved error string instead
+    /// of dropping it. The match is exhaustive over the variant set —
+    /// adding a future variant without an `error: AgentError` field is
+    /// then a compile error here, which is the right forcing function:
+    /// the wire-format contract is "every failure record carries a typed
+    /// error", and we want the type system to enforce that.
+    #[must_use]
+    pub fn error(&self) -> &crate::error::AgentError {
+        match self {
+            FailedAgent::Agent { error, .. }
+            | FailedAgent::UnparseableAgent { error, .. }
+            | FailedAgent::CompanionBundle { error, .. } => error,
+        }
+    }
+}
+
 /// Project an `AgentError` returned by `KiroProject::install_native_companions`
 /// into the `conflicts` list on `FailedAgent::CompanionBundle`.
 ///

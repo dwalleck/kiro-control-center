@@ -406,10 +406,14 @@ fn print_agent_outcome(result: &InstallAgentsResult) {
                 }
             }
             // `FailedAgent` is `#[non_exhaustive]`. A future variant
-            // shouldn't be a panic — render a generic line so the user
-            // still sees that something failed; the chain-preserved
-            // error string is the actionable payload.
-            _ => eprintln!("  {prefix} Agent install failed (unknown variant)"),
+            // shouldn't panic — render the chain-preserved error string
+            // via the common `error()` accessor so the user gets the
+            // actionable payload even when this CLI hasn't yet learned
+            // to render the new variant's per-variant context.
+            other => eprintln!(
+                "  {prefix} Agent install failed: {}",
+                kiro_market_core::error::error_full_chain(other.error()),
+            ),
         }
     }
     for w in &result.warnings {

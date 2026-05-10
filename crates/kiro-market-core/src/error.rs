@@ -288,6 +288,20 @@ pub enum SkillError {
 // Agent errors
 // ---------------------------------------------------------------------------
 
+/// Render a list of paths in OS-native form, comma-separated. Used by
+/// [`AgentError::MultipleScanRootsNotSupported`]'s Display so the rendered
+/// message reads naturally on Windows (`{:?}` would escape backslashes,
+/// producing `["C:\\Users\\me\\agents"]` which looks like a path-mangling
+/// bug to the user). Comma-joined `Path::display()` matches how every
+/// other error message in this file renders single paths.
+fn format_path_list(roots: &[PathBuf]) -> String {
+    roots
+        .iter()
+        .map(|p| p.display().to_string())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// Errors related to agent operations.
 #[derive(Debug, Error)]
 #[non_exhaustive]
@@ -380,7 +394,8 @@ pub enum AgentError {
     /// have to disambiguate which scan root each companion belongs to,
     /// expanding the tracking schema. Out of scope for v1.
     #[error(
-        "native plugin spans multiple agent scan roots ({roots:?}); v1 supports a single scan root only"
+        "native plugin spans multiple agent scan roots ({}); v1 supports a single scan root only",
+        format_path_list(roots)
     )]
     MultipleScanRootsNotSupported { roots: Vec<PathBuf> },
 
@@ -1020,7 +1035,17 @@ mod tests {
         let err = AgentError::MultipleScanRootsNotSupported {
             roots: vec![PathBuf::from("./agents/"), PathBuf::from("./extra/")],
         };
-        assert!(err.to_string().contains("multiple agent scan roots"));
+        let s = err.to_string();
+        assert!(s.contains("multiple agent scan roots"), "got: {s}");
+        // Lock the actionable payload — every root must appear in the
+        // rendered message. The whole reason this variant interpolates
+        // `format_path_list(roots)` is to surface scan roots to the user;
+        // a future "simplification" that drops the projection would pass
+        // the prefix-only assertion above. Each root path stays in the
+        // message via OS-native `Path::display()` rendering, not Debug
+        // (which on Windows escapes backslashes and dilutes signal).
+        assert!(s.contains("agents"), "scan root must render: {s}");
+        assert!(s.contains("extra"), "scan root must render: {s}");
     }
 
     #[test]
