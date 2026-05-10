@@ -641,24 +641,97 @@ pub enum UpdateChangeSignal {
     ContentChanged,
 }
 
-/// An agent that failed to install, with the typed error.
+/// A failure entry for one element of an agent install batch.
 ///
-/// `name` is `Some` once parsing has identified the agent; pre-parse
-/// failures use `source_path` as the fallback identifier. `error` is the
-/// typed [`AgentError`] so frontends can branch on cause without
-/// substring-matching the rendered message; a custom `Serialize` impl
-/// projects it to the chain string for the wire format.
+/// Three-variant tagged enum so the wire format distinguishes per-agent
+/// failures (where `name` is known after parse), pre-parse failures
+/// (where `source_path` is the only identifier), and bundle-level
+/// failures (companion bundles are plugin-scoped, not agent-scoped).
+///
+/// JSON shape via `#[serde(tag = "kind", rename_all = "snake_case")]`:
+/// - `{"kind": "agent", "name": "...", "source_path": "...", "error": "..."}`
+/// - `{"kind": "unparseable_agent", "source_path": "...", "error": "..."}`
+/// - `{"kind": "companion_bundle", "plugin": "...", "conflicts": [...], "error": "..."}`
+///
+/// Precedent: `UpdateChangeSignal` (this file) uses the same pattern.
 #[derive(Debug, Serialize)]
 #[cfg_attr(feature = "specta", derive(specta::Type))]
-pub struct FailedAgent {
-    pub name: Option<String>,
-    pub source_path: std::path::PathBuf,
-    /// Typed error. `Serialize` renders it as a string via
-    /// [`crate::error::error_full_chain`] so the wire shape stays string;
-    /// in-process consumers can match on the typed variants directly.
-    #[serde(serialize_with = "serialize_agent_error")]
-    #[cfg_attr(feature = "specta", specta(type = String))]
-    pub error: crate::error::AgentError,
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum FailedAgent {
+    /// A native or translated agent failed during install. Name is
+    /// known because parsing succeeded — callers had a parsed
+    /// `AgentDefinition` or `NativeAgentBundle` in scope when the
+    /// failure occurred.
+    Agent {
+        name: String,
+        source_path: std::path::PathBuf,
+        #[serde(serialize_with = "serialize_agent_error")]
+        #[cfg_attr(feature = "specta", specta(type = String))]
+        error: crate::error::AgentError,
+    },
+    /// An agent file failed before parse, so no name is available.
+    /// `source_path` is the only identifier the FE can show. The
+    /// error variant inside carries the structured parse failure.
+    UnparseableAgent {
+        source_path: std::path::PathBuf,
+        #[serde(serialize_with = "serialize_agent_error")]
+        #[cfg_attr(feature = "specta", specta(type = String))]
+        error: crate::error::AgentError,
+    },
+    /// A plugin's companion-file bundle (e.g. `agents/prompts/*.md`)
+    /// failed atomically. The bundle is plugin-scoped, not agent-scoped,
+    /// so neither `name` nor `source_path` (a per-agent concept) applies.
+    ///
+    /// `conflicts` enumerates destination paths that conflicted. Today
+    /// the engine bails on first conflict, so length is 0 (rejection
+    /// before per-file enumeration, e.g. `MultipleScanRootsNotSupported`)
+    /// or 1 (orphan / cross-plugin). Forward-compatible with future
+    /// "collect all conflicts" engine work without another wire migration.
+    CompanionBundle {
+        plugin: crate::validation::PluginName,
+        conflicts: Vec<std::path::PathBuf>,
+        #[serde(serialize_with = "serialize_agent_error")]
+        #[cfg_attr(feature = "specta", specta(type = String))]
+        error: crate::error::AgentError,
+    },
+}
+
+/// Project an `AgentError` returned by `KiroProject::install_native_companions`
+/// into the `conflicts` list on `FailedAgent::CompanionBundle`.
+///
+/// Two variants carry destination paths that ARE conflicts:
+/// `OrphanFileAtDestination` (orphan file with no tracking) and
+/// `PathOwnedByOtherPlugin` (cross-plugin conflict). All other variants
+/// either carry source paths (which don't belong in `conflicts`) or
+/// describe non-conflict failures.
+///
+/// Exhaustive per CLAUDE.md's "Classifier functions over error enums
+/// enumerate every variant" rule. A new `AgentError` variant should
+/// force a compile error here, not silently default to empty.
+fn companion_conflicts_from_error(err: &crate::error::AgentError) -> Vec<std::path::PathBuf> {
+    use crate::error::AgentError;
+    match err {
+        // Two destination-conflict variants share the same projection
+        // (the `path` field is the conflicting destination). Merged
+        // per `clippy::match_same_arms`; the union-pattern still
+        // counts as exhaustive over `AgentError` — adding a new
+        // variant breaks compilation here, satisfying the CLAUDE.md
+        // classifier rule.
+        AgentError::OrphanFileAtDestination { path }
+        | AgentError::PathOwnedByOtherPlugin { path, .. } => vec![path.clone()],
+        AgentError::AlreadyInstalled { .. }
+        | AgentError::NotInstalled { .. }
+        | AgentError::ParseFailed { .. }
+        | AgentError::NativeManifestParseFailed { .. }
+        | AgentError::NativeManifestMissingName { .. }
+        | AgentError::NativeManifestInvalidName { .. }
+        | AgentError::ManifestReadFailed { .. }
+        | AgentError::NameClashWithOtherPlugin { .. }
+        | AgentError::ContentChangedRequiresForce { .. }
+        | AgentError::MultipleScanRootsNotSupported { .. }
+        | AgentError::SourceHardlinked { .. }
+        | AgentError::InstallFailed { .. } => Vec::new(),
+    }
 }
 
 /// If the discovered `companion_files` span more than one scan root,
@@ -1645,8 +1718,8 @@ impl MarketplaceService {
                     // Install-layer variants (AlreadyInstalled/NotInstalled)
                     // shouldn't come from parse_agent_file, but we collect
                     // them as failures rather than crashing the batch.
-                    result.failed.push(FailedAgent {
-                        name: None,
+                    // Pre-parse failure → `UnparseableAgent` (no name yet).
+                    result.failed.push(FailedAgent::UnparseableAgent {
                         source_path: path.clone(),
                         error: e,
                     });
@@ -1724,8 +1797,9 @@ impl MarketplaceService {
                             source: Box::new(other),
                         },
                     };
-                    result.failed.push(FailedAgent {
-                        name: Some(def.name),
+                    // Parse succeeded earlier → name is known.
+                    result.failed.push(FailedAgent::Agent {
+                        name: def.name,
                         source_path: path.clone(),
                         error: agent_err,
                     });
@@ -1769,9 +1843,12 @@ impl MarketplaceService {
         // whole install — leaving the user with a partial install they
         // didn't ask for.
         if let Some(roots) = multiple_companion_scan_roots(&companion_files) {
-            result.failed.push(FailedAgent {
-                name: None,
-                source_path: plugin_dir.to_path_buf(),
+            // Bundle-level rejection BEFORE per-file enumeration —
+            // `conflicts` is empty because we never got to the
+            // collision-classification step.
+            result.failed.push(FailedAgent::CompanionBundle {
+                plugin: ctx.plugin.clone(),
+                conflicts: Vec::new(),
                 error: crate::error::AgentError::MultipleScanRootsNotSupported { roots },
             });
             return result;
@@ -1809,8 +1886,8 @@ impl MarketplaceService {
         {
             Ok(b) => b,
             Err(parse_err) => {
-                result.failed.push(FailedAgent {
-                    name: None,
+                // Parse failed → no `bundle.name` yet; route as UnparseableAgent.
+                result.failed.push(FailedAgent::UnparseableAgent {
                     source_path: file.source.clone(),
                     error: native_parse_failure_to_agent_error(&file.source, parse_err),
                 });
@@ -1838,8 +1915,8 @@ impl MarketplaceService {
         }
 
         let Some(filename) = file.source.file_name().map(std::path::PathBuf::from) else {
-            result.failed.push(FailedAgent {
-                name: Some(bundle.name.to_string()),
+            result.failed.push(FailedAgent::Agent {
+                name: bundle.name.to_string(),
                 source_path: file.source.clone(),
                 error: crate::error::AgentError::NativeManifestInvalidName {
                     path: file.source.clone(),
@@ -1851,8 +1928,8 @@ impl MarketplaceService {
         let source_hash = match crate::hash::hash_artifact(&file.scan_root, &[filename]) {
             Ok(h) => h,
             Err(e) => {
-                result.failed.push(FailedAgent {
-                    name: Some(bundle.name.to_string()),
+                result.failed.push(FailedAgent::Agent {
+                    name: bundle.name.to_string(),
                     source_path: file.source.clone(),
                     error: crate::error::AgentError::InstallFailed {
                         path: file.source.clone(),
@@ -1892,8 +1969,8 @@ impl MarketplaceService {
                 }
                 result.installed_native.push(outcome);
             }
-            Err(err) => result.failed.push(FailedAgent {
-                name: Some(bundle.name.to_string()),
+            Err(err) => result.failed.push(FailedAgent::Agent {
+                name: bundle.name.to_string(),
                 source_path: file.source.clone(),
                 error: err,
             }),
@@ -1918,9 +1995,10 @@ impl MarketplaceService {
             // Discovery guarantees `f.source` is under `f.scan_root` —
             // strip_prefix should never fail. Defensive fallback.
             let Ok(rel) = f.source.strip_prefix(&f.scan_root) else {
-                result.failed.push(FailedAgent {
-                    name: None,
-                    source_path: f.source.clone(),
+                // Discovery contract violation (not a destination conflict).
+                result.failed.push(FailedAgent::CompanionBundle {
+                    plugin: ctx.plugin.clone(),
+                    conflicts: Vec::new(),
                     error: crate::error::AgentError::InstallFailed {
                         path: f.source.clone(),
                         source: Box::new(crate::error::Error::Io(std::io::Error::other(
@@ -1936,9 +2014,11 @@ impl MarketplaceService {
         let source_hash = match crate::hash::hash_artifact(&scan_root, &rel_paths) {
             Ok(h) => h,
             Err(e) => {
-                result.failed.push(FailedAgent {
-                    name: None,
-                    source_path: scan_root,
+                // Bundle-level pre-promotion failure — no destination
+                // conflicts because we never reached collision classification.
+                result.failed.push(FailedAgent::CompanionBundle {
+                    plugin: ctx.plugin.clone(),
+                    conflicts: Vec::new(),
                     error: crate::error::AgentError::InstallFailed {
                         path: plugin_dir.to_path_buf(),
                         source: Box::new(e.into()),
@@ -1959,11 +2039,17 @@ impl MarketplaceService {
             plugin_dir,
         }) {
             Ok(outcome) => result.installed_companions = Some(outcome),
-            Err(err) => result.failed.push(FailedAgent {
-                name: None,
-                source_path: scan_root,
-                error: err,
-            }),
+            Err(err) => {
+                // The classifier extracts conflict paths from the typed
+                // error (Orphan / PathOwnedByOtherPlugin carry destination
+                // paths). All other variants → empty `conflicts`.
+                let conflicts = companion_conflicts_from_error(&err);
+                result.failed.push(FailedAgent::CompanionBundle {
+                    plugin: ctx.plugin.clone(),
+                    conflicts,
+                    error: err,
+                });
+            }
         }
     }
 
@@ -2775,8 +2861,8 @@ fn required_source_path(
 ) -> Result<crate::validation::RelativePath, FailedAgent> {
     crate::validation::RelativePath::from_path_under(path, plugin_dir).map_err(|e| {
         let path_buf = path.to_path_buf();
-        FailedAgent {
-            name: Some(agent_name),
+        FailedAgent::Agent {
+            name: agent_name,
             source_path: path_buf.clone(),
             error: crate::error::AgentError::InstallFailed {
                 path: path_buf,
@@ -2982,6 +3068,233 @@ mod tests {
         );
     }
 
+    // -----------------------------------------------------------------------
+    // Wire-format lock for `FailedAgent`. Pins the three-variant
+    // tagged-enum shape that crosses the FFI boundary via specta.
+    // `#[serde(tag = "kind", rename_all = "snake_case")]` produces
+    // `kind: "agent" | "unparseable_agent" | "companion_bundle"`
+    // in JSON. If a future change accidentally drops the tag,
+    // renames a variant, or adds/removes a field, these tests fire
+    // before bindings.ts drift reaches the frontend.
+    //
+    // Each variant has its own test (split for `clippy::too_many_lines`);
+    // CompanionBundle has two scenarios (orphan = length-1 conflicts;
+    // pre-enumeration rejection = empty conflicts) so the empty-vs-absent
+    // serde rendering for `Vec::new()` is locked.
+    //
+    // Asserts exact key-set per variant — the substitute for a
+    // round-trip test (we can't `from_value` because the typed
+    // `AgentError` doesn't `Deserialize`; a one-way `serialize_with`
+    // projects it to a string). Exact-key-set assertions catch the
+    // same drift a round-trip would: any added/removed/renamed field
+    // breaks the test.
+    // -----------------------------------------------------------------------
+
+    /// Helper: collect a JSON object's keys into a `BTreeSet` for
+    /// order-independent comparison.
+    fn failed_agent_key_set(value: &serde_json::Value) -> std::collections::BTreeSet<String> {
+        value
+            .as_object()
+            .expect("variant serializes to a JSON object")
+            .keys()
+            .cloned()
+            .collect()
+    }
+
+    #[test]
+    fn failed_agent_agent_variant_serializes_with_full_key_set() {
+        use crate::error::AgentError;
+        use std::collections::BTreeSet;
+        use std::path::PathBuf;
+
+        let agent = FailedAgent::Agent {
+            name: "reviewer".to_owned(),
+            source_path: PathBuf::from("/src/reviewer.json"),
+            error: AgentError::ContentChangedRequiresForce {
+                name: "reviewer".to_owned(),
+            },
+        };
+        let agent_json = serde_json::to_value(&agent).expect("serialize Agent");
+        assert_eq!(agent_json["kind"], "agent");
+        assert_eq!(agent_json["name"], "reviewer");
+        assert_eq!(agent_json["source_path"], "/src/reviewer.json");
+        assert!(
+            agent_json["error"].is_string(),
+            "error must serialize as string per FFI contract"
+        );
+        assert_eq!(
+            failed_agent_key_set(&agent_json),
+            BTreeSet::from([
+                "error".to_owned(),
+                "kind".to_owned(),
+                "name".to_owned(),
+                "source_path".to_owned()
+            ]),
+            "Agent variant key set drifted"
+        );
+    }
+
+    #[test]
+    fn failed_agent_unparseable_variant_serializes_without_name() {
+        use crate::error::AgentError;
+        use std::collections::BTreeSet;
+        use std::path::PathBuf;
+
+        let unparseable = FailedAgent::UnparseableAgent {
+            source_path: PathBuf::from("/src/broken.json"),
+            error: AgentError::NativeManifestParseFailed {
+                path: PathBuf::from("/src/broken.json"),
+                reason: "expected `,` or `}`".to_owned(),
+            },
+        };
+        let unparseable_json =
+            serde_json::to_value(&unparseable).expect("serialize UnparseableAgent");
+        assert_eq!(unparseable_json["kind"], "unparseable_agent");
+        assert_eq!(unparseable_json["source_path"], "/src/broken.json");
+        assert!(unparseable_json["error"].is_string());
+        assert_eq!(
+            failed_agent_key_set(&unparseable_json),
+            BTreeSet::from([
+                "error".to_owned(),
+                "kind".to_owned(),
+                "source_path".to_owned()
+            ]),
+            "UnparseableAgent variant key set drifted"
+        );
+    }
+
+    #[test]
+    fn failed_agent_companion_bundle_orphan_serializes_with_length_one_conflicts() {
+        use crate::error::AgentError;
+        use crate::validation::PluginName;
+        use std::collections::BTreeSet;
+        use std::path::PathBuf;
+
+        let bundle_orphan = FailedAgent::CompanionBundle {
+            plugin: PluginName::new("myplugin").expect("valid plugin name"),
+            conflicts: vec![PathBuf::from("prompts/code-reviewer.md")],
+            error: AgentError::OrphanFileAtDestination {
+                path: PathBuf::from("/dest/prompts/code-reviewer.md"),
+            },
+        };
+        let bundle_orphan_json =
+            serde_json::to_value(&bundle_orphan).expect("serialize CompanionBundle (orphan)");
+        assert_eq!(bundle_orphan_json["kind"], "companion_bundle");
+        assert_eq!(bundle_orphan_json["plugin"], "myplugin");
+        let conflicts = bundle_orphan_json["conflicts"]
+            .as_array()
+            .expect("conflicts is array");
+        assert_eq!(conflicts.len(), 1);
+        assert_eq!(conflicts[0], "prompts/code-reviewer.md");
+        assert!(bundle_orphan_json["error"].is_string());
+        assert_eq!(
+            failed_agent_key_set(&bundle_orphan_json),
+            BTreeSet::from([
+                "conflicts".to_owned(),
+                "error".to_owned(),
+                "kind".to_owned(),
+                "plugin".to_owned()
+            ]),
+            "CompanionBundle variant key set drifted"
+        );
+    }
+
+    /// Multi-scan-root rejection fires BEFORE per-file collision
+    /// classification — `conflicts` is correctly empty, NOT absent.
+    /// Locking this guarantees serde renders `Vec::new()` as `[]`,
+    /// not as the field being omitted.
+    #[test]
+    fn failed_agent_companion_bundle_empty_conflicts_serializes_as_empty_array() {
+        use crate::error::AgentError;
+        use crate::validation::PluginName;
+        use std::collections::BTreeSet;
+        use std::path::PathBuf;
+
+        let bundle_empty = FailedAgent::CompanionBundle {
+            plugin: PluginName::new("myplugin").expect("valid plugin name"),
+            conflicts: Vec::new(),
+            error: AgentError::MultipleScanRootsNotSupported {
+                roots: vec![PathBuf::from("agents"), PathBuf::from("other-agents")],
+            },
+        };
+        let bundle_empty_json =
+            serde_json::to_value(&bundle_empty).expect("serialize CompanionBundle (empty)");
+        assert_eq!(bundle_empty_json["kind"], "companion_bundle");
+        assert_eq!(bundle_empty_json["plugin"], "myplugin");
+        assert_eq!(
+            bundle_empty_json["conflicts"],
+            serde_json::json!([]),
+            "empty conflicts must serialize as `[]`, not be omitted"
+        );
+        assert!(bundle_empty_json["error"].is_string());
+        assert_eq!(
+            failed_agent_key_set(&bundle_empty_json),
+            BTreeSet::from([
+                "conflicts".to_owned(),
+                "error".to_owned(),
+                "kind".to_owned(),
+                "plugin".to_owned()
+            ]),
+            "CompanionBundle (empty conflicts) variant key set drifted"
+        );
+    }
+
+    /// Classifier routing test: orphan errors produce a length-1
+    /// `conflicts` entry containing the destination path.
+    #[test]
+    fn companion_conflicts_from_error_orphan_returns_destination_path() {
+        use crate::error::AgentError;
+        use std::path::PathBuf;
+
+        let err = AgentError::OrphanFileAtDestination {
+            path: PathBuf::from("/dest/prompts/code-reviewer.md"),
+        };
+        let conflicts = companion_conflicts_from_error(&err);
+        assert_eq!(
+            conflicts,
+            vec![PathBuf::from("/dest/prompts/code-reviewer.md")]
+        );
+    }
+
+    /// Classifier routing test: cross-plugin path conflicts also
+    /// produce a length-1 `conflicts` entry. The `owner` field is
+    /// not consumed by the classifier — it survives in the typed
+    /// error inside `FailedAgent::CompanionBundle.error`.
+    #[test]
+    fn companion_conflicts_from_error_path_owned_by_other_plugin_returns_destination_path() {
+        use crate::error::AgentError;
+        use std::path::PathBuf;
+
+        let err = AgentError::PathOwnedByOtherPlugin {
+            path: PathBuf::from("/dest/prompts/shared.md"),
+            owner: "otherplugin".to_owned(),
+        };
+        let conflicts = companion_conflicts_from_error(&err);
+        assert_eq!(conflicts, vec![PathBuf::from("/dest/prompts/shared.md")]);
+    }
+
+    /// Classifier routing test: errors that fire BEFORE per-file
+    /// enumeration produce an empty conflicts list. `MultipleScanRootsNotSupported`
+    /// is the canonical pre-enumeration case (rejection at discovery).
+    /// This test pins the empty-conflicts branch so that a future
+    /// "default to empty" wildcard regression (which CLAUDE.md
+    /// prohibits) is also caught behaviorally.
+    #[test]
+    fn companion_conflicts_from_error_multi_scan_root_returns_empty() {
+        use crate::error::AgentError;
+        use std::path::PathBuf;
+
+        let err = AgentError::MultipleScanRootsNotSupported {
+            roots: vec![PathBuf::from("agents"), PathBuf::from("other-agents")],
+        };
+        let conflicts = companion_conflicts_from_error(&err);
+        assert!(
+            conflicts.is_empty(),
+            "MultipleScanRootsNotSupported is a bundle-level rejection that fires \
+             BEFORE per-file enumeration; conflicts must be empty, got: {conflicts:?}"
+        );
+    }
+
     #[test]
     fn install_plugin_agents_emits_json_and_warnings_per_file() {
         use crate::agent::tools::UnmappedReason;
@@ -3154,7 +3467,10 @@ mod tests {
         // surfaces despite B's failure.
         assert_eq!(result.installed, vec!["aaa".to_string()]);
         assert_eq!(result.failed.len(), 1);
-        assert_eq!(result.failed[0].name.as_deref(), Some("bbb"));
+        match &result.failed[0] {
+            FailedAgent::Agent { name, .. } => assert_eq!(name, "bbb"),
+            other => panic!("expected FailedAgent::Agent, got {other:?}"),
+        }
         let has_unmapped = result.warnings.iter().any(|w| {
             matches!(
                 w,
@@ -3814,10 +4130,16 @@ mod tests {
 
         // The bundle is rejected wholesale.
         assert_eq!(result.failed.len(), 1);
-        assert!(matches!(
-            &result.failed[0].error,
-            crate::error::AgentError::MultipleScanRootsNotSupported { .. }
-        ));
+        match &result.failed[0] {
+            FailedAgent::CompanionBundle {
+                error: crate::error::AgentError::MultipleScanRootsNotSupported { .. },
+                ..
+            } => {}
+            other => panic!(
+                "expected FailedAgent::CompanionBundle {{ error: MultipleScanRootsNotSupported, .. }}, \
+                 got {other:?}"
+            ),
+        }
 
         // No agents commit, no companions commit.
         assert!(

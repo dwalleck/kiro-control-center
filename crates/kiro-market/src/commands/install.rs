@@ -361,11 +361,18 @@ fn print_agent_outcome(result: &InstallAgentsResult) {
         );
     }
     for failed in &result.failed {
-        let label = failed
-            .name
-            .as_deref()
-            .map_or_else(|| failed.source_path.display().to_string(), str::to_owned);
-        let rendered = kiro_market_core::error::error_full_chain(&failed.error);
+        let (label, error) = match failed {
+            kiro_market_core::service::FailedAgent::Agent { name, error, .. } => {
+                (name.clone(), error)
+            }
+            kiro_market_core::service::FailedAgent::UnparseableAgent { source_path, error } => {
+                (source_path.display().to_string(), error)
+            }
+            kiro_market_core::service::FailedAgent::CompanionBundle { plugin, error, .. } => {
+                (plugin.as_str().to_owned(), error)
+            }
+        };
+        let rendered = kiro_market_core::error::error_full_chain(error);
         eprintln!(
             "  {} Failed to install agent '{}': {rendered}",
             "✗".red().bold(),
