@@ -34,16 +34,14 @@ pub fn parse_claude_agent(content: &str) -> Result<AgentDefinition, ParseFailure
             reason: e.to_string(),
         })?;
 
-    let name = fm.name.ok_or(ParseFailure::MissingName)?;
-    // Validate the name at parse time so downstream fs operations (and the
-    // file:// URI in the emitted JSON) can trust it without re-checking.
-    crate::validation::validate_name(&name).map_err(|e| match e {
-        // Both ValidationError variants project to ParseFailure::InvalidName
-        // because validate_name only emits InvalidName in practice; the
-        // InvalidRelativePath arm is defensive against a future change to
-        // validate_name's contract. Listed explicitly (rather than via `_ =>`)
-        // so a new ValidationError variant forces a compile-time decision per
-        // CLAUDE.md "Classifier functions enumerate every variant".
+    let raw_name = fm.name.ok_or(ParseFailure::MissingName)?;
+    // Construct the validated AgentName at parse time so downstream fs
+    // operations (and the file:// URI in the emitted JSON) can trust it
+    // without re-checking. The two-arm match enumerates every
+    // ValidationError variant per CLAUDE.md "Classifier functions
+    // enumerate every variant" — a new variant forces a compile-time
+    // decision rather than silently routing via `_ =>`.
+    let name = crate::validation::AgentName::new(raw_name).map_err(|e| match e {
         crate::error::ValidationError::InvalidName { reason, .. }
         | crate::error::ValidationError::InvalidRelativePath { reason, .. } => {
             ParseFailure::InvalidName { reason }

@@ -379,7 +379,9 @@ pub enum AgentError {
     /// single scan root only — companion ownership tracking would otherwise
     /// have to disambiguate which scan root each companion belongs to,
     /// expanding the tracking schema. Out of scope for v1.
-    #[error("native plugin spans multiple agent scan roots; v1 supports a single scan root only")]
+    #[error(
+        "native plugin spans multiple agent scan roots ({roots:?}); v1 supports a single scan root only"
+    )]
     MultipleScanRootsNotSupported { roots: Vec<PathBuf> },
 
     /// A native companion source file is a hardlink (Unix `nlink > 1`).

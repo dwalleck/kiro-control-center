@@ -192,6 +192,30 @@ export const commands = {
 
 /* Types */
 /**
+ *  A string that has been validated as a safe agent / skill / plugin name.
+ * 
+ *  Construction goes through [`AgentName::new`], which applies
+ *  [`validate_name`] — so holding an `AgentName` is a static guarantee
+ *  that the inner string passed name validation (non-empty, no path
+ *  separators, no `..`, no NUL, no Windows reserved names, etc.).
+ * 
+ *  The newtype replaces a plain `String` for the validated `name` field
+ *  of [`crate::agent::parse_native::NativeAgentBundle`] so downstream
+ *  install code never needs to re-validate. `Deserialize` calls `new`
+ *  internally, so any future serializable type that embeds an
+ *  `AgentName` rejects bad names at parse time.
+ * 
+ *  The native-agent projection (`NativeAgentProjection`) deliberately
+ *  keeps a raw `Option<String>` for the wire-format `name` field so the
+ *  post-parse conversion can route into distinct
+ *  [`crate::agent::parse_native::NativeParseFailure`] variants
+ *  (`MissingName` vs `InvalidName(reason)` vs `InvalidJson`) — this
+ *  granularity is part of the contract surfaced via
+ *  `service::native_parse_failure_to_agent_error`.
+ */
+export type AgentName = string;
+
+/**
  *  Canonical content hash for installed artifacts.
  * 
  *  Stored on disk as the string `"blake3:" + 64 ASCII hex chars`. The
@@ -292,6 +316,12 @@ export type ErrorType = "not_found" | "already_exists" | "validation" | "git_err
  *  - `{"kind": "companion_bundle", "plugin": "...", "conflicts": [...], "error": "..."}`
  * 
  *  Precedent: `UpdateChangeSignal` (this file) uses the same pattern.
+ * 
+ *  `#[non_exhaustive]` matches the workspace convention for FFI-crossing
+ *  enums (`InstallWarning`, `PluginUpdateFailureKind`, `SkippedReason`).
+ *  Adding a fourth variant later is then a non-breaking change for
+ *  out-of-tree consumers; in-tree CLI / Tauri / test matches add `_ =>`
+ *  fallback arms.
  */
 export type FailedAgent = FailedAgent_Serialize | FailedAgent_Deserialize;
 
@@ -309,15 +339,22 @@ export type FailedAgent = FailedAgent_Serialize | FailedAgent_Deserialize;
  *  - `{"kind": "companion_bundle", "plugin": "...", "conflicts": [...], "error": "..."}`
  * 
  *  Precedent: `UpdateChangeSignal` (this file) uses the same pattern.
+ * 
+ *  `#[non_exhaustive]` matches the workspace convention for FFI-crossing
+ *  enums (`InstallWarning`, `PluginUpdateFailureKind`, `SkippedReason`).
+ *  Adding a fourth variant later is then a non-breaking change for
+ *  out-of-tree consumers; in-tree CLI / Tauri / test matches add `_ =>`
+ *  fallback arms.
  */
 export type FailedAgent_Deserialize = 
 /**
  *  A native or translated agent failed during install. Name is
- *  known because parsing succeeded — callers had a parsed
- *  `AgentDefinition` or `NativeAgentBundle` in scope when the
- *  failure occurred.
+ *  the validated [`crate::validation::AgentName`] — parsing succeeded
+ *  (callers had a parsed `AgentDefinition` or `NativeAgentBundle` in
+ *  scope), so the wire format carries a guaranteed-valid identifier
+ *  rather than a raw string.
  */
-{ kind: "agent"; name: string; source_path: string; error: string } | 
+{ kind: "agent"; name: AgentName; source_path: string; error: string } | 
 /**
  *  An agent file failed before parse, so no name is available.
  *  `source_path` is the only identifier the FE can show. The
@@ -351,15 +388,22 @@ export type FailedAgent_Deserialize =
  *  - `{"kind": "companion_bundle", "plugin": "...", "conflicts": [...], "error": "..."}`
  * 
  *  Precedent: `UpdateChangeSignal` (this file) uses the same pattern.
+ * 
+ *  `#[non_exhaustive]` matches the workspace convention for FFI-crossing
+ *  enums (`InstallWarning`, `PluginUpdateFailureKind`, `SkippedReason`).
+ *  Adding a fourth variant later is then a non-breaking change for
+ *  out-of-tree consumers; in-tree CLI / Tauri / test matches add `_ =>`
+ *  fallback arms.
  */
 export type FailedAgent_Serialize = 
 /**
  *  A native or translated agent failed during install. Name is
- *  known because parsing succeeded — callers had a parsed
- *  `AgentDefinition` or `NativeAgentBundle` in scope when the
- *  failure occurred.
+ *  the validated [`crate::validation::AgentName`] — parsing succeeded
+ *  (callers had a parsed `AgentDefinition` or `NativeAgentBundle` in
+ *  scope), so the wire format carries a guaranteed-valid identifier
+ *  rather than a raw string.
  */
-{ kind: "agent"; name: string; source_path: string; error: string } | 
+{ kind: "agent"; name: AgentName; source_path: string; error: string } | 
 /**
  *  An agent file failed before parse, so no name is available.
  *  `source_path` is the only identifier the FE can show. The

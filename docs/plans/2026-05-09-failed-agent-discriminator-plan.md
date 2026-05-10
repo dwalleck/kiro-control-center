@@ -24,6 +24,7 @@ Existing FE only reads `agents.failed.length` (variant-independent), so the in-a
 | File | Role | Operation |
 |------|------|-----------|
 | `crates/kiro-market-core/src/service/mod.rs` | Enum definition, classifier helper, all 11 construction sites, wire-format test | Modify |
+| `crates/kiro-market/src/commands/install.rs` | CLI install summary printer (`print_agent_outcome`); replace `.name`/`.source_path`/`.error` access with variant-aware match | Modify |
 | `crates/kiro-control-center/src-tauri/src/commands/agents.rs` | One existing pattern-match on `result.failed[0].error` | Modify |
 | `crates/kiro-control-center/src/lib/bindings.ts` | Auto-generated type definitions | Regenerate (machine-written) |
 | `crates/kiro-control-center/src/lib/plugin-actions.ts` | Add forward-looking comment about discriminator-pushdown for inline-failure UI | Modify |

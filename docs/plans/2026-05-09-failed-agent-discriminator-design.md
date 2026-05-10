@@ -130,7 +130,7 @@ match &result.failed[0] {
 | `crates/kiro-control-center/src/lib/format.ts` | 232-234, 246 | `agents.failed.length` | unchanged — variant-independent |
 | `crates/kiro-control-center/src/lib/plugin-actions.ts` | 146 | `result.data.agents.failed` (passed as `console.error` payload) | unchanged — diagnostic logger dumps the array, doesn't read fields |
 
-**Net FE consumer impact today: zero changes required.** The existing FE only reads `.length`. The wire-format upgrade pre-positions for the future inline-failure UI envisaged in the `plugin-actions.ts:130-138` comment without coupling that work to this PR.
+**Net FE consumer impact today: zero changes required.** The existing FE only reads `.length`. The wire-format upgrade pre-positions for the future inline-failure UI (F3 below) without coupling that work to this PR.
 
 ### bindings.ts
 
@@ -143,7 +143,7 @@ Three current type definitions at lines 290-330 (`FailedAgent`, `FailedAgent_Ser
 3. **`required_source_path` return type** stays `Result<RelativePath, FailedAgent>`; just constructs `FailedAgent::Agent { ... }` internally.
 4. **Tests** — `cargo test --workspace`, fix every compile error with the variant-aware match pattern shown above.
 5. **Bindings regen** — `cargo test -p kiro-control-center --lib -- --ignored`.
-6. **TS** — `npm run check`. Existing FE compiles unchanged. Add a comment near `plugin-actions.ts:130` documenting the discriminator-pushdown pattern future inline-failure UI should use (`switch (entry.kind) { ... default: const _: never = entry; ... }` plus `_ASSERT_EXHAUSTIVE` per CLAUDE.md's "discriminator-pushdown discipline" rule).
+6. **TS** — `npm run check`. Existing FE compiles unchanged. Add a comment near the `agents.failed` consumer in `plugin-actions.ts` documenting the discriminator-pushdown pattern future inline-failure UI should use (`switch (entry.kind) { ... default: const _exhaustive: never = entry; ... }` plus a value-position `_AssertExhaustive` per CLAUDE.md's "discriminator-pushdown discipline" rule).
 7. **Verify clean** — `cargo fmt --all --check`, `cargo clippy --workspace --tests -- -D warnings`, `npm run check`, `npm run test:unit`, `cargo test --workspace`.
 
 ## Follow-on work (intentionally not in this PR)
@@ -164,11 +164,33 @@ Steering has its own `FailedSteeringFile` wire shape with parallel ambiguity pot
 
 ### F3. Inline per-failure UI
 
-`crates/kiro-control-center/src/lib/plugin-actions.ts:130-138` documents this explicitly:
+The current FE consumes `result.data.agents.failed` only at the count level
+(`format.ts` reads `.length` for the banner; `plugin-actions.ts` passes the
+array through to `console.error` as an opaque diagnostic payload). Per-item
+reasons that the Rust backend already sends — `FailedSkill.error`,
+`FailedSteeringFile.error`, `FailedAgent.error` (each carrying the full
+chain via `error_full_chain`) — are not surfaced inline in the UI today.
 
-> Temporary diagnostic: the current banner only carries the count-level summary ("1 steering failed · 8 agents failed"), so the per-item reasons that the Rust backend already sends (FailedSkill.error, FailedSteeringFile.error, FailedAgent.error — each carrying the full error chain) are otherwise invisible to the user. Log them to the DevTools console so they can be inspected without a backend-side console (release builds run under the `windows` subsystem, which detaches from the launching terminal). Follow-up work will surface these failures inline in the UI; see runPluginRemove's per-failure `<details>` panel in InstalledTab.svelte for the target shape.
+The new discriminated `FailedAgent` is what the inline-UI work should
+consume. The forward-looking comment block added in
+`crates/kiro-control-center/src/lib/plugin-actions.ts` near the
+`agents.failed` consumer documents the target switch shape:
 
-The new discriminated `FailedAgent` is what that UI should consume. Pair the `switch (entry.kind)` rendering with the `_ASSERT_EXHAUSTIVE` value-position guard (CLAUDE.md "discriminator-pushdown discipline").
+```ts
+switch (entry.kind) {
+  case "agent":             return renderAgent(entry.name, entry.source_path, entry.error);
+  case "unparseable_agent": return renderUnparseable(entry.source_path, entry.error);
+  case "companion_bundle":  return renderBundle(entry.plugin, entry.conflicts, entry.error);
+  default: { const _exhaustive: never = entry; throw new Error(`unhandled ${JSON.stringify(_exhaustive)}`); }
+}
+```
+
+Pair the runtime switch with a value-position assert per CLAUDE.md
+"discriminator-pushdown discipline" (see `_PLUGIN_ACTION_VALUES` +
+`_AssertPluginActionExhaustive` in `stores/plugin-updates.ts` for the
+canonical precedent). For the target shape of the inline `<details>`
+panel, see `runPluginRemove`'s per-failure rendering in
+`InstalledTab.svelte`.
 
 **Why deferred:** UI work is a separate concern from the wire-format change. Bundling them would force this PR to also touch InstalledTab.svelte and component testing.
 

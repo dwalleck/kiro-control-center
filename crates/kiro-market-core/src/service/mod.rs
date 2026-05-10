@@ -654,16 +654,24 @@ pub enum UpdateChangeSignal {
 /// - `{"kind": "companion_bundle", "plugin": "...", "conflicts": [...], "error": "..."}`
 ///
 /// Precedent: `UpdateChangeSignal` (this file) uses the same pattern.
+///
+/// `#[non_exhaustive]` matches the workspace convention for FFI-crossing
+/// enums (`InstallWarning`, `PluginUpdateFailureKind`, `SkippedReason`).
+/// Adding a fourth variant later is then a non-breaking change for
+/// out-of-tree consumers; in-tree CLI / Tauri / test matches add `_ =>`
+/// fallback arms.
 #[derive(Debug, Serialize)]
 #[cfg_attr(feature = "specta", derive(specta::Type))]
 #[serde(tag = "kind", rename_all = "snake_case")]
+#[non_exhaustive]
 pub enum FailedAgent {
     /// A native or translated agent failed during install. Name is
-    /// known because parsing succeeded — callers had a parsed
-    /// `AgentDefinition` or `NativeAgentBundle` in scope when the
-    /// failure occurred.
+    /// the validated [`crate::validation::AgentName`] — parsing succeeded
+    /// (callers had a parsed `AgentDefinition` or `NativeAgentBundle` in
+    /// scope), so the wire format carries a guaranteed-valid identifier
+    /// rather than a raw string.
     Agent {
-        name: String,
+        name: crate::validation::AgentName,
         source_path: std::path::PathBuf,
         #[serde(serialize_with = "serialize_agent_error")]
         #[cfg_attr(feature = "specta", specta(type = String))]
@@ -1747,7 +1755,7 @@ impl MarketplaceService {
             };
             for u in unmapped {
                 result.warnings.push(InstallWarning::UnmappedTool {
-                    agent: def.name.clone(),
+                    agent: def.name.as_str().to_owned(),
                     tool: u.source,
                     reason: u.reason,
                 });
@@ -1785,7 +1793,7 @@ impl MarketplaceService {
                 project.install_agent(&def, &mapped, meta, Some(&path))
             };
             match install_result {
-                Ok(()) => result.installed.push(def.name),
+                Ok(()) => result.installed.push(def.name.into_inner()),
                 Err(Error::Agent(crate::error::AgentError::AlreadyInstalled { name })) => {
                     result.skipped.push(name);
                 }
@@ -1916,7 +1924,7 @@ impl MarketplaceService {
 
         let Some(filename) = file.source.file_name().map(std::path::PathBuf::from) else {
             result.failed.push(FailedAgent::Agent {
-                name: bundle.name.to_string(),
+                name: bundle.name.clone(),
                 source_path: file.source.clone(),
                 error: crate::error::AgentError::NativeManifestInvalidName {
                     path: file.source.clone(),
@@ -1929,7 +1937,7 @@ impl MarketplaceService {
             Ok(h) => h,
             Err(e) => {
                 result.failed.push(FailedAgent::Agent {
-                    name: bundle.name.to_string(),
+                    name: bundle.name.clone(),
                     source_path: file.source.clone(),
                     error: crate::error::AgentError::InstallFailed {
                         path: file.source.clone(),
@@ -1943,7 +1951,7 @@ impl MarketplaceService {
         let source_path = match required_source_path(
             &bundle.agent_json_source,
             plugin_dir,
-            bundle.name.to_string(),
+            bundle.name.clone(),
         ) {
             Ok(rp) => rp,
             Err(failed) => {
@@ -1970,7 +1978,7 @@ impl MarketplaceService {
                 result.installed_native.push(outcome);
             }
             Err(err) => result.failed.push(FailedAgent::Agent {
-                name: bundle.name.to_string(),
+                name: bundle.name.clone(),
                 source_path: file.source.clone(),
                 error: err,
             }),
@@ -2726,7 +2734,7 @@ fn translated_agent_blocked_by_mcp_gate(
         result
             .warnings
             .push(InstallWarning::McpServersRequireOptIn {
-                agent: def.name.clone(),
+                agent: def.name.as_str().to_owned(),
                 transports,
             });
         return true;
@@ -2857,7 +2865,7 @@ fn required_skill_scan_root(
 fn required_source_path(
     path: &Path,
     plugin_dir: &Path,
-    agent_name: String,
+    agent_name: crate::validation::AgentName,
 ) -> Result<crate::validation::RelativePath, FailedAgent> {
     crate::validation::RelativePath::from_path_under(path, plugin_dir).map_err(|e| {
         let path_buf = path.to_path_buf();
@@ -3108,7 +3116,7 @@ mod tests {
         use std::path::PathBuf;
 
         let agent = FailedAgent::Agent {
-            name: "reviewer".to_owned(),
+            name: crate::validation::AgentName::new("reviewer").expect("valid test name"),
             source_path: PathBuf::from("/src/reviewer.json"),
             error: AgentError::ContentChangedRequiresForce {
                 name: "reviewer".to_owned(),

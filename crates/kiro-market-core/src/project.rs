@@ -2208,7 +2208,9 @@ impl KiroProject {
         force: bool,
         source_path: Option<&Path>,
     ) -> crate::error::Result<()> {
-        validation::validate_name(&def.name)?;
+        // No re-validation: `def.name: AgentName` is a parse-time guarantee.
+        // Bind once so downstream uses don't repeat `def.name.as_str()`.
+        let name_str = def.name.as_str();
 
         // CPU-bound work outside the lock to keep the critical section short.
         let json = crate::agent::emit::build_kiro_json(def, mapped_tools)?;
@@ -2222,22 +2224,22 @@ impl KiroProject {
             &self.agent_tracking_path(),
             || -> crate::error::Result<()> {
                 let mut installed = self.load_installed_agents()?;
-                if !force && installed.agents.contains_key(&def.name) {
+                if !force && installed.agents.contains_key(name_str) {
                     return Err(AgentError::AlreadyInstalled {
-                        name: def.name.clone(),
+                        name: name_str.to_owned(),
                     }
                     .into());
                 }
 
                 let (staging, json_rel, prompt_rel, installed_hash) =
-                    self.stage_agent_files(&def.name, &json_bytes, def.prompt_body.as_bytes())?;
+                    self.stage_agent_files(name_str, &json_bytes, def.prompt_body.as_bytes())?;
 
                 let PromotedAgent {
                     json_target,
                     prompt_target,
                     backups,
                 } = self.promote_staged_agent(
-                    &def.name,
+                    name_str,
                     staging.path(),
                     &json_rel,
                     &prompt_rel,
@@ -2268,7 +2270,7 @@ impl KiroProject {
                     .and_then(|(parent, _)| crate::validation::RelativePath::new(parent).ok())
                     .unwrap_or_else(crate::validation::RelativePath::agents_root);
 
-                installed.agents.insert(def.name.clone(), meta);
+                installed.agents.insert(name_str.to_owned(), meta);
 
                 // Cross-plugin force-transfer: if a prior owner of the
                 // same prompt path is some OTHER plugin, scrub the prompt
@@ -4961,33 +4963,12 @@ mod tests {
         assert!(prompt.contains("fresh body"), "got: {prompt}");
     }
 
-    #[test]
-    fn install_agent_force_still_rejects_unsafe_name() {
-        // --force is not a bypass for name validation. The parser rejects
-        // unsafe names at frontmatter time, so construct the definition
-        // directly to exercise the validate_name guard inside install_agent_inner.
-        let (_dir, project) = temp_project();
-        let def = AgentDefinition {
-            name: "../escape".to_string(),
-            description: None,
-            prompt_body: "body".to_string(),
-            model: None,
-            source_tools: Vec::new(),
-            mcp_servers: std::collections::BTreeMap::new(),
-            dialect: AgentDialect::Claude,
-        };
-
-        let err = project
-            .install_agent_force(&def, &[], sample_agent_meta(), None)
-            .expect_err("unsafe name must be rejected under force");
-        assert!(
-            matches!(
-                err,
-                crate::error::Error::Validation(crate::error::ValidationError::InvalidName { .. })
-            ),
-            "expected InvalidName, got: {err:?}"
-        );
-    }
+    // `install_agent_force_still_rejects_unsafe_name` was removed alongside
+    // `install_agent_rejects_unsafe_name`. Both tested the install-layer
+    // `validate_name` re-check that `AgentDefinition.name: AgentName`
+    // makes structurally unreachable. Parse-time rejection is covered by
+    // `parse_claude::tests::parse_rejects_path_traversal_in_name` and
+    // the `validation::tests` for `AgentName::new`.
 
     #[test]
     fn install_agent_updates_tracking() {
@@ -5007,18 +4988,14 @@ mod tests {
         assert_eq!(tracking.agents["a"].dialect, AgentDialect::Claude);
     }
 
-    #[test]
-    fn install_agent_rejects_unsafe_name() {
-        let (_dir, project) = temp_project();
-        let src_tmp = tempfile::tempdir().unwrap();
-        let src = write_agent(src_tmp.path(), "x", "---\nname: x\n---\nbody\n");
-        let (mut def, mapped) = parse_and_map(&src);
-        def.name = "../escape".into();
-        let err = project
-            .install_agent(&def, &mapped, sample_agent_meta(), None)
-            .unwrap_err();
-        assert!(matches!(err, crate::error::Error::Validation(_)));
-    }
+    // `install_agent_rejects_unsafe_name` was removed when
+    // `AgentDefinition.name` was promoted to `AgentName` — the type system
+    // now precludes constructing a `def` with an unsafe name, so the
+    // install-layer defensive `validate_name` check became unreachable
+    // (and was deleted with it). Parse-time rejection is covered by
+    // `parse_claude::tests::parse_rejects_path_traversal_in_name` and
+    // `parse_rejects_empty_name`, plus `validation::tests` for the
+    // `AgentName::new` constructor.
 
     #[test]
     fn install_agent_emits_tools_and_allowed_tools_from_mapping() {
@@ -7264,7 +7241,7 @@ mod tests {
 
         let source_md = write_agent(tmp.path(), "rev", "You are a reviewer.");
         let def = crate::agent::AgentDefinition {
-            name: "rev".into(),
+            name: crate::validation::AgentName::new("rev").expect("valid test name"),
             description: None,
             prompt_body: "You are a reviewer.".into(),
             model: None,
@@ -7330,7 +7307,7 @@ mod tests {
         for name in ["alpha", "beta"] {
             let source_md = write_agent(tmp.path(), name, "body");
             let def = crate::agent::AgentDefinition {
-                name: name.into(),
+                name: crate::validation::AgentName::new(name).expect("valid test name"),
                 description: None,
                 prompt_body: "body".into(),
                 model: None,
@@ -7383,7 +7360,7 @@ mod tests {
         // First install: source under `agents/`.
         let alpha_md = write_agent(tmp.path(), "alpha", "body");
         let alpha_def = crate::agent::AgentDefinition {
-            name: "alpha".into(),
+            name: crate::validation::AgentName::new("alpha").expect("valid test name"),
             description: None,
             prompt_body: "body".into(),
             model: None,
@@ -7417,7 +7394,7 @@ mod tests {
         // source_scan_root must follow.
         let beta_md = write_agent(tmp.path(), "beta", "body2");
         let beta_def = crate::agent::AgentDefinition {
-            name: "beta".into(),
+            name: crate::validation::AgentName::new("beta").expect("valid test name"),
             description: None,
             prompt_body: "body2".into(),
             model: None,

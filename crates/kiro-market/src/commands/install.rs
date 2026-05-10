@@ -361,23 +361,56 @@ fn print_agent_outcome(result: &InstallAgentsResult) {
         );
     }
     for failed in &result.failed {
-        let (label, error) = match failed {
-            kiro_market_core::service::FailedAgent::Agent { name, error, .. } => {
-                (name.clone(), error)
+        // Per-variant rendering — the wire format distinguishes per-agent,
+        // pre-parse, and bundle-level failures so the CLI surface should
+        // too. A flat "Failed to install agent '<label>'" lie on a
+        // bundle failure was the original misdiagnosis class this PR
+        // (FailedAgent tagged enum) set out to prevent.
+        let prefix = "✗".red().bold();
+        match failed {
+            kiro_market_core::service::FailedAgent::Agent {
+                name,
+                source_path,
+                error,
+            } => {
+                eprintln!(
+                    "  {prefix} Failed to install agent '{name}' (from {}): {}",
+                    source_path.display(),
+                    kiro_market_core::error::error_full_chain(error),
+                );
             }
             kiro_market_core::service::FailedAgent::UnparseableAgent { source_path, error } => {
-                (source_path.display().to_string(), error)
+                eprintln!(
+                    "  {prefix} Failed to parse agent file {}: {}",
+                    source_path.display(),
+                    kiro_market_core::error::error_full_chain(error),
+                );
             }
-            kiro_market_core::service::FailedAgent::CompanionBundle { plugin, error, .. } => {
-                (plugin.as_str().to_owned(), error)
+            kiro_market_core::service::FailedAgent::CompanionBundle {
+                plugin,
+                conflicts,
+                error,
+            } => {
+                eprintln!(
+                    "  {prefix} Companion bundle for plugin '{plugin}' failed: {}",
+                    kiro_market_core::error::error_full_chain(error),
+                );
+                // Surface the destination paths the classifier projected
+                // (orphan / cross-plugin) so the user can see exactly
+                // which file conflicted. Empty for pre-enumeration
+                // rejections (e.g. MultipleScanRootsNotSupported); in
+                // that case the rendered error string carries the
+                // actionable payload (the scan roots).
+                for conflict in conflicts {
+                    eprintln!("      conflict: {}", conflict.display());
+                }
             }
-        };
-        let rendered = kiro_market_core::error::error_full_chain(error);
-        eprintln!(
-            "  {} Failed to install agent '{}': {rendered}",
-            "✗".red().bold(),
-            label
-        );
+            // `FailedAgent` is `#[non_exhaustive]`. A future variant
+            // shouldn't be a panic — render a generic line so the user
+            // still sees that something failed; the chain-preserved
+            // error string is the actionable payload.
+            _ => eprintln!("  {prefix} Agent install failed (unknown variant)"),
+        }
     }
     for w in &result.warnings {
         eprintln!("  {} {w}", "!".yellow().bold());
