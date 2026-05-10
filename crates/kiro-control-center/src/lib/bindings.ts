@@ -279,55 +279,105 @@ export type DiscoveredProject = {
 export type ErrorType = "not_found" | "already_exists" | "validation" | "git_error" | "io_error" | "parse_error" | "internal" | "unknown";
 
 /**
- *  An agent that failed to install, with the typed error.
+ *  A failure entry for one element of an agent install batch.
  * 
- *  `name` is `Some` once parsing has identified the agent; pre-parse
- *  failures use `source_path` as the fallback identifier. `error` is the
- *  typed [`AgentError`] so frontends can branch on cause without
- *  substring-matching the rendered message; a custom `Serialize` impl
- *  projects it to the chain string for the wire format.
+ *  Three-variant tagged enum so the wire format distinguishes per-agent
+ *  failures (where `name` is known after parse), pre-parse failures
+ *  (where `source_path` is the only identifier), and bundle-level
+ *  failures (companion bundles are plugin-scoped, not agent-scoped).
+ * 
+ *  JSON shape via `#[serde(tag = "kind", rename_all = "snake_case")]`:
+ *  - `{"kind": "agent", "name": "...", "source_path": "...", "error": "..."}`
+ *  - `{"kind": "unparseable_agent", "source_path": "...", "error": "..."}`
+ *  - `{"kind": "companion_bundle", "plugin": "...", "conflicts": [...], "error": "..."}`
+ * 
+ *  Precedent: `UpdateChangeSignal` (this file) uses the same pattern.
  */
 export type FailedAgent = FailedAgent_Serialize | FailedAgent_Deserialize;
 
 /**
- *  An agent that failed to install, with the typed error.
+ *  A failure entry for one element of an agent install batch.
  * 
- *  `name` is `Some` once parsing has identified the agent; pre-parse
- *  failures use `source_path` as the fallback identifier. `error` is the
- *  typed [`AgentError`] so frontends can branch on cause without
- *  substring-matching the rendered message; a custom `Serialize` impl
- *  projects it to the chain string for the wire format.
+ *  Three-variant tagged enum so the wire format distinguishes per-agent
+ *  failures (where `name` is known after parse), pre-parse failures
+ *  (where `source_path` is the only identifier), and bundle-level
+ *  failures (companion bundles are plugin-scoped, not agent-scoped).
+ * 
+ *  JSON shape via `#[serde(tag = "kind", rename_all = "snake_case")]`:
+ *  - `{"kind": "agent", "name": "...", "source_path": "...", "error": "..."}`
+ *  - `{"kind": "unparseable_agent", "source_path": "...", "error": "..."}`
+ *  - `{"kind": "companion_bundle", "plugin": "...", "conflicts": [...], "error": "..."}`
+ * 
+ *  Precedent: `UpdateChangeSignal` (this file) uses the same pattern.
  */
-export type FailedAgent_Deserialize = {
-	name: string | null,
-	source_path: string,
-	/**
-	 *  Typed error. `Serialize` renders it as a string via
-	 *  [`crate::error::error_full_chain`] so the wire shape stays string;
-	 *  in-process consumers can match on the typed variants directly.
-	 */
-	error: string,
-};
+export type FailedAgent_Deserialize = 
+/**
+ *  A native or translated agent failed during install. Name is
+ *  known because parsing succeeded — callers had a parsed
+ *  `AgentDefinition` or `NativeAgentBundle` in scope when the
+ *  failure occurred.
+ */
+{ kind: "agent"; name: string; source_path: string; error: string } | 
+/**
+ *  An agent file failed before parse, so no name is available.
+ *  `source_path` is the only identifier the FE can show. The
+ *  error variant inside carries the structured parse failure.
+ */
+{ kind: "unparseable_agent"; source_path: string; error: string } | 
+/**
+ *  A plugin's companion-file bundle (e.g. `agents/prompts/*.md`)
+ *  failed atomically. The bundle is plugin-scoped, not agent-scoped,
+ *  so neither `name` nor `source_path` (a per-agent concept) applies.
+ * 
+ *  `conflicts` enumerates destination paths that conflicted. Today
+ *  the engine bails on first conflict, so length is 0 (rejection
+ *  before per-file enumeration, e.g. `MultipleScanRootsNotSupported`)
+ *  or 1 (orphan / cross-plugin). Forward-compatible with future
+ *  "collect all conflicts" engine work without another wire migration.
+ */
+{ kind: "companion_bundle"; plugin: PluginName; conflicts: string[]; error: string };
 
 /**
- *  An agent that failed to install, with the typed error.
+ *  A failure entry for one element of an agent install batch.
  * 
- *  `name` is `Some` once parsing has identified the agent; pre-parse
- *  failures use `source_path` as the fallback identifier. `error` is the
- *  typed [`AgentError`] so frontends can branch on cause without
- *  substring-matching the rendered message; a custom `Serialize` impl
- *  projects it to the chain string for the wire format.
+ *  Three-variant tagged enum so the wire format distinguishes per-agent
+ *  failures (where `name` is known after parse), pre-parse failures
+ *  (where `source_path` is the only identifier), and bundle-level
+ *  failures (companion bundles are plugin-scoped, not agent-scoped).
+ * 
+ *  JSON shape via `#[serde(tag = "kind", rename_all = "snake_case")]`:
+ *  - `{"kind": "agent", "name": "...", "source_path": "...", "error": "..."}`
+ *  - `{"kind": "unparseable_agent", "source_path": "...", "error": "..."}`
+ *  - `{"kind": "companion_bundle", "plugin": "...", "conflicts": [...], "error": "..."}`
+ * 
+ *  Precedent: `UpdateChangeSignal` (this file) uses the same pattern.
  */
-export type FailedAgent_Serialize = {
-	name: string | null,
-	source_path: string,
-	/**
-	 *  Typed error. `Serialize` renders it as a string via
-	 *  [`crate::error::error_full_chain`] so the wire shape stays string;
-	 *  in-process consumers can match on the typed variants directly.
-	 */
-	error: string,
-};
+export type FailedAgent_Serialize = 
+/**
+ *  A native or translated agent failed during install. Name is
+ *  known because parsing succeeded — callers had a parsed
+ *  `AgentDefinition` or `NativeAgentBundle` in scope when the
+ *  failure occurred.
+ */
+{ kind: "agent"; name: string; source_path: string; error: string } | 
+/**
+ *  An agent file failed before parse, so no name is available.
+ *  `source_path` is the only identifier the FE can show. The
+ *  error variant inside carries the structured parse failure.
+ */
+{ kind: "unparseable_agent"; source_path: string; error: string } | 
+/**
+ *  A plugin's companion-file bundle (e.g. `agents/prompts/*.md`)
+ *  failed atomically. The bundle is plugin-scoped, not agent-scoped,
+ *  so neither `name` nor `source_path` (a per-agent concept) applies.
+ * 
+ *  `conflicts` enumerates destination paths that conflicted. Today
+ *  the engine bails on first conflict, so length is 0 (rejection
+ *  before per-file enumeration, e.g. `MultipleScanRootsNotSupported`)
+ *  or 1 (orphan / cross-plugin). Forward-compatible with future
+ *  "collect all conflicts" engine work without another wire migration.
+ */
+{ kind: "companion_bundle"; plugin: PluginName; conflicts: string[]; error: string };
 
 /**
  *  A skill that failed to install, with the reason.
