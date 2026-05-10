@@ -36,7 +36,7 @@ pub fn build_kiro_json(
     mapped_tools: &[MappedTool],
 ) -> serde_json::Result<Value> {
     let mut obj = Map::new();
-    obj.insert("name".into(), Value::String(def.name.clone()));
+    obj.insert("name".into(), Value::String(def.name.as_str().to_owned()));
     if let Some(desc) = &def.description {
         obj.insert("description".into(), Value::String(desc.clone()));
     }
@@ -44,7 +44,7 @@ pub fn build_kiro_json(
         "prompt".into(),
         Value::String(format!(
             "file://./prompts/{}.md",
-            percent_encode_path_segment(&def.name)
+            percent_encode_path_segment(def.name.as_str())
         )),
     );
     if let Some(model) = &def.model {
@@ -114,7 +114,7 @@ mod tests {
 
     fn sample_claude_def() -> AgentDefinition {
         AgentDefinition {
-            name: "reviewer".into(),
+            name: crate::validation::AgentName::new("reviewer").expect("valid test name"),
             description: Some("Reviews code".into()),
             prompt_body: "You are a reviewer.\n".into(),
             model: Some("opus".into()),
@@ -137,7 +137,7 @@ mod tests {
         // The JSON `name` field keeps the space; the file:// URI must
         // percent-encode it per RFC 3986.
         let mut def = sample_claude_def();
-        def.name = "Terraform Agent".into();
+        def.name = crate::validation::AgentName::new("Terraform Agent").expect("valid test name");
         let out = build_kiro_json(&def, &[]).unwrap();
         assert_eq!(out["name"], "Terraform Agent");
         assert_eq!(out["prompt"], "file://./prompts/Terraform%20Agent.md");
@@ -146,7 +146,8 @@ mod tests {
     #[test]
     fn emit_preserves_unreserved_chars_in_prompt_uri() {
         let mut def = sample_claude_def();
-        def.name = "pr-review_toolkit.v2~beta".into();
+        def.name = crate::validation::AgentName::new("pr-review_toolkit.v2~beta")
+            .expect("valid test name");
         let out = build_kiro_json(&def, &[]).unwrap();
         // Unreserved chars per RFC 3986: alphanumeric and -_.~ — no encoding.
         assert_eq!(

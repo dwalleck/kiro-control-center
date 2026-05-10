@@ -29,7 +29,7 @@ mod tests {
     #[test]
     fn agent_definition_constructs_with_minimum_fields() {
         let def = AgentDefinition {
-            name: "reviewer".into(),
+            name: crate::validation::AgentName::new("reviewer").expect("valid test name"),
             description: None,
             prompt_body: "You are a reviewer.".into(),
             model: None,

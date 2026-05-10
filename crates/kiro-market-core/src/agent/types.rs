@@ -108,15 +108,15 @@ mod tests {
 
 /// Agent definition normalized across Claude and Copilot source formats.
 ///
-/// Constructed only by the parsers in this module. Fields are `pub` for
-/// emitter and install-layer access, but callers should not mutate `name`
-/// after construction without re-running name validation — the parsers
-/// enforce path-safe naming up front so downstream fs operations can rely
-/// on it.
+/// Constructed only by the parsers in this module. The `name` field is a
+/// validated [`crate::validation::AgentName`] — the parsers route through
+/// `AgentName::new` so downstream fs operations can rely on path-safe
+/// naming without re-validation.
 #[derive(Debug, Clone)]
 pub struct AgentDefinition {
     /// Short identifier used as the filename stem and Kiro agent `name` key.
-    pub name: String,
+    /// Validated at parse time; see [`crate::validation::AgentName`].
+    pub name: crate::validation::AgentName,
     /// Optional human-readable blurb. Not shown to the model.
     pub description: Option<String>,
     /// Markdown body (everything after the closing YAML fence).

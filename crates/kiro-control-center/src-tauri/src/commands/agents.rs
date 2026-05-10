@@ -416,15 +416,16 @@ mod tests {
             "expected one failure with ContentChangedRequiresForce, got: {:?}",
             result.failed
         );
-        assert!(
-            matches!(
-                &result.failed[0].error,
-                kiro_market_core::error::AgentError::ContentChangedRequiresForce { name }
-                    if name == "reviewer"
+        match &result.failed[0] {
+            kiro_market_core::service::FailedAgent::Agent {
+                error: kiro_market_core::error::AgentError::ContentChangedRequiresForce { name },
+                ..
+            } if name == "reviewer" => {}
+            other => panic!(
+                "expected FailedAgent::Agent {{ error: ContentChangedRequiresForce {{ name: \"reviewer\" }}, .. }}, \
+                 got {other:?}"
             ),
-            "wrong error variant: {:?}",
-            result.failed[0].error
-        );
+        }
 
         let json = serde_json::to_value(&result).expect("InstallAgentsResult serializes");
         let failed_error = json

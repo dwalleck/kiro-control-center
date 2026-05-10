@@ -192,6 +192,30 @@ export const commands = {
 
 /* Types */
 /**
+ *  A string that has been validated as a safe agent / skill / plugin name.
+ * 
+ *  Construction goes through [`AgentName::new`], which applies
+ *  [`validate_name`] — so holding an `AgentName` is a static guarantee
+ *  that the inner string passed name validation (non-empty, no path
+ *  separators, no `..`, no NUL, no Windows reserved names, etc.).
+ * 
+ *  The newtype replaces a plain `String` for the validated `name` field
+ *  of [`crate::agent::parse_native::NativeAgentBundle`] so downstream
+ *  install code never needs to re-validate. `Deserialize` calls `new`
+ *  internally, so any future serializable type that embeds an
+ *  `AgentName` rejects bad names at parse time.
+ * 
+ *  The native-agent projection (`NativeAgentProjection`) deliberately
+ *  keeps a raw `Option<String>` for the wire-format `name` field so the
+ *  post-parse conversion can route into distinct
+ *  [`crate::agent::parse_native::NativeParseFailure`] variants
+ *  (`MissingName` vs `InvalidName(reason)` vs `InvalidJson`) — this
+ *  granularity is part of the contract surfaced via
+ *  `service::native_parse_failure_to_agent_error`.
+ */
+export type AgentName = string;
+
+/**
  *  Canonical content hash for installed artifacts.
  * 
  *  Stored on disk as the string `"blake3:" + 64 ASCII hex chars`. The
@@ -279,55 +303,125 @@ export type DiscoveredProject = {
 export type ErrorType = "not_found" | "already_exists" | "validation" | "git_error" | "io_error" | "parse_error" | "internal" | "unknown";
 
 /**
- *  An agent that failed to install, with the typed error.
+ *  A failure entry for one element of an agent install batch.
  * 
- *  `name` is `Some` once parsing has identified the agent; pre-parse
- *  failures use `source_path` as the fallback identifier. `error` is the
- *  typed [`AgentError`] so frontends can branch on cause without
- *  substring-matching the rendered message; a custom `Serialize` impl
- *  projects it to the chain string for the wire format.
+ *  Three-variant tagged enum so the wire format distinguishes per-agent
+ *  failures (where `name` is known after parse), pre-parse failures
+ *  (where `source_path` is the only identifier), and bundle-level
+ *  failures (companion bundles are plugin-scoped, not agent-scoped).
+ * 
+ *  JSON shape via `#[serde(tag = "kind", rename_all = "snake_case")]`:
+ *  - `{"kind": "agent", "name": "...", "source_path": "...", "error": "..."}`
+ *  - `{"kind": "unparseable_agent", "source_path": "...", "error": "..."}`
+ *  - `{"kind": "companion_bundle", "plugin": "...", "conflicts": [...], "error": "..."}`
+ * 
+ *  Precedent: `UpdateChangeSignal` (this file) uses the same pattern.
+ * 
+ *  `#[non_exhaustive]` matches the workspace convention for FFI-crossing
+ *  enums (`InstallWarning`, `PluginUpdateFailureKind`, `SkippedReason`).
+ *  Adding a fourth variant later is then a non-breaking change for
+ *  out-of-tree consumers; in-tree CLI / Tauri / test matches add `_ =>`
+ *  fallback arms.
  */
 export type FailedAgent = FailedAgent_Serialize | FailedAgent_Deserialize;
 
 /**
- *  An agent that failed to install, with the typed error.
+ *  A failure entry for one element of an agent install batch.
  * 
- *  `name` is `Some` once parsing has identified the agent; pre-parse
- *  failures use `source_path` as the fallback identifier. `error` is the
- *  typed [`AgentError`] so frontends can branch on cause without
- *  substring-matching the rendered message; a custom `Serialize` impl
- *  projects it to the chain string for the wire format.
+ *  Three-variant tagged enum so the wire format distinguishes per-agent
+ *  failures (where `name` is known after parse), pre-parse failures
+ *  (where `source_path` is the only identifier), and bundle-level
+ *  failures (companion bundles are plugin-scoped, not agent-scoped).
+ * 
+ *  JSON shape via `#[serde(tag = "kind", rename_all = "snake_case")]`:
+ *  - `{"kind": "agent", "name": "...", "source_path": "...", "error": "..."}`
+ *  - `{"kind": "unparseable_agent", "source_path": "...", "error": "..."}`
+ *  - `{"kind": "companion_bundle", "plugin": "...", "conflicts": [...], "error": "..."}`
+ * 
+ *  Precedent: `UpdateChangeSignal` (this file) uses the same pattern.
+ * 
+ *  `#[non_exhaustive]` matches the workspace convention for FFI-crossing
+ *  enums (`InstallWarning`, `PluginUpdateFailureKind`, `SkippedReason`).
+ *  Adding a fourth variant later is then a non-breaking change for
+ *  out-of-tree consumers; in-tree CLI / Tauri / test matches add `_ =>`
+ *  fallback arms.
  */
-export type FailedAgent_Deserialize = {
-	name: string | null,
-	source_path: string,
-	/**
-	 *  Typed error. `Serialize` renders it as a string via
-	 *  [`crate::error::error_full_chain`] so the wire shape stays string;
-	 *  in-process consumers can match on the typed variants directly.
-	 */
-	error: string,
-};
+export type FailedAgent_Deserialize = 
+/**
+ *  A native or translated agent failed during install. Name is
+ *  the validated [`crate::validation::AgentName`] — parsing succeeded
+ *  (callers had a parsed `AgentDefinition` or `NativeAgentBundle` in
+ *  scope), so the wire format carries a guaranteed-valid identifier
+ *  rather than a raw string.
+ */
+{ kind: "agent"; name: AgentName; source_path: string; error: string } | 
+/**
+ *  An agent file failed before parse, so no name is available.
+ *  `source_path` is the only identifier the FE can show. The
+ *  error variant inside carries the structured parse failure.
+ */
+{ kind: "unparseable_agent"; source_path: string; error: string } | 
+/**
+ *  A plugin's companion-file bundle (e.g. `agents/prompts/*.md`)
+ *  failed atomically. The bundle is plugin-scoped, not agent-scoped,
+ *  so neither `name` nor `source_path` (a per-agent concept) applies.
+ * 
+ *  `conflicts` enumerates destination paths that conflicted. Today
+ *  the engine bails on first conflict, so length is 0 (rejection
+ *  before per-file enumeration, e.g. `MultipleScanRootsNotSupported`)
+ *  or 1 (orphan / cross-plugin). Forward-compatible with future
+ *  "collect all conflicts" engine work without another wire migration.
+ */
+{ kind: "companion_bundle"; plugin: PluginName; conflicts: string[]; error: string };
 
 /**
- *  An agent that failed to install, with the typed error.
+ *  A failure entry for one element of an agent install batch.
  * 
- *  `name` is `Some` once parsing has identified the agent; pre-parse
- *  failures use `source_path` as the fallback identifier. `error` is the
- *  typed [`AgentError`] so frontends can branch on cause without
- *  substring-matching the rendered message; a custom `Serialize` impl
- *  projects it to the chain string for the wire format.
+ *  Three-variant tagged enum so the wire format distinguishes per-agent
+ *  failures (where `name` is known after parse), pre-parse failures
+ *  (where `source_path` is the only identifier), and bundle-level
+ *  failures (companion bundles are plugin-scoped, not agent-scoped).
+ * 
+ *  JSON shape via `#[serde(tag = "kind", rename_all = "snake_case")]`:
+ *  - `{"kind": "agent", "name": "...", "source_path": "...", "error": "..."}`
+ *  - `{"kind": "unparseable_agent", "source_path": "...", "error": "..."}`
+ *  - `{"kind": "companion_bundle", "plugin": "...", "conflicts": [...], "error": "..."}`
+ * 
+ *  Precedent: `UpdateChangeSignal` (this file) uses the same pattern.
+ * 
+ *  `#[non_exhaustive]` matches the workspace convention for FFI-crossing
+ *  enums (`InstallWarning`, `PluginUpdateFailureKind`, `SkippedReason`).
+ *  Adding a fourth variant later is then a non-breaking change for
+ *  out-of-tree consumers; in-tree CLI / Tauri / test matches add `_ =>`
+ *  fallback arms.
  */
-export type FailedAgent_Serialize = {
-	name: string | null,
-	source_path: string,
-	/**
-	 *  Typed error. `Serialize` renders it as a string via
-	 *  [`crate::error::error_full_chain`] so the wire shape stays string;
-	 *  in-process consumers can match on the typed variants directly.
-	 */
-	error: string,
-};
+export type FailedAgent_Serialize = 
+/**
+ *  A native or translated agent failed during install. Name is
+ *  the validated [`crate::validation::AgentName`] — parsing succeeded
+ *  (callers had a parsed `AgentDefinition` or `NativeAgentBundle` in
+ *  scope), so the wire format carries a guaranteed-valid identifier
+ *  rather than a raw string.
+ */
+{ kind: "agent"; name: AgentName; source_path: string; error: string } | 
+/**
+ *  An agent file failed before parse, so no name is available.
+ *  `source_path` is the only identifier the FE can show. The
+ *  error variant inside carries the structured parse failure.
+ */
+{ kind: "unparseable_agent"; source_path: string; error: string } | 
+/**
+ *  A plugin's companion-file bundle (e.g. `agents/prompts/*.md`)
+ *  failed atomically. The bundle is plugin-scoped, not agent-scoped,
+ *  so neither `name` nor `source_path` (a per-agent concept) applies.
+ * 
+ *  `conflicts` enumerates destination paths that conflicted. Today
+ *  the engine bails on first conflict, so length is 0 (rejection
+ *  before per-file enumeration, e.g. `MultipleScanRootsNotSupported`)
+ *  or 1 (orphan / cross-plugin). Forward-compatible with future
+ *  "collect all conflicts" engine work without another wire migration.
+ */
+{ kind: "companion_bundle"; plugin: PluginName; conflicts: string[]; error: string };
 
 /**
  *  A skill that failed to install, with the reason.

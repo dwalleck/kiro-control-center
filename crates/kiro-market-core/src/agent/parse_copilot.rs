@@ -56,12 +56,13 @@ pub fn parse_copilot_agent(content: &str) -> Result<AgentDefinition, ParseFailur
             reason: e.to_string(),
         })?;
 
-    let name = fm.name.ok_or(ParseFailure::MissingName)?;
-    // Validate the name at parse time so downstream fs operations (and the
-    // file:// URI in the emitted JSON) can trust it without re-checking.
-    crate::validation::validate_name(&name).map_err(|e| match e {
-        // See parse_claude.rs for rationale on the explicit two-arm form
-        // — same CLAUDE.md classifier-exhaustiveness discipline.
+    let raw_name = fm.name.ok_or(ParseFailure::MissingName)?;
+    // Construct the validated AgentName at parse time so downstream fs
+    // operations (and the file:// URI in the emitted JSON) can trust it
+    // without re-checking. See parse_claude.rs for rationale on the
+    // explicit two-arm form — same CLAUDE.md classifier-exhaustiveness
+    // discipline.
+    let name = crate::validation::AgentName::new(raw_name).map_err(|e| match e {
         crate::error::ValidationError::InvalidName { reason, .. }
         | crate::error::ValidationError::InvalidRelativePath { reason, .. } => {
             ParseFailure::InvalidName { reason }
@@ -154,6 +155,35 @@ Body text.
     fn parse_missing_name_errors() {
         let src = "---\ndescription: x\n---\nbody\n";
         assert!(parse_copilot_agent(src).is_err());
+    }
+
+    /// Mirrors `parse_claude::tests::parse_rejects_path_traversal_in_name`.
+    /// Both parsers route through `AgentName::new`, but the integration
+    /// path through Copilot frontmatter needs its own behavioral test —
+    /// a future refactor that skipped `AgentName::new` on this branch
+    /// (e.g. introducing a Copilot-specific naming convention) would
+    /// silently regress against the Claude-only test alone.
+    #[test]
+    fn parse_rejects_path_traversal_in_name() {
+        let src = "---\nname: ../escape\ntools: []\n---\nbody\n";
+        let err = parse_copilot_agent(src).unwrap_err();
+        assert!(
+            matches!(err, ParseFailure::InvalidName { .. }),
+            "expected InvalidName for traversal, got {err:?}"
+        );
+    }
+
+    /// Mirrors `parse_claude::tests::parse_rejects_empty_name`. Locks
+    /// the empty-string rejection path through Copilot frontmatter
+    /// independently of Claude.
+    #[test]
+    fn parse_rejects_empty_name() {
+        let src = "---\nname: \"\"\ntools: []\n---\nbody\n";
+        let err = parse_copilot_agent(src).unwrap_err();
+        assert!(
+            matches!(err, ParseFailure::InvalidName { .. }),
+            "expected InvalidName for empty name, got {err:?}"
+        );
     }
 
     #[test]
