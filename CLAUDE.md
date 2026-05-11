@@ -66,6 +66,31 @@ gate; new commits do.
 
   Requires the `tethys` binary on PATH (or `TETHYS_BIN` env var); pass `--no-reindex` to query the existing `.rivets/index/tethys.db` without re-indexing first; pass `--gate <NAME>` to run a single gate. Exits 1 on findings (CI gate fails).
 
+## Work tracking (rivets)
+
+The deferred-work backlog lives in `.rivets/issues.jsonl` (committed to git) and is managed by the [`rivets`](https://github.com/dwalleck/rivets) CLI — a JSONL-backed issue tracker. The binary must be on PATH; the sibling repo is at `~/repos/rivets`. Issue-ID prefix is `kiro-` (set once in `.rivets/config.yaml` by `rivets init -p kiro`; do not change). Initialized in commit `5e85b6e` with 17 issues seeded from the PR #113-#115 retrospectives.
+
+**Check before you build.** Before starting any non-trivial change, run `rivets ready` and `rivets list --status open`. There is a good chance the work is already filed — often with `--design` notes or `--acceptance` criteria that should shape the implementation. Duplicating an existing issue as a fresh PR loses the linked context. `rivets show <id>` prints the full issue including dependencies.
+
+**Daily commands:**
+- `rivets ready` — issues with no open blockers (default sort: hybrid priority/age, limit 10)
+- `rivets list --status open` / `--label <name>` / `--type bug` / `-p <0-4>` — filtered backlog
+- `rivets show <id> [<id>...]` — full issue(s) including dependencies, design notes, acceptance criteria
+- `rivets stats` — totals by status (use to confirm the tracker is reachable)
+- `rivets blocked` — issues waiting on dependencies
+- `rivets update <id> --status in_progress` — claim work when you start
+- `rivets close <id> --reason "PR #NNN: <one-line summary>"` — close on merge
+- `rivets dep tree <id>` — visualize the dependency graph rooted at an issue
+- `rivets list --json | jq ...` — every subcommand supports `--json` for scripting
+
+**Creating issues.** When PR review surfaces follow-up work, file it as a rivets issue rather than letting it die in a stale comment thread. Match the existing seeded-issue style: `--description` includes the originating PR number, the file path(s) involved, and what the reviewer flagged; `--design` captures the fix approach; `--deps` wires up blockers. Use the `blocks` dependency type for "must-happen-in-the-same-commit-as <other>" coupling, not just strict predecessor ordering — that's how `kiro-5qcb` (a diagnostic-removal cleanup) couples to `kiro-kmj4` (the F3 UI work that enables the cleanup). The cleanup blocks the enabler so `rivets ready` correctly hides it until F3 closes.
+
+**The ID-placeholder footgun.** Rivets generates the 4-character suffix at creation time, so when issue A's description needs to reference issue B, you cannot pre-name B. If you write `kiro-<this-id>` or `kiro-CONTINGENT` as a stand-in, you MUST backfill the real ID after creating B. Commit `e7e3d9b` exists precisely because this was missed during the initial seeding and PR review caught it. After creating any issue whose description was authored before its ID existed, immediately re-read it and replace placeholders with real IDs.
+
+**Direct JSONL edits.** Editing `.rivets/issues.jsonl` directly (rather than via `rivets update`) is acceptable *only* for fixes that intentionally should NOT bump `updated_at` — e.g., the placeholder-backfill cleanup in `e7e3d9b`. Any change to a semantic field (status, priority, description content, dependencies, labels) must go through `rivets update <id>` so the timestamp reflects the real change and `rivets stale` stays meaningful.
+
+**Shared namespace with tethys.** `.rivets/` is a shared directory: rivets writes `config.yaml` and `issues.jsonl` at the top level (tracked), tethys writes its SQLite index under `.rivets/index/` (untracked, regenerable via `cargo xtask plan-lint`). The root `.gitignore` line is precisely `/.rivets/index/` for this reason — broadening it to `/.rivets/` would un-track the entire issue backlog. Do not change that line without recognizing both consumers.
+
 ## Planning
 After writing a plan and before starting implementation, apply the 6 gates in `docs/plan-review-checklist.md` (Grounding / Threat Model / Wire Format / External Type Boundary / Type Design / Reference vs Transcription). The gates also fire as code-review questions on any change touching the public API of `kiro-market-core`. Originated from the PR #64 retrospective; Gate 6 added from the PR #96 retrospective (steering/agents scan-path bug — a faithful encoding of a plan that transcribed install-time *output* instead of citing install-time *mechanism*). Complement to (not replacement for) the upstream `superpowers:writing-plans` skill: invoke that skill first, then run the gates as a self-review pass before declaring the plan implementation-ready.
 
