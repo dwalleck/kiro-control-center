@@ -24,12 +24,13 @@ pub use types::{AgentDefinition, AgentDialect, ParseFailure};
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::service::test_support::agent_name;
     use std::collections::BTreeMap;
 
     #[test]
     fn agent_definition_constructs_with_minimum_fields() {
         let def = AgentDefinition {
-            name: crate::validation::AgentName::new("reviewer").expect("valid test name"),
+            name: agent_name("reviewer"),
             description: None,
             prompt_body: "You are a reviewer.".into(),
             model: None,

@@ -3616,7 +3616,7 @@ impl KiroProject {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::service::test_support::{mp, pn};
+    use crate::service::test_support::{agent_name, mp, pn};
 
     fn temp_project() -> (tempfile::TempDir, KiroProject) {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -7241,7 +7241,7 @@ mod tests {
 
         let source_md = write_agent(tmp.path(), "rev", "You are a reviewer.");
         let def = crate::agent::AgentDefinition {
-            name: crate::validation::AgentName::new("rev").expect("valid test name"),
+            name: agent_name("rev"),
             description: None,
             prompt_body: "You are a reviewer.".into(),
             model: None,
@@ -7307,7 +7307,7 @@ mod tests {
         for name in ["alpha", "beta"] {
             let source_md = write_agent(tmp.path(), name, "body");
             let def = crate::agent::AgentDefinition {
-                name: crate::validation::AgentName::new(name).expect("valid test name"),
+                name: agent_name(name),
                 description: None,
                 prompt_body: "body".into(),
                 model: None,
@@ -7360,7 +7360,7 @@ mod tests {
         // First install: source under `agents/`.
         let alpha_md = write_agent(tmp.path(), "alpha", "body");
         let alpha_def = crate::agent::AgentDefinition {
-            name: crate::validation::AgentName::new("alpha").expect("valid test name"),
+            name: agent_name("alpha"),
             description: None,
             prompt_body: "body".into(),
             model: None,
@@ -7394,7 +7394,7 @@ mod tests {
         // source_scan_root must follow.
         let beta_md = write_agent(tmp.path(), "beta", "body2");
         let beta_def = crate::agent::AgentDefinition {
-            name: crate::validation::AgentName::new("beta").expect("valid test name"),
+            name: agent_name("beta"),
             description: None,
             prompt_body: "body2".into(),
             model: None,

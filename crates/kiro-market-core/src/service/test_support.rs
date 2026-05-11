@@ -193,3 +193,99 @@ pub fn pn(s: &str) -> crate::validation::PluginName {
     crate::validation::PluginName::new(s)
         .unwrap_or_else(|e| panic!("test fixture: invalid plugin name {s:?}: {e}"))
 }
+
+/// Test helper: construct an [`AgentName`](crate::validation::AgentName) from a
+/// string literal. Sibling to [`mp`] / [`pn`] — same fixture-only contract.
+///
+/// # Panics
+///
+/// Panics if `s` is not a valid agent name. Test infrastructure only —
+/// callers pass known-good literals.
+#[cfg(any(test, feature = "test-support"))]
+#[must_use]
+pub fn agent_name(s: &str) -> crate::validation::AgentName {
+    crate::validation::AgentName::new(s)
+        .unwrap_or_else(|e| panic!("test fixture: invalid agent name {s:?}: {e}"))
+}
+
+/// Construct an [`AgentInstallContext`](crate::service::AgentInstallContext)
+/// with the defaults every test cares about: `InstallMode::New`, MCP gate
+/// closed, no version pin. Override individual fields via struct-update
+/// syntax (`AgentInstallContext { accept_mcp: true, ..default_install_ctx(&m, &p) }`).
+///
+/// Bind `marketplace` and `plugin` first so the borrows outlive the
+/// returned struct:
+///
+/// ```ignore
+/// let market = mp("mp");
+/// let plug = pn("p");
+/// let ctx = default_install_ctx(&market, &plug);
+/// ```
+///
+/// The struct is `Copy`, so the caller can pass it by value into the
+/// service entry points without a clone.
+#[cfg(any(test, feature = "test-support"))]
+#[must_use]
+pub fn default_install_ctx<'a>(
+    marketplace: &'a crate::validation::MarketplaceName,
+    plugin: &'a crate::validation::PluginName,
+) -> crate::service::AgentInstallContext<'a> {
+    crate::service::AgentInstallContext {
+        mode: crate::service::InstallMode::New,
+        accept_mcp: false,
+        marketplace,
+        plugin,
+        version: None,
+    }
+}
+
+/// Build a native (`format: "kiro-cli"`) plugin source tree on disk:
+/// writes `<root>/<scan>/<agent_name>.json` and, when `companion` is
+/// `Some(rel)`, writes the companion body at `<root>/<scan>/<rel>` and
+/// references it from the agent JSON's `prompt` field via `file://./<rel>`.
+/// Returns the scan-root path so callers can drop additional files (a
+/// second agent, a sibling companion) into the same scan.
+///
+/// `companion = None` produces an agent with an empty `prompt` field;
+/// most native install paths reject such an agent at parse, so the `None`
+/// variant is useful only for tests that want to exercise pre-validation
+/// rejection (e.g. multi-scan-root rejection, which fires before parse).
+///
+/// Replaces three near-identical inlined fixtures in
+/// `service::tests::install_plugin_agents_native_*` (the orphan,
+/// cross-plugin, and multi-scan-root tests each rebuilt the shape).
+///
+/// # Panics
+///
+/// Panics on any filesystem failure. Test infrastructure only — callers
+/// pass freshly created temp directories.
+#[cfg(any(test, feature = "test-support"))]
+// Returns the scan dir for callers that need it (e.g. to write extra
+// fixture files); callers that just want the side effect can discard
+// the value, so opt out of `must_use_candidate` here.
+#[allow(clippy::must_use_candidate)]
+pub fn make_native_plugin_dir(
+    root: &Path,
+    scan: &str,
+    agent_name: &str,
+    companion: Option<&str>,
+) -> PathBuf {
+    let scan_dir = root.join(scan);
+    std::fs::create_dir_all(&scan_dir).expect("create native scan dir");
+    let prompt = companion
+        .map(|rel| format!("file://./{rel}"))
+        .unwrap_or_default();
+    std::fs::write(
+        scan_dir.join(format!("{agent_name}.json")),
+        format!(r#"{{"name":"{agent_name}","prompt":"{prompt}"}}"#),
+    )
+    .expect("write native agent json");
+    if let Some(rel) = companion {
+        let companion_path = scan_dir.join(rel);
+        if let Some(parent) = companion_path.parent() {
+            std::fs::create_dir_all(parent).expect("create companion parent dir");
+        }
+        std::fs::write(&companion_path, b"prompt body").expect("write companion body");
+    }
+    scan_dir
+}

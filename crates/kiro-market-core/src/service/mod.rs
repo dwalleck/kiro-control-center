@@ -2981,9 +2981,11 @@ mod tests {
 
     use super::*;
     use crate::cache::CacheDir;
-    use crate::error::GitError;
+    use crate::error::{AgentError, GitError};
     use crate::git::CloneOptions;
-    use crate::service::test_support::{mp, pn};
+    use crate::service::test_support::{
+        agent_name, default_install_ctx, make_native_plugin_dir, mp, pn,
+    };
 
     #[test]
     fn install_warning_unmapped_tool_renders_with_reason() {
@@ -3136,7 +3138,7 @@ mod tests {
         use std::path::PathBuf;
 
         let agent = FailedAgent::Agent {
-            name: crate::validation::AgentName::new("reviewer").expect("valid test name"),
+            name: agent_name("reviewer"),
             source_path: PathBuf::from("/src/reviewer.json"),
             error: AgentError::ContentChangedRequiresForce {
                 name: "reviewer".to_owned(),
@@ -3267,59 +3269,287 @@ mod tests {
         );
     }
 
-    /// Classifier routing test: orphan errors produce a length-1
-    /// `conflicts` entry containing the destination path.
-    #[test]
-    fn companion_conflicts_from_error_orphan_returns_destination_path() {
-        use crate::error::AgentError;
-        use std::path::PathBuf;
-
-        let err = AgentError::OrphanFileAtDestination {
-            path: PathBuf::from("/dest/prompts/code-reviewer.md"),
+    /// `serialize_agent_error` must preserve the full `.source()` chain
+    /// of the typed `AgentError` it projects onto the wire. The CLAUDE.md
+    /// rule says FFI-string projections use `error_full_chain(&err)`,
+    /// not `err.to_string()`, because the latter renders only the top
+    /// Display and drops every inner source.
+    ///
+    /// Parameterized over the two `AgentError` variants that carry an
+    /// `Error`-typed source (and therefore feed `error_full_chain`'s
+    /// `.source()` walk):
+    ///
+    /// - `InstallFailed { source: Box<Error> }` — multi-layer chain
+    ///   wrapping a top-level `Error::Io`. Tests the deepest path
+    ///   through `error_full_chain`.
+    /// - `ManifestReadFailed { #[source] source: io::Error }` — direct
+    ///   `io::Error` source. A "simplification" that special-cased
+    ///   `InstallFailed` and short-circuited `to_string()` for other
+    ///   variants would pass the first case but drop the second's
+    ///   inner reason.
+    ///
+    /// Each case asserts the wire string contains BOTH the outer
+    /// Display fragment (locking that the top-level message still
+    /// surfaces) AND the inner reason (locking the source-chain walk).
+    /// A future swap of `error_full_chain` for `to_string()` keeps the
+    /// existing key-set tests passing (the field is still a string)
+    /// but drops the inner reason — the regression we're locking
+    /// against.
+    #[rstest::rstest]
+    #[case::install_failed_boxed_io(
+        AgentError::InstallFailed {
+            path: PathBuf::from("/src/reviewer.md"),
+            source: Box::new(crate::error::Error::Io(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "filesystem refused write: simulated EACCES",
+            ))),
+        },
+        "/src/reviewer.md",
+        "filesystem refused write: simulated EACCES",
+    )]
+    #[case::manifest_read_failed_direct_io(
+        AgentError::ManifestReadFailed {
+            path: PathBuf::from("/src/manifest.json"),
+            source: std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "perm reason marker",
+            ),
+        },
+        "/src/manifest.json",
+        "perm reason marker",
+    )]
+    fn failed_agent_error_serializes_with_full_source_chain(
+        #[case] error: AgentError,
+        #[case] expected_outer_fragment: &str,
+        #[case] expected_inner_fragment: &str,
+    ) {
+        let agent = FailedAgent::Agent {
+            name: agent_name("reviewer"),
+            source_path: PathBuf::from("/src/reviewer.md"),
+            error,
         };
-        let conflicts = companion_conflicts_from_error(&err);
-        assert_eq!(
-            conflicts,
-            vec![PathBuf::from("/dest/prompts/code-reviewer.md")]
+
+        let json = serde_json::to_value(&agent).expect("serialize Agent");
+        let rendered = json["error"]
+            .as_str()
+            .expect("error must serialize as a string per the FFI contract");
+
+        // Outer Display fragment from the variant's `#[error("...")]`
+        // attribute (see error.rs). Locks that the top-level message
+        // still surfaces.
+        assert!(
+            rendered.contains(expected_outer_fragment),
+            "outer Display must contain {expected_outer_fragment:?}, got: {rendered}"
+        );
+        // Inner reason walked via `.source()`. THIS is what
+        // `error_full_chain` surfaces and what a bare `to_string()`
+        // would silently drop. If this assertion ever starts failing,
+        // audit the projector — the chain preservation contract has
+        // regressed.
+        assert!(
+            rendered.contains(expected_inner_fragment),
+            "inner source fragment {expected_inner_fragment:?} must reach the wire \
+             via error_full_chain, got: {rendered}"
         );
     }
 
-    /// Classifier routing test: cross-plugin path conflicts also
-    /// produce a length-1 `conflicts` entry. The `owner` field is
-    /// not consumed by the classifier — it survives in the typed
-    /// error inside `FailedAgent::CompanionBundle.error`.
-    #[test]
-    fn companion_conflicts_from_error_path_owned_by_other_plugin_returns_destination_path() {
-        use crate::error::AgentError;
-        use std::path::PathBuf;
-
-        let err = AgentError::PathOwnedByOtherPlugin {
-            path: PathBuf::from("/dest/prompts/shared.md"),
-            owner: "otherplugin".to_owned(),
-        };
-        let conflicts = companion_conflicts_from_error(&err);
-        assert_eq!(conflicts, vec![PathBuf::from("/dest/prompts/shared.md")]);
+    /// `FailedAgent::error()` — the common-payload accessor added in
+    /// PR #113's second pass — must return a reference to the inner
+    /// error for every variant. The accessor's exhaustive match exists
+    /// to force the right behavior at the type level (a new variant
+    /// without an `error` field becomes a compile error there), but
+    /// the behavioral contract is "calling `.error()` on any variant
+    /// returns its `AgentError`." This test locks that contract.
+    ///
+    /// Regression caught: a future "simplification" of the accessor
+    /// (e.g. dropping arms by relying on a `_` catchall, or mismatching
+    /// the field binding) would silently return a stale or wrong
+    /// reference. The compile-time exhaustiveness alone doesn't catch
+    /// a wrong-arm-binding regression; this test does, one case per
+    /// variant.
+    #[rstest::rstest]
+    #[case::agent(
+        FailedAgent::Agent {
+            name: agent_name("reviewer"),
+            source_path: PathBuf::from("/src/reviewer.md"),
+            error: AgentError::ContentChangedRequiresForce {
+                name: "reviewer-agent-case".to_owned(),
+            },
+        },
+        "reviewer-agent-case",
+    )]
+    #[case::unparseable_agent(
+        FailedAgent::UnparseableAgent {
+            source_path: PathBuf::from("/src/broken.md"),
+            error: AgentError::NativeManifestParseFailed {
+                path: PathBuf::from("/src/broken.md"),
+                reason: "reviewer-unparseable-case".to_owned(),
+            },
+        },
+        "reviewer-unparseable-case",
+    )]
+    #[case::companion_bundle(
+        FailedAgent::CompanionBundle {
+            plugin: pn("p"),
+            conflicts: Vec::new(),
+            error: AgentError::OrphanFileAtDestination {
+                path: PathBuf::from("/dest/reviewer-bundle-case.md"),
+            },
+        },
+        "reviewer-bundle-case",
+    )]
+    fn failed_agent_error_returns_inner_error_for_every_variant(
+        #[case] failure: FailedAgent,
+        #[case] expected_marker_fragment: &str,
+    ) {
+        // Each case embeds a unique marker string in its inner
+        // `AgentError`'s Display output. Calling `.error()` and
+        // rendering it should surface that marker — confirming the
+        // accessor returned the right variant's error reference, not
+        // a stale or wrong one.
+        let rendered = failure.error().to_string();
+        assert!(
+            rendered.contains(expected_marker_fragment),
+            "FailedAgent::error() must return the variant's inner AgentError; \
+             expected marker {expected_marker_fragment:?} in rendered Display, got: {rendered}"
+        );
     }
 
-    /// Classifier routing test: errors that fire BEFORE per-file
-    /// enumeration produce an empty conflicts list. `MultipleScanRootsNotSupported`
-    /// is the canonical pre-enumeration case (rejection at discovery).
-    /// This test pins the empty-conflicts branch so that a future
-    /// "default to empty" wildcard regression (which CLAUDE.md
-    /// prohibits) is also caught behaviorally.
-    #[test]
-    fn companion_conflicts_from_error_multi_scan_root_returns_empty() {
-        use crate::error::AgentError;
-        use std::path::PathBuf;
+    // Shared literals for the classifier routing rstest below. Lifted
+    // to module scope because `#[case(...)]` arguments expand at the
+    // outer module level — function-body consts aren't in scope at
+    // macro-expansion time. Specific naming (SRC_X_JSON, ORPHAN_PATH,
+    // SHARED_PATH, etc.) keeps these from colliding with anything else
+    // in the test module.
+    const SRC_X_JSON: &str = "/src/x.json";
+    const ORPHAN_PATH: &str = "/dest/prompts/orphan.md";
+    const SHARED_PATH: &str = "/dest/prompts/shared.md";
+    const REVIEWER: &str = "reviewer";
+    const OTHER_PLUGIN: &str = "otherplugin";
 
-        let err = AgentError::MultipleScanRootsNotSupported {
+    /// Parameterized classifier routing test — locks the
+    /// `companion_conflicts_from_error` projection contract for every
+    /// `AgentError` variant behaviorally, not just at compile time via
+    /// the exhaustive match.
+    ///
+    /// The compile-time gate catches a missing variant when `AgentError`
+    /// grows. This test catches a future refactor that moves an
+    /// existing variant between the path-bearing arm and the empty arm
+    /// without anyone noticing — the wire format would still typecheck
+    /// but the FE would either lose a real conflict path (path-bearing
+    /// → empty regression) or render a spurious one (empty →
+    /// path-bearing regression). Subsumes and replaces the three
+    /// single-variant tests that previously covered orphan, cross-plugin,
+    /// and multi-scan-root in isolation.
+    ///
+    /// Covers all 14 `AgentError` variants as of this commit:
+    /// - 2 path-bearing (`OrphanFileAtDestination`, `PathOwnedByOtherPlugin`)
+    /// - 12 empty (every other variant)
+    ///
+    /// Common literals are lifted to module-level consts so each
+    /// `#[case]` highlights the variant-specific fields rather than the
+    /// shared scaffolding.
+    #[rstest::rstest]
+    // --- length-1 (path-bearing) arm ---
+    #[case::orphan(
+        AgentError::OrphanFileAtDestination {
+            path: PathBuf::from(ORPHAN_PATH),
+        },
+        vec![PathBuf::from(ORPHAN_PATH)],
+    )]
+    #[case::path_owned_by_other_plugin(
+        AgentError::PathOwnedByOtherPlugin {
+            path: PathBuf::from(SHARED_PATH),
+            owner: OTHER_PLUGIN.to_owned(),
+        },
+        vec![PathBuf::from(SHARED_PATH)],
+    )]
+    // --- empty arm (12 variants) ---
+    #[case::already_installed(
+        AgentError::AlreadyInstalled { name: REVIEWER.to_owned() },
+        Vec::new(),
+    )]
+    #[case::not_installed(
+        AgentError::NotInstalled { name: REVIEWER.to_owned() },
+        Vec::new(),
+    )]
+    #[case::parse_failed(
+        AgentError::ParseFailed {
+            path: PathBuf::from("/src/reviewer.md"),
+            failure: crate::agent::ParseFailure::MissingName,
+        },
+        Vec::new(),
+    )]
+    #[case::native_manifest_parse_failed(
+        AgentError::NativeManifestParseFailed {
+            path: PathBuf::from(SRC_X_JSON),
+            reason: "unexpected EOF".to_owned(),
+        },
+        Vec::new(),
+    )]
+    #[case::native_manifest_missing_name(
+        AgentError::NativeManifestMissingName {
+            path: PathBuf::from(SRC_X_JSON),
+        },
+        Vec::new(),
+    )]
+    #[case::native_manifest_invalid_name(
+        AgentError::NativeManifestInvalidName {
+            path: PathBuf::from(SRC_X_JSON),
+            reason: "contains slash".to_owned(),
+        },
+        Vec::new(),
+    )]
+    #[case::manifest_read_failed(
+        AgentError::ManifestReadFailed {
+            path: PathBuf::from(SRC_X_JSON),
+            source: std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+        },
+        Vec::new(),
+    )]
+    #[case::name_clash_with_other_plugin(
+        AgentError::NameClashWithOtherPlugin {
+            name: REVIEWER.to_owned(),
+            owner: OTHER_PLUGIN.to_owned(),
+        },
+        Vec::new(),
+    )]
+    #[case::content_changed_requires_force(
+        AgentError::ContentChangedRequiresForce {
+            name: REVIEWER.to_owned(),
+        },
+        Vec::new(),
+    )]
+    #[case::multiple_scan_roots_not_supported(
+        AgentError::MultipleScanRootsNotSupported {
             roots: vec![PathBuf::from("agents"), PathBuf::from("other-agents")],
-        };
+        },
+        Vec::new(),
+    )]
+    #[case::source_hardlinked(
+        AgentError::SourceHardlinked {
+            path: PathBuf::from(SRC_X_JSON),
+            nlink: 2,
+        },
+        Vec::new(),
+    )]
+    #[case::install_failed(
+        AgentError::InstallFailed {
+            path: PathBuf::from(SRC_X_JSON),
+            source: Box::new(crate::error::Error::Io(std::io::Error::from(
+                std::io::ErrorKind::Other,
+            ))),
+        },
+        Vec::new(),
+    )]
+    fn companion_conflicts_from_error_routes_every_variant(
+        #[case] err: AgentError,
+        #[case] expected: Vec<PathBuf>,
+    ) {
         let conflicts = companion_conflicts_from_error(&err);
-        assert!(
-            conflicts.is_empty(),
-            "MultipleScanRootsNotSupported is a bundle-level rejection that fires \
-             BEFORE per-file enumeration; conflicts must be empty, got: {conflicts:?}"
+        assert_eq!(
+            conflicts, expected,
+            "classifier routing regressed for variant: {err:?}"
         );
     }
 
@@ -3355,13 +3585,7 @@ mod tests {
             plugin_tmp.path(),
             &["./agents/".to_string()],
             crate::plugin::PluginFormat::Translated,
-            AgentInstallContext {
-                mode: InstallMode::New,
-                accept_mcp: false, // existing fixtures don't carry MCP servers
-                marketplace: &mp("mp"),
-                plugin: &pn("plugin-x"),
-                version: None,
-            },
+            default_install_ctx(&mp("mp"), &pn("plugin-x")),
         );
         let warnings = &result.warnings;
 
@@ -3434,13 +3658,7 @@ mod tests {
             plugin_tmp.path(),
             &["./agents/".to_string()],
             crate::plugin::PluginFormat::Translated,
-            AgentInstallContext {
-                mode: InstallMode::New,
-                accept_mcp: false,
-                marketplace: &mp("mp"),
-                plugin: &pn("p"),
-                version: None,
-            },
+            default_install_ctx(&mp("mp"), &pn("p")),
         );
         assert!(result.installed.is_empty());
         assert!(
@@ -3482,13 +3700,7 @@ mod tests {
             plugin_tmp.path(),
             &["./agents/".to_string()],
             crate::plugin::PluginFormat::Translated,
-            AgentInstallContext {
-                mode: InstallMode::New,
-                accept_mcp: false,
-                marketplace: &mp("mp"),
-                plugin: &pn("p"),
-                version: None,
-            },
+            default_install_ctx(&mp("mp"), &pn("p")),
         );
 
         // A succeeded, B failed, and the unmapped-tool warning for A still
@@ -3540,13 +3752,7 @@ mod tests {
             plugin_tmp.path(),
             &["./agents/".to_string()],
             crate::plugin::PluginFormat::Translated,
-            AgentInstallContext {
-                mode: InstallMode::New,
-                accept_mcp: false,
-                marketplace: &mp("mp"),
-                plugin: &pn("p"),
-                version: None,
-            },
+            default_install_ctx(&mp("mp"), &pn("p")),
         );
         assert!(result.installed.is_empty());
         assert!(result.failed.is_empty());
@@ -3589,13 +3795,8 @@ mod tests {
             plugin_tmp.path(),
             &["./agents/".to_string()],
             crate::plugin::PluginFormat::Translated,
-            AgentInstallContext {
-                mode: InstallMode::New,
-                accept_mcp: false, // gate must fire
-                marketplace: &mp("mp"),
-                plugin: &pn("p"),
-                version: None,
-            },
+            // gate must fire — accept_mcp stays false (the helper default).
+            default_install_ctx(&mp("mp"), &pn("p")),
         );
 
         assert!(
@@ -3644,12 +3845,10 @@ mod tests {
             plugin_tmp.path(),
             &["./agents/".to_string()],
             crate::plugin::PluginFormat::Translated,
+            // gate is bypassed — flip accept_mcp via struct-update.
             AgentInstallContext {
-                mode: InstallMode::New,
-                accept_mcp: true, // gate is bypassed
-                marketplace: &mp("mp"),
-                plugin: &pn("p"),
-                version: None,
+                accept_mcp: true,
+                ..default_install_ctx(&mp("mp"), &pn("p"))
             },
         );
 
@@ -3713,13 +3912,7 @@ mod tests {
             plugin_tmp.path(),
             &["./agents/".to_string()],
             crate::plugin::PluginFormat::Translated,
-            AgentInstallContext {
-                mode: InstallMode::New,
-                accept_mcp: false,
-                marketplace: &mp("mp"),
-                plugin: &pn("p"),
-                version: None,
-            },
+            default_install_ctx(&mp("mp"), &pn("p")),
         );
         assert!(result.installed.is_empty(), "MCP agent must be skipped");
 
@@ -3769,12 +3962,11 @@ mod tests {
             plugin_tmp.path(),
             &["./agents/".to_string()],
             crate::plugin::PluginFormat::Translated,
+            // Force mode + accept_mcp=false (the helper default): the MCP
+            // gate still fires; force does not bypass it.
             AgentInstallContext {
-                mode: InstallMode::Force, // force, but...
-                accept_mcp: false,        // accept_mcp = false should still gate
-                marketplace: &mp("mp"),
-                plugin: &pn("p"),
-                version: None,
+                mode: InstallMode::Force,
+                ..default_install_ctx(&mp("mp"), &pn("p"))
             },
         );
         assert!(
@@ -3810,13 +4002,7 @@ mod tests {
             plugin_tmp.path(),
             &["./agents/".to_string()],
             crate::plugin::PluginFormat::Translated,
-            AgentInstallContext {
-                mode: InstallMode::New,
-                accept_mcp: false,
-                marketplace: &mp("mp"),
-                plugin: &pn("p"),
-                version: None,
-            },
+            default_install_ctx(&mp("mp"), &pn("p")),
         );
         assert_eq!(r1.installed, vec!["dup".to_string()]);
         assert!(r1.failed.is_empty());
@@ -3827,13 +4013,7 @@ mod tests {
             plugin_tmp.path(),
             &["./agents/".to_string()],
             crate::plugin::PluginFormat::Translated,
-            AgentInstallContext {
-                mode: InstallMode::New,
-                accept_mcp: false,
-                marketplace: &mp("mp"),
-                plugin: &pn("p"),
-                version: None,
-            },
+            default_install_ctx(&mp("mp"), &pn("p")),
         );
         assert!(r2.installed.is_empty());
         assert_eq!(r2.skipped, vec!["dup".to_string()]);
@@ -3867,11 +4047,8 @@ mod tests {
             &["./agents/".to_string()],
             crate::plugin::PluginFormat::Translated,
             AgentInstallContext {
-                mode: InstallMode::New,
-                accept_mcp: false,
-                marketplace: &mp("mp"),
-                plugin: &pn("p"),
                 version: Some("1.0.0"),
+                ..default_install_ctx(&mp("mp"), &pn("p"))
             },
         );
         assert_eq!(r1.installed, vec!["dup".to_string()]);
@@ -3892,10 +4069,8 @@ mod tests {
             crate::plugin::PluginFormat::Translated,
             AgentInstallContext {
                 mode: InstallMode::Force,
-                accept_mcp: false,
-                marketplace: &mp("mp"),
-                plugin: &pn("p"),
                 version: Some("2.0.0"),
+                ..default_install_ctx(&mp("mp"), &pn("p"))
             },
         );
         assert_eq!(
@@ -3956,13 +4131,7 @@ mod tests {
             plugin_tmp.path(),
             &["./agents/".to_string()],
             crate::plugin::PluginFormat::Translated,
-            AgentInstallContext {
-                mode: InstallMode::New,
-                accept_mcp: false,
-                marketplace: &mp("mp"),
-                plugin: &pn("p"),
-                version: None,
-            },
+            default_install_ctx(&mp("mp"), &pn("p")),
         );
         assert!(result.installed.is_empty());
         // Rejection happens at parse time with a typed InvalidName.
@@ -4018,13 +4187,7 @@ mod tests {
             plugin_tmp.path(),
             &["./agents/".to_string()],
             crate::plugin::PluginFormat::KiroCli,
-            AgentInstallContext {
-                mode: InstallMode::New,
-                accept_mcp: false, // fixture has no MCP servers
-                marketplace: &mp("marketplace-x"),
-                plugin: &pn("p"),
-                version: None,
-            },
+            default_install_ctx(&mp("marketplace-x"), &pn("p")),
         );
 
         // Native dispatch surfaces installs in BOTH `installed` (legacy
@@ -4087,13 +4250,8 @@ mod tests {
             plugin_tmp.path(),
             &["./agents/".to_string()],
             crate::plugin::PluginFormat::KiroCli,
-            AgentInstallContext {
-                mode: InstallMode::New,
-                accept_mcp: false, // gate fires
-                marketplace: &mp("m"),
-                plugin: &pn("p"),
-                version: None,
-            },
+            // gate fires — accept_mcp stays false (the helper default).
+            default_install_ctx(&mp("m"), &pn("p")),
         );
 
         assert!(
@@ -4147,13 +4305,7 @@ mod tests {
             plugin_tmp.path(),
             &["./agents/".to_string(), "./extras/".to_string()],
             crate::plugin::PluginFormat::KiroCli,
-            AgentInstallContext {
-                mode: InstallMode::New,
-                accept_mcp: false,
-                marketplace: &mp("m"),
-                plugin: &pn("p"),
-                version: None,
-            },
+            default_install_ctx(&mp("m"), &pn("p")),
         );
 
         // The bundle is rejected wholesale.
@@ -4181,6 +4333,187 @@ mod tests {
         // Tracking file was never written for either agent.
         let tracking = project.load_installed_agents().expect("load tracking");
         assert!(tracking.agents.is_empty(), "no agents should be tracked");
+    }
+
+    /// End-to-end variant routing: an orphan companion file at the
+    /// destination (no tracking entry) must surface as
+    /// `FailedAgent::CompanionBundle` carrying
+    /// `AgentError::OrphanFileAtDestination`, with the projected
+    /// `conflicts` list containing exactly the destination path.
+    ///
+    /// Without this test, a future refactor that misroutes the error
+    /// variant — e.g. constructs `FailedAgent::Agent` instead of
+    /// `FailedAgent::CompanionBundle` at the companion-install Err
+    /// branch — would pass the existing wire-format and classifier
+    /// unit tests (they exercise the projection in isolation), pass
+    /// the per-agent install tests (they don't hit the bundle path),
+    /// and silently regress the misdiagnosis class PR #113 was designed
+    /// to prevent. The test fixture deliberately uses the native
+    /// install path because that's the only path whose collision
+    /// matrix surfaces the orphan variant for companions.
+    #[test]
+    fn install_plugin_agents_native_orphan_companion_routes_to_companion_bundle() {
+        let plugin_tmp = tempfile::tempdir().expect("plugin tempdir");
+        make_native_plugin_dir(
+            plugin_tmp.path(),
+            "agents",
+            "reviewer",
+            Some("prompts/reviewer.md"),
+        );
+
+        let project_tmp = tempfile::tempdir().expect("project tempdir");
+        let project = crate::project::KiroProject::new(project_tmp.path().to_path_buf());
+
+        // Pre-write an orphan at the companion's destination with no
+        // tracking entry — the collision matrix routes "untracked +
+        // on-disk" to OrphanFileAtDestination (project.rs:3163).
+        let dest_prompts = project_tmp.path().join(".kiro/agents/prompts");
+        std::fs::create_dir_all(&dest_prompts).expect("create dest prompts dir");
+        std::fs::write(
+            dest_prompts.join("reviewer.md"),
+            b"pre-existing orphan content",
+        )
+        .expect("write orphan");
+
+        let result = MarketplaceService::install_plugin_agents(
+            &project,
+            plugin_tmp.path(),
+            &["./agents/".to_string()],
+            crate::plugin::PluginFormat::KiroCli,
+            default_install_ctx(&mp("mp"), &pn("p")),
+        );
+
+        assert_eq!(
+            result.failed.len(),
+            1,
+            "expected exactly one failure (the companion bundle), got: {:?}",
+            result.failed
+        );
+        match &result.failed[0] {
+            FailedAgent::CompanionBundle {
+                plugin,
+                conflicts,
+                error: crate::error::AgentError::OrphanFileAtDestination { path },
+            } => {
+                assert_eq!(plugin.as_str(), "p", "bundle is plugin-scoped");
+                assert_eq!(
+                    conflicts.len(),
+                    1,
+                    "orphan classifier must produce length-1 conflicts, got: {conflicts:?}"
+                );
+                assert!(
+                    conflicts[0].ends_with("prompts/reviewer.md"),
+                    "wire-format conflict must point at the orphan destination: {conflicts:?}"
+                );
+                assert!(
+                    path.ends_with("prompts/reviewer.md"),
+                    "typed error path must match the wire-format conflict: {path:?}"
+                );
+            }
+            other => panic!(
+                "expected FailedAgent::CompanionBundle {{ error: OrphanFileAtDestination, .. }}, \
+                 got {other:?}"
+            ),
+        }
+    }
+
+    /// End-to-end variant routing: a companion path owned by a
+    /// different plugin must surface as `FailedAgent::CompanionBundle`
+    /// carrying `AgentError::PathOwnedByOtherPlugin`, with the owner
+    /// preserved in the typed error and the destination path projected
+    /// into `conflicts`. Same forcing function as the orphan test
+    /// above: catches a misrouted variant at the cross-plugin Err
+    /// branch in `install_native_companions_for_plugin`.
+    #[test]
+    fn install_plugin_agents_native_cross_plugin_companion_routes_to_companion_bundle() {
+        let alpha_plugin_dir = tempfile::tempdir().expect("plugin A tempdir");
+        let beta_plugin_dir = tempfile::tempdir().expect("plugin B tempdir");
+        make_native_plugin_dir(
+            alpha_plugin_dir.path(),
+            "agents",
+            "alpha",
+            Some("prompts/shared.md"),
+        );
+        make_native_plugin_dir(
+            beta_plugin_dir.path(),
+            "agents",
+            "beta",
+            Some("prompts/shared.md"),
+        );
+
+        let project_tmp = tempfile::tempdir().expect("project tempdir");
+        let project = crate::project::KiroProject::new(project_tmp.path().to_path_buf());
+
+        let market = mp("mp");
+        let alpha = pn("plugin-a");
+        let beta = pn("plugin-b");
+
+        // Install plugin A — succeeds; tracking now records that
+        // "plugin-a" owns prompts/shared.md.
+        let result_a = MarketplaceService::install_plugin_agents(
+            &project,
+            alpha_plugin_dir.path(),
+            &["./agents/".to_string()],
+            crate::plugin::PluginFormat::KiroCli,
+            default_install_ctx(&market, &alpha),
+        );
+        assert!(
+            result_a.failed.is_empty(),
+            "plugin A install must succeed before exercising the cross-plugin \
+             branch, got: {:?}",
+            result_a.failed
+        );
+        assert!(
+            !result_a.installed.is_empty(),
+            "plugin A must actually install (not just skip) so tracking records \
+             ownership of prompts/shared.md, got installed: {:?}, skipped: {:?}",
+            result_a.installed,
+            result_a.skipped,
+        );
+
+        // Install plugin B — collision matrix at project.rs:3145 sees
+        // prompts/shared.md owned by plugin-a → PathOwnedByOtherPlugin.
+        let result_b = MarketplaceService::install_plugin_agents(
+            &project,
+            beta_plugin_dir.path(),
+            &["./agents/".to_string()],
+            crate::plugin::PluginFormat::KiroCli,
+            default_install_ctx(&market, &beta),
+        );
+
+        assert_eq!(
+            result_b.failed.len(),
+            1,
+            "plugin B must fail with one CompanionBundle entry, got: {:?}",
+            result_b.failed
+        );
+        match &result_b.failed[0] {
+            FailedAgent::CompanionBundle {
+                plugin,
+                conflicts,
+                error: crate::error::AgentError::PathOwnedByOtherPlugin { path, owner },
+            } => {
+                assert_eq!(plugin.as_str(), "plugin-b", "bundle is plugin-scoped");
+                assert_eq!(owner, "plugin-a", "owner field survives in the typed error");
+                assert_eq!(
+                    conflicts.len(),
+                    1,
+                    "cross-plugin classifier must produce length-1 conflicts: {conflicts:?}"
+                );
+                assert!(
+                    conflicts[0].ends_with("prompts/shared.md"),
+                    "wire-format conflict must point at the shared path: {conflicts:?}"
+                );
+                assert!(
+                    path.ends_with("prompts/shared.md"),
+                    "typed error path must match the wire-format conflict: {path:?}"
+                );
+            }
+            other => panic!(
+                "expected FailedAgent::CompanionBundle {{ error: PathOwnedByOtherPlugin, .. }}, \
+                 got {other:?}"
+            ),
+        }
     }
 
     /// Mock git backend that records calls and creates a minimal marketplace
