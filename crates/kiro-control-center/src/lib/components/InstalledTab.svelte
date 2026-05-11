@@ -130,6 +130,8 @@
     installStaleRefresh = null;
     removeResult = null;
     removeResultPlugin = null;
+    installResult = null;
+    installResultPlugin = null;
 
     try {
       const outcome = await runPluginRemove({
