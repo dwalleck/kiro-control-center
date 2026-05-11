@@ -78,7 +78,7 @@ export type PluginBanner = {
 };
 
 export type PluginActionOutcome =
-  | { kind: "ok"; banner: PluginBanner }
+  | { kind: "ok"; banner: PluginBanner; installResult: InstallPluginResult_Serialize }
   | { kind: "fail"; error: string };
 
 export type PluginRemoveOutcome =
@@ -157,19 +157,6 @@ export async function runPluginInstall(
       } else {
         primary = { kind: "message", text: `${successPrefix}: ${summary}` };
       }
-      // Per design 2026-05-09-failed-agent-discriminator-design.md (F3):
-      // when the inline-failure UI ships, render `result.data.agents.failed`
-      // by switching on the discriminator with an exhaustiveness guard:
-      //
-      //   switch (entry.kind) {
-      //     case "agent": return renderAgent(entry.name, entry.source_path, entry.error);
-      //     case "unparseable_agent": return renderUnparseable(entry.source_path, entry.error);
-      //     case "companion_bundle": return renderBundle(entry.plugin, entry.conflicts, entry.error);
-      //     default: { const _exhaustive: never = entry; throw new Error(`unhandled ${JSON.stringify(_exhaustive)}`); }
-      //   }
-      //
-      // Pair the runtime switch with a value-position assert per CLAUDE.md
-      // discriminator-pushdown discipline (see _PLUGIN_ACTION_VALUES + _AssertPluginActionExhaustive).
       if (warnings) {
         warning = `${successPrefix}: ${warnings}`;
       }
@@ -206,6 +193,7 @@ export async function runPluginInstall(
       return {
         kind: "ok",
         banner: { primary, warning, staleRefresh },
+        installResult: result.data,
       };
     }
     return {

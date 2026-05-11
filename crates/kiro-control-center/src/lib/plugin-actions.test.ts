@@ -95,6 +95,7 @@ describe("runPluginInstall", () => {
       });
       expect(outcome.banner.warning).toBeNull();
       expect(outcome.banner.staleRefresh).toBeNull();
+      expect(outcome.installResult).toBe(r);
     }
     expect(installPlugin).toHaveBeenCalledWith(
       "acme",
@@ -104,6 +105,39 @@ describe("runPluginInstall", () => {
       "/test/project",
     );
     expect(storeRefresh).toHaveBeenCalledOnce();
+  });
+
+  it("install with failures: outcome.installResult carries each FailedX entry intact", async () => {
+    const r = emptyInstallResult();
+    r.skills.failed = [
+      { name: "bad-skill", error: "disk error", kind: { kind: "install_failed" } },
+    ];
+    r.steering.failed = [
+      { source: "rules/bad.md", error: "permission denied" },
+    ];
+    r.agents.failed = [
+      { kind: "agent", name: "my-agent" as import("$lib/bindings").AgentName, source_path: "agents/my-agent.md", error: "parse error" },
+      { kind: "unparseable_agent", source_path: "agents/broken.md", error: "invalid frontmatter" },
+      { kind: "companion_bundle", plugin: "demo-plugin" as import("$lib/bindings").PluginName, conflicts: ["agents/prompts/foo.md"], error: "conflict detected" },
+    ];
+    const installPlugin: PluginActionContext["installPlugin"] = vi
+      .fn()
+      .mockResolvedValue({ status: "ok", data: r });
+
+    const outcome = await runPluginInstall(
+      makeInstallCtx({ installPlugin }),
+      { kind: "install", force: false },
+    );
+
+    expect(outcome.kind).toBe("ok");
+    if (outcome.kind === "ok") {
+      expect(outcome.installResult.skills.failed).toEqual(r.skills.failed);
+      expect(outcome.installResult.steering.failed).toEqual(r.steering.failed);
+      expect(outcome.installResult.agents.failed).toHaveLength(3);
+      expect(outcome.installResult.agents.failed[0].kind).toBe("agent");
+      expect(outcome.installResult.agents.failed[1].kind).toBe("unparseable_agent");
+      expect(outcome.installResult.agents.failed[2].kind).toBe("companion_bundle");
+    }
   });
 
   it("update mode: force=true and successPrefix='Updated' regardless of context", async () => {
