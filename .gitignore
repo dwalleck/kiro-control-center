@@ -8,8 +8,10 @@ __pycache__/
 *.pyc
 
 # Tethys index built by `cargo xtask plan-lint` (and direct `tethys index`).
-# Never committed — recreated on demand from source.
-/.rivets/
+# Never committed — recreated on demand from source. Scoped to `index/`
+# only because `.rivets/` is also used by the rivets issue tracker (its
+# `config.yaml` and `issues.jsonl` ARE tracked for collaboration).
+/.rivets/index/
 
 # Git worktrees for isolated feature branches
 .worktrees/
