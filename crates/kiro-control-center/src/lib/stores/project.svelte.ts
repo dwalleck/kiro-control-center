@@ -92,6 +92,18 @@ export async function refreshProjects() {
       console.error("Failed to discover projects:", result.error.message);
       store.projectError = `Could not scan for projects: ${result.error.message}`;
     }
+  } catch (e) {
+    // Transport-level failures (IPC channel disconnect, plugin crash,
+    // panic in the command handler before structured-error mapping)
+    // cause `commands.discoverProjects()` to throw rather than return
+    // an Err. Without this catch, the exception propagates unhandled
+    // to `addScanRoot` / `removeScanRoot` (which don't catch either)
+    // and the user sees the spinner vanish with no error feedback.
+    // Mirrors the catch shape used by `runPluginInstall` /
+    // `runPluginRemove` in plugin-actions.ts for the same reason.
+    const reason = e instanceof Error ? e.message : String(e);
+    console.error("[project-store] discoverProjects threw:", e);
+    store.projectError = `Could not scan for projects: ${reason}`;
   } finally {
     store.scanning = false;
   }
