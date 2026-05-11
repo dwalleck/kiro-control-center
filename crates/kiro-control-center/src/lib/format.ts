@@ -1,4 +1,5 @@
 import type {
+  FailedAgent,
   FailedSkill,
   FailedSkillReason,
   FailedSteeringFile_Serialize,
@@ -198,6 +199,44 @@ export function formatFailedSkill(f: FailedSkill): string {
 const _FAILED_SKILL_REASON_KINDS = ["install_failed", "requested_but_not_found"] as const satisfies readonly FailedSkillReason["kind"][];
 type _AssertFailedSkillReasonExhaustive = Exclude<FailedSkillReason["kind"], (typeof _FAILED_SKILL_REASON_KINDS)[number]> extends never ? true : never;
 const _assertFailedSkillReasonExhaustive: _AssertFailedSkillReasonExhaustive = true;
+
+// Render a FailedAgent tagged-enum entry as a one-line label. Switches on the
+// three discriminated variants (agent / unparseable_agent / companion_bundle).
+// The default arm uses assertNever so a future fourth variant added on the Rust
+// side (and regenerated into bindings.ts) becomes a compile-time error here
+// rather than a silent runtime fallthrough. Paired with value-position
+// exhaustiveness asserts below per CLAUDE.md discriminator-pushdown discipline.
+// The `error` field is opaque pre-rendered diagnostic text from Rust's
+// error_full_chain — render directly without parsing or truncating.
+// The `conflicts` join for companion_bundle uses `|| "no enumeration"` to
+// handle the rejection-pre-enumeration case (MultipleScanRootsNotSupported)
+// where the engine bails before enumerating any conflict paths.
+export function formatFailedAgent(entry: FailedAgent): string {
+  switch (entry.kind) {
+    case "agent":
+      return `${entry.name} (${entry.source_path}) — ${entry.error}`;
+    case "unparseable_agent":
+      return `${entry.source_path} (unparseable) — ${entry.error}`;
+    case "companion_bundle":
+      return `${entry.plugin} bundle [${entry.conflicts.join(", ") || "no enumeration"}] — ${entry.error}`;
+    default: {
+      const _exhaustive: never = entry;
+      throw new Error(
+        `unhandled FailedAgent variant: ${JSON.stringify(_exhaustive)}`,
+      );
+    }
+  }
+}
+
+// Value-position exhaustiveness asserts for FailedAgent["kind"].
+// The `satisfies` arm catches shape changes (a literal becomes an object arm).
+// The `Exclude<>` arm catches additions (a new variant added to the type that
+// isn't listed here). The trailing const assignment is what makes the tripwire
+// fire — an unused type alias resolving to `never` is valid TS, so the const
+// is the active gate. Precedent: _PLUGIN_ACTION_VALUES at stores/plugin-updates.ts:135-137.
+const _FAILED_AGENT_KINDS = ["agent", "unparseable_agent", "companion_bundle"] as const satisfies readonly FailedAgent["kind"][];
+type _AssertFailedAgentKindExhaustive = Exclude<FailedAgent["kind"], (typeof _FAILED_AGENT_KINDS)[number]> extends never ? true : never;
+const _assertFailedAgentKindExhaustive: _AssertFailedAgentKindExhaustive = true;
 
 // Render a FailedSteeringFile as a one-line label. Single-shape type today
 // (source + error), so no switch is needed. If FailedSteeringFile grows

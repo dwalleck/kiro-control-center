@@ -1,5 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type {
+  AgentName,
+  FailedAgent,
   FailedSkill,
   FailedSkillReason,
   FailedSteeringFile_Serialize,
@@ -10,6 +12,7 @@ import type {
   SkippedSkill,
 } from "$lib/bindings";
 import {
+  formatFailedAgent,
   formatFailedSkill,
   formatFailedSteeringFile,
   formatInstallPluginResult,
@@ -302,5 +305,64 @@ describe("formatFailedSkill", () => {
       kind: { kind: "totally_new_variant" } as unknown as FailedSkillReason,
     };
     expect(() => formatFailedSkill(f)).toThrow();
+  });
+});
+
+describe("formatFailedAgent", () => {
+  it("agent variant: renders name (source_path) — error", () => {
+    const f: FailedAgent = {
+      kind: "agent",
+      name: "code-reviewer" as AgentName,
+      source_path: "agents/code-reviewer.md",
+      error: "io error: permission denied",
+    };
+    expect(formatFailedAgent(f)).toBe(
+      "code-reviewer (agents/code-reviewer.md) — io error: permission denied",
+    );
+  });
+
+  it("unparseable_agent variant: renders source_path (unparseable) — error", () => {
+    const f: FailedAgent = {
+      kind: "unparseable_agent",
+      source_path: "agents/broken.md",
+      error: "missing frontmatter fence",
+    };
+    expect(formatFailedAgent(f)).toBe(
+      "agents/broken.md (unparseable) — missing frontmatter fence",
+    );
+  });
+
+  it("companion_bundle with empty conflicts: renders [no enumeration] placeholder", () => {
+    // covers MultipleScanRootsNotSupported — rejection before per-file enumeration
+    const f: FailedAgent = {
+      kind: "companion_bundle",
+      plugin: "demo-plugin" as PluginName,
+      conflicts: [],
+      error: "multiple scan roots not supported",
+    };
+    expect(formatFailedAgent(f)).toBe(
+      "demo-plugin bundle [no enumeration] — multiple scan roots not supported",
+    );
+  });
+
+  it("companion_bundle with one conflict: renders the conflict path", () => {
+    const f: FailedAgent = {
+      kind: "companion_bundle",
+      plugin: "demo-plugin" as PluginName,
+      conflicts: ["agents/prompts/x.md"],
+      error: "orphan conflict at agents/prompts/x.md",
+    };
+    expect(formatFailedAgent(f)).toBe(
+      "demo-plugin bundle [agents/prompts/x.md] — orphan conflict at agents/prompts/x.md",
+    );
+  });
+
+  it("assertNever path: throws for unknown kind", () => {
+    // Double-cast through `unknown` to inject an invalid runtime variant —
+    // the ts-expect-error directive does not fire on double-casts (valid TS
+    // expression), so `as unknown as FailedAgent` is the correct pattern.
+    // Same approach as formatFailedSkill's assertNever test above.
+    const f = { kind: "future_variant", error: "x" } as unknown as FailedAgent;
+    expect(() => formatFailedAgent(f)).toThrow();
   });
 });
