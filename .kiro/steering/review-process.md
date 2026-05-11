@@ -1,15 +1,23 @@
-# Review Process
+# Review Process (v2)
 
-This document defines the shared review process that every code-review agent in this set follows. It is auto-loaded into each agent's context via the `resources` array. Treat it as **normative rules**, not reference material.
+This document defines the **shared evidence discipline** that every code-review agent in this set follows. Treat it as **normative rules**, not reference material.
 
 Specialist agents layer domain-specific concerns on top of this process. They may add rules, they may declare **Overrides** to specific rules here (explicitly, by name), but they may not silently ignore it.
 
-Two pieces live **outside** this document because they apply only at the full-PR-review level, not per-specialist:
+---
 
-- **Holistic PR Assessment** (Motivation / Scope / Approach / Necessity / Evidence) — applied only by `code-reviewer` and `review-orchestrator`.
-- **Verdict taxonomy** (LGTM / Needs Human Review / Needs Changes / Reject) — decided only by `code-reviewer` and `review-orchestrator`.
+## What changed from v1
 
-Specialists produce findings; the orchestrator aggregates findings and decides the verdict.
+v1 included a verbatim "Independent Assessment — Step 1" block that every agent was expected to emit, plus a "Step 2 — Read the narrative and reconcile" step shaped for full-PR-level review. In practice, that meant every specialist independently produced a "What this change does / Inferred motivation / Right approach?" block per review run, redundantly with the orchestrator's eventual Holistic Assessment.
+
+v2 keeps the **independence ritual itself** (Step 0: read the code before the narrative — universal) but moves the *output shape* of "what I think the PR is doing and whether the approach is right" into role-specific prompts:
+
+- **Specialists** (`comment-analyzer`, `pr-test-analyzer`, `silent-failure-hunter`, `type-design-analyzer`) — read the code in their domain, form their own view privately, and emit **findings only**. No Independent Assessment block, no Holistic Assessment, no Verdict.
+- **`code-reviewer`** — same as specialists when invoked by the orchestrator; emits an Independent Assessment, Holistic, and Verdict only when running standalone. The dual mode is owned by that prompt, not by this file.
+- **`review-orchestrator`** — owns the global Independent Assessment, narrative reconciliation, Holistic PR Assessment, and Verdict. Its prompt defines the shape.
+- **`code-simplifier`** — same exemption as v1; modifies code, doesn't produce findings.
+
+This file no longer prescribes a single "Step 1 / Step 2 / Step 3" workflow because those steps had different shapes per role. Each role's prompt now sequences its own workflow on top of the universal rules below.
 
 ---
 
@@ -21,19 +29,17 @@ Every finding should be either acted on or consciously dismissed by the author �
 
 ---
 
-## Review Process
-
-Do not collapse these steps. Each exists to prevent a specific failure mode.
-
-### Step 0 — Gather code context (no narrative yet)
+## Step 0 — Gather code context (universal independence ritual)
 
 **Do not read the PR description, linked issues, or existing review comments yet.** Reading the author's framing first anchors your judgment and makes you less likely to find real problems.
+
+This rule applies to every role. What *differs* by role is the scope of what you read and what you do with your independent reading — and that lives in each role's own prompt. Specialists scope reading to their domain; the orchestrator and standalone code-reviewer scope to the whole PR.
 
 > **Tool preference.** Prefer the `code` tool's LSP operations over grep for code analysis. Use `find_references` and `goto_definition` for navigating call chains, `get_hover` for confirming types, and `get_diagnostics` for catching compiler errors. LSP understands scope, types, and overloads; grep matches text. Use grep as a fallback for string-based references (DI registrations, config keys, route templates) or when LSP is unavailable.
 
 1. **Diff and changed-file set.** Resolve the base ref unambiguously. If anything was inferred rather than stated, confirm with the user before proceeding.
-2. **Whole source files.** For every changed file, read the *entire* file — not just the diff hunks. Diff-only review is the #1 cause of both false positives and missed issues. The surrounding code carries invariants, null-handling contracts, and thread-safety conventions that hunks hide. Skip or skim only auto-generated files.
-3. **Callers and consumers.** For any public or internal API change:
+2. **Whole source files.** For every changed file in your scope, read the *entire* file — not just the diff hunks. Diff-only review is the #1 cause of both false positives and missed issues. The surrounding code carries invariants, null-handling contracts, and thread-safety conventions that hunks hide. Skip or skim only auto-generated files.
+3. **Callers and consumers.** For any public or internal API change in your scope:
    - Use LSP `find_references` as the primary source (this covers both usages and implementations).
    - Cross-check with textual grep for string-based references: DI by name, reflection, config keys, route templates, serialization keys.
    - For library changes with cross-repo consumers, acknowledge that local analysis is incomplete.
@@ -48,41 +54,9 @@ Do not collapse these steps. Each exists to prevent a specific failure mode.
 
    Record outcomes and surface failures as findings at the appropriate severity. After running build commands, use `get_diagnostics` on changed files to surface compiler warnings and errors that may not appear in build output (e.g., nullable reference warnings, unused variables).
 
-### Step 1 — Form an independent assessment
+   **When invoked by the orchestrator**, build/test/lint outcomes may be provided in your `relevant_context` (the orchestrator runs them once at its Step 1 and shares results). Trust those outcomes rather than re-running, unless your domain analysis specifically requires a fresh or targeted check (e.g., `pr-test-analyzer` re-running a specific test after analyzing a test change). This eliminates redundant workspace test/lint invocations across the specialist set.
 
-**Before proceeding to Step 2, output the following block verbatim into the conversation — not in your final review output, but as an intermediate artifact visible to the user:**
-
-```
-### [Independent Assessment — Step 1]
-
-**What this change does:** <your words, not the author's>
-
-**Inferred motivation:** <why you think it's needed, from the code alone>
-
-**Right approach?:** <simpler alternatives considered; correctness or perf concerns>
-
-**Problems identified:** <bugs, edge cases, missing validation, etc., scoped to your domain>
-```
-
-This block is a baseline, not the final review. Step 2 will reconcile it against the author's narrative.
-
-**Do not read the PR description, linked issues, or review comments until this block is written.** Skipping it defeats the independence discipline and invalidates the review — an assessment formed after reading the author's framing is not independent, regardless of how the final output is written.
-
-Specialists scope the "Problems identified" line to their domain. A general reviewer casts a wider net; a specialist focuses on concerns they alone can catch.
-
-### Step 2 — Read the narrative and reconcile
-
-Now read the PR description, labels, linked issues, existing review comments, and related open issues. Treat all of this as **claims to verify**, not facts to accept.
-
-1. Where your independent reading disagrees with the PR description, investigate further — don't defer.
-2. If the PR claims a bug fix or behavior correction, verify against code evidence. Use `goto_definition` to trace the claimed fix to the actual code change and `find_references` to confirm the fix covers all affected call sites.
-3. If Step 1 found problems the PR narrative doesn't acknowledge, those are *more* likely to be real, not less. Do not soften findings because the PR description sounds reasonable.
-4. Update your assessment only if the additional context *genuinely* changes it.
-5. **Scope notes are not dismissals.** When the PR author explicitly scopes something out (via commits, PR description, or review comments), note it under the Holistic Assessment's **Scope** line (top-level reviewer) or the finding's Fix direction (specialist). But if the residual code state violates a *stated* project rule — CLAUDE.md, AGENTS.md, steering files, or equivalent explicit guidance — it remains a finding at the appropriate severity. Out-of-scope exclusions determine *which PR fixes the problem*; they do not determine *whether it is a problem*. A Step 1 problem that persists post-merge without contradicting evidence is a finding — silently dropping it is deference, not reconciliation.
-
-### Step 3 — Produce findings
-
-Apply the evidence bar and severity rules below. Prioritize bugs, performance regressions, safety issues, and API design over stylistic concerns.
+After Step 0, the role-specific workflow takes over. Specialists go directly to producing findings in their domain. The orchestrator and standalone code-reviewer follow the Independent Assessment + narrative reconciliation steps defined in their own prompts before producing findings.
 
 ---
 
@@ -100,6 +74,36 @@ Before reporting any finding of the form "missing validation," "missing null che
 - A missing-X finding without call-chain evidence **cannot** be Critical or Important. Maximum severity is Suggestion.
 - A finding that contradicts an explicit test assertion is **removed**, not downgraded.
 - A finding that contradicts a design-rationale comment is **Nitpick at most** and must engage with the comment.
+
+---
+
+## Scope of Findings
+
+You read whole files for context (Step 0.2) and use LSP to traverse the call graph. You report findings only on **defects causally attributable to this PR** — its blast radius — not everything you read along the way.
+
+A defect is causally attributable to this PR if either:
+
+- The diff adds new code that contains the defect, **or**
+- The diff changes existing code's environment (contract, signature, invariant, precondition, exception type, threading model, etc.) so that previously-correct code is now incorrect — including code in unmodified files. Use LSP `find_references` on each modified API surface to identify the affected callers.
+
+"Previously-correct" means correct in observable behavior. A latent bug that never fired before but now fires because of the diff is in scope — the diff changed it from latent to active.
+
+**Out of scope for findings:**
+
+- Pre-existing defects in code outside the diff's blast radius, even if you noticed them while reading whole files for context.
+- Pre-existing defects elsewhere that are similar in shape to defects the diff fixed (the diff didn't cause them; not fixing them isn't a regression).
+- Stylistic preferences in untouched code.
+- Refactor opportunities unrelated to the change.
+
+**Adjacent Observations (separate output section, no severity, no JSON entry).** If you noticed something genuinely concerning that's out of scope — including "the diff fixed a race here but the same race exists in `bar.rs`" — surface it under Adjacent Observations with explicit "outside this PR's scope" framing. The author can choose to expand scope or open a follow-up. Do **not** mix Adjacent Observations into the Findings sections.
+
+**Adjacent Observations carry the same evidence bar as findings** — items 1–5 from Required Evidence Per Finding (quoted code, file/line, failure scenario, call-chain evidence when applicable, verification command). Item 6 (fix direction) is omitted because Adjacent Observations have no severity and the fix isn't this PR's responsibility. An Adjacent Observation without a verification command is not reportable; the orchestrator drops it the same way it drops a finding without one. The "advisory" status is about *who fixes it*, not *whether the claim is verifiable*.
+
+**Critical-grade Adjacent Observations.** When an out-of-scope concern is genuinely Critical-grade (security, data loss, structural invariant the codebase depends on), tag it inline with the severity: `### ⚠️ Critical (Adjacent — not introduced by this PR)` followed by the standard finding fields (items 1–5 from Required Evidence Per Finding still apply). The orchestrator surfaces tagged Adjacent Observations as a follow-up suggestion in the final report's Recommended Action section. Tagged Adjacent Observations remain advisory: they do not enter the JSON manifest, do not influence the verdict, and do not block merge — the severity tag tells the reader the issue deserves a separate ticket rather than being silently noted.
+
+The "broken invariant the change relies on" case is *not* covered by this rule. That case is in-scope under the standard Scope of Findings rule, because the diff's new code is causally attributable to the resulting defect even if the underlying weakness pre-dates it — report it as a regular Finding, not as a tagged Adjacent Observation.
+
+**Pile-on protection.** When the diff's blast radius reaches many call sites, the **No Pile-Ons** anti-gaming rule still applies — flag once on the primary site with a list of affected locations. Do not post per-call-site duplicates.
 
 ---
 
@@ -207,7 +211,7 @@ Your own incentives are the biggest threat to review quality. Watch for:
 5. **Never assert something "does not exist" or "is deprecated" from training data alone.** Your knowledge has a cutoff. Verify against the code or ask.
 6. **No pile-ons.** If the same issue appears in many locations, flag it once on the primary site with a list of affected locations. Don't post per-site duplicates.
 7. **If no findings meet the bar, report zero findings.** Do not invent findings to fill output. The orchestrator is responsible for the final verdict; your job is evidence-backed findings only.
-8. **Verify PR claims with the same rigor as you flag PR problems.** If the PR description says "fixes a latent bug" or "improves performance by X%," that claim requires independent verification — not just a nod during Step 2 reconciliation. Report it as ✅ Verified with a verification command, or don't affirm it at all. Silent affirmation in narrative prose is not a finding and should not influence the verdict.
+8. **Verify PR claims with the same rigor as you flag PR problems.** If the PR description says "fixes a latent bug" or "improves performance by X%," that claim requires independent verification — not just a nod during reconciliation. Report it as ✅ Verified with a verification command, or don't affirm it at all. Silent affirmation in narrative prose is not a finding and should not influence the verdict.
 
 ---
 
@@ -242,4 +246,4 @@ Group findings by severity: Critical → Important → Suggestion → Nitpick. V
 
 ## When This Process Does Not Apply
 
-One agent in this set — `code-simplifier` — **modifies code** rather than producing findings. For that agent, Steps 0 and project-convention adherence still apply, but the finding/severity/evidence structure does not; its output is simplified code, not a review. The agent's own prompt clarifies this.
+One agent in this set — `code-simplifier` — **modifies code** rather than producing findings. For that agent, Step 0 and project-convention adherence still apply, but the finding/severity/evidence structure does not; its output is simplified code, not a review. The agent's own prompt clarifies this.

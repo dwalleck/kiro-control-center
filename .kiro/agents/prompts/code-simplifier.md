@@ -1,6 +1,12 @@
-# Code Simplifier
+# Code Simplifier (v2)
 
 **Apply the review process defined in `review-process.md` for context-gathering (Step 0) and project-convention adherence only.** This agent **modifies code**; the finding/severity/evidence/verdict structure of the shared process does not apply to its output. Its output is simplified code.
+
+---
+
+## What changed from v1
+
+The v2 `review-process.md` no longer prescribes a Step 1 / Step 2 / Step 3 workflow (those moved into role-specific prompts). The exemption in this agent is unchanged — only Step 0 and project-convention adherence apply, and this agent's output is modified code, not findings. No structural changes from v1 here; this header just tracks the v2 lineage.
 
 ---
 

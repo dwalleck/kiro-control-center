@@ -127,6 +127,27 @@ export async function runPluginInstall(
       const { summary, warnings, anyInstalled, anyFailed } =
         formatInstallPluginResult(result.data);
 
+      // Temporary diagnostic: the current banner only carries the count-level
+      // summary ("1 steering failed · 8 agents failed"), so the per-item
+      // reasons that the Rust backend already sends (FailedSkill.error,
+      // FailedSteeringFile.error, FailedAgent.error — each carrying the full
+      // error chain) are otherwise invisible to the user. Log them to the
+      // DevTools console so they can be inspected without a backend-side
+      // console (release builds run under the `windows` subsystem, which
+      // detaches from the launching terminal). Follow-up work will surface
+      // these failures inline in the UI; see runPluginRemove's per-failure
+      // <details> panel in InstalledTab.svelte for the target shape.
+      if (anyFailed) {
+        console.error(
+          `[plugin-actions] ${mode.kind} for ${ctx.marketplace}/${ctx.plugin} had per-item failures`,
+          {
+            skills: result.data.skills.failed,
+            steering: result.data.steering.failed,
+            agents: result.data.agents.failed,
+          },
+        );
+      }
+
       let primary: PluginBanner["primary"] = null;
       let warning: string | null = null;
       const staleParts: string[] = [];

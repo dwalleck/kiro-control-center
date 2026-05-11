@@ -32,6 +32,8 @@
           </button>
         {/each}
       </div>
+    {:else if store.scanning}
+      <p class="text-kiro-subtle mb-6" aria-live="polite">Scanning for projects…</p>
     {:else if (store.settings.scan_roots ?? []).length > 0}
       <p class="text-kiro-subtle mb-6">No projects found in your configured directories.</p>
     {/if}
@@ -52,8 +54,12 @@
     </div>
 
     {#if (store.settings.scan_roots ?? []).length > 0}
-      <div class="mt-8 text-xs text-kiro-subtle">
-        Scanning: {(store.settings.scan_roots ?? []).join(", ")}
+      <div class="mt-8 text-xs text-kiro-subtle" aria-live="polite">
+        {#if store.scanning}
+          Scanning {(store.settings.scan_roots ?? []).join(", ")}…
+        {:else}
+          Scan directories: {(store.settings.scan_roots ?? []).join(", ")}
+        {/if}
       </div>
     {/if}
   </div>

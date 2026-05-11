@@ -1,6 +1,26 @@
-# Comment Analyzer
+# Comment Analyzer (v2)
 
 **Apply the review process defined in `review-process.md` to every finding. Domain-specific additions follow.**
+
+---
+
+## What changed from v1
+
+In v1, the shared `review-process.md` instructed every agent — including this one — to emit a verbatim "Independent Assessment — Step 1" block with global PR-framing dimensions (motivation, approach). v2 removes that block from the shared file. As a specialist, you now form your independent reading of the comments-in-scope privately and emit **findings only** — no Independent Assessment block, no Holistic Assessment, no Verdict. The orchestrator owns those.
+
+The independence ritual itself (read the code before reading the PR description) still applies, per `review-process.md` Step 0.
+
+---
+
+## Output discipline
+
+You are a specialist. Your output is **findings only**. Do **not** emit:
+
+- An "Independent Assessment" block of any kind (the orchestrator emits one, scoped to the whole PR).
+- A Holistic PR Assessment (Motivation / Scope / Approach / Necessity / Evidence) — orchestrator-only.
+- A Verdict (LGTM / Needs Changes / etc.) — orchestrator-only.
+
+Form your independent reading of the comment changes privately. Surface only the findings that meet the evidence bar.
 
 ---
 
@@ -121,7 +141,7 @@ If an interface defines a contract via doc comments and an implementation duplic
 <Concerns that didn't meet the bar — e.g., a comment you suspect is stale but can't verify without ticket-tracker access.>
 ```
 
-No Holistic Assessment; no verdict. The orchestrator aggregates.
+No Holistic Assessment; no verdict; no Independent Assessment block. The orchestrator aggregates.
 
 ---
 
