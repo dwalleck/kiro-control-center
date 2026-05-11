@@ -110,11 +110,12 @@ mod tests {
     use super::*;
     use crate::agent::tools::MappedTool;
     use crate::agent::types::{AgentDefinition, AgentDialect, McpServerConfig};
+    use crate::service::test_support::agent_name;
     use std::collections::BTreeMap;
 
     fn sample_claude_def() -> AgentDefinition {
         AgentDefinition {
-            name: crate::validation::AgentName::new("reviewer").expect("valid test name"),
+            name: agent_name("reviewer"),
             description: Some("Reviews code".into()),
             prompt_body: "You are a reviewer.\n".into(),
             model: Some("opus".into()),
@@ -137,7 +138,7 @@ mod tests {
         // The JSON `name` field keeps the space; the file:// URI must
         // percent-encode it per RFC 3986.
         let mut def = sample_claude_def();
-        def.name = crate::validation::AgentName::new("Terraform Agent").expect("valid test name");
+        def.name = agent_name("Terraform Agent");
         let out = build_kiro_json(&def, &[]).unwrap();
         assert_eq!(out["name"], "Terraform Agent");
         assert_eq!(out["prompt"], "file://./prompts/Terraform%20Agent.md");
@@ -146,8 +147,7 @@ mod tests {
     #[test]
     fn emit_preserves_unreserved_chars_in_prompt_uri() {
         let mut def = sample_claude_def();
-        def.name = crate::validation::AgentName::new("pr-review_toolkit.v2~beta")
-            .expect("valid test name");
+        def.name = agent_name("pr-review_toolkit.v2~beta");
         let out = build_kiro_json(&def, &[]).unwrap();
         // Unreserved chars per RFC 3986: alphanumeric and -_.~ — no encoding.
         assert_eq!(
