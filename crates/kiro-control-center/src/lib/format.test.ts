@@ -357,6 +357,21 @@ describe("formatFailedAgent", () => {
     );
   });
 
+  it("companion_bundle with multiple conflicts: comma-joins all paths", () => {
+    // Forward-compat coverage: the wire shape supports N conflicts even though
+    // the engine emits length-0 or length-1 today (per F1 / kiro-1ah3, deferred).
+    // Pins the .join(", ") behavior against a future refactor to indexed access.
+    const f: FailedAgent = {
+      kind: "companion_bundle",
+      plugin: "demo-plugin" as PluginName,
+      conflicts: ["agents/prompts/x.md", "agents/prompts/y.md"],
+      error: "multiple orphan conflicts",
+    };
+    expect(formatFailedAgent(f)).toBe(
+      "demo-plugin bundle [agents/prompts/x.md, agents/prompts/y.md] — multiple orphan conflicts",
+    );
+  });
+
   it("assertNever path: throws for unknown kind", () => {
     // Double-cast through `unknown` to inject an invalid runtime variant —
     // the ts-expect-error directive does not fire on double-casts (valid TS

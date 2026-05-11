@@ -242,6 +242,7 @@ describe("runPluginInstall", () => {
         text: "Plugin install failed for demo-plugin: 1 skill failed",
       });
       expect(outcome.banner.warning).toBeNull();
+      expect(outcome.installResult).toBe(r);
     }
   });
 
@@ -267,6 +268,7 @@ describe("runPluginInstall", () => {
         text: "Plugin demo-plugin: 1 skill · 1 skill failed",
       });
       expect(outcome.banner.warning).toBeNull();
+      expect(outcome.installResult).toBe(r);
     }
   });
 
