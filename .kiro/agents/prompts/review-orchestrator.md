@@ -81,7 +81,7 @@ Use `use_subagent` to invoke the selected agents. For each agent, pass:
 
 Do **not** pass your private Step 2 view to specialists. Specialists are required to form their own independent view per their Output Discipline rules; pre-anchoring them on your framing defeats that. The `query` and `relevant_context` you pass should describe scope (which files, which focus areas) — not your conclusions about motivation or approach.
 
-**Mode-detection marker.** Include the literal string `[orchestrator-invoked]` somewhere in each specialist's `relevant_context`. The `code-reviewer` agent uses this marker to detect orchestrator-driven mode and suppress its standalone-mode Holistic Assessment and Verdict. Other specialists do not branch on this marker but may include it in their reasoning trace for traceability.
+**Mode-detection marker.** Inject the literal string `[orchestrator-invoked]` into `code-reviewer`'s `relevant_context` — that's the only specialist that branches on it (to suppress its standalone-mode Holistic Assessment and Verdict). The other specialists (`comment-analyzer`, `pr-test-analyzer`, `silent-failure-hunter`, `type-design-analyzer`, `code-simplifier`) emit findings-only in both modes, so the marker is a no-op for them and including it is optional. If you do include it for symmetry, do not rely on those specialists acknowledging it — none of their prompts read it today.
 
 **Build/test/lint share-down.** Include the build/test/lint outcomes you captured at Step 1 in each specialist's `relevant_context` (e.g., *"cargo test: 247 passing, 0 failing; cargo clippy: clean; cargo build: clean"*). Specialists are instructed by the shared process to trust these rather than re-run — eliminating ~5× redundant test/lint invocations per review. The exception is when a specialist's domain-specific analysis requires a fresh or targeted check (e.g., `pr-test-analyzer` re-running a specific test after analyzing a test change).
 
@@ -92,7 +92,7 @@ Do **not** pass your private Step 2 view to specialists. Specialists are require
 
 ### 7. Verify findings — audit, not re-do
 
-Specialists already produced verification commands per Required Evidence Per Finding item 5. Their findings are presumed verified by the specialist. Your job at Step 7 is to **audit a sample** — catch systematic specialist errors and deep-check the highest-stakes findings — not to re-run every verification. Specialists have `fs_read`, `execute_bash`, `grep`, `code`, and `glob`; their call-site and type analysis may be grep-based and incomplete, which is what your audit catches.
+Specialists already produced verification commands per Required Evidence Per Finding item 5. Their findings are presumed verified by the specialist. Your job at Step 7 is to **audit a sample** — catch systematic specialist errors and deep-check the highest-stakes findings — not to re-run every verification. Specialists carry a limited tool set defined in each agent's manifest (`tools` array); confirm against the manifest before reasoning about specialist capabilities. Their call-site and type analysis may also be grep-based and incomplete, which is what your audit catches.
 
 **Tier the verification work:**
 
