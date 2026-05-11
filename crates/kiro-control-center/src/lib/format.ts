@@ -1,4 +1,6 @@
 import type {
+  FailedSkill,
+  FailedSkillReason,
   FailedSteeringFile_Serialize,
   InstallPluginResult_Serialize,
   InstallWarning,
@@ -162,6 +164,40 @@ function formatParseFailure(f: ParseFailure): string {
     }
   }
 }
+
+// Render a FailedSkill as a one-line label. Both FailedSkillReason variants
+// share the same `${name} — ${error}` render shape — the `kind` discriminator
+// lets the surrounding context (panel section heading) convey "install failed"
+// vs. "not found", so the rendered string itself is uniform. The switch is
+// still required: the default assertNever arm ensures a new FailedSkillReason
+// variant (added on the Rust side and regenerated into bindings.ts) becomes
+// a compile-time error here rather than a silent runtime fallthrough.
+// Paired with value-position exhaustiveness asserts below per CLAUDE.md
+// discriminator-pushdown discipline.
+export function formatFailedSkill(f: FailedSkill): string {
+  switch (f.kind.kind) {
+    case "install_failed":
+      return `${f.name} — ${f.error}`;
+    case "requested_but_not_found":
+      return `${f.name} — ${f.error}`;
+    default: {
+      const _exhaustive: never = f.kind;
+      throw new Error(
+        `unhandled FailedSkillReason variant: ${JSON.stringify(_exhaustive)}`,
+      );
+    }
+  }
+}
+
+// Value-position exhaustiveness asserts for FailedSkillReason["kind"].
+// The `satisfies` arm catches shape changes (a literal becomes an object arm).
+// The `Exclude<>` arm catches additions (a new variant added to the type that
+// isn't listed here). The trailing const assignment is what makes the tripwire
+// fire — an unused type alias resolving to `never` is valid TS, so the const
+// is the active gate. Precedent: _PLUGIN_ACTION_VALUES at stores/plugin-updates.ts:135-137.
+const _FAILED_SKILL_REASON_KINDS = ["install_failed", "requested_but_not_found"] as const satisfies readonly FailedSkillReason["kind"][];
+type _AssertFailedSkillReasonExhaustive = Exclude<FailedSkillReason["kind"], (typeof _FAILED_SKILL_REASON_KINDS)[number]> extends never ? true : never;
+const _assertFailedSkillReasonExhaustive: _AssertFailedSkillReasonExhaustive = true;
 
 // Render a FailedSteeringFile as a one-line label. Single-shape type today
 // (source + error), so no switch is needed. If FailedSteeringFile grows

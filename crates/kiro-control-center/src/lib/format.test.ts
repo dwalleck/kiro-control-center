@@ -1,5 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type {
+  FailedSkill,
+  FailedSkillReason,
   FailedSteeringFile_Serialize,
   InstallPluginResult_Serialize,
   MarketplaceName,
@@ -8,6 +10,7 @@ import type {
   SkippedSkill,
 } from "$lib/bindings";
 import {
+  formatFailedSkill,
   formatFailedSteeringFile,
   formatInstallPluginResult,
   formatRemovePluginResult,
@@ -266,5 +269,38 @@ describe("formatFailedSteeringFile", () => {
       error: "permission denied: foo",
     };
     expect(formatFailedSteeringFile(f)).toBe("some/file.md — permission denied: foo");
+  });
+});
+
+describe("formatFailedSkill", () => {
+  it("install_failed variant: renders name — error", () => {
+    const f: FailedSkill = {
+      name: "my-skill",
+      error: "io error: permission denied",
+      kind: { kind: "install_failed" },
+    };
+    expect(formatFailedSkill(f)).toBe("my-skill — io error: permission denied");
+  });
+
+  it("requested_but_not_found variant: renders name — error", () => {
+    const f: FailedSkill = {
+      name: "my-skill",
+      error: "skill 'my-skill' not found in plugin 'acme'",
+      kind: { kind: "requested_but_not_found", plugin: "acme" },
+    };
+    expect(formatFailedSkill(f)).toBe(
+      "my-skill — skill 'my-skill' not found in plugin 'acme'",
+    );
+  });
+
+  it("assertNever path: throws for unknown kind", () => {
+    const f: FailedSkill = {
+      name: "my-skill",
+      error: "some error",
+      // Cast through `unknown` to inject an invalid runtime variant that
+      // TypeScript cannot catch statically — exercises the default assertNever arm.
+      kind: { kind: "totally_new_variant" } as unknown as FailedSkillReason,
+    };
+    expect(() => formatFailedSkill(f)).toThrow();
   });
 });
