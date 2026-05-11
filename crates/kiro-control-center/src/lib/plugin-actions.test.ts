@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type {
+  AgentName,
   ErrorType,
   InstallPluginResult_Serialize,
   MarketplaceName,
@@ -107,7 +108,7 @@ describe("runPluginInstall", () => {
     expect(storeRefresh).toHaveBeenCalledOnce();
   });
 
-  it("install with failures: outcome.installResult carries each FailedX entry intact", async () => {
+  it("install with failures: outcome.installResult is the same object reference as the IPC response", async () => {
     const r = emptyInstallResult();
     r.skills.failed = [
       { name: "bad-skill", error: "disk error", kind: { kind: "install_failed" } },
@@ -116,9 +117,9 @@ describe("runPluginInstall", () => {
       { source: "rules/bad.md", error: "permission denied" },
     ];
     r.agents.failed = [
-      { kind: "agent", name: "my-agent" as import("$lib/bindings").AgentName, source_path: "agents/my-agent.md", error: "parse error" },
+      { kind: "agent", name: "my-agent" as AgentName, source_path: "agents/my-agent.md", error: "parse error" },
       { kind: "unparseable_agent", source_path: "agents/broken.md", error: "invalid frontmatter" },
-      { kind: "companion_bundle", plugin: "demo-plugin" as import("$lib/bindings").PluginName, conflicts: ["agents/prompts/foo.md"], error: "conflict detected" },
+      { kind: "companion_bundle", plugin: "demo-plugin" as PluginName, conflicts: ["agents/prompts/foo.md"], error: "conflict detected" },
     ];
     const installPlugin: PluginActionContext["installPlugin"] = vi
       .fn()
@@ -131,12 +132,9 @@ describe("runPluginInstall", () => {
 
     expect(outcome.kind).toBe("ok");
     if (outcome.kind === "ok") {
-      expect(outcome.installResult.skills.failed).toEqual(r.skills.failed);
-      expect(outcome.installResult.steering.failed).toEqual(r.steering.failed);
-      expect(outcome.installResult.agents.failed).toHaveLength(3);
-      expect(outcome.installResult.agents.failed[0].kind).toBe("agent");
-      expect(outcome.installResult.agents.failed[1].kind).toBe("unparseable_agent");
-      expect(outcome.installResult.agents.failed[2].kind).toBe("companion_bundle");
+      // Reference equality: runPluginInstall must pass result.data through
+      // without cloning. A deep-equal check would miss an accidental copy.
+      expect(outcome.installResult).toBe(r);
     }
   });
 
