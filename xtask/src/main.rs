@@ -202,7 +202,15 @@ fn parse_dirty_paths_from_git_status(porcelain: &str) -> Vec<PathBuf> {
                 return None;
             }
             let rest = &line[3..];
-            let path = rest.rsplit_once(" -> ").map_or(rest, |(_, dst)| dst);
+            // Only `R`-prefixed (rename) and `C`-prefixed (copy) lines carry the
+            // `old -> new` form; for every other status the path is the whole
+            // tail and may legitimately contain ` -> ` as part of the filename.
+            // Splitting unconditionally would silently truncate such names.
+            let path = if line.starts_with('R') || line.starts_with('C') {
+                rest.rsplit_once(" -> ").map_or(rest, |(_, dst)| dst)
+            } else {
+                rest
+            };
             Some(PathBuf::from(path))
         })
         .collect()
@@ -694,6 +702,22 @@ members = ["a", "b"]
         let porcelain = " M foo.rs\n\n";
         let paths = parse_dirty_paths_from_git_status(porcelain);
         assert_eq!(paths, vec![PathBuf::from("foo.rs")]);
+    }
+
+    #[test]
+    fn git_status_parser_preserves_arrow_substring_in_non_rename_paths() {
+        // Defensive: a non-rename status (e.g. `M `, `??`) with a filename that
+        // happens to contain ` -> ` must NOT be split. Only `R`- and `C`-prefixed
+        // lines carry the `old -> new` rename/copy form. Without the status-gate
+        // the path would be silently truncated to whatever follows ` -> `.
+        let porcelain = " M crates/kiro-control-center/src/weird -> name.ts\n";
+        let paths = parse_dirty_paths_from_git_status(porcelain);
+        assert_eq!(
+            paths,
+            vec![PathBuf::from(
+                "crates/kiro-control-center/src/weird -> name.ts"
+            )]
+        );
     }
 
     #[test]
