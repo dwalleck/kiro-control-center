@@ -1,4 +1,23 @@
 {
+  "autoMode": {
+    "environment": [
+      "$defaults",
+      "Source control: github.com/dwalleck and all projects in it",
+      "Local temp directories"
+    ],
+    "allow": [
+      "$defaults",
+      "Creation and deletion of temporary files and directories",
+      "commits and pushes to allow repositories"
+    ],
+    "soft_deny": [
+      "$defaults"
+    ],
+    "hard_deny": [
+      "$defaults",
+      "Deleting files, repositories"
+    ]
+  },
   "hooks": {
     "PreToolUse": [
       {
