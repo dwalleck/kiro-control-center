@@ -5,6 +5,7 @@
   import type {
     InstalledSkillInfo,
     InstalledPluginInfo,
+    InstallPluginResult_Serialize,
     RemovePluginResult,
   } from "$lib/bindings";
   import { DELIM, pluginKey } from "$lib/keys";
@@ -19,6 +20,7 @@
   } from "$lib/error-source";
   import type { UpdateCheckKey } from "$lib/error-source";
   import { runPluginInstall, runPluginRemove } from "$lib/plugin-actions";
+  import { formatFailedSkill, formatFailedSteeringFile, formatFailedAgent } from "$lib/format";
   import { usePluginUpdateBanners } from "$lib/stores/plugin-update-banners.svelte";
   import BannerStack from "./BannerStack.svelte";
 
@@ -44,6 +46,18 @@
       (removeResult.skills.failures ?? []).length +
         (removeResult.steering.failures ?? []).length +
         (removeResult.agents.failures ?? []).length >
+      0
+    );
+  });
+
+  let installResult: InstallPluginResult_Serialize | null = $state(null);
+  let installResultPlugin: string | null = $state(null);
+  let installResultHasFailures = $derived.by(() => {
+    if (installResult === null) return false;
+    return (
+      installResult.skills.failed.length +
+        installResult.steering.failed.length +
+        installResult.agents.failed.length >
       0
     );
   });
@@ -155,6 +169,8 @@
     installStaleRefresh = null;
     removeResult = null;
     removeResultPlugin = null;
+    installResult = null;
+    installResultPlugin = null;
 
     try {
       const outcome = await runPluginInstall(
@@ -176,6 +192,14 @@
         installMessage = p?.kind === "message" ? p.text : null;
         installWarning = outcome.banner.warning;
         installStaleRefresh = outcome.banner.staleRefresh;
+        const failureSum =
+          outcome.installResult.skills.failed.length +
+          outcome.installResult.steering.failed.length +
+          outcome.installResult.agents.failed.length;
+        if (failureSum > 0) {
+          installResult = outcome.installResult;
+          installResultPlugin = plugin;
+        }
       } else {
         installError = outcome.error;
       }
@@ -250,6 +274,8 @@
     if (priorProjectPath !== null && priorProjectPath !== projectPath) {
       removeResult = null;
       removeResultPlugin = null;
+      installResult = null;
+      installResultPlugin = null;
       installError = null;
       installMessage = null;
       installWarning = null;
@@ -316,6 +342,48 @@
         type="button"
         onclick={() => { removeResult = null; removeResultPlugin = null; }}
         aria-label="Dismiss remove summary"
+        class="opacity-70 hover:opacity-100 text-lg leading-none flex-shrink-0 focus:outline-none focus:ring-2 focus:ring-kiro-accent-500 rounded"
+      >
+        ×
+      </button>
+    </div>
+  {/if}
+
+  {#if installResult && installResultPlugin && installResultHasFailures}
+    {@const anyInstalled =
+      installResult.skills.installed.length +
+        installResult.steering.installed.length +
+        installResult.agents.installed.length >
+      0}
+    <div
+      class="mx-4 mt-3 px-4 py-3 rounded-md text-sm flex items-start gap-3
+        {anyInstalled
+          ? 'bg-kiro-warning/10 border border-kiro-warning/30 text-kiro-warning'
+          : 'bg-kiro-error/10 border border-kiro-error/30 text-kiro-error'}"
+    >
+      <details
+        class="flex-1"
+        open={true}
+      >
+        <summary class="cursor-pointer text-xs opacity-85">
+          Show failures
+        </summary>
+        <div class="mt-2 pl-3 border-l-2 border-current/40 text-xs space-y-1">
+          {#each installResult.skills.failed as f (f.name)}
+            <div><b>Skill failed:</b> {formatFailedSkill(f)}</div>
+          {/each}
+          {#each installResult.steering.failed as f (f.source)}
+            <div><b>Steering failed:</b> {formatFailedSteeringFile(f)}</div>
+          {/each}
+          {#each installResult.agents.failed as f, i (i)}
+            <div><b>Agent failed:</b> {formatFailedAgent(f)}</div>
+          {/each}
+        </div>
+      </details>
+      <button
+        type="button"
+        onclick={() => { installResult = null; installResultPlugin = null; }}
+        aria-label="Dismiss install failures"
         class="opacity-70 hover:opacity-100 text-lg leading-none flex-shrink-0 focus:outline-none focus:ring-2 focus:ring-kiro-accent-500 rounded"
       >
         ×
