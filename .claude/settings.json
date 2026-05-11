@@ -14,12 +14,23 @@
     ],
     "PostToolUse": [
       {
-        "matcher": "Write|Edit",
+        "matcher": "Write|Edit|MultiEdit",
         "hooks": [
           {
             "type": "command",
             "command": "cd \"$CLAUDE_PROJECT_DIR\" && cargo xtask hook-post-edit",
             "timeout": 60
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "cd \"$CLAUDE_PROJECT_DIR\" && cargo xtask hook-stop-frontend-check",
+            "timeout": 120
           }
         ]
       }

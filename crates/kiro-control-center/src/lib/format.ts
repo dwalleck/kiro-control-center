@@ -1,4 +1,8 @@
 import type {
+  FailedAgent,
+  FailedSkill,
+  FailedSkillReason,
+  FailedSteeringFile_Serialize,
   InstallPluginResult_Serialize,
   InstallWarning,
   ParseFailure,
@@ -160,6 +164,63 @@ function formatParseFailure(f: ParseFailure): string {
       );
     }
   }
+}
+
+// Both FailedSkillReason variants share the `${name} — ${error}` shape;
+// the switch is retained so a new variant becomes a compile-time error
+// at the assertNever arm rather than a silent fallthrough.
+export function formatFailedSkill(f: FailedSkill): string {
+  switch (f.kind.kind) {
+    case "install_failed":
+      return `${f.name} — ${f.error}`;
+    case "requested_but_not_found":
+      return `${f.name} — ${f.error}`;
+    default: {
+      const _exhaustive: never = f.kind;
+      throw new Error(
+        `unhandled FailedSkillReason variant: ${JSON.stringify(_exhaustive)}`,
+      );
+    }
+  }
+}
+
+// Value-position exhaustiveness asserts; see _PLUGIN_ACTION_VALUES at stores/plugin-updates.ts:135-137.
+const _FAILED_SKILL_REASON_KINDS = ["install_failed", "requested_but_not_found"] as const satisfies readonly FailedSkillReason["kind"][];
+type _AssertFailedSkillReasonExhaustive = Exclude<FailedSkillReason["kind"], (typeof _FAILED_SKILL_REASON_KINDS)[number]> extends never ? true : never;
+const _assertFailedSkillReasonExhaustive: _AssertFailedSkillReasonExhaustive = true;
+
+// `entry.error` is opaque pre-rendered text from Rust's error_full_chain —
+// render directly. The companion_bundle `|| "no enumeration"` fallback
+// covers MultipleScanRootsNotSupported, where the engine bails before
+// enumerating any conflict paths.
+export function formatFailedAgent(entry: FailedAgent): string {
+  switch (entry.kind) {
+    case "agent":
+      return `${entry.name} (${entry.source_path}) — ${entry.error}`;
+    case "unparseable_agent":
+      return `${entry.source_path} (unparseable) — ${entry.error}`;
+    case "companion_bundle":
+      return `${entry.plugin} bundle [${entry.conflicts.join(", ") || "no enumeration"}] — ${entry.error}`;
+    default: {
+      const _exhaustive: never = entry;
+      throw new Error(
+        `unhandled FailedAgent variant: ${JSON.stringify(_exhaustive)}`,
+      );
+    }
+  }
+}
+
+// Value-position exhaustiveness asserts; see _PLUGIN_ACTION_VALUES at stores/plugin-updates.ts:135-137.
+const _FAILED_AGENT_KINDS = ["agent", "unparseable_agent", "companion_bundle"] as const satisfies readonly FailedAgent["kind"][];
+type _AssertFailedAgentKindExhaustive = Exclude<FailedAgent["kind"], (typeof _FAILED_AGENT_KINDS)[number]> extends never ? true : never;
+const _assertFailedAgentKindExhaustive: _AssertFailedAgentKindExhaustive = true;
+
+// Render a FailedSteeringFile as a one-line label. Single-shape type today
+// (source + error), so no switch is needed. If FailedSteeringFile grows
+// discriminated variants in the future (per docs/plans/2026-05-09-failed-agent-discriminator-design.md),
+// revisit with the same discriminator-pushdown pattern used by formatFailedAgent.
+export function formatFailedSteeringFile(f: FailedSteeringFile_Serialize): string {
+  return `${f.source} — ${f.error}`;
 }
 
 export function formatSkippedSkillsForPlugin(list: readonly SkippedSkill[]): string {

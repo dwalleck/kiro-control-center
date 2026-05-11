@@ -1,5 +1,6 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type {
+  AgentName,
   ErrorType,
   InstallPluginResult_Serialize,
   MarketplaceName,
@@ -95,6 +96,7 @@ describe("runPluginInstall", () => {
       });
       expect(outcome.banner.warning).toBeNull();
       expect(outcome.banner.staleRefresh).toBeNull();
+      expect(outcome.installResult).toBe(r);
     }
     expect(installPlugin).toHaveBeenCalledWith(
       "acme",
@@ -104,6 +106,36 @@ describe("runPluginInstall", () => {
       "/test/project",
     );
     expect(storeRefresh).toHaveBeenCalledOnce();
+  });
+
+  it("install with failures: outcome.installResult is the same object reference as the IPC response", async () => {
+    const r = emptyInstallResult();
+    r.skills.failed = [
+      { name: "bad-skill", error: "disk error", kind: { kind: "install_failed" } },
+    ];
+    r.steering.failed = [
+      { source: "rules/bad.md", error: "permission denied" },
+    ];
+    r.agents.failed = [
+      { kind: "agent", name: "my-agent" as AgentName, source_path: "agents/my-agent.md", error: "parse error" },
+      { kind: "unparseable_agent", source_path: "agents/broken.md", error: "invalid frontmatter" },
+      { kind: "companion_bundle", plugin: "demo-plugin" as PluginName, conflicts: ["agents/prompts/foo.md"], error: "conflict detected" },
+    ];
+    const installPlugin: PluginActionContext["installPlugin"] = vi
+      .fn()
+      .mockResolvedValue({ status: "ok", data: r });
+
+    const outcome = await runPluginInstall(
+      makeInstallCtx({ installPlugin }),
+      { kind: "install", force: false },
+    );
+
+    expect(outcome.kind).toBe("ok");
+    if (outcome.kind === "ok") {
+      // Reference equality: runPluginInstall must pass result.data through
+      // without cloning. A deep-equal check would miss an accidental copy.
+      expect(outcome.installResult).toBe(r);
+    }
   });
 
   it("update mode: force=true and successPrefix='Updated' regardless of context", async () => {
@@ -210,6 +242,7 @@ describe("runPluginInstall", () => {
         text: "Plugin install failed for demo-plugin: 1 skill failed",
       });
       expect(outcome.banner.warning).toBeNull();
+      expect(outcome.installResult).toBe(r);
     }
   });
 
@@ -235,6 +268,7 @@ describe("runPluginInstall", () => {
         text: "Plugin demo-plugin: 1 skill · 1 skill failed",
       });
       expect(outcome.banner.warning).toBeNull();
+      expect(outcome.installResult).toBe(r);
     }
   });
 

@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest";
 import type {
+  AgentName,
+  FailedAgent,
+  FailedSkill,
+  FailedSkillReason,
+  FailedSteeringFile_Serialize,
   InstallPluginResult_Serialize,
   MarketplaceName,
   PluginName,
@@ -7,6 +12,9 @@ import type {
   SkippedSkill,
 } from "$lib/bindings";
 import {
+  formatFailedAgent,
+  formatFailedSkill,
+  formatFailedSteeringFile,
   formatInstallPluginResult,
   formatRemovePluginResult,
   formatSkippedSkillsForPlugin,
@@ -254,5 +262,122 @@ describe("formatSkippedSkillsForPlugin", () => {
     expect(out.startsWith("6 skill(s) failed to load — ")).toBe(true);
     expect(out).toContain("e: malformed frontmatter");
     expect(out).not.toContain("f: malformed frontmatter");
+  });
+});
+
+describe("formatFailedSteeringFile", () => {
+  it("renders source and error joined by em-dash", () => {
+    const f: FailedSteeringFile_Serialize = {
+      source: "some/file.md",
+      error: "permission denied: foo",
+    };
+    expect(formatFailedSteeringFile(f)).toBe("some/file.md — permission denied: foo");
+  });
+});
+
+describe("formatFailedSkill", () => {
+  it("install_failed variant: renders name — error", () => {
+    const f: FailedSkill = {
+      name: "my-skill",
+      error: "io error: permission denied",
+      kind: { kind: "install_failed" },
+    };
+    expect(formatFailedSkill(f)).toBe("my-skill — io error: permission denied");
+  });
+
+  it("requested_but_not_found variant: renders name — error", () => {
+    const f: FailedSkill = {
+      name: "my-skill",
+      error: "skill 'my-skill' not found in plugin 'acme'",
+      kind: { kind: "requested_but_not_found", plugin: "acme" },
+    };
+    expect(formatFailedSkill(f)).toBe(
+      "my-skill — skill 'my-skill' not found in plugin 'acme'",
+    );
+  });
+
+  it("assertNever path: throws for unknown kind", () => {
+    const f: FailedSkill = {
+      name: "my-skill",
+      error: "some error",
+      // Cast through `unknown` to inject an invalid runtime variant that
+      // TypeScript cannot catch statically — exercises the default assertNever arm.
+      kind: { kind: "totally_new_variant" } as unknown as FailedSkillReason,
+    };
+    expect(() => formatFailedSkill(f)).toThrow();
+  });
+});
+
+describe("formatFailedAgent", () => {
+  it("agent variant: renders name (source_path) — error", () => {
+    const f: FailedAgent = {
+      kind: "agent",
+      name: "code-reviewer" as AgentName,
+      source_path: "agents/code-reviewer.md",
+      error: "io error: permission denied",
+    };
+    expect(formatFailedAgent(f)).toBe(
+      "code-reviewer (agents/code-reviewer.md) — io error: permission denied",
+    );
+  });
+
+  it("unparseable_agent variant: renders source_path (unparseable) — error", () => {
+    const f: FailedAgent = {
+      kind: "unparseable_agent",
+      source_path: "agents/broken.md",
+      error: "missing frontmatter fence",
+    };
+    expect(formatFailedAgent(f)).toBe(
+      "agents/broken.md (unparseable) — missing frontmatter fence",
+    );
+  });
+
+  it("companion_bundle with empty conflicts: renders [no enumeration] placeholder", () => {
+    // covers MultipleScanRootsNotSupported — rejection before per-file enumeration
+    const f: FailedAgent = {
+      kind: "companion_bundle",
+      plugin: "demo-plugin" as PluginName,
+      conflicts: [],
+      error: "multiple scan roots not supported",
+    };
+    expect(formatFailedAgent(f)).toBe(
+      "demo-plugin bundle [no enumeration] — multiple scan roots not supported",
+    );
+  });
+
+  it("companion_bundle with one conflict: renders the conflict path", () => {
+    const f: FailedAgent = {
+      kind: "companion_bundle",
+      plugin: "demo-plugin" as PluginName,
+      conflicts: ["agents/prompts/x.md"],
+      error: "orphan conflict at agents/prompts/x.md",
+    };
+    expect(formatFailedAgent(f)).toBe(
+      "demo-plugin bundle [agents/prompts/x.md] — orphan conflict at agents/prompts/x.md",
+    );
+  });
+
+  it("companion_bundle with multiple conflicts: comma-joins all paths", () => {
+    // Forward-compat coverage: the wire shape supports N conflicts even though
+    // the engine emits length-0 or length-1 today (per F1 / kiro-1ah3, deferred).
+    // Pins the .join(", ") behavior against a future refactor to indexed access.
+    const f: FailedAgent = {
+      kind: "companion_bundle",
+      plugin: "demo-plugin" as PluginName,
+      conflicts: ["agents/prompts/x.md", "agents/prompts/y.md"],
+      error: "multiple orphan conflicts",
+    };
+    expect(formatFailedAgent(f)).toBe(
+      "demo-plugin bundle [agents/prompts/x.md, agents/prompts/y.md] — multiple orphan conflicts",
+    );
+  });
+
+  it("assertNever path: throws for unknown kind", () => {
+    // Double-cast through `unknown` to inject an invalid runtime variant —
+    // the ts-expect-error directive does not fire on double-casts (valid TS
+    // expression), so `as unknown as FailedAgent` is the correct pattern.
+    // Same approach as formatFailedSkill's assertNever test above.
+    const f = { kind: "future_variant", error: "x" } as unknown as FailedAgent;
+    expect(() => formatFailedAgent(f)).toThrow();
   });
 });
