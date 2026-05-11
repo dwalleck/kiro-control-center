@@ -97,7 +97,7 @@ Specialists already produced verification commands per Required Evidence Per Fin
 **Tier the verification work:**
 
 - **Critical findings → always re-verify.** High stakes, low volume.
-- **Important findings + Adjacent Observations → sample-verify.** At minimum, re-verify **3 or 30% (whichever is more)**, prioritizing the ones with the highest blast radius or weakest evidence. If your sample reveals **2+ failed verifications from the same specialist**, expand to full verification of that specialist's remaining findings — you've found a systematic problem.
+- **Important findings + Adjacent Observations → sample-verify.** If the total count is **≤ 3, re-verify all**. Otherwise re-verify **3 or 30% (whichever is more)**, prioritizing the ones with the highest blast radius or weakest evidence. If your sample reveals **2+ failed verifications from the same specialist**, expand to full verification of that specialist's remaining findings — you've found a systematic problem.
 - **Suggestions, Nitpicks, ✅ Verified → trust by default.** Rely on the specialist's verification command + Step 8 evidence enforcement.
 - **Triggered re-verification (any severity).** Always re-verify a finding whose evidence looks weak (vague verification command, missing call-chain evidence) or whose claim contradicts your Step 1 survey understanding. These are the leaks the audit catches.
 - **Corroboration deprioritization.** Within the sample-verify tier, *deprioritize* findings flagged by multiple specialists — corroboration is itself audit evidence (see the **Cross-specialist corroboration** section). Spend the verification budget on single-source findings first.
