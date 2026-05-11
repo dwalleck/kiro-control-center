@@ -23,6 +23,10 @@ export const store = $state({
   settings: { scan_roots: [], last_project: null } as Settings,
   discoveredProjects: [] as DiscoveredProject[],
   loading: true,
+  // True while a project-discovery scan is running. Distinct from `loading`,
+  // which covers one-shot initial bootstrap. `scanning` stays live for any
+  // later refresh triggered by adding/removing a scan root.
+  scanning: false,
 });
 
 // ---------------------------------------------------------------------------
@@ -79,12 +83,17 @@ export async function selectProject(path: string) {
 }
 
 export async function refreshProjects() {
-  const result = await commands.discoverProjects();
-  if (result.status === "ok") {
-    store.discoveredProjects = result.data;
-  } else {
-    console.error("Failed to discover projects:", result.error.message);
-    store.projectError = `Could not scan for projects: ${result.error.message}`;
+  store.scanning = true;
+  try {
+    const result = await commands.discoverProjects();
+    if (result.status === "ok") {
+      store.discoveredProjects = result.data;
+    } else {
+      console.error("Failed to discover projects:", result.error.message);
+      store.projectError = `Could not scan for projects: ${result.error.message}`;
+    }
+  } finally {
+    store.scanning = false;
   }
 }
 

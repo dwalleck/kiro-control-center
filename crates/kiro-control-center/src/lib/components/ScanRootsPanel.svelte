@@ -57,6 +57,12 @@
         </p>
       {/if}
 
+      {#if store.scanning}
+        <p class="text-xs text-kiro-subtle mb-4" aria-live="polite">
+          Scanning for projects…
+        </p>
+      {/if}
+
       <button
         class="w-full px-4 py-2 rounded-lg border border-dashed border-kiro-muted text-sm text-kiro-text-secondary hover:border-kiro-accent-400 hover:text-kiro-accent-400 transition-colors"
         onclick={handleAddRoot}
