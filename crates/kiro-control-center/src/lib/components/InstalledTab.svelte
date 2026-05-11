@@ -371,10 +371,16 @@
           Show failures
         </summary>
         <div class="mt-2 pl-3 border-l-2 border-current/40 text-xs space-y-1">
-          {#each installResult.skills.failed as f (f.name)}
+          <!-- Index keys throughout: FailedSkill.name and FailedSteeringFile.source
+               are not structurally unique on the Rust side (service/mod.rs:1437-1447
+               can push duplicate FailedSkill::RequestedButNotFound when a Names(_)
+               filter contains the same name twice), and FailedAgent variants don't
+               share a single identity field. Svelte's {#each} silently dedupes on
+               key collision — index keys eliminate that drop risk. -->
+          {#each installResult.skills.failed as f, i (i)}
             <div><b>Skill failed:</b> {formatFailedSkill(f)}</div>
           {/each}
-          {#each installResult.steering.failed as f (f.source)}
+          {#each installResult.steering.failed as f, i (i)}
             <div><b>Steering failed:</b> {formatFailedSteeringFile(f)}</div>
           {/each}
           {#each installResult.agents.failed as f, i (i)}
