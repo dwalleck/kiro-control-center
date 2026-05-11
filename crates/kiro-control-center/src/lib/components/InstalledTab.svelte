@@ -365,7 +365,7 @@
     >
       <details
         class="flex-1"
-        open={true}
+        open
       >
         <summary class="cursor-pointer text-xs opacity-85">
           Show failures

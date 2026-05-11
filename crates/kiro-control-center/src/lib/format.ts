@@ -166,15 +166,9 @@ function formatParseFailure(f: ParseFailure): string {
   }
 }
 
-// Render a FailedSkill as a one-line label. Both FailedSkillReason variants
-// share the same `${name} — ${error}` render shape — the `kind` discriminator
-// lets the surrounding context (panel section heading) convey "install failed"
-// vs. "not found", so the rendered string itself is uniform. The switch is
-// still required: the default assertNever arm ensures a new FailedSkillReason
-// variant (added on the Rust side and regenerated into bindings.ts) becomes
-// a compile-time error here rather than a silent runtime fallthrough.
-// Paired with value-position exhaustiveness asserts below per CLAUDE.md
-// discriminator-pushdown discipline.
+// Both FailedSkillReason variants share the `${name} — ${error}` shape;
+// the switch is retained so a new variant becomes a compile-time error
+// at the assertNever arm rather than a silent fallthrough.
 export function formatFailedSkill(f: FailedSkill): string {
   switch (f.kind.kind) {
     case "install_failed":
@@ -190,27 +184,15 @@ export function formatFailedSkill(f: FailedSkill): string {
   }
 }
 
-// Value-position exhaustiveness asserts for FailedSkillReason["kind"].
-// The `satisfies` arm catches shape changes (a literal becomes an object arm).
-// The `Exclude<>` arm catches additions (a new variant added to the type that
-// isn't listed here). The trailing const assignment is what makes the tripwire
-// fire — an unused type alias resolving to `never` is valid TS, so the const
-// is the active gate. Precedent: _PLUGIN_ACTION_VALUES at stores/plugin-updates.ts:135-137.
+// Value-position exhaustiveness asserts; see _PLUGIN_ACTION_VALUES at stores/plugin-updates.ts:135-137.
 const _FAILED_SKILL_REASON_KINDS = ["install_failed", "requested_but_not_found"] as const satisfies readonly FailedSkillReason["kind"][];
 type _AssertFailedSkillReasonExhaustive = Exclude<FailedSkillReason["kind"], (typeof _FAILED_SKILL_REASON_KINDS)[number]> extends never ? true : never;
 const _assertFailedSkillReasonExhaustive: _AssertFailedSkillReasonExhaustive = true;
 
-// Render a FailedAgent tagged-enum entry as a one-line label. Switches on the
-// three discriminated variants (agent / unparseable_agent / companion_bundle).
-// The default arm uses assertNever so a future fourth variant added on the Rust
-// side (and regenerated into bindings.ts) becomes a compile-time error here
-// rather than a silent runtime fallthrough. Paired with value-position
-// exhaustiveness asserts below per CLAUDE.md discriminator-pushdown discipline.
-// The `error` field is opaque pre-rendered diagnostic text from Rust's
-// error_full_chain — render directly without parsing or truncating.
-// The `conflicts` join for companion_bundle uses `|| "no enumeration"` to
-// handle the rejection-pre-enumeration case (MultipleScanRootsNotSupported)
-// where the engine bails before enumerating any conflict paths.
+// `entry.error` is opaque pre-rendered text from Rust's error_full_chain —
+// render directly. The companion_bundle `|| "no enumeration"` fallback
+// covers MultipleScanRootsNotSupported, where the engine bails before
+// enumerating any conflict paths.
 export function formatFailedAgent(entry: FailedAgent): string {
   switch (entry.kind) {
     case "agent":
@@ -228,12 +210,7 @@ export function formatFailedAgent(entry: FailedAgent): string {
   }
 }
 
-// Value-position exhaustiveness asserts for FailedAgent["kind"].
-// The `satisfies` arm catches shape changes (a literal becomes an object arm).
-// The `Exclude<>` arm catches additions (a new variant added to the type that
-// isn't listed here). The trailing const assignment is what makes the tripwire
-// fire — an unused type alias resolving to `never` is valid TS, so the const
-// is the active gate. Precedent: _PLUGIN_ACTION_VALUES at stores/plugin-updates.ts:135-137.
+// Value-position exhaustiveness asserts; see _PLUGIN_ACTION_VALUES at stores/plugin-updates.ts:135-137.
 const _FAILED_AGENT_KINDS = ["agent", "unparseable_agent", "companion_bundle"] as const satisfies readonly FailedAgent["kind"][];
 type _AssertFailedAgentKindExhaustive = Exclude<FailedAgent["kind"], (typeof _FAILED_AGENT_KINDS)[number]> extends never ? true : never;
 const _assertFailedAgentKindExhaustive: _AssertFailedAgentKindExhaustive = true;
