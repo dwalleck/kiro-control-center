@@ -745,7 +745,7 @@ fn companion_conflicts_from_error(err: &crate::error::AgentError) -> Vec<std::pa
         // counts as exhaustive over `AgentError` — adding a new
         // variant breaks compilation here, satisfying the CLAUDE.md
         // classifier rule.
-        crate::error::AgentError::OrphanFileAtDestination { path }
+        AgentError::OrphanFileAtDestination { path }
         | AgentError::PathOwnedByOtherPlugin { path, .. } => vec![path.clone()],
         AgentError::AlreadyInstalled { .. }
         | AgentError::NotInstalled { .. }
