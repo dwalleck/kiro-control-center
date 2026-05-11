@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type {
+  FailedSteeringFile_Serialize,
   InstallPluginResult_Serialize,
   MarketplaceName,
   PluginName,
@@ -7,6 +8,7 @@ import type {
   SkippedSkill,
 } from "$lib/bindings";
 import {
+  formatFailedSteeringFile,
   formatInstallPluginResult,
   formatRemovePluginResult,
   formatSkippedSkillsForPlugin,
@@ -254,5 +256,15 @@ describe("formatSkippedSkillsForPlugin", () => {
     expect(out.startsWith("6 skill(s) failed to load — ")).toBe(true);
     expect(out).toContain("e: malformed frontmatter");
     expect(out).not.toContain("f: malformed frontmatter");
+  });
+});
+
+describe("formatFailedSteeringFile", () => {
+  it("renders source and error joined by em-dash", () => {
+    const f: FailedSteeringFile_Serialize = {
+      source: "some/file.md",
+      error: "permission denied: foo",
+    };
+    expect(formatFailedSteeringFile(f)).toBe("some/file.md — permission denied: foo");
   });
 });

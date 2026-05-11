@@ -1,4 +1,5 @@
 import type {
+  FailedSteeringFile_Serialize,
   InstallPluginResult_Serialize,
   InstallWarning,
   ParseFailure,
@@ -160,6 +161,14 @@ function formatParseFailure(f: ParseFailure): string {
       );
     }
   }
+}
+
+// Render a FailedSteeringFile as a one-line label. Single-shape type today
+// (source + error), so no switch is needed. If FailedSteeringFile grows
+// discriminated variants in the future (per docs/plans/2026-05-09-failed-agent-discriminator-design.md),
+// revisit with the same discriminator-pushdown pattern used by formatFailedAgent.
+export function formatFailedSteeringFile(f: FailedSteeringFile_Serialize): string {
+  return `${f.source} — ${f.error}`;
 }
 
 export function formatSkippedSkillsForPlugin(list: readonly SkippedSkill[]): string {
