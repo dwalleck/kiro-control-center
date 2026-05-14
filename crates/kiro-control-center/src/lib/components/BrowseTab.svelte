@@ -4,7 +4,7 @@
   import { commands } from "$lib/bindings";
   import {
     formatSkippedSkill,
-    formatSkippedSkillsForPlugin,
+    formatSkippedItemsForPlugin,
     formatSteeringWarning,
     formatFailedSkill,
     formatFailedSteeringFile,
@@ -313,13 +313,36 @@
           catalogByMarketplace[mp] = view;
           // The bulk response is authoritative for working plugins;
           // every per-plugin skipped-banner from a prior fetch for THIS
-          // marketplace is replaced wholesale. Build the new banner set
-          // first, then sweep stale entries — same ownership boundary as
-          // the prior fetchAllSkillsForMarketplace path.
+          // marketplace is replaced wholesale. Two banner sources share
+          // the catalog-skipped<mp><plugin> key:
+          //
+          //   1. Plugin-level skips (view.skipped) — the plugin couldn't
+          //      be enumerated at all (missing dir, malformed manifest,
+          //      remote source).
+          //   2. Per-item skips (entry.skipped_items inside a working
+          //      plugin) — restored here in slice 2 follow-up after the
+          //      cache swap silently dropped them.
+          //
+          // The two sources are disjoint: a plugin is either in
+          // view.skipped OR in view.plugins, never both, so they can
+          // share the banner key without collision. Build the union of
+          // fresh keys, then sweep stale entries — mirrors the prior
+          // fetchAllSkillsForMarketplace ownership boundary.
+          const fresh = new Set<ErrorSource>();
           for (const sp of view.skipped) {
-            fetchErrors.set(catalogSkippedKey(mp, sp.name), `${mp}/${sp.name}: ${sp.reason}`);
+            const k = catalogSkippedKey(mp, sp.name);
+            fetchErrors.set(k, `${mp}/${sp.name}: ${sp.reason}`);
+            fresh.add(k);
           }
-          const fresh = new Set(view.skipped.map((sp) => catalogSkippedKey(mp, sp.name)));
+          for (const entry of view.plugins) {
+            if (entry.skipped_items.length === 0) continue;
+            const k = catalogSkippedKey(mp, entry.plugin);
+            fetchErrors.set(
+              k,
+              `${mp}/${entry.plugin}: ${formatSkippedItemsForPlugin(entry.skipped_items)}`,
+            );
+            fresh.add(k);
+          }
           const stale: ErrorSource[] = [];
           for (const k of fetchErrors.keys()) {
             if (!k.startsWith(CATALOG_SKIPPED_PREFIX)) continue;

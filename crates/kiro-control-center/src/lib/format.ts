@@ -8,6 +8,7 @@ import type {
   ParseFailure,
   RemovePluginResult,
   SkillCount,
+  SkippedItem,
   SkippedReason,
   SkippedSkill,
   SteeringWarning,
@@ -242,6 +243,69 @@ export function formatSkippedSkillsForPlugin(list: readonly SkippedSkill[]): str
   return overflow > 0
     ? `${list.length} skill(s) failed to load — ${joined}; +${overflow} more`
     : `${list.length} skill(s) failed to load — ${joined}`;
+}
+
+// Render a plugin's `entry.skipped_items` as a compact banner body —
+// the catalog-side counterpart to `formatSkippedSkillsForPlugin`,
+// covering all three categories (skills, steering, agents) the bulk
+// catalog can surface. The switch on `item.kind` is exhaustive (with
+// the standard `_exhaustive: never` guard) so a future SkippedItem
+// variant lands as a compile error here rather than a silent miss
+// in the banner output.
+export function formatSkippedItemsForPlugin(items: readonly SkippedItem[]): string {
+  // Bucket by category first so the per-category formatters
+  // (formatSkippedSkill, formatSteeringWarning) get the same
+  // single-shape input they were designed for. The reconstruction
+  // overhead is trivial — each plugin's skipped_items is typically
+  // 0–5 entries and pathologically ≤30.
+  const skills: SkippedSkill[] = [];
+  const steering: SteeringWarning[] = [];
+  const agents: { source_path: string; reason: string }[] = [];
+  for (const item of items) {
+    switch (item.kind) {
+      case "skill":
+        skills.push(item.skill);
+        break;
+      case "steering_discovery":
+        steering.push(item.warning);
+        break;
+      case "agent_parse":
+        agents.push({ source_path: item.source_path, reason: item.reason });
+        break;
+      default: {
+        const _exhaustive: never = item;
+        throw new Error(
+          `unhandled SkippedItem variant in formatSkippedItemsForPlugin: ${JSON.stringify(_exhaustive)}`,
+        );
+      }
+    }
+  }
+  const parts: string[] = [];
+  if (skills.length > 0) parts.push(formatSkippedSkillsForPlugin(skills));
+  if (steering.length > 0) {
+    const MAX = 3;
+    const detail = steering.slice(0, MAX).map(formatSteeringWarning).join("; ");
+    const overflow = steering.length - Math.min(steering.length, MAX);
+    parts.push(
+      overflow > 0
+        ? `${steering.length} steering warning(s) — ${detail}; +${overflow} more`
+        : `${steering.length} steering warning(s) — ${detail}`,
+    );
+  }
+  if (agents.length > 0) {
+    const MAX = 3;
+    const detail = agents
+      .slice(0, MAX)
+      .map((a) => `${a.source_path}: ${a.reason}`)
+      .join("; ");
+    const overflow = agents.length - Math.min(agents.length, MAX);
+    parts.push(
+      overflow > 0
+        ? `${agents.length} agent(s) failed to parse — ${detail}; +${overflow} more`
+        : `${agents.length} agent(s) failed to parse — ${detail}`,
+    );
+  }
+  return parts.join(" | ");
 }
 
 export type FormattedInstallPluginResult = {

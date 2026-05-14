@@ -2903,8 +2903,8 @@ mod tests {
     /// 2/3 of the failure surface. This fixture shoves one valid + one
     /// invalid item into EACH of the three channels and asserts all
     /// three appear with their distinguishing `SkippedItem` variant.
-    /// Wire-format regression fence for SkippedItem. Pins the bug
-    /// caught during slice 2 of the BrowseTab redesign: tuple variants
+    /// Wire-format regression fence for `SkippedItem`. Pins the bug
+    /// caught during slice 2 of the `BrowseTab` redesign: tuple variants
     /// `Skill(SkippedSkill)` and `SteeringDiscovery(SteeringWarning)`
     /// under `#[serde(tag = "kind")]` collapsed the outer tag with the
     /// inner type's own `kind` discriminator, making the steering
