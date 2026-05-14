@@ -41,6 +41,7 @@
   import BannerStack from "./BannerStack.svelte";
   import SkillCard from "./SkillCard.svelte";
   import PluginCard from "./PluginCard.svelte";
+  import CustomizeDrawer from "./CustomizeDrawer.svelte";
 
   type BrowseView = "plugins" | "skills";
 
@@ -149,6 +150,24 @@
       0
     );
   });
+
+  // Slice 4: customize-drawer host. Holds the entry whose drawer is
+  // open, or null when closed. The drawer derives selectedSkills from
+  // the entry's per-item flags at mount, so a fresh-from-cache entry
+  // is the source of truth — `applyDrawerDiff` re-fetches the catalog
+  // before re-opening to avoid showing stale flags after an Apply.
+  let drawerEntry: PluginCatalogEntryView | null = $state(null);
+  let drawerMarketplace: string | null = $state(null);
+
+  function openDrawer(marketplace: string, entry: PluginCatalogEntryView) {
+    drawerMarketplace = marketplace;
+    drawerEntry = entry;
+  }
+
+  function closeDrawer() {
+    drawerEntry = null;
+    drawerMarketplace = null;
+  }
 
   // The Plugins-view grid pairs each catalog entry with its
   // marketplace name. PluginCard consumes the full catalog entry
@@ -609,6 +628,117 @@
     } finally {
       installing = false;
     }
+  }
+
+  // Slice 4: apply the customize drawer's diff. Skills install via
+  // commands.installSkills; skill removes loop commands.removeSkill;
+  // steering/agents are deliberately not in the diff (Option A,
+  // pending kiro-zx73's per-item commands). The install/remove paths
+  // mirror installSelected's surface so the same banner stream
+  // reports the outcome — no separate "drawer apply" banner family.
+  // Closes the drawer and refreshes the catalog before returning so
+  // the next open shows fresh state.
+  async function applyDrawerDiff(
+    marketplace: string,
+    plugin: string,
+    diff: { skills: { install: string[]; remove: string[] } },
+  ) {
+    installError = null;
+    installMessage = null;
+    installWarning = null;
+    installStaleRefresh = null;
+
+    const installedAll: string[] = [];
+    const skippedAll: string[] = [];
+    const failedAll: { name: string; error: string }[] = [];
+    const unreadableAll: SkippedSkill[] = [];
+    let removed = 0;
+    let removeFailed: { name: string; error: string }[] = [];
+
+    if (diff.skills.install.length > 0) {
+      try {
+        const result = await commands.installSkills(
+          marketplace,
+          plugin,
+          diff.skills.install,
+          forceInstall,
+          projectPath,
+        );
+        if (result.status === "ok") {
+          installedAll.push(...result.data.installed);
+          skippedAll.push(...result.data.skipped);
+          failedAll.push(...result.data.failed);
+          unreadableAll.push(...result.data.skipped_skills);
+        } else {
+          installError = `Customize apply: install failed for ${marketplace}/${plugin}: ${result.error.message}`;
+          return;
+        }
+      } catch (e) {
+        const reason = e instanceof Error ? e.message : String(e);
+        installError = `Customize apply: install threw for ${marketplace}/${plugin}: ${reason}`;
+        return;
+      }
+    }
+
+    for (const name of diff.skills.remove) {
+      try {
+        const result = await commands.removeSkill(name, projectPath);
+        if (result.status === "ok") {
+          removed++;
+        } else {
+          removeFailed.push({ name, error: result.error.message });
+        }
+      } catch (e) {
+        const reason = e instanceof Error ? e.message : String(e);
+        removeFailed.push({ name, error: reason });
+      }
+    }
+
+    // Compose summary banner. Same parts vocabulary as installSelected
+    // (installed / skipped / failed / unreadable) plus removal counts,
+    // so users who read both flows see consistent prose.
+    const parts: string[] = [];
+    if (installedAll.length > 0) parts.push(`Installed: ${installedAll.join(", ")}`);
+    if (skippedAll.length > 0) parts.push(`Already installed: ${skippedAll.join(", ")}`);
+    if (removed > 0) parts.push(`Removed: ${removed}`);
+    if (failedAll.length > 0) {
+      parts.push(`Failed: ${failedAll.map((f) => `${f.name} (${f.error})`).join(", ")}`);
+    }
+    if (removeFailed.length > 0) {
+      parts.push(
+        `Remove failed: ${removeFailed.map((f) => `${f.name} (${f.error})`).join(", ")}`,
+      );
+    }
+    if (unreadableAll.length > 0) {
+      parts.push(`Unreadable: ${unreadableAll.map(formatSkippedSkill).join(", ")}`);
+    }
+
+    const hadAnyInstall = installedAll.length > 0;
+    const hadAnyRemove = removed > 0;
+    if (parts.length === 0) {
+      installMessage = `${marketplace}/${plugin}: no changes applied`;
+    } else if (
+      !hadAnyInstall &&
+      !hadAnyRemove &&
+      (failedAll.length > 0 || removeFailed.length > 0)
+    ) {
+      installError = `${marketplace}/${plugin}: ${parts.join(" | ")}`;
+    } else {
+      installMessage = `${marketplace}/${plugin}: ${parts.join(" | ")}`;
+    }
+
+    // Refresh catalog so the drawer's next open sees fresh per-item
+    // installed flags. Closing happens AFTER refresh so a re-open
+    // from BrowseTab (rare, but possible if the user clicks Manage
+    // again immediately) doesn't read stale state.
+    try {
+      await fetchCatalogFor(marketplace, true);
+    } catch (e) {
+      console.error("[BrowseTab] post-drawer-apply refresh rejected", e);
+      const reason = e instanceof Error ? e.message : String(e);
+      installError = `Post-apply refresh failed: ${reason}`;
+    }
+    closeDrawer();
   }
 
   // Per-plugin in-flight tracker so two plugins can install in parallel
@@ -1127,6 +1257,7 @@
               projectPicked={!!projectPath}
               onInstall={() => runPluginInstall(ap.marketplace, ap.entry.plugin, "install")}
               onUpdate={() => runPluginInstall(ap.marketplace, ap.entry.plugin, "update")}
+              onCustomize={() => openDrawer(ap.marketplace, ap.entry)}
             />
           {/each}
         </div>
@@ -1183,3 +1314,18 @@
     </div>
   </div>
 </div>
+
+<!--
+  Customize drawer host. Rendered outside the main BrowseTab flex
+  column so its position:fixed overlay isn't constrained by the
+  flex parent. The drawer's onApply receives a skill-only diff
+  (Option A — kiro-zx73 widens to per-item steering/agents).
+-->
+{#if drawerEntry && drawerMarketplace}
+  <CustomizeDrawer
+    entry={drawerEntry}
+    marketplace={drawerMarketplace}
+    onClose={closeDrawer}
+    onApply={(diff) => applyDrawerDiff(drawerMarketplace!, drawerEntry!.plugin, diff)}
+  />
+{/if}

@@ -32,6 +32,11 @@
     projectPicked: boolean;
     onInstall: () => void;
     onUpdate: () => void;
+    /// Slice 4: opens the customize drawer for per-skill granular
+    /// install/remove. No-op-tolerant — the parent decides whether
+    /// the click does anything (e.g., disabled when no project
+    /// picked). The drawer caller is BrowseTab; the card just emits.
+    onCustomize: () => void;
   };
 
   let {
@@ -44,6 +49,7 @@
     projectPicked,
     onInstall,
     onUpdate,
+    onCustomize,
   }: Props = $props();
 
   // Per-item state, derived purely from the catalog entry's per-item
@@ -155,7 +161,7 @@
     {/if}
   </div>
 
-  <div class="flex flex-col items-end gap-1.5 flex-shrink-0">
+  <div class="flex items-center gap-1.5 flex-shrink-0">
     {#if pending}
       {@const label = pendingLabel(pending)}
       <button
@@ -168,13 +174,46 @@
         {label}…
       </button>
     {:else if failure && installed}
+      <!--
+        Update check failed: show the error chip AND a Manage button so
+        the user can still open the drawer to inspect / curate items.
+        Without the Manage button this branch was actionless, leaving
+        users stranded after a transient update-check error.
+      -->
       <span
         class="px-2 py-0.5 text-[11px] font-medium text-kiro-error border border-kiro-error/40 rounded"
         title={kindLabel(failure.kind)}
       >
         Update check failed
       </span>
+      <button
+        type="button"
+        onclick={onCustomize}
+        disabled={!projectPicked}
+        aria-label="Manage {entry.plugin}"
+        title={projectPicked ? `Manage installed items for ${entry.plugin}` : "Pick a project first"}
+        class="px-3 py-1.5 text-xs font-medium rounded-md transition-colors
+          {projectPicked
+            ? 'bg-transparent border border-kiro-muted text-kiro-text-secondary hover:bg-kiro-muted hover:text-kiro-text'
+            : 'bg-kiro-muted text-kiro-subtle border border-transparent cursor-not-allowed'}"
+      >
+        Manage
+      </button>
     {:else if update}
+      <!-- Update available: pair with Customize so the user can preview/edit before updating. -->
+      <button
+        type="button"
+        onclick={onCustomize}
+        disabled={!projectPicked}
+        aria-label="Customize {entry.plugin}"
+        title={projectPicked ? `Customize installed items for ${entry.plugin}` : "Pick a project first"}
+        class="px-3 py-1.5 text-xs font-medium rounded-md transition-colors
+          {projectPicked
+            ? 'bg-transparent border border-kiro-muted text-kiro-text-secondary hover:bg-kiro-muted hover:text-kiro-text'
+            : 'bg-kiro-muted text-kiro-subtle border border-transparent cursor-not-allowed'}"
+      >
+        Customize
+      </button>
       <button
         type="button"
         onclick={onUpdate}
@@ -188,7 +227,42 @@
       >
         {updateLabel}
       </button>
-    {:else if !installed}
+    {:else if installed}
+      <!-- Installed and no update: Manage opens the drawer for add/remove. -->
+      <button
+        type="button"
+        onclick={onCustomize}
+        disabled={!projectPicked}
+        aria-label="Manage {entry.plugin}"
+        title={projectPicked ? `Manage installed items for ${entry.plugin}` : "Pick a project first"}
+        class="px-3 py-1.5 text-xs font-medium rounded-md transition-colors
+          {projectPicked
+            ? 'bg-transparent border border-kiro-muted text-kiro-text-secondary hover:bg-kiro-muted hover:text-kiro-text'
+            : 'bg-kiro-muted text-kiro-subtle border border-transparent cursor-not-allowed'}"
+      >
+        Manage
+      </button>
+    {:else}
+      <!--
+        Not installed (any per-item state, including partial via skill-
+        view installs). Customize opens the drawer for granular pick;
+        Install does the whole-plugin runPluginInstall path. Both go
+        through the same pendingPluginActions guard so a click on
+        either correctly disables BOTH while the action runs.
+      -->
+      <button
+        type="button"
+        onclick={onCustomize}
+        disabled={!projectPicked}
+        aria-label="Customize {entry.plugin}"
+        title={projectPicked ? `Customize which items to install for ${entry.plugin}` : "Pick a project first"}
+        class="px-3 py-1.5 text-xs font-medium rounded-md transition-colors
+          {projectPicked
+            ? 'bg-transparent border border-kiro-muted text-kiro-text-secondary hover:bg-kiro-muted hover:text-kiro-text'
+            : 'bg-kiro-muted text-kiro-subtle border border-transparent cursor-not-allowed'}"
+      >
+        Customize
+      </button>
       <button
         type="button"
         onclick={onInstall}
@@ -203,14 +277,5 @@
         Install
       </button>
     {/if}
-    <!--
-      Slice 3 deliberately omits Customize/Manage buttons — those open
-      the customize drawer which slice 4 builds. An installed plugin
-      with no `update` lands here with no action button at all (the
-      "Installed" pill in the header is the only signal). That matches
-      pre-redesign behavior for the installed-no-update state. Adding a
-      no-op Customize button now would make the action area look
-      different across releases for what is the same actionless state.
-    -->
   </div>
 </div>
