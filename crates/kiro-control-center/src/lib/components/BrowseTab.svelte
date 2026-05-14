@@ -9,8 +9,6 @@
     formatFailedSkill,
     formatFailedSteeringFile,
     formatFailedAgent,
-    skillCountLabel,
-    skillCountTitle,
   } from "$lib/format";
   import {
     DELIM,
@@ -37,7 +35,6 @@
     MarketplaceInfo,
     PluginCatalogEntryView,
     PluginCatalogResponseView,
-    PluginInfo,
     SkillInfo,
     SkippedSkill,
   } from "$lib/bindings";
@@ -153,30 +150,21 @@
     );
   });
 
-  // Project a PluginCatalogEntryView into the today-shaped PluginInfo
-  // so PluginCard, skillCountLabel, and skillCountTitle stay unchanged.
-  // The catalog only includes plugins whose manifest loaded; broken-
-  // manifest plugins live in `view.skipped` and surface as banners
-  // (see fetchCatalogFor). This is a UX shift from the prior path,
-  // which kept manifest_failed plugins in the grid with a colored
-  // count — banners are more discoverable, and the previous on-card
-  // signal was a 1px color change easy to miss.
-  function pluginInfoFromEntry(entry: PluginCatalogEntryView): PluginInfo {
-    return {
-      name: entry.plugin,
-      description: entry.description,
-      skill_count: { state: "known", count: entry.skills.length },
-      source_type: entry.source_type,
-    };
-  }
-
+  // The Plugins-view grid pairs each catalog entry with its
+  // marketplace name. PluginCard consumes the full catalog entry
+  // directly so it can derive its three-state stripe and "X of Y
+  // installed" badge from per-item flags — slice 3 dropped the
+  // intermediate PluginInfo synthesis the cache swap (slice 2) had
+  // briefly used as scaffolding. Broken-manifest plugins still live
+  // in view.skipped and surface as banners (see fetchCatalogFor);
+  // they don't reach this derived list.
   let availablePlugins = $derived.by(() => {
-    const out: { marketplace: string; plugin: PluginInfo }[] = [];
+    const out: { marketplace: string; entry: PluginCatalogEntryView }[] = [];
     for (const mp of selectedMarketplaces) {
       const view = catalogByMarketplace[mp];
       if (view === undefined) continue;
       for (const entry of view.plugins) {
-        out.push({ marketplace: mp, plugin: pluginInfoFromEntry(entry) });
+        out.push({ marketplace: mp, entry });
       }
     }
     return out;
@@ -888,8 +876,9 @@
           {#if availablePlugins.length > 0}
             <div class="mb-3.5">
               <div class="mb-1.5 text-[10px] font-semibold uppercase tracking-wider text-kiro-subtle">Plugin</div>
-              {#each availablePlugins as ap (pluginKey(ap.marketplace, ap.plugin.name))}
-                {@const key = pluginKey(ap.marketplace, ap.plugin.name)}
+              {#each availablePlugins as ap (pluginKey(ap.marketplace, ap.entry.plugin))}
+                {@const key = pluginKey(ap.marketplace, ap.entry.plugin)}
+                {@const skillLabel = `${ap.entry.skills.length} ${ap.entry.skills.length === 1 ? "skill" : "skills"}`}
                 <label class="flex items-center gap-2 px-1.5 py-1 text-[13px] text-kiro-text-secondary rounded hover:bg-kiro-accent-900/15 hover:text-kiro-text cursor-pointer">
                   <input
                     type="checkbox"
@@ -897,12 +886,12 @@
                     onchange={() => togglePlugin(key)}
                     class="h-3.5 w-3.5 rounded border-kiro-muted text-kiro-accent-500"
                   />
-                  <span class="flex-1 truncate">{ap.plugin.name}</span>
+                  <span class="flex-1 truncate">{ap.entry.plugin}</span>
                   <span
-                    class="text-[11px] {ap.plugin.skill_count.state === 'manifest_failed' ? 'text-kiro-warning' : 'text-kiro-subtle'}"
-                    title={skillCountTitle(ap.plugin.skill_count)}
-                    aria-label={skillCountTitle(ap.plugin.skill_count)}
-                  >{skillCountLabel(ap.plugin.skill_count)}</span>
+                    class="text-[11px] text-kiro-subtle"
+                    title={skillLabel}
+                    aria-label={skillLabel}
+                  >{skillLabel}</span>
                 </label>
               {/each}
             </div>
@@ -1126,18 +1115,18 @@
         </div>
       {:else}
         <div class="grid gap-3 grid-cols-1 lg:grid-cols-2">
-          {#each availablePlugins as ap (pluginKey(ap.marketplace, ap.plugin.name))}
-            {@const key = pluginKey(ap.marketplace, ap.plugin.name)}
+          {#each availablePlugins as ap (pluginKey(ap.marketplace, ap.entry.plugin))}
+            {@const key = pluginKey(ap.marketplace, ap.entry.plugin)}
             <PluginCard
-              plugin={ap.plugin}
+              entry={ap.entry}
               marketplace={ap.marketplace}
               installed={installedPluginKeys.has(key)}
               pending={pendingPluginActions.get(key)}
-              update={pluginUpdates.updateFor(ap.marketplace, ap.plugin.name)}
-              failure={pluginUpdates.failureFor(ap.marketplace, ap.plugin.name)}
+              update={pluginUpdates.updateFor(ap.marketplace, ap.entry.plugin)}
+              failure={pluginUpdates.failureFor(ap.marketplace, ap.entry.plugin)}
               projectPicked={!!projectPath}
-              onInstall={() => runPluginInstall(ap.marketplace, ap.plugin.name, "install")}
-              onUpdate={() => runPluginInstall(ap.marketplace, ap.plugin.name, "update")}
+              onInstall={() => runPluginInstall(ap.marketplace, ap.entry.plugin, "install")}
+              onUpdate={() => runPluginInstall(ap.marketplace, ap.entry.plugin, "update")}
             />
           {/each}
         </div>

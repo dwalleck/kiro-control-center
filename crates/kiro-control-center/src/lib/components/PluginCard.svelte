@@ -1,24 +1,31 @@
 <script lang="ts">
   import type {
-    PluginInfo,
+    PluginCatalogEntryView,
     PluginUpdateFailure,
     PluginUpdateInfo,
   } from "$lib/bindings";
   import { actionUpdateLabel, kindLabel } from "$lib/stores/plugin-updates";
   import type { BrowseAction } from "$lib/stores/plugin-updates";
-  import { skillCountLabel, skillCountTitle } from "$lib/format";
 
   type Props = {
-    plugin: PluginInfo;
+    /// Catalog entry from `commands.listPluginCatalogForMarketplace`.
+    /// Drives the new three-state visual (stripe + badge + per-category
+    /// counts) by aggregating per-item `installed` flags across the
+    /// skills, steering, and agents arrays.
+    entry: PluginCatalogEntryView;
     marketplace: string;
+    /// Whole-plugin tracking state from `installedPluginKeys` (which is
+    /// derived from `listInstalledPlugins`). Distinct from the per-item
+    /// state derived from `entry`: a plugin can be tracked-as-installed
+    /// (this prop true) while having only a subset of its items present
+    /// (e.g., user removed one skill via removeSkill after a whole-
+    /// plugin install). The button matrix below uses this prop; the
+    /// stripe/badge use the per-item state. The two signals together
+    /// describe both "is this plugin formally installed" and "how much
+    /// of it is on disk."
     installed: boolean;
     // Single discriminator carried through from the producer's
     // `pendingPluginActions.get(key)` (a `BrowseAction | undefined`).
-    // Importing `BrowseAction` couples this card to the per-tab vocabulary,
-    // but the alternative — a duplicated `"install" | "update"` literal
-    // — drifts silently if `BrowseAction` ever widens. The single producer
-    // today is BrowseTab; if a second consumer with a different action
-    // vocabulary materializes, widen this prop to a shared union.
     pending: BrowseAction | undefined;
     update: PluginUpdateInfo | undefined;
     failure: PluginUpdateFailure | undefined;
@@ -28,7 +35,7 @@
   };
 
   let {
-    plugin,
+    entry,
     marketplace,
     installed,
     pending,
@@ -39,12 +46,66 @@
     onUpdate,
   }: Props = $props();
 
+  // Per-item state, derived purely from the catalog entry's per-item
+  // `installed` flags. Independent of the `installed` prop (which
+  // tracks whole-plugin install state via installed-plugins.json).
+  // The stripe color and badge consume itemState; the action buttons
+  // consume the `installed` / `pending` / `update` / `failure` props.
+  type ItemState = "not_installed" | "partial" | "installed";
+  const counts = $derived.by(() => {
+    const all = [...entry.skills, ...entry.steering, ...entry.agents];
+    const total = all.length;
+    const installedCount = all.filter((i) => i.installed).length;
+    let state: ItemState;
+    if (total === 0 || installedCount === 0) state = "not_installed";
+    else if (installedCount === total) state = "installed";
+    else state = "partial";
+    return { installed: installedCount, total, state };
+  });
+
+  // Stripe color uses a switch with `const _exhaustive: never` per
+  // CLAUDE.md's discriminator-pushdown discipline so a future
+  // ItemState arm becomes a compile error rather than a silent
+  // fallback to one of the existing colors.
+  const stripeClass = $derived.by(() => {
+    switch (counts.state) {
+      case "installed":
+        return "border-l-kiro-success";
+      case "partial":
+        return "border-l-kiro-warning";
+      case "not_installed":
+        return "border-l-kiro-accent-800";
+      default: {
+        const _exhaustive: never = counts.state;
+        throw new Error(`unhandled ItemState: ${JSON.stringify(_exhaustive)}`);
+      }
+    }
+  });
+
+  // Per-category subline: only show categories that have items, so an
+  // agent-less plugin doesn't read "5 skills · 0 steering · 0 agents."
+  const categorySummary = $derived.by(() => {
+    const parts: string[] = [];
+    if (entry.skills.length > 0) {
+      parts.push(`${entry.skills.length} skill${entry.skills.length === 1 ? "" : "s"}`);
+    }
+    if (entry.steering.length > 0) {
+      parts.push(
+        `${entry.steering.length} steering`,
+      );
+    }
+    if (entry.agents.length > 0) {
+      parts.push(`${entry.agents.length} agent${entry.agents.length === 1 ? "" : "s"}`);
+    }
+    return parts.length === 0 ? "no items" : parts.join(" · ");
+  });
+
   const installTitle = $derived(
     !projectPicked
       ? "Pick a project first"
       : installed
-        ? `${plugin.name} is already installed in this project`
-        : `Install ${plugin.name} (skills + steering + agents) into the active project`,
+        ? `${entry.plugin} is already installed in this project`
+        : `Install ${entry.plugin} (skills + steering + agents) into the active project`,
   );
 
   const updateLabel = $derived(update ? actionUpdateLabel(update) : "Update");
@@ -66,29 +127,32 @@
   }
 </script>
 
-<div class="flex items-start gap-3 px-3 py-3 rounded-md border border-kiro-muted bg-kiro-overlay">
+<div
+  class="flex items-start gap-3 px-3 py-3 rounded-md border border-kiro-muted bg-kiro-overlay border-l-2 {stripeClass}"
+>
   <div class="flex-1 min-w-0">
     <div class="flex items-center gap-2 flex-wrap">
-      <span class="text-sm font-medium text-kiro-text truncate">{plugin.name}</span>
-      <span
-        class="text-[11px] {plugin.skill_count.state === 'manifest_failed'
-          ? 'text-kiro-warning'
-          : 'text-kiro-subtle'} flex-shrink-0"
-        title={skillCountTitle(plugin.skill_count)}
-        aria-label={skillCountTitle(plugin.skill_count)}
-      >
-        {skillCountLabel(plugin.skill_count)} skill{plugin.skill_count.state === "known" &&
-        plugin.skill_count.count === 1
-          ? ""
-          : "s"}
-      </span>
+      <span class="text-sm font-medium text-kiro-text truncate">{entry.plugin}</span>
+      {#if counts.state === "installed"}
+        <span
+          class="inline-flex items-center px-2 py-0.5 text-[11px] font-medium rounded-full bg-kiro-success/15 text-kiro-success"
+        >
+          Installed
+        </span>
+      {:else if counts.state === "partial"}
+        <span
+          class="inline-flex items-center px-2 py-0.5 text-[11px] font-medium rounded-full bg-kiro-warning/15 text-kiro-warning"
+        >
+          {counts.installed} of {counts.total} installed
+        </span>
+      {/if}
     </div>
-    {#if plugin.description}
-      <div class="mt-1 text-xs text-kiro-subtle">{plugin.description}</div>
+    <div class="mt-1 text-[10px] uppercase tracking-wider text-kiro-subtle">
+      {marketplace} <span class="normal-case tracking-normal text-kiro-subtle">· {categorySummary}</span>
+    </div>
+    {#if entry.description}
+      <div class="mt-1 text-xs text-kiro-subtle">{entry.description}</div>
     {/if}
-    <div class="mt-1.5 text-[10px] uppercase tracking-wider text-kiro-subtle">
-      {marketplace}
-    </div>
   </div>
 
   <div class="flex flex-col items-end gap-1.5 flex-shrink-0">
@@ -98,7 +162,7 @@
         type="button"
         disabled
         aria-busy="true"
-        aria-label="{label} {plugin.name}"
+        aria-label="{label} {entry.plugin}"
         class="px-3 py-1.5 text-xs font-medium rounded-md bg-kiro-muted text-kiro-subtle border border-transparent cursor-not-allowed"
       >
         {label}…
@@ -116,7 +180,7 @@
         onclick={onUpdate}
         disabled={!projectPicked}
         title="Update will replace local edits to plugin files"
-        aria-label="Update {plugin.name}"
+        aria-label="Update {entry.plugin}"
         class="px-3 py-1.5 text-xs font-medium rounded-md transition-colors
           {projectPicked
             ? 'bg-kiro-warning/10 border border-kiro-warning/40 text-kiro-warning hover:bg-kiro-warning/15'
@@ -124,19 +188,13 @@
       >
         {updateLabel}
       </button>
-    {:else if installed}
-      <span
-        class="px-2 py-0.5 text-[11px] font-medium text-kiro-success border border-kiro-success/40 rounded"
-      >
-        Installed
-      </span>
-    {:else}
+    {:else if !installed}
       <button
         type="button"
         onclick={onInstall}
         disabled={!projectPicked}
         title={installTitle}
-        aria-label="Install {plugin.name}"
+        aria-label="Install {entry.plugin}"
         class="px-3 py-1.5 text-xs font-medium rounded-md transition-colors
           {projectPicked
             ? 'bg-kiro-overlay border border-kiro-muted text-kiro-accent-300 hover:bg-kiro-muted hover:text-kiro-accent-200'
@@ -145,5 +203,14 @@
         Install
       </button>
     {/if}
+    <!--
+      Slice 3 deliberately omits Customize/Manage buttons — those open
+      the customize drawer which slice 4 builds. An installed plugin
+      with no `update` lands here with no action button at all (the
+      "Installed" pill in the header is the only signal). That matches
+      pre-redesign behavior for the installed-no-update state. Adding a
+      no-op Customize button now would make the action area look
+      different across releases for what is the same actionless state.
+    -->
   </div>
 </div>
