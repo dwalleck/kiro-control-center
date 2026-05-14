@@ -192,22 +192,33 @@ pub struct AgentItemInfo {
 ///
 /// Variant ordering matches the order items are enumerated:
 /// skills first, then steering, then agents. Frontend renderers that
-/// group by category can match on `kind` without losing the discovery
+/// group by category match on `kind` without losing the discovery
 /// order within a single category.
+///
+/// **All variants use named struct fields, even the single-payload
+/// ones.** A tuple variant `Skill(SkippedSkill)` under
+/// `#[serde(tag = "kind")]` would flatten the inner `SkippedSkill`
+/// into the outer object, and for `SteeringDiscovery(SteeringWarning)`
+/// the inner type's own `kind` discriminator would collide with the
+/// outer tag — at runtime serde silently drops the outer tag and the
+/// frontend can't tell `SteeringDiscovery` from `Skill` any more.
+/// Pinned by `skipped_item_serializes_to_kind_discriminated_shape`.
 #[derive(Clone, Debug, Serialize)]
 #[cfg_attr(feature = "specta", derive(specta::Type))]
 #[serde(tag = "kind", rename_all = "snake_case")]
 #[non_exhaustive]
 pub enum SkippedItem {
     /// One skill could not be read or parsed (frontmatter, I/O, etc.).
-    /// Reuses the existing per-skill skip type so single-plugin and
-    /// bulk callers agree on the wire shape.
-    Skill(SkippedSkill),
+    /// Wraps [`SkippedSkill`] under the `skill` field so the outer
+    /// `kind: "skill"` tag stays distinct from the inner's
+    /// `reason.kind` discriminator.
+    Skill { skill: SkippedSkill },
     /// Steering discovery emitted a structured warning (invalid scan
-    /// path, unreadable scan dir). Reuses [`SteeringWarning`] so the
-    /// existing `installPluginSteering` call's warning shape is the
-    /// same one this catalog surface uses.
-    SteeringDiscovery(SteeringWarning),
+    /// path, unreadable scan dir). Wraps [`SteeringWarning`] under the
+    /// `warning` field — without the wrapper, the inner `kind` tag
+    /// would collide with the outer at the wire level (see the enum
+    /// doc-comment above for the regression this avoids).
+    SteeringDiscovery { warning: SteeringWarning },
     /// One agent file could not be parsed (frontmatter, JSON, dialect
     /// detection). The `source_path` matches [`SkippedSkill::path`]'s
     /// shape (specta renders `PathBuf` as `string` on TS) so frontend
@@ -1118,13 +1129,13 @@ impl MarketplaceService {
             skills_result
                 .skipped_skills
                 .into_iter()
-                .map(SkippedItem::Skill),
+                .map(|skill| SkippedItem::Skill { skill }),
         );
         skipped_items.extend(
             steering_result
                 .warnings
                 .into_iter()
-                .map(SkippedItem::SteeringDiscovery),
+                .map(|warning| SkippedItem::SteeringDiscovery { warning }),
         );
         skipped_items.extend(
             agents_result
@@ -2892,6 +2903,69 @@ mod tests {
     /// 2/3 of the failure surface. This fixture shoves one valid + one
     /// invalid item into EACH of the three channels and asserts all
     /// three appear with their distinguishing `SkippedItem` variant.
+    /// Wire-format regression fence for SkippedItem. Pins the bug
+    /// caught during slice 2 of the BrowseTab redesign: tuple variants
+    /// `Skill(SkippedSkill)` and `SteeringDiscovery(SteeringWarning)`
+    /// under `#[serde(tag = "kind")]` collapsed the outer tag with the
+    /// inner type's own `kind` discriminator, making the steering
+    /// variant indistinguishable from a Skill on the wire (TS code
+    /// switching on `item.kind` would land in the never arm). The
+    /// fix moved both to struct variants (`Skill { skill }` and
+    /// `SteeringDiscovery { warning }`) so the inner `kind` nests
+    /// under `.skill.reason.kind` and `.warning.kind` respectively.
+    #[test]
+    fn skipped_item_serializes_to_kind_discriminated_shape() {
+        // Skill variant: outer `kind: "skill"` and inner SkippedSkill
+        // nests under `.skill`. Inner reason's `kind` lives at
+        // `.skill.reason.kind`, no collision with the outer tag.
+        let skill_item = SkippedItem::Skill {
+            skill: SkippedSkill {
+                plugin: "alpha".into(),
+                name_hint: Some("bad".into()),
+                path: PathBuf::from("/x/SKILL.md"),
+                reason: SkippedSkillReason::FrontmatterInvalid {
+                    reason: "bad yaml".into(),
+                },
+            },
+        };
+        let json: serde_json::Value = serde_json::to_value(&skill_item).expect("serialize skill");
+        assert_eq!(json["kind"], "skill");
+        assert_eq!(json["skill"]["plugin"], "alpha");
+        assert_eq!(json["skill"]["name_hint"], "bad");
+        assert_eq!(json["skill"]["reason"]["kind"], "frontmatter_invalid");
+
+        // Steering variant: outer `kind: "steering_discovery"` and
+        // inner SteeringWarning nests under `.warning`. Without the
+        // wrapper, this assertion would fail — the inner's `kind`
+        // would shadow the outer's tag.
+        let steering_item = SkippedItem::SteeringDiscovery {
+            warning: SteeringWarning::ScanPathInvalid {
+                path: PathBuf::from("../escape/"),
+                reason: "traversal".into(),
+            },
+        };
+        let json: serde_json::Value =
+            serde_json::to_value(&steering_item).expect("serialize steering");
+        assert_eq!(
+            json["kind"], "steering_discovery",
+            "outer SkippedItem tag must survive wrapping a kind-tagged inner type; \
+             got: {json}"
+        );
+        assert_eq!(json["warning"]["kind"], "scan_path_invalid");
+        assert_eq!(json["warning"]["path"], "../escape/");
+
+        // Agent variant: struct variant — already disambiguated by
+        // construction. Pinned for symmetry.
+        let agent_item = SkippedItem::AgentParse {
+            plugin: "alpha".into(),
+            source_path: PathBuf::from("/x/agent.md"),
+            reason: "no frontmatter".into(),
+        };
+        let json: serde_json::Value = serde_json::to_value(&agent_item).expect("serialize agent");
+        assert_eq!(json["kind"], "agent_parse");
+        assert_eq!(json["plugin"], "alpha");
+    }
+
     #[test]
     fn list_plugin_catalog_partial_item_failures_surface_in_skipped_items() {
         let (dir, svc) = temp_service();
@@ -2967,11 +3041,11 @@ mod tests {
         let mut kind_seen = (false, false, false); // (skill, steering, agent)
         for item in &alpha.skipped_items {
             match item {
-                SkippedItem::Skill(s) => {
-                    assert_eq!(s.name_hint.as_deref(), Some("bad-skill"));
+                SkippedItem::Skill { skill } => {
+                    assert_eq!(skill.name_hint.as_deref(), Some("bad-skill"));
                     kind_seen.0 = true;
                 }
-                SkippedItem::SteeringDiscovery(_) => {
+                SkippedItem::SteeringDiscovery { warning: _ } => {
                     // The bad-scan-path manifest entry produced this.
                     kind_seen.1 = true;
                 }

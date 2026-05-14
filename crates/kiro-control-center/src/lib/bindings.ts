@@ -1505,23 +1505,34 @@ export type SkillInfo = {
  * 
  *  Variant ordering matches the order items are enumerated:
  *  skills first, then steering, then agents. Frontend renderers that
- *  group by category can match on `kind` without losing the discovery
+ *  group by category match on `kind` without losing the discovery
  *  order within a single category.
+ * 
+ *  **All variants use named struct fields, even the single-payload
+ *  ones.** A tuple variant `Skill(SkippedSkill)` under
+ *  `#[serde(tag = "kind")]` would flatten the inner `SkippedSkill`
+ *  into the outer object, and for `SteeringDiscovery(SteeringWarning)`
+ *  the inner type's own `kind` discriminator would collide with the
+ *  outer tag — at runtime serde silently drops the outer tag and the
+ *  frontend can't tell `SteeringDiscovery` from `Skill` any more.
+ *  Pinned by `skipped_item_serializes_to_kind_discriminated_shape`.
  */
 export type SkippedItem = 
 /**
  *  One skill could not be read or parsed (frontmatter, I/O, etc.).
- *  Reuses the existing per-skill skip type so single-plugin and
- *  bulk callers agree on the wire shape.
+ *  Wraps [`SkippedSkill`] under the `skill` field so the outer
+ *  `kind: "skill"` tag stays distinct from the inner's
+ *  `reason.kind` discriminator.
  */
-{ kind: "skill" } & (SkippedSkill) | 
+{ kind: "skill"; skill: SkippedSkill } | 
 /**
  *  Steering discovery emitted a structured warning (invalid scan
- *  path, unreadable scan dir). Reuses [`SteeringWarning`] so the
- *  existing `installPluginSteering` call's warning shape is the
- *  same one this catalog surface uses.
+ *  path, unreadable scan dir). Wraps [`SteeringWarning`] under the
+ *  `warning` field — without the wrapper, the inner `kind` tag
+ *  would collide with the outer at the wire level (see the enum
+ *  doc-comment above for the regression this avoids).
  */
-{ kind: "steering_discovery" } & (SteeringWarning) | 
+{ kind: "steering_discovery"; warning: SteeringWarning } | 
 /**
  *  One agent file could not be parsed (frontmatter, JSON, dialect
  *  detection). The `source_path` matches [`SkippedSkill::path`]'s
