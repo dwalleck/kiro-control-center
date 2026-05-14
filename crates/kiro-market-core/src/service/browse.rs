@@ -466,6 +466,19 @@ pub enum SkippedSkillReason {
     /// `SKILL.md` read successfully but the frontmatter could not be
     /// parsed (missing fences, malformed YAML, missing `name`, etc.).
     FrontmatterInvalid { reason: String },
+    /// Two `SKILL.md` files declare the same frontmatter `name` within
+    /// one (plugin, category) — possible because `discover_skill_dirs`
+    /// dedupes by `skill_dir` path, not by parsed name. The catalog
+    /// path picks first-wins (the discovery iteration order is sorted,
+    /// so "first" is deterministic) and surfaces the loser here so the
+    /// UI can warn that the plugin's manifest is shipping a name
+    /// collision. Both fields are the directories containing the
+    /// `SKILL.md` (not the markdown file itself); rendered as TS
+    /// strings via specta on the wire.
+    DuplicateName {
+        existing_dir: PathBuf,
+        conflict_dir: PathBuf,
+    },
 }
 
 /// Result of [`MarketplaceService::list_skills_for_plugin`]. Mirrors
@@ -1186,6 +1199,14 @@ fn collect_skills_for_plugin_into(
     let skill_dirs = discover_skills_for_plugin(&plugin_dir, plugin_manifest.as_ref());
     out.reserve(skill_dirs.len());
 
+    // Dedup tracker: first-seen `name` wins; subsequent dirs declaring
+    // the same frontmatter `name` go to `skipped_skills` with
+    // `DuplicateName`. `discover_skills_for_plugin` returns sorted
+    // entries, so "first" is deterministic across runs. Loop budget:
+    // O(skills_per_plugin) — one HashMap lookup per discovered dir.
+    let mut seen_names: std::collections::HashMap<String, PathBuf> =
+        std::collections::HashMap::with_capacity(skill_dirs.len());
+
     for discovered in &skill_dirs {
         let skill_dir = &discovered.skill_dir;
         let skill_md_path = skill_dir.join("SKILL.md");
@@ -1232,6 +1253,32 @@ fn collect_skills_for_plugin_into(
                 continue;
             }
         };
+
+        // Dedup by parsed name: first wins, subsequent collisions surface
+        // as `DuplicateName` skips. The check happens AFTER frontmatter
+        // parse because the join key is the parsed `name`, not the dir
+        // name (which `discover_skill_dirs` already deduped on path).
+        if let Some(existing_dir) = seen_names.get(&frontmatter.name) {
+            warn!(
+                marketplace = %marketplace_name,
+                plugin = %plugin_entry.name,
+                name = %frontmatter.name,
+                existing = %existing_dir.display(),
+                conflict = %skill_dir.display(),
+                "duplicate skill name within plugin; keeping first-seen"
+            );
+            skipped_skills.push(SkippedSkill {
+                plugin: plugin_entry.name.clone(),
+                name_hint: Some(frontmatter.name.clone()),
+                path: skill_md_path,
+                reason: SkippedSkillReason::DuplicateName {
+                    existing_dir: existing_dir.clone(),
+                    conflict_dir: skill_dir.clone(),
+                },
+            });
+            continue;
+        }
+        seen_names.insert(frontmatter.name.clone(), skill_dir.clone());
 
         let is_installed = installed.skills.contains_key(&frontmatter.name);
         out.push(SkillInfo {
@@ -2509,6 +2556,86 @@ mod tests {
             !by_name.contains_key("helper"),
             "native filename stem MUST NOT appear as the join key either"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Skill name dedup (S4 of BrowseTab redesign — C8 regression fence)
+    // -----------------------------------------------------------------------
+
+    /// C8 regression fence: when two `SKILL.md` files within one plugin
+    /// declare the same frontmatter `name`, the catalog reports first-
+    /// wins in `result.skills` AND surfaces the loser in
+    /// `result.skipped_skills` with `SkippedSkillReason::DuplicateName`.
+    ///
+    /// Adversarial bug class: an implementer who didn't dedup would
+    /// emit the same `SkillInfo.name` twice — Svelte's `{#each ... key}`
+    /// then silently drops one item (because key collisions in `each`
+    /// are silently ignored), and the user sees an inconsistent grid.
+    /// Or the install path keys on `name` and the second install
+    /// silently overwrites the first. Either way the bug is silent.
+    /// This test exercises the fixture both `discover_skill_dirs` and
+    /// the dedup logic must agree on.
+    #[test]
+    fn list_plugin_catalog_dedupe_skill_names_across_scan_paths() {
+        let (dir, svc) = temp_service();
+        let entries = vec![relative_path_entry("alpha", "plugins/alpha")];
+        let marketplace_path = seed_marketplace_with_registry(dir.path(), &svc, "mp1", &entries);
+
+        // Build two scan dirs, each with `s1/SKILL.md` declaring the SAME
+        // frontmatter name. discover_skill_dirs returns both because it
+        // dedupes by skill_dir path; the dedup logic in
+        // collect_skills_for_plugin_into is what catches the name clash.
+        let plugin_root = marketplace_path.join("plugins").join("alpha");
+        for scan in &["scan_a", "scan_b"] {
+            let skill_dir = plugin_root.join(scan).join("s1");
+            fs::create_dir_all(&skill_dir).expect("create skill dir");
+            fs::write(
+                skill_dir.join("SKILL.md"),
+                "---\nname: s1\ndescription: clashing\n---\n",
+            )
+            .expect("write SKILL.md");
+        }
+        // Manifest declares both scan dirs; without it, only ./skills/
+        // would be scanned and the collision wouldn't surface.
+        fs::write(
+            plugin_root.join("plugin.json"),
+            r#"{"name":"alpha","skills":["./scan_a/","./scan_b/"]}"#,
+        )
+        .expect("write manifest");
+
+        let installed = InstalledSkills::default();
+        let result = svc
+            .list_skills_for_plugin("mp1", "alpha", &installed)
+            .expect("happy path");
+
+        assert_eq!(result.skills.len(), 1, "first-wins: only one s1 in skills");
+        assert_eq!(result.skills[0].name, "s1");
+        assert_eq!(
+            result.skipped_skills.len(),
+            1,
+            "the second occurrence surfaces in skipped_skills"
+        );
+        assert_eq!(result.skipped_skills[0].name_hint.as_deref(), Some("s1"));
+        assert!(
+            matches!(
+                result.skipped_skills[0].reason,
+                SkippedSkillReason::DuplicateName { .. }
+            ),
+            "expected DuplicateName, got: {:?}",
+            result.skipped_skills[0].reason
+        );
+
+        // Sanity: existing_dir and conflict_dir actually point at
+        // distinct directories (no degenerate "same path twice" bug).
+        if let SkippedSkillReason::DuplicateName {
+            existing_dir,
+            conflict_dir,
+        } = &result.skipped_skills[0].reason
+        {
+            assert_ne!(existing_dir, conflict_dir);
+            assert!(existing_dir.ends_with("scan_a/s1") || existing_dir.ends_with("scan_b/s1"));
+            assert!(conflict_dir.ends_with("scan_a/s1") || conflict_dir.ends_with("scan_b/s1"));
+        }
     }
 
     // -----------------------------------------------------------------------
