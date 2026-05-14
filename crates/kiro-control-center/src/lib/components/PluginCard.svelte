@@ -55,8 +55,10 @@
   // Per-item state, derived purely from the catalog entry's per-item
   // `installed` flags. Independent of the `installed` prop (which
   // tracks whole-plugin install state via installed-plugins.json).
-  // The stripe color and badge consume itemState; the action buttons
-  // consume the `installed` / `pending` / `update` / `failure` props.
+  // The stripe color and badge consume itemState; the button matrix
+  // consumes BOTH itemState and the `installed` prop via
+  // `effectiveInstalled` below — see its doc-comment for the
+  // two-signal reconciliation rationale.
   type ItemState = "not_installed" | "partial" | "installed";
   const counts = $derived.by(() => {
     const all = [...entry.skills, ...entry.steering, ...entry.agents];
@@ -68,6 +70,24 @@
     else state = "partial";
     return { installed: installedCount, total, state };
   });
+
+  // Reconcile the two install signals for the button matrix. The
+  // `installed` prop tracks `.kiro/installed-plugins.json` (whole-
+  // plugin install via commands.installPlugin); per-item flags track
+  // the per-category tracking files (commands.installSkills,
+  // installPluginSteering, etc.). A plugin installed entirely via
+  // the Skills view's multi-select would have `installed=false` BUT
+  // every per-item flag true — without this reconciliation the card
+  // would show "[Customize] [Install]" while the header pill said
+  // "Installed", which users correctly read as broken.
+  //
+  // Treats per-item-fully-installed as "installed enough" for button
+  // purposes, so the user sees [Manage] and can curate via the
+  // drawer. The `installed` prop still gates `failure` and `update`
+  // branches because those signals are only emitted for plugins
+  // tracked in installed-plugins.json (the update-check store keys
+  // on whole-plugin tracking).
+  const effectiveInstalled = $derived(installed || counts.state === "installed");
 
   // Stripe color uses a switch with `const _exhaustive: never` per
   // CLAUDE.md's discriminator-pushdown discipline so a future
@@ -227,8 +247,12 @@
       >
         {updateLabel}
       </button>
-    {:else if installed}
-      <!-- Installed and no update: Manage opens the drawer for add/remove. -->
+    {:else if effectiveInstalled}
+      <!--
+        Installed (either via whole-plugin tracking OR fully-installed
+        per-item — see effectiveInstalled doc). Manage opens the
+        drawer for add/remove.
+      -->
       <button
         type="button"
         onclick={onCustomize}

@@ -98,6 +98,17 @@
     return `Apply will ${parts.join(" and ")}.`;
   });
 
+  // True when the drawer has no interactive items — the plugin ships
+  // only steering and/or agents (no skills), so every visible
+  // checkbox is the disabled Option-A surface. Without an explicit
+  // banner, users open Customize and see a wall of grayed-out
+  // checkboxes that reads as "broken" rather than "not yet
+  // supported." Triggers the explanatory banner below.
+  const noInteractiveItems = $derived(
+    entry.skills.length === 0
+      && (entry.steering.length > 0 || entry.agents.length > 0),
+  );
+
   let applying = $state(false);
 
   async function apply() {
@@ -172,6 +183,23 @@
       >
         {entry.description}
       </p>
+    {/if}
+
+    {#if noInteractiveItems}
+      <!--
+        Skills-less plugin (only steering and/or agents). Without this
+        banner, users open Customize and see only disabled checkboxes,
+        which reads as "drawer broken." The banner names the limitation
+        and points at the remediation.
+      -->
+      <div
+        class="px-4 py-3 text-xs leading-relaxed border-b border-kiro-muted bg-kiro-info/[0.10] text-kiro-info"
+      >
+        This plugin ships only steering and/or agents. Per-item toggling
+        for those categories isn't supported yet — install or update
+        them as a whole using the plugin's <strong>Install</strong> /
+        <strong>Update</strong> button on the card.
+      </div>
     {/if}
 
     <div class="flex-1 overflow-y-auto py-1">
@@ -250,6 +278,9 @@
             class="flex w-full items-center gap-2 px-4 pt-3 pb-1.5 bg-kiro-base border-b border-kiro-muted text-[10px] font-semibold uppercase tracking-wider text-kiro-subtle"
           >
             <span class="flex-1 text-left">Steering files</span>
+            <span class="text-[10px] font-medium normal-case tracking-normal text-kiro-subtle italic">
+              read-only
+            </span>
             <span class="text-[10px] font-medium tracking-normal normal-case text-kiro-text-secondary">
               {installedCount} / {entry.steering.length}
             </span>
@@ -287,6 +318,9 @@
             class="flex w-full items-center gap-2 px-4 pt-3 pb-1.5 bg-kiro-base border-b border-kiro-muted text-[10px] font-semibold uppercase tracking-wider text-kiro-subtle"
           >
             <span class="flex-1 text-left">Agents</span>
+            <span class="text-[10px] font-medium normal-case tracking-normal text-kiro-subtle italic">
+              read-only
+            </span>
             <span class="text-[10px] font-medium tracking-normal normal-case text-kiro-text-secondary">
               {installedCount} / {entry.agents.length}
             </span>
