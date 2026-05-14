@@ -1008,6 +1008,114 @@ impl MarketplaceService {
         Ok(PluginAgentsResult { agents, skipped })
     }
 
+    /// Bulk per-marketplace catalog read: assemble [`PluginCatalogView`]
+    /// by iterating every plugin in the marketplace, calling
+    /// [`Self::list_skills_for_plugin`], [`Self::list_steering_for_plugin`],
+    /// and [`Self::list_agents_for_plugin`] per plugin, and folding
+    /// plugin-level resolution failures into [`PluginCatalogView::skipped`]
+    /// via [`SkippedPlugin::from_plugin_error`] (the same classifier
+    /// [`Self::list_all_skills`] uses, so the skip / propagate split is
+    /// identical to today's bulk path).
+    ///
+    /// **Tracking files are passed by reference** — the wrapper
+    /// (`list_plugin_catalog_for_marketplace_impl` in the Tauri crate)
+    /// loads them ONCE per call before invoking this method. This is
+    /// the structural enforcement of design claim C11: changing this
+    /// signature to take `&KiroProject` and load internally would
+    /// fail S7's compile-time assertion that the wrapper passes
+    /// pre-loaded sets.
+    ///
+    /// The empty `skipped_items` field on each [`PluginCatalogEntry`]
+    /// is populated by S6 (per-item skip aggregation); this slice
+    /// scaffolds the iteration shape and leaves the field empty.
+    ///
+    /// # Errors
+    ///
+    /// - [`Error::Marketplace`] / [`Error::Io`] from
+    ///   [`Self::list_plugin_entries`] (unknown marketplace, corrupt
+    ///   registry).
+    /// - Any error from the per-plugin methods that
+    ///   [`SkippedReason::from_plugin_error`] does NOT classify as a
+    ///   plugin-level skip — propagated rather than folded.
+    pub fn list_plugin_catalog(
+        &self,
+        marketplace: &str,
+        installed_skills: &InstalledSkills,
+        installed_steering: &InstalledSteering,
+        installed_agents: &InstalledAgents,
+    ) -> Result<PluginCatalogView, Error> {
+        let plugin_entries = self.list_plugin_entries(marketplace)?;
+
+        // Loop budget: O(K × (skills + steering + agents)) where
+        // K = plugin_entries.len(). Production scale K ≤ 50 plugins per
+        // marketplace, items ≤ 50 per category. Bound: 50 × 50 × 3 =
+        // 7,500 items per call, well under the 10^6 ceiling.
+        let mut plugins = Vec::with_capacity(plugin_entries.len());
+        let mut skipped = Vec::new();
+
+        for plugin_entry in &plugin_entries {
+            match self.assemble_catalog_entry(
+                marketplace,
+                plugin_entry,
+                installed_skills,
+                installed_steering,
+                installed_agents,
+            ) {
+                Ok(entry) => plugins.push(entry),
+                Err(err) => match SkippedPlugin::from_plugin_error(plugin_entry.name.clone(), &err)
+                {
+                    Some(sp) => {
+                        warn!(
+                            marketplace = %marketplace,
+                            plugin = %plugin_entry.name,
+                            error = %sp.reason(),
+                            "skipping plugin in catalog"
+                        );
+                        skipped.push(sp);
+                    }
+                    None => return Err(err),
+                },
+            }
+        }
+
+        Ok(PluginCatalogView { plugins, skipped })
+    }
+
+    /// Build one plugin's `PluginCatalogEntry` by calling the three
+    /// per-category enumerators. Plugin-level failures (missing dir,
+    /// invalid manifest, remote-source-not-local) propagate as `Err` so
+    /// the caller can classify via [`SkippedPlugin::from_plugin_error`].
+    /// Per-item failures (within a working plugin) live inside the
+    /// returned per-category Results' skipped fields and are folded
+    /// into `entry.skipped_items` by S6.
+    fn assemble_catalog_entry(
+        &self,
+        marketplace: &str,
+        plugin_entry: &PluginEntry,
+        installed_skills: &InstalledSkills,
+        installed_steering: &InstalledSteering,
+        installed_agents: &InstalledAgents,
+    ) -> Result<PluginCatalogEntry, Error> {
+        let skills_result =
+            self.list_skills_for_plugin(marketplace, &plugin_entry.name, installed_skills)?;
+        let steering_result =
+            self.list_steering_for_plugin(marketplace, &plugin_entry.name, installed_steering)?;
+        let agents_result =
+            self.list_agents_for_plugin(marketplace, &plugin_entry.name, installed_agents)?;
+
+        Ok(PluginCatalogEntry {
+            marketplace: marketplace.to_owned(),
+            plugin: plugin_entry.name.clone(),
+            description: plugin_entry.description.clone(),
+            skills: skills_result.skills,
+            steering: steering_result.steering,
+            agents: agents_result.agents,
+            // S6 populates this from skills_result.skipped_skills,
+            // steering_result.warnings, and agents_result.skipped.
+            skipped_items: Vec::new(),
+        })
+    }
+
     /// Count skills for a single plugin entry without loading skill bodies.
     ///
     /// Returns [`SkillCount::RemoteNotCounted`] for remote sources,
@@ -2636,6 +2744,107 @@ mod tests {
             assert!(existing_dir.ends_with("scan_a/s1") || existing_dir.ends_with("scan_b/s1"));
             assert!(conflict_dir.ends_with("scan_a/s1") || conflict_dir.ends_with("scan_b/s1"));
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // list_plugin_catalog (S5 of BrowseTab redesign — C1, C6, C10 fences)
+    // -----------------------------------------------------------------------
+
+    /// Combined fence for C1 (N working plugins → N entries), C6
+    /// (resolution failure → skipped, not plugins), C10 (empty plugin
+    /// → empty entry, NOT in skipped). One fixture, three assertions —
+    /// the bug class C10 targets is "empty plugin treated as failed
+    /// plugin," which is an iteration-shape bug visible only when
+    /// alpha (working+nonempty), beta (failed), and gamma (working+
+    /// empty) coexist in one call.
+    #[test]
+    fn list_plugin_catalog_iteration_split() {
+        let (dir, svc) = temp_service();
+        let entries = vec![
+            // alpha: working, has 2 skills
+            relative_path_entry("alpha", "plugins/alpha"),
+            // beta: RelativePath pointing at a missing dir (will fail
+            // resolve_local_plugin_dir with PluginError::DirectoryMissing)
+            relative_path_entry("beta", "plugins/missing-beta"),
+            // gamma: clean plugin dir but no scan dirs and an empty
+            // manifest declaring no scan paths → all categories empty
+            relative_path_entry("gamma", "plugins/gamma"),
+        ];
+        let marketplace_path = seed_marketplace_with_registry(dir.path(), &svc, "mp1", &entries);
+
+        // alpha: 2 skills via the test_support helper.
+        make_plugin_with_skills(&marketplace_path, "alpha", &["a1", "a2"]);
+        // beta: deliberately do NOT create plugins/missing-beta on disk.
+        // gamma: create the dir but no scan dirs; declare empty arrays
+        // in the manifest so DEFAULT_*_PATHS fallback doesn't pull
+        // anything in either.
+        let gamma_dir = marketplace_path.join("plugins").join("gamma");
+        fs::create_dir_all(&gamma_dir).expect("create gamma dir");
+        fs::write(
+            gamma_dir.join("plugin.json"),
+            r#"{"name":"gamma","skills":["./does-not-exist/"],"agents":["./does-not-exist/"],"steering":["./does-not-exist/"]}"#,
+        )
+        .expect("write gamma manifest");
+
+        let installed_skills = InstalledSkills::default();
+        let installed_steering = InstalledSteering::default();
+        let installed_agents = InstalledAgents::default();
+        let view = svc
+            .list_plugin_catalog(
+                "mp1",
+                &installed_skills,
+                &installed_steering,
+                &installed_agents,
+            )
+            .expect("bulk catalog must succeed with one broken plugin");
+
+        // C1: N working plugins → N entries. alpha + gamma = 2 working;
+        // beta lands in skipped, not plugins.
+        assert_eq!(view.plugins.len(), 2, "alpha + gamma in plugins");
+        let plugin_names: std::collections::HashSet<&str> =
+            view.plugins.iter().map(|p| p.plugin.as_str()).collect();
+        assert!(plugin_names.contains("alpha"));
+        assert!(plugin_names.contains("gamma"));
+        assert!(
+            !plugin_names.contains("beta"),
+            "beta is skipped, not plugins"
+        );
+
+        // C6: beta is in skipped with the documented variant.
+        assert_eq!(view.skipped.len(), 1);
+        assert_eq!(view.skipped[0].name(), "beta");
+        assert!(
+            matches!(
+                view.skipped[0].kind(),
+                SkippedReason::DirectoryMissing { .. }
+            ),
+            "expected DirectoryMissing, got {:?}",
+            view.skipped[0].kind()
+        );
+
+        // C10: gamma's entry has empty arrays AND is NOT in skipped.
+        let gamma = view
+            .plugins
+            .iter()
+            .find(|p| p.plugin == "gamma")
+            .expect("gamma in plugins");
+        assert!(gamma.skills.is_empty(), "gamma has no skills");
+        assert!(gamma.steering.is_empty(), "gamma has no steering");
+        assert!(gamma.agents.is_empty(), "gamma has no agents");
+        // skipped_items is also empty until S6 wires aggregation.
+        assert!(
+            gamma.skipped_items.is_empty(),
+            "gamma has no per-item failures"
+        );
+
+        // Sanity: alpha's two skills are enumerated and uninstalled.
+        let alpha = view
+            .plugins
+            .iter()
+            .find(|p| p.plugin == "alpha")
+            .expect("alpha in plugins");
+        assert_eq!(alpha.skills.len(), 2);
+        assert!(alpha.skills.iter().all(|s| !s.installed));
     }
 
     // -----------------------------------------------------------------------
