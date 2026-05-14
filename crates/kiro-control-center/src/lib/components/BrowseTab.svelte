@@ -35,6 +35,8 @@
     InstalledPluginInfo,
     InstallPluginResult_Serialize,
     MarketplaceInfo,
+    PluginCatalogEntryView,
+    PluginCatalogResponseView,
     PluginInfo,
     SkillInfo,
     SkippedSkill,
@@ -47,31 +49,34 @@
 
   let { projectPath }: { projectPath: string } = $props();
 
-  // Error-source key family. The `plugins\u001f` / `skills\u001f` /
-  // `bulk-skills\u001f` prefixes embed DELIM so a marketplace literally
-  // named `plugins`, `skills`, or `bulk-skills` still produces a distinct
-  // key from the namespace tag.
-  const PLUGINS_ERR_PREFIX = `plugins${DELIM}` as const;
-  const SKILLS_ERR_PREFIX = `skills${DELIM}` as const;
-  const BULK_SKILLS_ERR_PREFIX = `bulk-skills${DELIM}` as const;
+  // Error-source key family. The `catalog\u001f` and
+  // `catalog-skipped\u001f` prefixes embed DELIM so a marketplace
+  // literally named `catalog` or `catalog-skipped` still produces a
+  // distinct key from the namespace tag. CATALOG keys cover whole-
+  // marketplace fetch failures (one banner per failed catalog call);
+  // CATALOG_SKIPPED keys cover per-plugin skips returned in
+  // PluginCatalogResponseView.skipped (one banner per skipped plugin).
+  // Slice 2 of the BrowseTab redesign collapsed the prior
+  // `plugins` / `skills` / `bulk-skills` prefix trio into these two,
+  // mirroring the bulk catalog command's response surface.
+  const CATALOG_ERR_PREFIX = `catalog${DELIM}` as const;
+  const CATALOG_SKIPPED_PREFIX = `catalog-skipped${DELIM}` as const;
   const ERR_MARKETPLACES = "marketplaces" as const;
   type ErrorSource =
     | typeof ERR_MARKETPLACES
     | typeof ERR_INSTALLED_PLUGINS
     | typeof ERR_UPDATE_FETCH
     | UpdateCheckKey
-    | `${typeof PLUGINS_ERR_PREFIX}${string}`
-    | `${typeof SKILLS_ERR_PREFIX}${string}${typeof DELIM}${string}`
-    | `${typeof BULK_SKILLS_ERR_PREFIX}${string}`;
+    | `${typeof CATALOG_ERR_PREFIX}${string}`
+    | `${typeof CATALOG_SKIPPED_PREFIX}${string}${typeof DELIM}${string}`;
   // Compile-time guard: fails if any `as const` above is removed and the
   // union silently widens back to `string` (which would defeat typo
   // protection on `fetchErrors.get/set/delete` with zero compile errors).
   const _ = null as unknown as (string extends ErrorSource ? never : 0);
   void _;
-  const pluginsErrKey = (mp: string): ErrorSource => `${PLUGINS_ERR_PREFIX}${mp}`;
-  const skillsErrKey = (mp: string, plugin: string): ErrorSource =>
-    `${SKILLS_ERR_PREFIX}${mp}${DELIM}${plugin}`;
-  const bulkSkillsErrKey = (mp: string): ErrorSource => `${BULK_SKILLS_ERR_PREFIX}${mp}`;
+  const catalogErrKey = (mp: string): ErrorSource => `${CATALOG_ERR_PREFIX}${mp}`;
+  const catalogSkippedKey = (mp: string, plugin: string): ErrorSource =>
+    `${CATALOG_SKIPPED_PREFIX}${mp}${DELIM}${plugin}`;
 
   // Short source-label for screen-reader aria-label on dismiss buttons. The
   // banner body already holds the full message; the button label just needs
@@ -84,19 +89,24 @@
       const { marketplace } = parseUpdateCheckKey(key);
       return `Dismiss update-check banner for ${marketplace}`;
     }
-    if (key.startsWith(PLUGINS_ERR_PREFIX)) {
-      return `Dismiss error for ${key.slice(PLUGINS_ERR_PREFIX.length)}`;
+    if (key.startsWith(CATALOG_ERR_PREFIX)) {
+      return `Dismiss error for ${key.slice(CATALOG_ERR_PREFIX.length)}`;
     }
-    if (key.startsWith(BULK_SKILLS_ERR_PREFIX)) {
-      return `Dismiss error for ${key.slice(BULK_SKILLS_ERR_PREFIX.length)}`;
-    }
-    const { marketplace, plugin } = parsePluginKey(key.slice(SKILLS_ERR_PREFIX.length));
+    const { marketplace, plugin } = parsePluginKey(key.slice(CATALOG_SKIPPED_PREFIX.length));
     return `Dismiss error for ${marketplace}/${plugin}`;
   }
 
   let marketplaces: MarketplaceInfo[] = $state([]);
-  let pluginsByMarketplace: Record<string, PluginInfo[]> = $state({});
-  let skillsByPluginPair: Record<string, SkillInfo[]> = $state({});
+  // Bulk plugin catalog, keyed by marketplace name. Populated by
+  // `fetchCatalogFor(mp)` which calls
+  // `commands.listPluginCatalogForMarketplace`. Each entry carries the
+  // plugin's full per-category item tree (skills + steering + agents)
+  // with per-item `installed: bool` flags computed against the project's
+  // tracking files at fetch time. Slice 2 of the BrowseTab redesign
+  // collapses the prior `pluginsByMarketplace + skillsByPluginPair`
+  // pair (powered by separate listPlugins / listAvailableSkills /
+  // listAllSkillsForMarketplace fetches) into this single source.
+  let catalogByMarketplace: Record<string, PluginCatalogResponseView> = $state({});
 
   let selectedMarketplaces = new SvelteSet<string>();
   let selectedPlugins = new SvelteSet<string>();
@@ -143,11 +153,31 @@
     );
   });
 
+  // Project a PluginCatalogEntryView into the today-shaped PluginInfo
+  // so PluginCard, skillCountLabel, and skillCountTitle stay unchanged.
+  // The catalog only includes plugins whose manifest loaded; broken-
+  // manifest plugins live in `view.skipped` and surface as banners
+  // (see fetchCatalogFor). This is a UX shift from the prior path,
+  // which kept manifest_failed plugins in the grid with a colored
+  // count — banners are more discoverable, and the previous on-card
+  // signal was a 1px color change easy to miss.
+  function pluginInfoFromEntry(entry: PluginCatalogEntryView): PluginInfo {
+    return {
+      name: entry.plugin,
+      description: entry.description,
+      skill_count: { state: "known", count: entry.skills.length },
+      source_type: entry.source_type,
+    };
+  }
+
   let availablePlugins = $derived.by(() => {
     const out: { marketplace: string; plugin: PluginInfo }[] = [];
     for (const mp of selectedMarketplaces) {
-      const list = pluginsByMarketplace[mp] ?? [];
-      for (const plugin of list) out.push({ marketplace: mp, plugin });
+      const view = catalogByMarketplace[mp];
+      if (view === undefined) continue;
+      for (const entry of view.plugins) {
+        out.push({ marketplace: mp, plugin: pluginInfoFromEntry(entry) });
+      }
     }
     return out;
   });
@@ -155,11 +185,11 @@
   let skills = $derived.by(() => {
     const rows: SkillInfo[] = [];
     for (const mp of selectedMarketplaces) {
-      const list = pluginsByMarketplace[mp] ?? [];
-      for (const pl of list) {
-        if (selectedPlugins.size > 0 && !selectedPlugins.has(pluginKey(mp, pl.name))) continue;
-        const pairSkills = skillsByPluginPair[pluginKey(mp, pl.name)] ?? [];
-        rows.push(...pairSkills);
+      const view = catalogByMarketplace[mp];
+      if (view === undefined) continue;
+      for (const entry of view.plugins) {
+        if (selectedPlugins.size > 0 && !selectedPlugins.has(pluginKey(mp, entry.plugin))) continue;
+        rows.push(...entry.skills);
       }
     }
     return rows;
@@ -258,145 +288,47 @@
     }
   }
 
-  async function fetchPluginsFor(mp: string) {
-    const key = pluginsErrKey(mp);
-    if (pendingFetches.has(key) || pluginsByMarketplace[mp]) return;
-    await withFetchGuard(key, mp, () => commands.listPlugins(mp), {
-      onSuccess: (data) => {
-        pluginsByMarketplace[mp] = data;
-        fetchErrors.delete(key);
-      },
-      onError: (message) => {
-        fetchErrors.set(key, `${mp}: ${message}`);
-      },
-    });
-  }
-
-  async function fetchSkillsFor(mp: string, plugin: string, force = false) {
-    const cacheKey = pluginKey(mp, plugin);
-    const key = skillsErrKey(mp, plugin);
+  // Single bulk fetch per marketplace, replacing the prior
+  // listPlugins / listAvailableSkills / listAllSkillsForMarketplace
+  // cascade. Returns the full per-plugin item tree (skills + steering +
+  // agents) plus structurally-surfaced skipped plugins. Per-item parse
+  // failures live on each entry's `skipped_items` and aren't surfaced as
+  // banners here — slice 3 (visual redesign) decides where to render
+  // them; today's banner-stack carries only plugin-level skips, matching
+  // the prior `bulk-skills` and `skills` prefixes' semantics.
+  //
+  // Loop budget: O(K × items) inside the backend per call, K ≤ 50
+  // plugins per marketplace at production scale. This frontend function
+  // is one Tauri call per invocation.
+  async function fetchCatalogFor(mp: string, force = false) {
+    const key = catalogErrKey(mp);
     if (pendingFetches.has(key)) return;
-    if (!force && skillsByPluginPair[cacheKey]) return;
-    await withFetchGuard(
-      key,
-      `${mp}/${plugin}`,
-      () => commands.listAvailableSkills(mp, plugin, projectPath),
-      {
-        onSuccess: (data) => {
-          // data is PluginSkillsResult: { skills, skipped_skills }.
-          // Happy-path skills populate the card grid; per-skill read
-          // failures surface via the same per-plugin fetchErrors banner
-          // stream used by plugin-level skips (from the bulk path), so a
-          // user who sees "plugin X" in the warning list can also see
-          // "plugin Y has 2 skills that failed to load" on the same
-          // panel. The set/delete branches are mutually exclusive: a
-          // retry that fixes the malformed SKILL.md must clear the stale
-          // banner, a retry that still has failures must replace it.
-          skillsByPluginPair[cacheKey] = data.skills;
-          if (data.skipped_skills.length > 0) {
-            fetchErrors.set(
-              key,
-              `${mp}/${plugin}: ${formatSkippedSkillsForPlugin(data.skipped_skills)}`
-            );
-          } else {
-            fetchErrors.delete(key);
-          }
-        },
-        onError: (message) => {
-          fetchErrors.set(key, `${mp}/${plugin}: ${message}`);
-        },
-      }
-    );
-  }
-
-  // Bulk path: one backend call populates per-plugin cache entries for an
-  // entire marketplace. Used when no plugin filter is active; a marketplace
-  // with 50 plugins would otherwise fire 50 concurrent `listAvailableSkills`
-  // calls on first paint. Plugins with zero skills get empty-array cache
-  // entries so the per-pair guard in `fetchSkillsFor` doesn't re-fetch them
-  // later if the user applies a plugin filter. Plugins the backend couldn't
-  // load (missing dir, malformed manifest) come back in `skipped` and get
-  // per-plugin error banners — avoids the silent-partial-listing footgun.
-  async function fetchAllSkillsForMarketplace(
-    mp: string,
-    plugins: readonly { name: string }[]
-  ) {
-    const key = bulkSkillsErrKey(mp);
-    if (plugins.length === 0 || pendingFetches.has(key)) return;
-    const allCached = plugins.every(
-      (p) => skillsByPluginPair[pluginKey(mp, p.name)] !== undefined
-    );
-    if (allCached) return;
-
+    if (!force && catalogByMarketplace[mp] !== undefined) return;
     await withFetchGuard(
       key,
       mp,
-      () => commands.listAllSkillsForMarketplace(mp, projectPath),
+      () => commands.listPluginCatalogForMarketplace(mp, projectPath),
       {
-        onSuccess: ({ skills: skillList, skipped, skipped_skills }) => {
-          const byPlugin = new Map<string, SkillInfo[]>();
-          for (const s of skillList) {
-            const arr = byPlugin.get(s.plugin);
-            if (arr) arr.push(s);
-            else byPlugin.set(s.plugin, [s]);
+        onSuccess: (view) => {
+          catalogByMarketplace[mp] = view;
+          // The bulk response is authoritative for working plugins;
+          // every per-plugin skipped-banner from a prior fetch for THIS
+          // marketplace is replaced wholesale. Build the new banner set
+          // first, then sweep stale entries — same ownership boundary as
+          // the prior fetchAllSkillsForMarketplace path.
+          for (const sp of view.skipped) {
+            fetchErrors.set(catalogSkippedKey(mp, sp.name), `${mp}/${sp.name}: ${sp.reason}`);
           }
-          const skippedNames = new Set(skipped.map((s) => s.name));
-
-          // Group per-skill skips by plugin so each plugin gets one
-          // warning banner regardless of how many of its skills failed.
-          // Per-skill and plugin-level skips are disjoint (a plugin whose
-          // directory fails to resolve never reaches the per-skill loop),
-          // so the two banner streams don't collide on the same key.
-          const skippedSkillsByPlugin = new Map<string, SkippedSkill[]>();
-          for (const s of skipped_skills) {
-            const arr = skippedSkillsByPlugin.get(s.plugin);
-            if (arr) arr.push(s);
-            else skippedSkillsByPlugin.set(s.plugin, [s]);
-          }
-
-          for (const p of plugins) {
-            // Skipped plugins get NO cache entry so the per-plugin path can
-            // still be tried if the user narrows to them — a retry might
-            // succeed (e.g. if the manifest was hand-edited).
-            if (skippedNames.has(p.name)) continue;
-            skillsByPluginPair[pluginKey(mp, p.name)] = byPlugin.get(p.name) ?? [];
-          }
-
-          // Record per-plugin error banners for every skipped plugin.
-          for (const s of skipped) {
-            fetchErrors.set(skillsErrKey(mp, s.name), `${mp}/${s.name}: ${s.reason}`);
-          }
-          // Record per-plugin error banners for plugins with per-skill
-          // read/parse failures — previously dropped silently (the exact
-          // regression the code-review called out for the bulk path).
-          for (const [plugin, list] of skippedSkillsByPlugin) {
-            fetchErrors.set(
-              skillsErrKey(mp, plugin),
-              `${mp}/${plugin}: ${formatSkippedSkillsForPlugin(list)}`
-            );
-          }
-
-          // The bulk response is authoritative for working plugins — clear
-          // stale per-plugin skill errors for THIS mp EXCEPT for pairs whose
-          // fetch is still in flight (racing write could clobber us) and
-          // EXCEPT entries we just set above for skipped plugins OR plugins
-          // with surfaced per-skill failures (both populate the same
-          // banner key and must survive the post-bulk cleanup).
+          const fresh = new Set(view.skipped.map((sp) => catalogSkippedKey(mp, sp.name)));
           const stale: ErrorSource[] = [];
           for (const k of fetchErrors.keys()) {
-            if (!k.startsWith(SKILLS_ERR_PREFIX)) continue;
-            const { marketplace, plugin } = parsePluginKey(k.slice(SKILLS_ERR_PREFIX.length));
+            if (!k.startsWith(CATALOG_SKIPPED_PREFIX)) continue;
+            const { marketplace } = parsePluginKey(k.slice(CATALOG_SKIPPED_PREFIX.length));
             if (marketplace !== mp) continue;
-            if (skippedNames.has(plugin)) continue;
-            if (skippedSkillsByPlugin.has(plugin)) continue;
-            if (pendingFetches.has(skillsErrKey(marketplace, plugin))) continue;
+            if (fresh.has(k)) continue;
             stale.push(k);
           }
           for (const k of stale) fetchErrors.delete(k);
-
-          // Clear the bulk-level error banner for this marketplace. The
-          // per-plugin writes above target a different prefix, so this
-          // does not collide with anything we just set.
           fetchErrors.delete(key);
         },
         onError: (message) => {
@@ -466,39 +398,27 @@
     logPrefix: "BrowseTab",
   });
 
+  // Single effect: one bulk catalog fetch per selected marketplace.
+  // No second effect for plugin-narrowing — the catalog returns ALL
+  // plugins per marketplace in one call, and `availablePlugins` /
+  // `skills` derives narrow visually. Over-fetch on plugin filter (the
+  // optimization the prior dual-effect setup chased) is replaced by
+  // never re-fetching once the catalog is cached for the marketplace.
   $effect(() => {
-    for (const mp of selectedMarketplaces) fetchPluginsFor(mp);
+    for (const mp of selectedMarketplaces) fetchCatalogFor(mp);
   });
 
-  // When no plugin filter is active, prefer the bulk path — one call per
-  // marketplace instead of one per (mp, plugin). Once a filter narrows the
-  // set, fall back to per-plugin calls which avoid over-fetching skills
-  // the user explicitly hid.
-  $effect(() => {
-    for (const mp of selectedMarketplaces) {
-      const plugins = pluginsByMarketplace[mp];
-      if (plugins === undefined) continue;
-
-      if (selectedPlugins.size === 0) {
-        fetchAllSkillsForMarketplace(mp, plugins);
-      } else {
-        for (const pl of plugins) {
-          if (!selectedPlugins.has(pluginKey(mp, pl.name))) continue;
-          fetchSkillsFor(mp, pl.name);
-        }
-      }
-    }
-  });
-
-  // Skill caches and skill-fetch errors (both per-plugin `skills\u001f` and
-  // marketplace-level `bulk-skills\u001f`) are project-scoped — `installed`
-  // flags flip and error messages cite paths under the previous project — so
-  // invalidate the lot when projectPath changes. Plugin-fetch and marketplace
-  // errors are project-agnostic and survive.
+  // The catalog is project-scoped: every entry's `installed: bool`
+  // flags are computed against the previous project's tracking files,
+  // and any `catalog-skipped` banner cites paths under the previous
+  // project root. Drop the catalog cache and project-scoped banners
+  // when projectPath changes so the next $effect run re-fetches under
+  // the new project. Marketplace-listing errors are project-agnostic
+  // and survive.
   let priorProjectPath: string | null = null;
   $effect(() => {
     if (priorProjectPath !== null && priorProjectPath !== projectPath) {
-      skillsByPluginPair = {};
+      catalogByMarketplace = {};
       selectedSkills.clear();
       installError = null;
       installMessage = null;
@@ -511,8 +431,8 @@
       const stale: ErrorSource[] = [];
       for (const key of fetchErrors.keys()) {
         if (
-          key.startsWith(SKILLS_ERR_PREFIX) ||
-          key.startsWith(BULK_SKILLS_ERR_PREFIX) ||
+          key.startsWith(CATALOG_ERR_PREFIX) ||
+          key.startsWith(CATALOG_SKIPPED_PREFIX) ||
           key.startsWith(UPDATE_CHECK_PREFIX + DELIM) ||
           key === ERR_UPDATE_FETCH ||
           key === ERR_INSTALLED_PLUGINS
@@ -537,14 +457,11 @@
     const stale: ErrorSource[] = [];
     for (const key of fetchErrors.keys()) {
       if (key === ERR_MARKETPLACES) continue;
-      if (key.startsWith(PLUGINS_ERR_PREFIX)) {
-        const mp = key.slice(PLUGINS_ERR_PREFIX.length);
+      if (key.startsWith(CATALOG_ERR_PREFIX)) {
+        const mp = key.slice(CATALOG_ERR_PREFIX.length);
         if (!selectedMarketplaces.has(mp)) stale.push(key);
-      } else if (key.startsWith(BULK_SKILLS_ERR_PREFIX)) {
-        const mp = key.slice(BULK_SKILLS_ERR_PREFIX.length);
-        if (!selectedMarketplaces.has(mp)) stale.push(key);
-      } else if (key.startsWith(SKILLS_ERR_PREFIX)) {
-        const { marketplace, plugin } = parsePluginKey(key.slice(SKILLS_ERR_PREFIX.length));
+      } else if (key.startsWith(CATALOG_SKIPPED_PREFIX)) {
+        const { marketplace, plugin } = parsePluginKey(key.slice(CATALOG_SKIPPED_PREFIX.length));
         const stillSelected =
           selectedMarketplaces.has(marketplace) &&
           (selectedPlugins.size === 0 || selectedPlugins.has(pluginKey(marketplace, plugin)));
@@ -657,18 +574,21 @@
 
       selectedSkills.clear();
 
-      // Force-refresh so `installed` flags reflect new state. Fan out in
-      // parallel — these reads are independent and serializing them delays
-      // the grid refresh in proportion to the number of affected plugins.
-      // fetchSkillsFor never rejects externally (its own try/catch surfaces
-      // failures via fetchErrors), so this Promise.all should resolve. The
-      // outer try/catch is defense-in-depth against a future regression in
-      // that invariant that would otherwise strand `installing = true`.
+      // Force-refresh so `installed` flags reflect new state. Fan out
+      // by marketplace (not by plugin) — the catalog returns the entire
+      // marketplace's tree per call, so re-fetching once per affected
+      // marketplace covers every plugin that just had skills installed.
+      // fetchCatalogFor never rejects externally (its own try/catch
+      // surfaces failures via fetchErrors), so this Promise.all should
+      // resolve. The outer try/catch is defense-in-depth against a
+      // future regression in that invariant that would otherwise
+      // strand `installing = true`.
       try {
+        const affected = new Set(
+          Array.from(groups.values(), (group) => group.marketplace),
+        );
         await Promise.all(
-          Array.from(groups.values(), (group) =>
-            fetchSkillsFor(group.marketplace, group.plugin, true)
-          )
+          [...affected].map((mp) => fetchCatalogFor(mp, true)),
         );
       } catch (e) {
         console.error("[BrowseTab] post-install refresh rejected unexpectedly", e);
