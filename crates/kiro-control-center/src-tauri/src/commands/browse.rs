@@ -10,8 +10,9 @@ use kiro_market_core::error::error_full_chain;
 use kiro_market_core::marketplace::{PluginSource, StructuredSource};
 use kiro_market_core::project::{InstalledSkills, KiroProject};
 use kiro_market_core::service::{
-    BulkSkillsResult, InstallFilter, InstallMode, InstallSkillsResult, MarketplaceService,
-    PluginSkillsResult, SkillCount,
+    AgentItemInfo, BulkSkillsResult, InstallFilter, InstallMode, InstallSkillsResult,
+    MarketplaceService, PluginSkillsResult, SkillCount, SkillInfo, SkippedItem, SkippedPlugin,
+    SteeringItemInfo,
 };
 use kiro_market_core::validation::{MarketplaceName, PluginName};
 
@@ -66,6 +67,32 @@ pub struct ProjectInfo {
     pub path: String,
     pub kiro_initialized: bool,
     pub installed_skill_count: u32,
+}
+
+/// Wire-shaped catalog entry — the core
+/// [`PluginCatalogEntry`](kiro_market_core::service::PluginCatalogEntry)
+/// plus the per-plugin `source_type` (which lives in this crate, not in
+/// core, so the enrichment happens at the FFI boundary). All other
+/// fields pass through unchanged.
+#[derive(Clone, Debug, Serialize, specta::Type)]
+pub struct PluginCatalogEntryView {
+    pub marketplace: String,
+    pub plugin: String,
+    pub description: Option<String>,
+    pub source_type: SourceType,
+    pub skills: Vec<SkillInfo>,
+    pub steering: Vec<SteeringItemInfo>,
+    pub agents: Vec<AgentItemInfo>,
+    pub skipped_items: Vec<SkippedItem>,
+}
+
+/// Wire-shaped bulk catalog response. Wraps the core
+/// [`PluginCatalogView`](kiro_market_core::service::PluginCatalogView)
+/// with the per-entry `source_type` enrichment.
+#[derive(Clone, Debug, Serialize, specta::Type)]
+pub struct PluginCatalogResponseView {
+    pub plugins: Vec<PluginCatalogEntryView>,
+    pub skipped: Vec<SkippedPlugin>,
 }
 
 // ---------------------------------------------------------------------------
@@ -307,6 +334,118 @@ fn load_installed_or_error(
     })
 }
 
+/// Bulk per-marketplace catalog read for the BrowseTab redesign. Wraps
+/// the core [`MarketplaceService::list_plugin_catalog`] with the
+/// FFI-side `source_type` enrichment (`SourceType` lives in this crate,
+/// not core, per the existing `PluginInfo` precedent).
+///
+/// The `_impl` loads the three project tracking files **once** before
+/// invoking the core method. Per design claim C11, this is the load-
+/// once enforcement: changing `_impl` to call the core method N times
+/// (once per plugin) would break the type-system contract on
+/// [`MarketplaceService::list_plugin_catalog`]'s reference parameters.
+#[tauri::command]
+#[specta::specta]
+pub async fn list_plugin_catalog_for_marketplace(
+    marketplace: String,
+    project_path: String,
+) -> Result<PluginCatalogResponseView, CommandError> {
+    let svc = make_service()?;
+    list_plugin_catalog_for_marketplace_impl(&svc, &marketplace, &project_path)
+}
+
+/// Body of [`list_plugin_catalog_for_marketplace`] split out per
+/// CLAUDE.md's testable-Tauri-command pattern (precedent:
+/// `install_skills_impl` above). Loads the three Installed* tracking
+/// files via the project handle, then calls the core bulk method
+/// passing them by reference.
+///
+/// Tracking-file load failures (corrupt JSON, missing required field
+/// on an entry) propagate as `CommandError` here — they do NOT
+/// silently substitute an empty installed-set, which would mis-mark
+/// installed items as not installed in the catalog. This is the C9
+/// regression-fence claim, pinned by
+/// `list_plugin_catalog_command_propagates_corrupt_tracking_file`.
+fn list_plugin_catalog_for_marketplace_impl(
+    svc: &MarketplaceService,
+    marketplace: &str,
+    project_path: &str,
+) -> Result<PluginCatalogResponseView, CommandError> {
+    let project_root = validate_kiro_project_path(project_path)?;
+    let project = KiroProject::new(project_root);
+    let installed_skills = project.load_installed().map_err(|e| {
+        warn!(path = %project_path, error = %e, "failed to load installed skills");
+        CommandError::new(
+            format!("failed to read installed skills: {}", error_full_chain(&e)),
+            ErrorType::IoError,
+        )
+    })?;
+    let installed_steering = project.load_installed_steering().map_err(|e| {
+        warn!(path = %project_path, error = %e, "failed to load installed steering");
+        CommandError::new(
+            format!(
+                "failed to read installed steering: {}",
+                error_full_chain(&e)
+            ),
+            ErrorType::IoError,
+        )
+    })?;
+    let installed_agents = project.load_installed_agents().map_err(|e| {
+        warn!(path = %project_path, error = %e, "failed to load installed agents");
+        CommandError::new(
+            format!("failed to read installed agents: {}", error_full_chain(&e)),
+            ErrorType::IoError,
+        )
+    })?;
+
+    let view = svc
+        .list_plugin_catalog(
+            marketplace,
+            &installed_skills,
+            &installed_steering,
+            &installed_agents,
+        )
+        .map_err(CommandError::from)?;
+
+    // Build name → SourceType lookup ONCE from the registry. Each
+    // PluginCatalogEntry then enriches via map lookup. Falling back
+    // to SourceType::Relative on missing-name (defensive — shouldn't
+    // happen since list_plugin_catalog enumerates the same registry,
+    // but a future race between registry-reload and catalog-call
+    // shouldn't crash; the relative fallback matches the most common
+    // local-plugin shape).
+    let entries = svc
+        .list_plugin_entries(marketplace)
+        .map_err(CommandError::from)?;
+    let source_types: std::collections::HashMap<String, SourceType> = entries
+        .iter()
+        .map(|e| (e.name.clone(), plugin_source_type(&e.source)))
+        .collect();
+
+    let plugins = view
+        .plugins
+        .into_iter()
+        .map(|e| PluginCatalogEntryView {
+            source_type: source_types
+                .get(&e.plugin)
+                .cloned()
+                .unwrap_or(SourceType::Relative),
+            marketplace: e.marketplace,
+            plugin: e.plugin,
+            description: e.description,
+            skills: e.skills,
+            steering: e.steering,
+            agents: e.agents,
+            skipped_items: e.skipped_items,
+        })
+        .collect();
+
+    Ok(PluginCatalogResponseView {
+        plugins,
+        skipped: view.skipped,
+    })
+}
+
 /// Narrow a `usize` count into a `u32` for the serialized frontend
 /// response, saturating at `u32::MAX` if the count overflows.
 ///
@@ -510,6 +649,81 @@ mod tests {
                 .exists(),
             "installed-skills.json must land under the requested project_path, not an unrelated directory"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // list_plugin_catalog_for_marketplace_impl
+    // (S7 of BrowseTab redesign — C9 fence)
+    // -----------------------------------------------------------------------
+
+    /// C9 regression fence: a corrupt tracking file fails the wrapper
+    /// with `Err(_)`, never silently substitutes an empty installed-set.
+    ///
+    /// Adversarial bug class: an implementer who wrapped the load in
+    /// `.unwrap_or_default()` for "ergonomics" would silently mark every
+    /// catalog item as `installed=false`, breaking the UX promise that
+    /// installed items always show as installed. The fixture writes
+    /// malformed JSON to `.kiro/installed-skills.json` and asserts the
+    /// `_impl` returns `Err`.
+    #[test]
+    fn list_plugin_catalog_command_propagates_corrupt_tracking_file() {
+        let (dir, svc) = temp_service();
+        let entries = vec![relative_path_entry("alpha", "plugins/alpha")];
+        let marketplace_path = seed_marketplace_with_registry(dir.path(), &svc, "mp1", &entries);
+        make_plugin_with_skills(&marketplace_path, "alpha", &["s1"]);
+        let project_path = make_kiro_project(dir.path());
+
+        // Hand-write malformed JSON to installed-skills.json so the
+        // load_installed() call inside the _impl fails.
+        let tracking_path =
+            std::path::PathBuf::from(&project_path).join(".kiro/installed-skills.json");
+        fs::write(&tracking_path, b"{\"skills\": \"not-a-map\"}")
+            .expect("write malformed tracking");
+
+        let result = list_plugin_catalog_for_marketplace_impl(&svc, "mp1", &project_path);
+        assert!(
+            result.is_err(),
+            "corrupt installed-skills.json must propagate as Err, got Ok"
+        );
+        // The error_full_chain rendering should mention the failure
+        // mode somewhere in the message — a surface-level check that
+        // the wrapper isn't swallowing the cause.
+        let err = result.expect_err("checked above");
+        let msg = format!("{err:?}");
+        assert!(
+            msg.to_lowercase().contains("installed skills")
+                || msg.to_lowercase().contains("expected"),
+            "error message should reference the failed load surface, got: {msg}"
+        );
+    }
+
+    /// Happy-path smoke: clean fixture with one plugin yields a
+    /// PluginCatalogResponseView with one entry whose source_type was
+    /// enriched correctly. Doubles as the implicit C11 evidence — if
+    /// `list_plugin_catalog`'s signature ever changes to take a
+    /// `&KiroProject` and load tracking internally, this _impl will
+    /// stop calling `load_*` three times and the structural contract
+    /// breaks at compile time.
+    #[test]
+    fn list_plugin_catalog_for_marketplace_impl_enriches_source_type() {
+        let (dir, svc) = temp_service();
+        let entries = vec![relative_path_entry("alpha", "plugins/alpha")];
+        let marketplace_path = seed_marketplace_with_registry(dir.path(), &svc, "mp1", &entries);
+        make_plugin_with_skills(&marketplace_path, "alpha", &["s1"]);
+        let project_path = make_kiro_project(dir.path());
+
+        let view = list_plugin_catalog_for_marketplace_impl(&svc, "mp1", &project_path)
+            .expect("clean fixture");
+        assert_eq!(view.plugins.len(), 1);
+        assert_eq!(view.plugins[0].plugin, "alpha");
+        // RelativePath plugin → SourceType::Relative.
+        assert!(
+            matches!(view.plugins[0].source_type, SourceType::Relative),
+            "expected SourceType::Relative for a relative_path_entry, got {:?}",
+            view.plugins[0].source_type
+        );
+        assert_eq!(view.plugins[0].skills.len(), 1);
+        assert_eq!(view.plugins[0].skills[0].name, "s1");
     }
 
     #[test]

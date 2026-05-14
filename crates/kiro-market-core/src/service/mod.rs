@@ -9,8 +9,9 @@ pub mod browse;
 pub mod test_support;
 
 pub use browse::{
-    BulkSkillsResult, PluginSkillsResult, SkillCount, SkillInfo, SkippedPlugin, SkippedReason,
-    SkippedSkill, SkippedSkillReason,
+    AgentItemInfo, AgentParseSkip, BulkSkillsResult, PluginAgentsResult, PluginCatalogEntry,
+    PluginCatalogView, PluginSkillsResult, PluginSteeringResult, SkillCount, SkillInfo,
+    SkippedItem, SkippedPlugin, SkippedReason, SkippedSkill, SkippedSkillReason, SteeringItemInfo,
 };
 
 use std::fs;
