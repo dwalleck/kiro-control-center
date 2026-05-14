@@ -12,12 +12,14 @@ use std::path::{Path, PathBuf};
 use serde::Serialize;
 use tracing::{debug, error, warn};
 
+use crate::agent::AgentDialect;
 use crate::error::{Error, PluginError, error_full_chain};
 use crate::marketplace::{PluginEntry, PluginSource, StructuredSource};
 use crate::plugin::{PluginManifest, discover_skill_dirs};
 use crate::project::InstalledSkills;
 use crate::service::MarketplaceService;
 use crate::skill::parse_frontmatter;
+use crate::steering::SteeringWarning;
 
 // ---------------------------------------------------------------------------
 // Response types
@@ -131,6 +133,123 @@ impl SkippedPlugin {
     pub fn kind(&self) -> &SkippedReason {
         &self.kind
     }
+}
+
+// ---------------------------------------------------------------------------
+// Plugin-catalog wire types (slice 1 of BrowseTab redesign).
+//
+// `PluginCatalogView` is the bulk-read counterpart to `BulkSkillsResult`,
+// extended to all three categories (skills, steering, agents). The Tauri
+// layer enriches each entry with `source_type: SourceType` on its way to
+// the FFI; the core type stays free of that enum (which lives in the
+// Tauri crate per existing `PluginInfo` precedent).
+// ---------------------------------------------------------------------------
+
+/// One discovered steering file in a plugin's catalog, cross-referenced
+/// with the project's installed-steering set. Mirrors [`SkillInfo`]'s
+/// shape; the join key is the filename under `.kiro/steering/`.
+#[derive(Clone, Debug, Serialize)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
+pub struct SteeringItemInfo {
+    /// Filename under `.kiro/steering/` — the user-facing identity of
+    /// this steering file. Must NOT carry a `PathBuf`; the caller's
+    /// install pipeline keys on this exact string.
+    pub name: String,
+    pub plugin: String,
+    pub marketplace: String,
+    /// `true` iff `installed_steering.files.contains_key(Path::new(&name))`.
+    /// Tracking-file membership only — not disk presence (see
+    /// `kiro-3ivx` for the cross-check follow-up).
+    pub installed: bool,
+}
+
+/// One discovered agent in a plugin's catalog, cross-referenced with
+/// the project's installed-agents set. Names are the parsed identity
+/// (frontmatter `name` for markdown, JSON `name` field for native) —
+/// NOT the source filename. See `prove_it_list_plugin_catalog`'s
+/// `wrong-filename.md` adversarial fixture for the bug class this
+/// distinction kills.
+#[derive(Clone, Debug, Serialize)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
+pub struct AgentItemInfo {
+    pub name: String,
+    pub description: Option<String>,
+    pub plugin: String,
+    pub marketplace: String,
+    /// `true` iff `installed_agents.agents.contains_key(&name)`.
+    pub installed: bool,
+    pub dialect: AgentDialect,
+}
+
+/// Per-item failure surfaced inside a working plugin's
+/// [`PluginCatalogEntry`]. Plugin-level failures still go to
+/// [`PluginCatalogView::skipped`] via [`SkippedPlugin`]; this enum is
+/// the union of the three categories' per-item skip channels.
+///
+/// Variant ordering matches the order items are enumerated:
+/// skills first, then steering, then agents. Frontend renderers that
+/// group by category can match on `kind` without losing the discovery
+/// order within a single category.
+#[derive(Clone, Debug, Serialize)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
+#[serde(tag = "kind", rename_all = "snake_case")]
+#[non_exhaustive]
+pub enum SkippedItem {
+    /// One skill could not be read or parsed (frontmatter, I/O, etc.).
+    /// Reuses the existing per-skill skip type so single-plugin and
+    /// bulk callers agree on the wire shape.
+    Skill(SkippedSkill),
+    /// Steering discovery emitted a structured warning (invalid scan
+    /// path, unreadable scan dir). Reuses [`SteeringWarning`] so the
+    /// existing `installPluginSteering` call's warning shape is the
+    /// same one this catalog surface uses.
+    SteeringDiscovery(SteeringWarning),
+    /// One agent file could not be parsed (frontmatter, JSON, dialect
+    /// detection). The `source_path` matches [`SkippedSkill::path`]'s
+    /// shape (specta renders `PathBuf` as `string` on TS) so frontend
+    /// renderers can re-use the same path-formatting helper.
+    AgentParse {
+        plugin: String,
+        source_path: PathBuf,
+        reason: String,
+    },
+}
+
+/// One plugin's full per-category item tree, plus per-item skips. The
+/// `marketplace` and `plugin` fields are owned (not borrowed against
+/// the registry) so the wire format survives the registry being freed
+/// after the catalog assembly.
+///
+/// `source_type` is intentionally absent — the Tauri layer enriches
+/// each entry with `SourceType` (which lives in the Tauri crate per
+/// `PluginInfo`'s precedent) when projecting into the FFI shape.
+#[derive(Clone, Debug, Serialize)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
+pub struct PluginCatalogEntry {
+    pub marketplace: String,
+    pub plugin: String,
+    pub description: Option<String>,
+    pub skills: Vec<SkillInfo>,
+    pub steering: Vec<SteeringItemInfo>,
+    pub agents: Vec<AgentItemInfo>,
+    pub skipped_items: Vec<SkippedItem>,
+}
+
+/// Result of the bulk per-marketplace catalog read. Plugin-level
+/// failures (missing dir, malformed manifest, remote-source-not-local)
+/// land in [`Self::skipped`]; per-item failures inside otherwise-working
+/// plugins land in their entry's [`PluginCatalogEntry::skipped_items`].
+///
+/// Tracking-file load failures are NOT in this view — the wrapper
+/// loads `InstalledSkills`, `InstalledSteering`, `InstalledAgents`
+/// before calling the core method, and a parse failure on any of them
+/// fails the wrapper (see [`crate::service::MarketplaceService::list_plugin_catalog`]'s
+/// signature, which takes them by reference).
+#[derive(Clone, Debug, Serialize)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
+pub struct PluginCatalogView {
+    pub plugins: Vec<PluginCatalogEntry>,
+    pub skipped: Vec<SkippedPlugin>,
 }
 
 impl SkippedReason {

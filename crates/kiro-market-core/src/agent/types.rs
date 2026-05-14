@@ -83,6 +83,7 @@ impl McpServerConfig {
 /// change for external consumers, and so the tracking file's Deserialize
 /// can be tolerantly extended later.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
 #[serde(rename_all = "lowercase")]
 #[non_exhaustive]
 pub enum AgentDialect {
