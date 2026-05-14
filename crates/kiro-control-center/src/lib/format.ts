@@ -81,6 +81,12 @@ export function formatSkippedSkill(s: SkippedSkill): string {
     case "frontmatter_invalid":
       reason = `malformed frontmatter: ${s.reason.reason}`;
       break;
+    case "duplicate_name":
+      // Two SKILL.md files in the plugin's scan paths declared the same
+      // frontmatter `name`. The catalog kept the first; the second's
+      // dir is surfaced here so the plugin author can see the conflict.
+      reason = `duplicate skill name (kept ${s.reason.existing_dir}; dropped ${s.reason.conflict_dir})`;
+      break;
     default: {
       const _exhaustive: never = s.reason;
       throw new Error(

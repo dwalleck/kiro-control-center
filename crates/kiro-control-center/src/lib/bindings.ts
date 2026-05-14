@@ -46,6 +46,19 @@ export const commands = {
 	 */
 	listAllSkillsForMarketplace: (marketplace: string, projectPath: string) => typedError<BulkSkillsResult, CommandError>(__TAURI_INVOKE("list_all_skills_for_marketplace", { marketplace, projectPath })),
 	/**
+	 *  Bulk per-marketplace catalog read for the BrowseTab redesign. Wraps
+	 *  the core [`MarketplaceService::list_plugin_catalog`] with the
+	 *  FFI-side `source_type` enrichment (`SourceType` lives in this crate,
+	 *  not core, per the existing `PluginInfo` precedent).
+	 * 
+	 *  The `_impl` loads the three project tracking files **once** before
+	 *  invoking the core method. Per design claim C11, this is the load-
+	 *  once enforcement: changing `_impl` to call the core method N times
+	 *  (once per plugin) would break the type-system contract on
+	 *  [`MarketplaceService::list_plugin_catalog`]'s reference parameters.
+	 */
+	listPluginCatalogForMarketplace: (marketplace: string, projectPath: string) => typedError<PluginCatalogResponseView, CommandError>(__TAURI_INVOKE("list_plugin_catalog_for_marketplace", { marketplace, projectPath })),
+	/**
 	 *  Install specific skills from a plugin into a Kiro project.
 	 * 
 	 *  Returns the core [`InstallSkillsResult`] directly rather than through a
@@ -191,6 +204,42 @@ export const commands = {
 };
 
 /* Types */
+/**
+ *  Which source dialect the agent came from. Used for applying
+ *  dialect-specific tool-mapping rules and for warnings.
+ * 
+ *  Serializes to `"claude"` / `"copilot"` so it can live directly in the
+ *  installed-agents tracking file without a string sidecar.
+ * 
+ *  Marked `#[non_exhaustive]` so adding a future dialect is not a breaking
+ *  change for external consumers, and so the tracking file's Deserialize
+ *  can be tolerantly extended later.
+ */
+export type AgentDialect = "claude" | "copilot" | 
+/**
+ *  Plugin authored in Kiro's native JSON format. Installed via
+ *  validate-and-copy (no parse-and-translate).
+ */
+"native";
+
+/**
+ *  One discovered agent in a plugin's catalog, cross-referenced with
+ *  the project's installed-agents set. Names are the parsed identity
+ *  (frontmatter `name` for markdown, JSON `name` field for native) —
+ *  NOT the source filename. See `prove_it_list_plugin_catalog`'s
+ *  `wrong-filename.md` adversarial fixture for the bug class this
+ *  distinction kills.
+ */
+export type AgentItemInfo = {
+	name: string,
+	description: string | null,
+	plugin: string,
+	marketplace: string,
+	// `true` iff `installed_agents.agents.contains_key(&name)`.
+	installed: boolean,
+	dialect: AgentDialect,
+};
+
 /**
  *  A string that has been validated as a safe agent / skill / plugin name.
  * 
@@ -1076,6 +1125,34 @@ export type PluginBasicInfo = {
 	description: string | null,
 };
 
+/**
+ *  Wire-shaped catalog entry — the core
+ *  [`PluginCatalogEntry`](kiro_market_core::service::PluginCatalogEntry)
+ *  plus the per-plugin `source_type` (which lives in this crate, not in
+ *  core, so the enrichment happens at the FFI boundary). All other
+ *  fields pass through unchanged.
+ */
+export type PluginCatalogEntryView = {
+	marketplace: string,
+	plugin: string,
+	description: string | null,
+	source_type: SourceType,
+	skills: SkillInfo[],
+	steering: SteeringItemInfo[],
+	agents: AgentItemInfo[],
+	skipped_items: SkippedItem[],
+};
+
+/**
+ *  Wire-shaped bulk catalog response. Wraps the core
+ *  [`PluginCatalogView`](kiro_market_core::service::PluginCatalogView)
+ *  with the per-entry `source_type` enrichment.
+ */
+export type PluginCatalogResponseView = {
+	plugins: PluginCatalogEntryView[],
+	skipped: SkippedPlugin[],
+};
+
 // Summary information about a plugin within a marketplace.
 export type PluginInfo = {
 	name: string,
@@ -1421,6 +1498,39 @@ export type SkillInfo = {
 };
 
 /**
+ *  Per-item failure surfaced inside a working plugin's
+ *  [`PluginCatalogEntry`]. Plugin-level failures still go to
+ *  [`PluginCatalogView::skipped`] via [`SkippedPlugin`]; this enum is
+ *  the union of the three categories' per-item skip channels.
+ * 
+ *  Variant ordering matches the order items are enumerated:
+ *  skills first, then steering, then agents. Frontend renderers that
+ *  group by category can match on `kind` without losing the discovery
+ *  order within a single category.
+ */
+export type SkippedItem = 
+/**
+ *  One skill could not be read or parsed (frontmatter, I/O, etc.).
+ *  Reuses the existing per-skill skip type so single-plugin and
+ *  bulk callers agree on the wire shape.
+ */
+{ kind: "skill" } & (SkippedSkill) | 
+/**
+ *  Steering discovery emitted a structured warning (invalid scan
+ *  path, unreadable scan dir). Reuses [`SteeringWarning`] so the
+ *  existing `installPluginSteering` call's warning shape is the
+ *  same one this catalog surface uses.
+ */
+{ kind: "steering_discovery" } & (SteeringWarning) | 
+/**
+ *  One agent file could not be parsed (frontmatter, JSON, dialect
+ *  detection). The `source_path` matches [`SkippedSkill::path`]'s
+ *  shape (specta renders `PathBuf` as `string` on TS) so frontend
+ *  renderers can re-use the same path-formatting helper.
+ */
+{ kind: "agent_parse"; plugin: string; source_path: string; reason: string };
+
+/**
  *  A plugin that was excluded from a bulk listing. Carries both a
  *  human-readable `reason` (the error's rendered Display, suitable for
  *  direct UI rendering or log lines) and a structured `kind` that
@@ -1522,7 +1632,19 @@ export type SkippedSkillReason =
  *  `SKILL.md` read successfully but the frontmatter could not be
  *  parsed (missing fences, malformed YAML, missing `name`, etc.).
  */
-{ kind: "frontmatter_invalid"; reason: string };
+{ kind: "frontmatter_invalid"; reason: string } | 
+/**
+ *  Two `SKILL.md` files declare the same frontmatter `name` within
+ *  one (plugin, category) — possible because `discover_skill_dirs`
+ *  dedupes by `skill_dir` path, not by parsed name. The catalog
+ *  path picks first-wins (the discovery iteration order is sorted,
+ *  so "first" is deterministic) and surfaces the loser here so the
+ *  UI can warn that the plugin's manifest is shipping a name
+ *  collision. Both fields are the directories containing the
+ *  `SKILL.md` (not the markdown file itself); rendered as TS
+ *  strings via specta on the wire.
+ */
+{ kind: "duplicate_name"; existing_dir: string; conflict_dir: string };
 
 /**
  *  Source type classification for marketplaces and plugins.
@@ -1531,6 +1653,28 @@ export type SkippedSkillReason =
  *  type like `"github" | "git" | "local" | "relative" | "git_subdir"`.
  */
 export type SourceType = "github" | "git" | "local" | "relative" | "git-subdir";
+
+/**
+ *  One discovered steering file in a plugin's catalog, cross-referenced
+ *  with the project's installed-steering set. Mirrors [`SkillInfo`]'s
+ *  shape; the join key is the filename under `.kiro/steering/`.
+ */
+export type SteeringItemInfo = {
+	/**
+	 *  Filename under `.kiro/steering/` — the user-facing identity of
+	 *  this steering file. Must NOT carry a `PathBuf`; the caller's
+	 *  install pipeline keys on this exact string.
+	 */
+	name: string,
+	plugin: string,
+	marketplace: string,
+	/**
+	 *  `true` iff `installed_steering.files.contains_key(Path::new(&name))`.
+	 *  Tracking-file membership only — not disk presence (see
+	 *  `kiro-3ivx` for the cross-check follow-up).
+	 */
+	installed: boolean,
+};
 
 /**
  *  Non-fatal issues raised during steering discovery. Surface
