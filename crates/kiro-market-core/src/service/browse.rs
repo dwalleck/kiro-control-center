@@ -16,10 +16,11 @@ use crate::agent::AgentDialect;
 use crate::error::{Error, PluginError, error_full_chain};
 use crate::marketplace::{PluginEntry, PluginSource, StructuredSource};
 use crate::plugin::{PluginManifest, discover_skill_dirs};
-use crate::project::InstalledSkills;
+use crate::project::{InstalledSkills, InstalledSteering};
 use crate::service::MarketplaceService;
 use crate::skill::parse_frontmatter;
 use crate::steering::SteeringWarning;
+use crate::steering::discover::discover_steering_files_in_dirs;
 
 // ---------------------------------------------------------------------------
 // Response types
@@ -233,6 +234,18 @@ pub struct PluginCatalogEntry {
     pub steering: Vec<SteeringItemInfo>,
     pub agents: Vec<AgentItemInfo>,
     pub skipped_items: Vec<SkippedItem>,
+}
+
+/// Per-plugin steering enumeration result, mirroring [`PluginSkillsResult`]'s
+/// shape for the steering category. Discovery-time warnings (invalid scan
+/// paths, unreadable scan dirs) are surfaced structurally rather than
+/// vanishing into a `warn!` log; the bulk catalog folds these into
+/// [`PluginCatalogEntry::skipped_items`] via [`SkippedItem::SteeringDiscovery`].
+#[derive(Clone, Debug, Serialize)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
+pub struct PluginSteeringResult {
+    pub steering: Vec<SteeringItemInfo>,
+    pub warnings: Vec<SteeringWarning>,
 }
 
 /// Result of the bulk per-marketplace catalog read. Plugin-level
@@ -772,6 +785,81 @@ impl MarketplaceService {
             skipped,
             skipped_skills,
         })
+    }
+
+    /// List every steering file declared by a single plugin, cross-
+    /// referenced with the project's installed-steering set.
+    ///
+    /// Mirrors [`Self::list_skills_for_plugin`] for the steering category.
+    /// Discovery-time issues (invalid scan paths, unreadable scan dirs)
+    /// surface structurally as [`PluginSteeringResult::warnings`] rather
+    /// than only via `warn!` logs — the bulk catalog
+    /// [`Self::list_plugin_catalog`] folds these into the per-plugin
+    /// [`PluginCatalogEntry::skipped_items`] union.
+    ///
+    /// `installed.files` is keyed by the relative path under
+    /// `.kiro/steering/`, and the join key on the marketplace side is the
+    /// discovered file's basename. Names round-trip Unicode losslessly
+    /// (the `to_str()` filter above drops non-UTF-8 names rather than
+    /// fabricating a lossy placeholder); this is pinned by the
+    /// `list_plugin_catalog_steering_installed_flag_matches_tracking`
+    /// stress fixture (S2 of the `BrowseTab` redesign plan), whose
+    /// non-ASCII `règles.md` probe falsifies an implementer who joined
+    /// via `to_string_lossy()`.
+    ///
+    /// # Errors
+    ///
+    /// Same error surface as [`Self::list_skills_for_plugin`]: registry
+    /// or directory resolution failures propagate as `Err`; per-file
+    /// discovery warnings are collected, not propagated.
+    pub fn list_steering_for_plugin(
+        &self,
+        marketplace: &str,
+        plugin: &str,
+        installed: &InstalledSteering,
+    ) -> Result<PluginSteeringResult, Error> {
+        let marketplace_path = self.marketplace_path(marketplace);
+        let plugin_entries = self.list_plugin_entries(marketplace)?;
+        let plugin_entry = plugin_entries
+            .iter()
+            .find(|p| p.name == plugin)
+            .ok_or_else(|| {
+                Error::Plugin(PluginError::NotFound {
+                    plugin: plugin.to_owned(),
+                    marketplace: marketplace.to_owned(),
+                })
+            })?;
+        let plugin_dir = self.resolve_local_plugin_dir(plugin_entry, &marketplace_path)?;
+        let manifest = load_plugin_manifest(&plugin_dir)?;
+        let scan_paths = steering_scan_paths_for_plugin(manifest.as_ref());
+
+        // Loop budget: O(steering_files_per_plugin). Production scale ≤20
+        // files per plugin (CLAUDE.md plugins ship 1–5; observed max ≈8).
+        let (discovered, warnings) = discover_steering_files_in_dirs(&plugin_dir, &scan_paths);
+        let mut steering = Vec::with_capacity(discovered.len());
+        for f in &discovered {
+            // Skip discovered files whose source filename isn't valid UTF-8.
+            // Returning a `SteeringItemInfo` with a lossy String would lie
+            // about the install join key (which uses the raw OsStr); rather
+            // than fabricate a placeholder name we drop the entry — the
+            // upstream discover path already validated the parent scan dir,
+            // so a non-UTF-8 leaf here is a degenerate filesystem case, not
+            // user-visible content.
+            let Some(name) = f.source.file_name().and_then(|s| s.to_str()) else {
+                debug!(
+                    path = %f.source.display(),
+                    "skipping discovered steering file with non-UTF-8 filename"
+                );
+                continue;
+            };
+            steering.push(SteeringItemInfo {
+                name: name.to_owned(),
+                plugin: plugin.to_owned(),
+                marketplace: marketplace.to_owned(),
+                installed: installed.files.contains_key(Path::new(name)),
+            });
+        }
+        Ok(PluginSteeringResult { steering, warnings })
     }
 
     /// Count skills for a single plugin entry without loading skill bodies.
@@ -2046,6 +2134,116 @@ mod tests {
                 .iter()
                 .any(|s| s.name == "fresh" && !s.installed),
             "fresh skill should not be marked installed"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // list_steering_for_plugin (S2 of BrowseTab redesign — C4 regression fence)
+    // -----------------------------------------------------------------------
+
+    /// Builds a plugin directory with `steering/<filename>` markdown files
+    /// alongside the `skills/` layout that `make_plugin_with_skills`
+    /// produces. Mirrors the `test_support` helper's shape; lives inline
+    /// because the steering-discovery path is exercised only by this slice
+    /// today (S5/S6 will add coverage for the bulk path).
+    fn make_plugin_with_steering(root: &std::path::Path, plugin_name: &str, files: &[&str]) {
+        let steering_root = root.join("plugins").join(plugin_name).join("steering");
+        fs::create_dir_all(&steering_root).expect("create steering dir");
+        for name in files {
+            fs::write(steering_root.join(name), b"steering body\n").expect("write steering file");
+        }
+    }
+
+    /// Build an `InstalledSteering` with one tracked file. The `HashMap`
+    /// key is the relative path under `.kiro/steering/`, mirroring what
+    /// the install path writes.
+    fn installed_steering_with(
+        filename: &str,
+        plugin: &str,
+        marketplace: &str,
+    ) -> InstalledSteering {
+        use std::collections::HashMap;
+
+        use chrono::Utc;
+
+        use crate::project::InstalledSteeringMeta;
+        use crate::service::test_support::{mp, pn};
+
+        let mut files = HashMap::new();
+        files.insert(
+            std::path::PathBuf::from(filename),
+            InstalledSteeringMeta {
+                marketplace: mp(marketplace),
+                plugin: pn(plugin),
+                version: None,
+                installed_at: Utc::now(),
+                source_hash: crate::hash::BlakeHash::placeholder(),
+                installed_hash: crate::hash::BlakeHash::placeholder(),
+                source_scan_root: crate::validation::RelativePath::new("steering").expect("valid"),
+            },
+        );
+        InstalledSteering { files }
+    }
+
+    /// C4 regression fence: per-file `installed` flag is the membership
+    /// of the discovered filename in `installed.files` (`HashMap` keyed
+    /// by `PathBuf`). Adversarial bug class: an implementer who marked every
+    /// discovered file as `installed=true` (or returned the tracking-set
+    /// directly without joining against discovery) would pass a one-file
+    /// happy-path fixture but fail this test, which has multiple files
+    /// where only some are tracked.
+    ///
+    /// The original draft also probed case-mismatch (`Rules.md` vs
+    /// `rules.md` tracking entry) but Windows filesystems are case-
+    /// insensitive at the OS level — `Rules.md` silently merges with
+    /// `rules.md` at write time, so the case-sensitivity bug class is
+    /// uncatchable here. The Unicode probe (`règles.md` — non-ASCII)
+    /// catches a parallel bug class: an implementer who used
+    /// `to_string_lossy()` instead of `to_str()` on the discovered
+    /// filename would pass under ASCII fixtures and fail here.
+    #[test]
+    fn list_plugin_catalog_steering_installed_flag_matches_tracking() {
+        let (dir, svc) = temp_service();
+        let entries = vec![relative_path_entry("alpha", "plugins/alpha")];
+        let marketplace_path = seed_marketplace_with_registry(dir.path(), &svc, "mp1", &entries);
+        // rules.md is in tracking; style.md is not; règles.md (non-ASCII)
+        // is also tracked — the join key must round-trip Unicode losslessly.
+        make_plugin_with_steering(
+            &marketplace_path,
+            "alpha",
+            &["rules.md", "style.md", "règles.md"],
+        );
+
+        let installed = {
+            let mut s = installed_steering_with("rules.md", "alpha", "mp1");
+            // Reuse the seeded entry's metadata for the Unicode tracking row.
+            let unicode_meta = s.files.values().next().expect("seeded entry").clone();
+            s.files
+                .insert(std::path::PathBuf::from("règles.md"), unicode_meta);
+            s
+        };
+        let result = svc
+            .list_steering_for_plugin("mp1", "alpha", &installed)
+            .expect("happy path");
+
+        assert_eq!(result.steering.len(), 3, "all three files enumerated");
+        assert!(result.warnings.is_empty(), "no warnings on a clean fixture");
+
+        let by_name: std::collections::HashMap<&str, bool> = result
+            .steering
+            .iter()
+            .map(|s| (s.name.as_str(), s.installed))
+            .collect();
+        assert_eq!(by_name.get("rules.md"), Some(&true), "rules.md is tracked");
+        assert_eq!(
+            by_name.get("style.md"),
+            Some(&false),
+            "style.md is not tracked"
+        );
+        assert_eq!(
+            by_name.get("règles.md"),
+            Some(&true),
+            "non-ASCII filename joined losslessly against tracking"
         );
     }
 
