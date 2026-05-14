@@ -233,7 +233,13 @@ fn run_steering_install(
     if skill_filter.is_some() {
         return InstallSteeringResult::default();
     }
-    MarketplaceService::install_plugin_steering(project, plugin_dir, steering_scan_paths, ctx)
+    MarketplaceService::install_plugin_steering(
+        project,
+        plugin_dir,
+        steering_scan_paths,
+        &kiro_market_core::service::InstallFilter::All,
+        ctx,
+    )
 }
 
 /// Decide whether the command exits zero or non-zero based on the

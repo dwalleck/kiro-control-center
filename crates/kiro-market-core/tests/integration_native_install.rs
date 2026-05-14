@@ -101,6 +101,7 @@ impl IntegrationHarness {
             &self.project,
             plugin_dir,
             &ctx.steering_scan_paths,
+            &kiro_market_core::service::InstallFilter::All,
             steering_ctx,
         )
     }

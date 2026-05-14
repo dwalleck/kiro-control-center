@@ -93,6 +93,15 @@ pub enum SteeringError {
     )]
     OrphanFileAtDestination { path: PathBuf },
 
+    /// A name passed in `InstallFilter::Names` did not match any
+    /// discovered steering file. Surfaces typos and stale references
+    /// (e.g., a drawer apply against a catalog snapshot taken before
+    /// the user removed a file out-of-band) instead of silently
+    /// no-op'ing them. Mirrors `FailedSkill::RequestedButNotFound`.
+    #[non_exhaustive]
+    #[error("requested steering file `{rel}` was not found in plugin `{plugin}`")]
+    RequestedButNotFound { rel: PathBuf, plugin: String },
+
     #[non_exhaustive]
     #[error(
         "steering file `{rel}` content has changed since last install; \

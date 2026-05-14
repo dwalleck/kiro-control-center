@@ -67,6 +67,9 @@ fn install_plugin_steering_impl(
         &project,
         &ctx.plugin_dir,
         &ctx.steering_scan_paths,
+        // Whole-plugin Tauri command; per-file granularity ships in
+        // commands::steering::install_steering_files (kiro-zx73 slice A3).
+        &kiro_market_core::service::InstallFilter::All,
         install_ctx,
     ))
 }

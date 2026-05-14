@@ -1637,10 +1637,19 @@ impl MarketplaceService {
         }
     }
 
-    /// Install every steering file declared by a plugin into the
-    /// project's `.kiro/steering/` directory. Per-file failures land
-    /// in `result.failed`; the batch keeps making progress so a single
-    /// bad file doesn't break the rest.
+    /// Install steering files declared by a plugin into the project's
+    /// `.kiro/steering/` directory. The `filter` selects which
+    /// discovered files to install: [`InstallFilter::All`] preserves
+    /// the prior whole-plugin behavior; [`InstallFilter::Names`] /
+    /// [`InstallFilter::SingleName`] match against the file's relative
+    /// path under its scan root (which equals the basename for
+    /// non-recursive discovery, the only shape `discover_steering_files_in_dirs`
+    /// produces today). Names that don't match any discovered file
+    /// surface as `RequestedButNotFound` failures, mirroring
+    /// [`Self::install_skills`].
+    ///
+    /// Per-file failures land in `result.failed`; the batch keeps
+    /// making progress so a single bad file doesn't break the rest.
     ///
     /// # Multi-scan-root semantics
     ///
@@ -1657,6 +1666,7 @@ impl MarketplaceService {
         project: &crate::project::KiroProject,
         plugin_dir: &Path,
         scan_paths: &[String],
+        filter: &InstallFilter<'_>,
         ctx: crate::steering::SteeringInstallContext<'_>,
     ) -> crate::steering::InstallSteeringResult {
         let mut result = crate::steering::InstallSteeringResult::default();
@@ -1664,6 +1674,13 @@ impl MarketplaceService {
         let (files, warnings) =
             crate::steering::discover_steering_files_in_dirs(plugin_dir, scan_paths);
         result.warnings = warnings;
+
+        // Track the set of rel-strings actually attempted so the
+        // unmatched-name pass below can surface typos / stale
+        // references in `Names(_)` filters. Mirrors `install_skills`'s
+        // `processed: HashSet<String>` pattern.
+        let mut processed: std::collections::HashSet<String> =
+            std::collections::HashSet::with_capacity(files.len());
 
         for f in &files {
             let Ok(rel_ref) = f.source.strip_prefix(&f.scan_root) else {
@@ -1680,6 +1697,19 @@ impl MarketplaceService {
                 continue;
             };
             let rel = rel_ref.to_path_buf();
+
+            // Filter by rel-string. `to_str()` returns None for
+            // non-UTF-8 paths — those get skipped silently (the
+            // discovery layer already filtered to known-UTF-8 in
+            // practice; the None branch is defensive).
+            if let Some(rel_str) = rel.to_str() {
+                if !filter_matches(filter, rel_str) {
+                    continue;
+                }
+                processed.insert(rel_str.to_owned());
+            } else {
+                continue;
+            }
 
             let source_hash =
                 match crate::hash::hash_artifact(&f.scan_root, std::slice::from_ref(&rel)) {
@@ -1703,6 +1733,47 @@ impl MarketplaceService {
                     error,
                 }),
             }
+        }
+
+        // For Names(_) / SingleName filters, surface unmatched requests
+        // as failures so typos and stale references don't become silent
+        // no-ops. Mirrors the matching block in `install_skills`.
+        match *filter {
+            InstallFilter::Names(requested) => {
+                for name in requested {
+                    if !processed.contains(name) {
+                        warn!(
+                            steering = %name,
+                            plugin = %ctx.plugin.as_str(),
+                            "requested steering file not found in plugin"
+                        );
+                        result.failed.push(crate::steering::FailedSteeringFile {
+                            source: PathBuf::from(name),
+                            error: crate::steering::SteeringError::RequestedButNotFound {
+                                rel: PathBuf::from(name),
+                                plugin: ctx.plugin.as_str().to_owned(),
+                            },
+                        });
+                    }
+                }
+            }
+            InstallFilter::SingleName(name) => {
+                if !processed.contains(name) {
+                    warn!(
+                        steering = %name,
+                        plugin = %ctx.plugin.as_str(),
+                        "requested steering file not found in plugin"
+                    );
+                    result.failed.push(crate::steering::FailedSteeringFile {
+                        source: PathBuf::from(name),
+                        error: crate::steering::SteeringError::RequestedButNotFound {
+                            rel: PathBuf::from(name),
+                            plugin: ctx.plugin.as_str().to_owned(),
+                        },
+                    });
+                }
+            }
+            InstallFilter::All => {}
         }
 
         result
@@ -2288,6 +2359,7 @@ impl MarketplaceService {
             project,
             &ctx.plugin_dir,
             &ctx.steering_scan_paths,
+            &InstallFilter::All,
             crate::steering::SteeringInstallContext {
                 mode,
                 marketplace,
@@ -4642,6 +4714,7 @@ mod tests {
             &project,
             plugin_tmp.path(),
             &scan_paths,
+            &InstallFilter::All,
             ctx,
         );
 
@@ -4659,6 +4732,7 @@ mod tests {
             &project,
             plugin_tmp.path(),
             &scan_paths,
+            &InstallFilter::All,
             ctx,
         );
         assert!(
@@ -4668,6 +4742,105 @@ mod tests {
                 .all(|o| o.kind == crate::project::InstallOutcomeKind::Idempotent),
             "all reinstalls must be idempotent: {:?}",
             again.installed
+        );
+    }
+
+    /// C2 fence (kiro-zx73 slice A1): `InstallFilter::Names` installs
+    /// only the named files, leaving siblings untouched. Adversarial
+    /// shape: 3 files in the plugin, install only 1 by name; assert
+    /// `.kiro/steering/` contains exactly that one file. The bug
+    /// class — implementer wires the filter parameter but forgets to
+    /// actually skip non-matching files — fails this test.
+    #[test]
+    fn install_plugin_steering_names_filter_installs_only_listed() {
+        let plugin_tmp = tempfile::tempdir().expect("plugin tempdir");
+        let steering = plugin_tmp.path().join("steering");
+        std::fs::create_dir_all(&steering).expect("create steering dir");
+        std::fs::write(steering.join("a.md"), b"a").unwrap();
+        std::fs::write(steering.join("b.md"), b"b").unwrap();
+        std::fs::write(steering.join("c.md"), b"c").unwrap();
+
+        let project_tmp = tempfile::tempdir().expect("project tempdir");
+        let project = crate::project::KiroProject::new(project_tmp.path().to_path_buf());
+
+        let scan_paths = vec!["./steering/".to_string()];
+        let mp_name = crate::service::test_support::mp("mp");
+        let pn_name = crate::service::test_support::pn("p");
+        let ctx = crate::steering::SteeringInstallContext {
+            mode: InstallMode::New,
+            marketplace: &mp_name,
+            plugin: &pn_name,
+            version: None,
+            plugin_dir: plugin_tmp.path(),
+        };
+
+        let names = vec!["a.md".to_string()];
+        let result = MarketplaceService::install_plugin_steering(
+            &project,
+            plugin_tmp.path(),
+            &scan_paths,
+            &InstallFilter::Names(&names),
+            ctx,
+        );
+
+        assert_eq!(result.installed.len(), 1, "only a.md should install");
+        assert!(
+            result.failed.is_empty(),
+            "no failures expected; got {:?}",
+            result.failed
+        );
+        let dest = project_tmp.path().join(".kiro/steering");
+        assert!(dest.join("a.md").exists(), "a.md should be on disk");
+        assert!(!dest.join("b.md").exists(), "b.md MUST NOT be installed");
+        assert!(!dest.join("c.md").exists(), "c.md MUST NOT be installed");
+    }
+
+    /// C3 fence (kiro-zx73 slice A1): a name in `InstallFilter::Names`
+    /// that doesn't match any discovered file surfaces as a
+    /// `RequestedButNotFound` failure rather than silently no-op'ing.
+    /// The bug class — drawer apply against a stale catalog snapshot
+    /// where a file was removed out-of-band — produces a typed error
+    /// the UI can surface, not silence.
+    #[test]
+    fn install_plugin_steering_names_filter_reports_unmatched_names() {
+        let plugin_tmp = tempfile::tempdir().expect("plugin tempdir");
+        let steering = plugin_tmp.path().join("steering");
+        std::fs::create_dir_all(&steering).expect("create steering dir");
+        std::fs::write(steering.join("real.md"), b"real").unwrap();
+
+        let project_tmp = tempfile::tempdir().expect("project tempdir");
+        let project = crate::project::KiroProject::new(project_tmp.path().to_path_buf());
+
+        let scan_paths = vec!["./steering/".to_string()];
+        let mp_name = crate::service::test_support::mp("mp");
+        let pn_name = crate::service::test_support::pn("p");
+        let ctx = crate::steering::SteeringInstallContext {
+            mode: InstallMode::New,
+            marketplace: &mp_name,
+            plugin: &pn_name,
+            version: None,
+            plugin_dir: plugin_tmp.path(),
+        };
+
+        // Request "phantom.md" which doesn't exist; "real.md" does.
+        let names = vec!["real.md".to_string(), "phantom.md".to_string()];
+        let result = MarketplaceService::install_plugin_steering(
+            &project,
+            plugin_tmp.path(),
+            &scan_paths,
+            &InstallFilter::Names(&names),
+            ctx,
+        );
+
+        assert_eq!(result.installed.len(), 1, "real.md installed");
+        assert_eq!(result.failed.len(), 1, "phantom.md surfaces as failure");
+        assert!(
+            matches!(
+                result.failed[0].error,
+                crate::steering::SteeringError::RequestedButNotFound { .. }
+            ),
+            "expected RequestedButNotFound, got {:?}",
+            result.failed[0].error
         );
     }
 
@@ -4705,6 +4878,7 @@ mod tests {
             &project,
             plugin_tmp.path(),
             &scan_paths,
+            &InstallFilter::All,
             ctx,
         );
 
@@ -4778,6 +4952,7 @@ mod tests {
             &project,
             plugin_tmp.path(),
             &scan_paths,
+            &InstallFilter::All,
             ctx,
         );
 
