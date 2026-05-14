@@ -1103,6 +1103,40 @@ impl MarketplaceService {
         let agents_result =
             self.list_agents_for_plugin(marketplace, &plugin_entry.name, installed_agents)?;
 
+        // Aggregate per-category skip channels into the union
+        // SkippedItem vector. Order: skills first, then steering, then
+        // agents — matches the enumeration order in list_plugin_catalog
+        // so frontend renderers grouping by category see consistent
+        // ordering across plugins. Loop budget: O(skips_per_plugin),
+        // typically zero, pathological ≤30.
+        let mut skipped_items = Vec::with_capacity(
+            skills_result.skipped_skills.len()
+                + steering_result.warnings.len()
+                + agents_result.skipped.len(),
+        );
+        skipped_items.extend(
+            skills_result
+                .skipped_skills
+                .into_iter()
+                .map(SkippedItem::Skill),
+        );
+        skipped_items.extend(
+            steering_result
+                .warnings
+                .into_iter()
+                .map(SkippedItem::SteeringDiscovery),
+        );
+        skipped_items.extend(
+            agents_result
+                .skipped
+                .into_iter()
+                .map(|s| SkippedItem::AgentParse {
+                    plugin: s.plugin,
+                    source_path: s.source_path,
+                    reason: s.reason,
+                }),
+        );
+
         Ok(PluginCatalogEntry {
             marketplace: marketplace.to_owned(),
             plugin: plugin_entry.name.clone(),
@@ -1110,9 +1144,7 @@ impl MarketplaceService {
             skills: skills_result.skills,
             steering: steering_result.steering,
             agents: agents_result.agents,
-            // S6 populates this from skills_result.skipped_skills,
-            // steering_result.warnings, and agents_result.skipped.
-            skipped_items: Vec::new(),
+            skipped_items,
         })
     }
 
@@ -2845,6 +2877,183 @@ mod tests {
             .expect("alpha in plugins");
         assert_eq!(alpha.skills.len(), 2);
         assert!(alpha.skills.iter().all(|s| !s.installed));
+    }
+
+    // -----------------------------------------------------------------------
+    // skipped_items aggregation + scan-path resolution
+    // (S6 of BrowseTab redesign — C7 + C13 fences)
+    // -----------------------------------------------------------------------
+
+    /// C7 regression fence: per-item failures across all three categories
+    /// surface in `entry.skipped_items` with distinct variant kinds.
+    ///
+    /// Adversarial bug class: an implementer who aggregated only one
+    /// category's skips and forgot the other two would silently drop
+    /// 2/3 of the failure surface. This fixture shoves one valid + one
+    /// invalid item into EACH of the three channels and asserts all
+    /// three appear with their distinguishing `SkippedItem` variant.
+    #[test]
+    fn list_plugin_catalog_partial_item_failures_surface_in_skipped_items() {
+        let (dir, svc) = temp_service();
+        let entries = vec![relative_path_entry("alpha", "plugins/alpha")];
+        let marketplace_path = seed_marketplace_with_registry(dir.path(), &svc, "mp1", &entries);
+
+        let plugin_root = marketplace_path.join("plugins").join("alpha");
+
+        // Skill: one valid + one with malformed frontmatter (missing `name:`).
+        let skills_root = plugin_root.join("skills");
+        fs::create_dir_all(skills_root.join("ok-skill")).expect("create dir");
+        fs::write(
+            skills_root.join("ok-skill/SKILL.md"),
+            "---\nname: ok-skill\ndescription: x\n---\n",
+        )
+        .expect("write");
+        fs::create_dir_all(skills_root.join("bad-skill")).expect("create dir");
+        fs::write(
+            skills_root.join("bad-skill/SKILL.md"),
+            "---\ndescription: missing name field\n---\n",
+        )
+        .expect("write");
+
+        // Steering: one valid + a manifest declaring an invalid scan
+        // path (`../escape/`) that fails validate_relative_path.
+        let steering_root = plugin_root.join("steering");
+        fs::create_dir_all(&steering_root).expect("create steering dir");
+        fs::write(steering_root.join("rules.md"), b"steering body\n").expect("write");
+
+        // Agents: one valid markdown + one with bad-frontmatter
+        // (missing `---` fences entirely → ParseFailure::MissingFrontmatter).
+        let agents_root = plugin_root.join("agents");
+        fs::create_dir_all(&agents_root).expect("create agents dir");
+        fs::write(
+            agents_root.join("ok-agent.md"),
+            "---\nname: ok-agent\ndescription: x\n---\nbody",
+        )
+        .expect("write");
+        fs::write(agents_root.join("bad-agent.md"), "no frontmatter at all\n").expect("write");
+
+        // Manifest declares the bad steering scan path so the warning
+        // is surfaced via discover_steering_files_in_dirs.
+        fs::write(
+            plugin_root.join("plugin.json"),
+            r#"{"name":"alpha","steering":["./steering/","../escape/"]}"#,
+        )
+        .expect("write manifest");
+
+        let view = svc
+            .list_plugin_catalog(
+                "mp1",
+                &InstalledSkills::default(),
+                &InstalledSteering::default(),
+                &InstalledAgents::default(),
+            )
+            .expect("bulk catalog");
+
+        assert_eq!(view.plugins.len(), 1, "alpha is the only plugin");
+        let alpha = &view.plugins[0];
+
+        // Valid items still land in their category arrays.
+        assert_eq!(alpha.skills.len(), 1, "ok-skill enumerated");
+        assert_eq!(alpha.skills[0].name, "ok-skill");
+        assert_eq!(alpha.steering.len(), 1, "rules.md enumerated");
+        assert_eq!(alpha.steering[0].name, "rules.md");
+        // ok-agent.md parses; bad-agent.md falls through to the parse
+        // failure surface (no frontmatter triggers ParseFailure::
+        // MissingFrontmatter via the markdown parser pipeline).
+        assert_eq!(alpha.agents.len(), 1, "ok-agent enumerated");
+        assert_eq!(alpha.agents[0].name, "ok-agent");
+
+        // skipped_items has one entry per channel, with distinct kinds.
+        let mut kind_seen = (false, false, false); // (skill, steering, agent)
+        for item in &alpha.skipped_items {
+            match item {
+                SkippedItem::Skill(s) => {
+                    assert_eq!(s.name_hint.as_deref(), Some("bad-skill"));
+                    kind_seen.0 = true;
+                }
+                SkippedItem::SteeringDiscovery(_) => {
+                    // The bad-scan-path manifest entry produced this.
+                    kind_seen.1 = true;
+                }
+                SkippedItem::AgentParse { source_path, .. } => {
+                    assert!(
+                        source_path.ends_with("bad-agent.md"),
+                        "agent skip should reference bad-agent.md, got {source_path:?}"
+                    );
+                    kind_seen.2 = true;
+                }
+            }
+        }
+        assert!(kind_seen.0, "skill skip surfaced");
+        assert!(kind_seen.1, "steering discovery warning surfaced");
+        assert!(kind_seen.2, "agent parse failure surfaced");
+        assert_eq!(
+            alpha.skipped_items.len(),
+            3,
+            "exactly one entry per channel"
+        );
+    }
+
+    /// C13 regression fence: scan paths come from manifest's declared
+    /// list when non-empty; otherwise from `DEFAULT_*_PATHS`.
+    ///
+    /// Adversarial bug class: implementer hardcodes default
+    /// `./skills/` and ignores the manifest's `skills:` field. The
+    /// alpha fixture's missing `s1` skill (because `./custom_skills/`
+    /// is the only source) catches this.
+    #[test]
+    fn list_plugin_catalog_scan_path_resolution_matches_existing_helpers() {
+        let (dir, svc) = temp_service();
+        let entries = vec![
+            // alpha: manifest declares custom skill scan path
+            relative_path_entry("alpha", "plugins/alpha"),
+            // beta: NO manifest — falls back to DEFAULT_SKILL_PATHS = ["./skills/"]
+            relative_path_entry("beta", "plugins/beta"),
+        ];
+        let marketplace_path = seed_marketplace_with_registry(dir.path(), &svc, "mp1", &entries);
+
+        // alpha: SKILL.md ONLY under custom path; nothing under ./skills/.
+        let alpha_root = marketplace_path.join("plugins").join("alpha");
+        let s1_dir = alpha_root.join("custom_skills").join("s1");
+        fs::create_dir_all(&s1_dir).expect("create s1 dir");
+        fs::write(
+            s1_dir.join("SKILL.md"),
+            "---\nname: s1\ndescription: from custom path\n---\n",
+        )
+        .expect("write SKILL.md");
+        fs::write(
+            alpha_root.join("plugin.json"),
+            r#"{"name":"alpha","skills":["./custom_skills/"]}"#,
+        )
+        .expect("write manifest");
+
+        // beta: NO manifest, SKILL.md only under default ./skills/.
+        make_plugin_with_skills(&marketplace_path, "beta", &["s2"]);
+
+        let view = svc
+            .list_plugin_catalog(
+                "mp1",
+                &InstalledSkills::default(),
+                &InstalledSteering::default(),
+                &InstalledAgents::default(),
+            )
+            .expect("bulk catalog");
+
+        let alpha = view
+            .plugins
+            .iter()
+            .find(|p| p.plugin == "alpha")
+            .expect("alpha enumerated");
+        let beta = view
+            .plugins
+            .iter()
+            .find(|p| p.plugin == "beta")
+            .expect("beta enumerated");
+
+        assert_eq!(alpha.skills.len(), 1, "alpha discovers from custom path");
+        assert_eq!(alpha.skills[0].name, "s1");
+        assert_eq!(beta.skills.len(), 1, "beta discovers from default path");
+        assert_eq!(beta.skills[0].name, "s2");
     }
 
     // -----------------------------------------------------------------------
