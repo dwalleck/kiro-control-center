@@ -12,11 +12,14 @@ use std::path::{Path, PathBuf};
 use serde::Serialize;
 use tracing::{debug, error, warn};
 
-use crate::agent::AgentDialect;
+use crate::agent::parse_native::parse_native_kiro_agent_file;
+use crate::agent::{
+    AgentDialect, discover_agents_in_dirs, discover_native_kiro_agents_in_dirs, parse_agent_file,
+};
 use crate::error::{Error, PluginError, error_full_chain};
 use crate::marketplace::{PluginEntry, PluginSource, StructuredSource};
 use crate::plugin::{PluginManifest, discover_skill_dirs};
-use crate::project::{InstalledSkills, InstalledSteering};
+use crate::project::{InstalledAgents, InstalledSkills, InstalledSteering};
 use crate::service::MarketplaceService;
 use crate::skill::parse_frontmatter;
 use crate::steering::SteeringWarning;
@@ -246,6 +249,35 @@ pub struct PluginCatalogEntry {
 pub struct PluginSteeringResult {
     pub steering: Vec<SteeringItemInfo>,
     pub warnings: Vec<SteeringWarning>,
+}
+
+/// Per-agent parse failure, surfaced from
+/// [`MarketplaceService::list_agents_for_plugin`]. Mirrors the
+/// `SkippedItem::AgentParse` variant's wire shape so the bulk catalog
+/// can map directly without a second projection. Carries a flat
+/// `reason: String` (rendered via `error_full_chain` at the adapter
+/// boundary) per CLAUDE.md's "external errors don't cross the public
+/// API" rule — the source `AgentError` / `NativeParseFailure` types
+/// stay inside the parser modules.
+#[derive(Clone, Debug, Serialize)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
+pub struct AgentParseSkip {
+    pub plugin: String,
+    pub source_path: PathBuf,
+    pub reason: String,
+}
+
+/// Per-plugin agent enumeration result, mirroring [`PluginSkillsResult`]'s
+/// shape for the agents category. Covers both translated dialects
+/// (Claude, Copilot — markdown frontmatter) and native Kiro agents (JSON).
+/// Per-file parse failures land in [`Self::skipped`] structurally
+/// rather than vanishing into `warn!` logs; the bulk catalog folds
+/// each entry into [`SkippedItem::AgentParse`].
+#[derive(Clone, Debug, Serialize)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
+pub struct PluginAgentsResult {
+    pub agents: Vec<AgentItemInfo>,
+    pub skipped: Vec<AgentParseSkip>,
 }
 
 /// Result of the bulk per-marketplace catalog read. Plugin-level
@@ -860,6 +892,107 @@ impl MarketplaceService {
             });
         }
         Ok(PluginSteeringResult { steering, warnings })
+    }
+
+    /// List every agent declared by a single plugin, cross-referenced
+    /// with the project's installed-agents set. Covers BOTH translated
+    /// dialects (Claude/Copilot — markdown frontmatter via
+    /// [`parse_agent_file`]) AND native Kiro agents (JSON via
+    /// [`parse_native_kiro_agent_file`]).
+    ///
+    /// The join key on the marketplace side is the **parsed** agent
+    /// name (frontmatter `name` for markdown; JSON `name` field for
+    /// native), NOT the source filename. This is the load-bearing
+    /// distinction the probe surfaced — a plugin shipping
+    /// `wrong-filename.md` whose frontmatter declares `name: actual-name`
+    /// must report `installed=true` against a tracking entry for
+    /// `actual-name`. The S3 stress fixture
+    /// `list_plugin_catalog_agent_installed_flag_matches_tracking`
+    /// pins this exactly.
+    ///
+    /// Per-file parse failures (any dialect) land in
+    /// [`PluginAgentsResult::skipped`] structurally rather than vanishing
+    /// into a `warn!` log; the bulk catalog folds these into the
+    /// per-plugin [`PluginCatalogEntry::skipped_items`] union via
+    /// [`SkippedItem::AgentParse`].
+    ///
+    /// # Errors
+    ///
+    /// Same error surface as [`Self::list_skills_for_plugin`]: registry
+    /// or directory resolution failures propagate as `Err`; per-file
+    /// parse failures are collected, not propagated.
+    pub fn list_agents_for_plugin(
+        &self,
+        marketplace: &str,
+        plugin: &str,
+        installed: &InstalledAgents,
+    ) -> Result<PluginAgentsResult, Error> {
+        let marketplace_path = self.marketplace_path(marketplace);
+        let plugin_entries = self.list_plugin_entries(marketplace)?;
+        let plugin_entry = plugin_entries
+            .iter()
+            .find(|p| p.name == plugin)
+            .ok_or_else(|| {
+                Error::Plugin(PluginError::NotFound {
+                    plugin: plugin.to_owned(),
+                    marketplace: marketplace.to_owned(),
+                })
+            })?;
+        let plugin_dir = self.resolve_local_plugin_dir(plugin_entry, &marketplace_path)?;
+        let manifest = load_plugin_manifest(&plugin_dir)?;
+        let scan_paths = agent_scan_paths_for_plugin(manifest.as_ref());
+
+        let mut agents = Vec::new();
+        let mut skipped = Vec::new();
+
+        // Loop budget: O(markdown_agents_per_plugin × parse_cost).
+        // Production scale ≤10 markdown agents per plugin; per-agent
+        // parse ≤5ms (frontmatter YAML).
+        for path in discover_agents_in_dirs(&plugin_dir, &scan_paths) {
+            match parse_agent_file(&path) {
+                Ok(def) => agents.push(AgentItemInfo {
+                    name: def.name.as_str().to_owned(),
+                    description: def.description,
+                    plugin: plugin.to_owned(),
+                    marketplace: marketplace.to_owned(),
+                    installed: installed.agents.contains_key(def.name.as_str()),
+                    dialect: def.dialect,
+                }),
+                Err(e) => skipped.push(AgentParseSkip {
+                    plugin: plugin.to_owned(),
+                    source_path: path,
+                    reason: error_full_chain(&e),
+                }),
+            }
+        }
+
+        // Loop budget: O(native_agents_per_plugin × parse_cost). Same
+        // production scale as the markdown loop above; native parse
+        // additionally validates JSON shape + size cap.
+        for discovered in discover_native_kiro_agents_in_dirs(&plugin_dir, &scan_paths) {
+            match parse_native_kiro_agent_file(&discovered.source, &discovered.scan_root) {
+                Ok(bundle) => agents.push(AgentItemInfo {
+                    name: bundle.name.as_str().to_owned(),
+                    // NativeAgentBundle has no description field — native
+                    // agents declare metadata in the `description` JSON
+                    // field but the parser doesn't surface it (the
+                    // install layer doesn't need it). UI gets None for
+                    // native agents until the parser is widened.
+                    description: None,
+                    plugin: plugin.to_owned(),
+                    marketplace: marketplace.to_owned(),
+                    installed: installed.agents.contains_key(bundle.name.as_str()),
+                    dialect: AgentDialect::Native,
+                }),
+                Err(e) => skipped.push(AgentParseSkip {
+                    plugin: plugin.to_owned(),
+                    source_path: discovered.source,
+                    reason: error_full_chain(&e),
+                }),
+            }
+        }
+
+        Ok(PluginAgentsResult { agents, skipped })
     }
 
     /// Count skills for a single plugin entry without loading skill bodies.
@@ -2244,6 +2377,137 @@ mod tests {
             by_name.get("règles.md"),
             Some(&true),
             "non-ASCII filename joined losslessly against tracking"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // list_agents_for_plugin (S3 of BrowseTab redesign — C5 regression fence)
+    // -----------------------------------------------------------------------
+
+    /// Build a plugin's `agents/` dir with a markdown agent declaring
+    /// the given frontmatter `name` (which intentionally may differ
+    /// from the file basename — that's the bug class the S3 stress
+    /// fixture targets).
+    fn make_plugin_with_markdown_agent(
+        root: &std::path::Path,
+        plugin_name: &str,
+        filename: &str,
+        frontmatter_name: &str,
+    ) {
+        let agents_root = root.join("plugins").join(plugin_name).join("agents");
+        fs::create_dir_all(&agents_root).expect("create agents dir");
+        let body = format!("---\nname: {frontmatter_name}\ndescription: test agent\n---\nbody");
+        fs::write(agents_root.join(filename), body).expect("write agent md");
+    }
+
+    /// Build a plugin's `agents/` dir with a native (JSON) agent. The
+    /// JSON declares the given `name`; the filename is independent (the
+    /// install layer keys on the parsed name, not the basename).
+    fn make_plugin_with_native_agent(
+        root: &std::path::Path,
+        plugin_name: &str,
+        filename: &str,
+        json_name: &str,
+    ) {
+        let agents_root = root.join("plugins").join(plugin_name).join("agents");
+        fs::create_dir_all(&agents_root).expect("create agents dir");
+        let body = format!(r#"{{"name":"{json_name}"}}"#);
+        fs::write(agents_root.join(filename), body).expect("write agent json");
+    }
+
+    /// Build an `InstalledAgents` with the given names, all attributed
+    /// to the same (plugin, marketplace). The `HashMap` key is the
+    /// agent's parsed name.
+    fn installed_agents_with(names: &[&str], plugin: &str, marketplace: &str) -> InstalledAgents {
+        use std::collections::HashMap;
+
+        use chrono::Utc;
+
+        use crate::project::InstalledAgentMeta;
+        use crate::service::test_support::{mp, pn};
+
+        let mut agents = HashMap::new();
+        for name in names {
+            agents.insert(
+                (*name).to_owned(),
+                InstalledAgentMeta {
+                    marketplace: mp(marketplace),
+                    plugin: pn(plugin),
+                    version: None,
+                    installed_at: Utc::now(),
+                    dialect: AgentDialect::Claude,
+                    source_path: crate::validation::RelativePath::new(format!("agents/{name}.md"))
+                        .expect("valid"),
+                    source_hash: crate::hash::BlakeHash::placeholder(),
+                    installed_hash: crate::hash::BlakeHash::placeholder(),
+                },
+            );
+        }
+        InstalledAgents {
+            agents,
+            native_companions: HashMap::new(),
+        }
+    }
+
+    /// C5 regression fence: per-agent `installed` flag is the membership
+    /// of the **parsed** agent name in `installed.agents`, NOT the source
+    /// filename. The adversarial fixture is the load-bearing one: file
+    /// `wrong-filename.md` declares `name: actual-name` in its
+    /// frontmatter. The naive bug — joining on filename — would silently
+    /// pass on a happy-path fixture (where filename and name coincide,
+    /// like `reviewer.md` declaring `name: reviewer`) and fail here:
+    ///
+    /// - tracking has `actual-name` → must report `installed=true`
+    /// - tracking has NO `wrong-filename` → naive bug would report `false`
+    ///
+    /// Also covers the native dialect: `helper.json` with JSON
+    /// `name: helper-actual`, tracked under `helper-actual`.
+    #[test]
+    fn list_plugin_catalog_agent_installed_flag_matches_tracking() {
+        let (dir, svc) = temp_service();
+        let entries = vec![relative_path_entry("alpha", "plugins/alpha")];
+        let marketplace_path = seed_marketplace_with_registry(dir.path(), &svc, "mp1", &entries);
+        // Markdown agent: filename and frontmatter name DIFFER.
+        make_plugin_with_markdown_agent(
+            &marketplace_path,
+            "alpha",
+            "wrong-filename.md",
+            "actual-name",
+        );
+        // Native agent: filename and JSON name also DIFFER.
+        make_plugin_with_native_agent(&marketplace_path, "alpha", "helper.json", "helper-actual");
+
+        let installed = installed_agents_with(&["actual-name"], "alpha", "mp1");
+        let result = svc
+            .list_agents_for_plugin("mp1", "alpha", &installed)
+            .expect("happy path");
+
+        assert!(result.skipped.is_empty(), "no parse failures expected");
+        assert_eq!(result.agents.len(), 2, "both dialects enumerated");
+
+        let by_name: std::collections::HashMap<&str, (bool, AgentDialect)> = result
+            .agents
+            .iter()
+            .map(|a| (a.name.as_str(), (a.installed, a.dialect)))
+            .collect();
+
+        assert_eq!(
+            by_name.get("actual-name"),
+            Some(&(true, AgentDialect::Claude)),
+            "markdown agent joined on PARSED name (not filename), reports installed"
+        );
+        assert_eq!(
+            by_name.get("helper-actual"),
+            Some(&(false, AgentDialect::Native)),
+            "native agent joined on PARSED name; not in tracking → not installed"
+        );
+        assert!(
+            !by_name.contains_key("wrong-filename"),
+            "filename MUST NOT appear as the join key (bug class: implementer joined on basename)"
+        );
+        assert!(
+            !by_name.contains_key("helper"),
+            "native filename stem MUST NOT appear as the join key either"
         );
     }
 
