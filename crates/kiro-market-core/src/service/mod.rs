@@ -3296,6 +3296,26 @@ mod tests {
         assert!(s.contains("name"));
     }
 
+    /// `InstallFilter::Names(&[one])` and `InstallFilter::SingleName(one)`
+    /// must behave identically for the same name. Both arms feed the
+    /// install loop and the unmatched-name surface pass, so a divergence
+    /// would mean a CLI caller using `SingleName` sees a different
+    /// outcome from a drawer caller using a one-element `Names`.
+    #[rstest::rstest]
+    #[case::matches_via_names("alpha", &InstallFilter::Names(&["alpha".to_owned()]), true)]
+    #[case::matches_via_single("alpha", &InstallFilter::SingleName("alpha"), true)]
+    #[case::misses_via_names("alpha", &InstallFilter::Names(&["beta".to_owned()]), false)]
+    #[case::misses_via_single("alpha", &InstallFilter::SingleName("beta"), false)]
+    #[case::all_matches_any("alpha", &InstallFilter::All, true)]
+    #[case::empty_names_matches_nothing("alpha", &InstallFilter::Names(&[]), false)]
+    fn filter_matches_names_single_equivalence(
+        #[case] name: &str,
+        #[case] filter: &InstallFilter<'_>,
+        #[case] expected: bool,
+    ) {
+        assert_eq!(super::filter_matches(filter, name), expected);
+    }
+
     /// Wire-format lock for `InstallWarning`. The `ffi-enum-serde-tag`
     /// plan-lint gate enforces that pub `Serialize + specta::Type` enums
     /// with payload-bearing variants carry an explicit
