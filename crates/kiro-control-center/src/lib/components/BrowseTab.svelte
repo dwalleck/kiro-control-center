@@ -151,6 +151,54 @@
     );
   });
 
+  // Detects the install-time cross-plugin ownership-conflict failure
+  // class. The Rust side surfaces these as
+  // SteeringError::PathOwnedByOtherPlugin and the analogous agent /
+  // companion-bundle variants, all of which carry the suffix
+  // "pass --force to transfer ownership" in the rendered Display
+  // (stable thiserror impls). When this fires, the user's only path
+  // forward is the existing forceInstall toggle — without the hint
+  // below they'd see the failures and have no idea where to act.
+  // String-matching the rendered error is brittle in the abstract but
+  // safe here: these error strings have stable Display impls per
+  // CLAUDE.md's structural-error rule, and the substring is specific
+  // enough that an unrelated "force" mention can't false-positive.
+  function failureMentionsOwnership(s: string): boolean {
+    return s.includes("--force to transfer");
+  }
+  let installResultHasOwnershipConflict = $derived.by(() => {
+    if (installResult === null) return false;
+    for (const f of installResult.skills.failed) {
+      if (failureMentionsOwnership(f.error)) return true;
+    }
+    for (const f of installResult.steering.failed) {
+      if (failureMentionsOwnership(f.error)) return true;
+    }
+    for (const f of installResult.agents.failed) {
+      // FailedAgent variants either carry an `error: string` field
+      // (agent / unparseable_agent / companion_bundle) or no error
+      // (requested_but_not_found). The ownership-conflict variants
+      // are all in the error-bearing set, so missing-error variants
+      // can't trigger this signal.
+      switch (f.kind) {
+        case "agent":
+        case "unparseable_agent":
+        case "companion_bundle":
+          if (failureMentionsOwnership(f.error)) return true;
+          break;
+        case "requested_but_not_found":
+          break;
+        default: {
+          const _exhaustive: never = f;
+          throw new Error(
+            `unhandled FailedAgent variant: ${JSON.stringify(_exhaustive)}`,
+          );
+        }
+      }
+    }
+    return false;
+  });
+
   // Slice 4: customize-drawer host. Holds the entry whose drawer is
   // open, or null when closed. The drawer derives selectedSkills from
   // the entry's per-item flags at mount, so a fresh-from-cache entry
@@ -1303,31 +1351,66 @@
           ? 'bg-kiro-warning/10 border border-kiro-warning/30 text-kiro-warning'
           : 'bg-kiro-error/10 border border-kiro-error/30 text-kiro-error'}"
     >
-      <details
-        class="flex-1"
-        open
-      >
-        <summary class="cursor-pointer text-xs opacity-85">
-          Show failures
-        </summary>
-        <div class="mt-2 pl-3 border-l-2 border-current/40 text-xs space-y-1">
-          <!-- Index keys throughout: FailedSkill.name and FailedSteeringFile.source
-               are not structurally unique on the Rust side (service/mod.rs can push
-               duplicate FailedSkill::RequestedButNotFound when a Names(_) filter
-               contains the same name twice), and FailedAgent variants don't share a
-               single identity field. Svelte's {#each} silently dedupes on key
-               collision — index keys eliminate that drop risk. -->
-          {#each installResult.skills.failed as f, i (i)}
-            <div><b>Skill failed:</b> {formatFailedSkill(f)}</div>
-          {/each}
-          {#each installResult.steering.failed as f, i (i)}
-            <div><b>Steering failed:</b> {formatFailedSteeringFile(f)}</div>
-          {/each}
-          {#each installResult.agents.failed as f, i (i)}
-            <div><b>Agent failed:</b> {formatFailedAgent(f)}</div>
-          {/each}
-        </div>
-      </details>
+      <div class="flex-1 min-w-0">
+        {#if installResultHasOwnershipConflict}
+          <!--
+            Cross-plugin ownership-conflict hint. These failures fire
+            when the install path detects items already owned by a
+            DIFFERENT plugin in the project (typical: installing v2
+            of a plugin where v1 already owns the same agent / steering
+            file / companion bundle). The remediation is the existing
+            `forceInstall` toggle, but it lives at the bottom of the
+            page with no visual link to the failure panel. The button
+            below just flips the toggle; the user still consciously
+            re-clicks Install (no auto-retry) so the ownership-transfer
+            decision stays explicit.
+          -->
+          <div class="mb-2 px-2 py-1.5 rounded bg-current/10 text-xs leading-relaxed">
+            <strong>Some items belong to another plugin</strong> — likely a
+            previous version installed under a different plugin name. To
+            transfer ownership to this plugin, enable
+            <strong>Force reinstall</strong> and click
+            <strong>Install all</strong> again.
+            {#if !forceInstall}
+              <button
+                type="button"
+                onclick={() => (forceInstall = true)}
+                class="ml-1 underline cursor-pointer hover:opacity-100 opacity-90 bg-transparent border-none p-0 text-current text-xs"
+              >
+                Enable Force Reinstall now
+              </button>
+            {:else}
+              <span class="ml-1 italic opacity-90">
+                (Force Reinstall is on — click Install all again.)
+              </span>
+            {/if}
+          </div>
+        {/if}
+        <details
+          open
+        >
+          <summary class="cursor-pointer text-xs opacity-85">
+            Show failures
+          </summary>
+          <div class="mt-2 pl-3 border-l-2 border-current/40 text-xs space-y-1">
+            <!-- Index keys throughout: FailedSkill.name and FailedSteeringFile.source
+                 are not structurally unique on the Rust side (service/mod.rs can push
+                 duplicate FailedSkill::RequestedButNotFound when a Names(_) filter
+                 contains the same name twice), and FailedAgent variants don't share a
+                 single identity field. Svelte's {#each} silently dedupes on key
+                 collision — index keys eliminate that drop risk. -->
+            {#each installResult.skills.failed as f, i (i)}
+              <div><b>Skill failed:</b> {formatFailedSkill(f)}</div>
+            {/each}
+            {#each installResult.steering.failed as f, i (i)}
+              <div><b>Steering failed:</b> {formatFailedSteeringFile(f)}</div>
+            {/each}
+            {#each installResult.agents.failed as f, i (i)}
+              <div><b>Agent failed:</b> {formatFailedAgent(f)}</div>
+            {/each}
+          </div>
+        </details>
+      </div>
       <button
         type="button"
         onclick={() => { installResult = null; installResultPlugin = null; }}
