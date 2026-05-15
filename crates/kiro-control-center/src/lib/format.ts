@@ -313,6 +313,15 @@ export function formatSkippedItemsForPlugin(items: readonly SkippedItem[]): stri
   return parts.join(" | ");
 }
 
+// Value-position exhaustiveness assert mirroring _FAILED_AGENT_KINDS above.
+// The `satisfies` catches arm-shape changes; `Exclude<...> extends never`
+// catches arm additions; the value-position `const _assert: T = true` is
+// what makes the guard active — an unused type alias resolving to `never`
+// is valid TS, so without the value-assignment the tripwire is dead.
+const _SKIPPED_ITEM_KINDS = ["skill", "steering_discovery", "agent_parse"] as const satisfies readonly SkippedItem["kind"][];
+type _AssertSkippedItemKindExhaustive = Exclude<SkippedItem["kind"], (typeof _SKIPPED_ITEM_KINDS)[number]> extends never ? true : never;
+const _assertSkippedItemKindExhaustive: _AssertSkippedItemKindExhaustive = true;
+
 export type FormattedInstallPluginResult = {
   summary: string;
   warnings: string | null;

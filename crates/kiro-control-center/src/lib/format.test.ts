@@ -9,6 +9,7 @@ import type {
   MarketplaceName,
   PluginName,
   RemovePluginResult,
+  SkippedItem,
   SkippedSkill,
 } from "$lib/bindings";
 import {
@@ -17,6 +18,7 @@ import {
   formatFailedSteeringFile,
   formatInstallPluginResult,
   formatRemovePluginResult,
+  formatSkippedItemsForPlugin,
   formatSkippedSkillsForPlugin,
 } from "./format";
 
@@ -372,6 +374,17 @@ describe("formatFailedAgent", () => {
     );
   });
 
+  it("requested_but_not_found variant: composes 'agent X not found in plugin Y'", () => {
+    const f: FailedAgent = {
+      kind: "requested_but_not_found",
+      name: "ghost-agent" as AgentName,
+      plugin: "demo-plugin" as PluginName,
+    };
+    expect(formatFailedAgent(f)).toBe(
+      "agent 'ghost-agent' not found in plugin 'demo-plugin'",
+    );
+  });
+
   it("assertNever path: throws for unknown kind", () => {
     // Double-cast through `unknown` to inject an invalid runtime variant —
     // the ts-expect-error directive does not fire on double-casts (valid TS
@@ -379,5 +392,116 @@ describe("formatFailedAgent", () => {
     // Same approach as formatFailedSkill's assertNever test above.
     const f = { kind: "future_variant", error: "x" } as unknown as FailedAgent;
     expect(() => formatFailedAgent(f)).toThrow();
+  });
+});
+
+describe("formatSkippedItemsForPlugin", () => {
+  function skillItem(name: string): SkippedItem {
+    return {
+      kind: "skill",
+      skill: {
+        plugin: "p",
+        name_hint: name,
+        path: `/p/${name}/SKILL.md`,
+        reason: { kind: "frontmatter_invalid", reason: "missing name field" },
+      },
+    };
+  }
+  function steeringItem(path: string): SkippedItem {
+    return {
+      kind: "steering_discovery",
+      warning: { kind: "scan_path_invalid", path, reason: "not absolute" },
+    };
+  }
+  function agentItem(source: string, reason: string): SkippedItem {
+    return {
+      kind: "agent_parse",
+      plugin: "p",
+      source_path: source,
+      reason,
+    };
+  }
+
+  it("empty list: returns empty string (no parts joined)", () => {
+    expect(formatSkippedItemsForPlugin([])).toBe("");
+  });
+
+  it("skill-only bucket: routes through formatSkippedSkillsForPlugin", () => {
+    const out = formatSkippedItemsForPlugin([skillItem("a"), skillItem("b")]);
+    expect(out).toBe(
+      "2 skill(s) failed to load — " +
+        "a: malformed frontmatter: missing name field; " +
+        "b: malformed frontmatter: missing name field",
+    );
+  });
+
+  it("steering-only bucket under cap: lists detail, no overflow", () => {
+    const out = formatSkippedItemsForPlugin([
+      steeringItem("/a"),
+      steeringItem("/b"),
+    ]);
+    expect(out).toBe(
+      "2 steering warning(s) — " +
+        "invalid scan path '/a': not absolute; " +
+        "invalid scan path '/b': not absolute",
+    );
+  });
+
+  it("steering bucket over cap (4 entries, MAX=3): '+1 more' suffix", () => {
+    const out = formatSkippedItemsForPlugin([
+      steeringItem("/a"),
+      steeringItem("/b"),
+      steeringItem("/c"),
+      steeringItem("/d"),
+    ]);
+    expect(out.startsWith("4 steering warning(s) — ")).toBe(true);
+    expect(out.endsWith("; +1 more")).toBe(true);
+    expect(out).toContain("'/c'");
+    expect(out).not.toContain("'/d'");
+  });
+
+  it("agent-only bucket: source_path: reason joined by '; '", () => {
+    const out = formatSkippedItemsForPlugin([
+      agentItem("/agents/a.md", "missing frontmatter"),
+      agentItem("/agents/b.json", "invalid JSON"),
+    ]);
+    expect(out).toBe(
+      "2 agent(s) failed to parse — " +
+        "/agents/a.md: missing frontmatter; " +
+        "/agents/b.json: invalid JSON",
+    );
+  });
+
+  it("agent bucket over cap (4 entries, MAX=3): '+1 more' suffix", () => {
+    const out = formatSkippedItemsForPlugin([
+      agentItem("/a.md", "r1"),
+      agentItem("/b.md", "r2"),
+      agentItem("/c.md", "r3"),
+      agentItem("/d.md", "r4"),
+    ]);
+    expect(out.startsWith("4 agent(s) failed to parse — ")).toBe(true);
+    expect(out.endsWith("; +1 more")).toBe(true);
+    expect(out).toContain("/c.md: r3");
+    expect(out).not.toContain("/d.md: r4");
+  });
+
+  it("mixed buckets: skills | steering | agents joined by ' | ' in that order", () => {
+    const out = formatSkippedItemsForPlugin([
+      skillItem("a"),
+      steeringItem("/bad"),
+      agentItem("/agents/x.md", "boom"),
+    ]);
+    expect(out).toBe(
+      "1 skill(s) failed to load — a: malformed frontmatter: missing name field" +
+        " | " +
+        "1 steering warning(s) — invalid scan path '/bad': not absolute" +
+        " | " +
+        "1 agent(s) failed to parse — /agents/x.md: boom",
+    );
+  });
+
+  it("assertNever path: throws for unknown kind", () => {
+    const bad = { kind: "future_variant" } as unknown as SkippedItem;
+    expect(() => formatSkippedItemsForPlugin([bad])).toThrow();
   });
 });
