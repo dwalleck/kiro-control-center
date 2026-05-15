@@ -2,6 +2,12 @@
   import { untrack } from "svelte";
   import { SvelteSet } from "svelte/reactivity";
   import type { PluginCatalogEntryView } from "$lib/bindings";
+  import {
+    deriveDiff,
+    deriveSectionState,
+    pluralize,
+    type SectionToggleState,
+  } from "$lib/drawer-diff";
 
   /// Diff payload emitted to the BrowseTab apply handler. Per-category
   /// install/remove name lists. Skills join on frontmatter name (catalog
@@ -53,18 +59,6 @@
     untrack(() => entry.agents.filter((a) => a.installed).map((a) => a.name)),
   );
 
-  type SectionToggleState = "empty" | "none" | "partial" | "all";
-
-  function deriveSectionState(
-    items: readonly { name: string }[],
-    selected: SvelteSet<string>,
-  ): SectionToggleState {
-    if (items.length === 0) return "empty";
-    if (selected.size === 0) return "none";
-    if (selected.size === items.length) return "all";
-    return "partial";
-  }
-
   function toggleItem(set: SvelteSet<string>, name: string) {
     if (set.has(name)) set.delete(name);
     else set.add(name);
@@ -93,24 +87,6 @@
     deriveSectionState(entry.agents, selectedAgents),
   );
 
-  // Diff vs the original (initial) installed state. Computed per-
-  // category from each entry's `installed` flags, NOT from a snapshot
-  // of selectedX at mount — those agree at mount and would diverge
-  // pointlessly if the catalog updated underneath the drawer.
-  function deriveDiff(
-    items: readonly { name: string; installed: boolean }[],
-    selected: SvelteSet<string>,
-  ): { install: string[]; remove: string[] } {
-    const install: string[] = [];
-    const remove: string[] = [];
-    for (const i of items) {
-      const willBeChecked = selected.has(i.name);
-      if (willBeChecked && !i.installed) install.push(i.name);
-      if (!willBeChecked && i.installed) remove.push(i.name);
-    }
-    return { install, remove };
-  }
-
   const diff = $derived.by(() => ({
     skills: deriveDiff(entry.skills, selectedSkills),
     steering: deriveDiff(entry.steering, selectedSteering),
@@ -125,13 +101,6 @@
       && diff.agents.install.length === 0
       && diff.agents.remove.length === 0,
   );
-
-  // Compose the human summary. Pluralizes per-category nouns and
-  // omits zero-count categories so a steering-only diff doesn't
-  // read "install 0 skills, install 1 steering, install 0 agents."
-  function pluralize(n: number, singular: string, plural: string): string {
-    return n === 1 ? singular : plural;
-  }
 
   const summary = $derived.by(() => {
     if (noChanges) return "No changes to apply.";
