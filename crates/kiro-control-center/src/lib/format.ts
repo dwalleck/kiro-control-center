@@ -208,6 +208,11 @@ export function formatFailedAgent(entry: FailedAgent): string {
       return `${entry.source_path} (unparseable) — ${entry.error}`;
     case "companion_bundle":
       return `${entry.plugin} bundle [${entry.conflicts.join(", ") || "no enumeration"}] — ${entry.error}`;
+    case "requested_but_not_found":
+      // No file was attempted — the request itself failed (typo or
+      // stale catalog reference). Compose the user-facing string
+      // from name + plugin since there's no underlying AgentError.
+      return `agent '${entry.name}' not found in plugin '${entry.plugin}'`;
     default: {
       const _exhaustive: never = entry;
       throw new Error(
@@ -218,7 +223,7 @@ export function formatFailedAgent(entry: FailedAgent): string {
 }
 
 // Value-position exhaustiveness asserts; see _PLUGIN_ACTION_VALUES at stores/plugin-updates.ts:135-137.
-const _FAILED_AGENT_KINDS = ["agent", "unparseable_agent", "companion_bundle"] as const satisfies readonly FailedAgent["kind"][];
+const _FAILED_AGENT_KINDS = ["agent", "unparseable_agent", "companion_bundle", "requested_but_not_found"] as const satisfies readonly FailedAgent["kind"][];
 type _AssertFailedAgentKindExhaustive = Exclude<FailedAgent["kind"], (typeof _FAILED_AGENT_KINDS)[number]> extends never ? true : never;
 const _assertFailedAgentKindExhaustive: _AssertFailedAgentKindExhaustive = true;
 

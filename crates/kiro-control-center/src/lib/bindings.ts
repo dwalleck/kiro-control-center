@@ -421,7 +421,21 @@ export type FailedAgent_Deserialize =
  *  or 1 (orphan / cross-plugin). Forward-compatible with future
  *  "collect all conflicts" engine work without another wire migration.
  */
-{ kind: "companion_bundle"; plugin: PluginName; conflicts: string[]; error: string };
+{ kind: "companion_bundle"; plugin: PluginName; conflicts: string[]; error: string } | 
+/**
+ *  A name passed in `InstallFilter::Names` did not match any
+ *  discovered + parsed agent. Surfaces typos and stale references
+ *  (e.g., a drawer apply against a catalog snapshot taken before
+ *  the user removed an agent out-of-band) instead of silently
+ *  no-op'ing them. Mirrors `FailedSkill::RequestedButNotFound`
+ *  and `SteeringError::RequestedButNotFound`.
+ * 
+ *  No typed `AgentError` payload because no file was attempted —
+ *  the request itself is what failed. The error() accessor returns
+ *  None for this variant; renderers that need a string compose one
+ *  from `name` + `plugin`.
+ */
+{ kind: "requested_but_not_found"; name: AgentName; plugin: PluginName };
 
 /**
  *  A failure entry for one element of an agent install batch.
@@ -470,7 +484,21 @@ export type FailedAgent_Serialize =
  *  or 1 (orphan / cross-plugin). Forward-compatible with future
  *  "collect all conflicts" engine work without another wire migration.
  */
-{ kind: "companion_bundle"; plugin: PluginName; conflicts: string[]; error: string };
+{ kind: "companion_bundle"; plugin: PluginName; conflicts: string[]; error: string } | 
+/**
+ *  A name passed in `InstallFilter::Names` did not match any
+ *  discovered + parsed agent. Surfaces typos and stale references
+ *  (e.g., a drawer apply against a catalog snapshot taken before
+ *  the user removed an agent out-of-band) instead of silently
+ *  no-op'ing them. Mirrors `FailedSkill::RequestedButNotFound`
+ *  and `SteeringError::RequestedButNotFound`.
+ * 
+ *  No typed `AgentError` payload because no file was attempted —
+ *  the request itself is what failed. The error() accessor returns
+ *  None for this variant; renderers that need a string compose one
+ *  from `name` + `plugin`.
+ */
+{ kind: "requested_but_not_found"; name: AgentName; plugin: PluginName };
 
 /**
  *  A skill that failed to install, with the reason.

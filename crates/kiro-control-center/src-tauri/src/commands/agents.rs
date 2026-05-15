@@ -15,7 +15,7 @@
 
 use kiro_market_core::project::KiroProject;
 use kiro_market_core::service::{
-    AgentInstallContext, InstallAgentsResult, InstallMode, MarketplaceService,
+    AgentInstallContext, InstallAgentsResult, InstallFilter, InstallMode, MarketplaceService,
 };
 use kiro_market_core::validation::{MarketplaceName, PluginName};
 
@@ -71,6 +71,7 @@ fn install_plugin_agents_impl(
         &ctx.plugin_dir,
         &ctx.agent_scan_paths,
         ctx.format,
+        &InstallFilter::All,
         AgentInstallContext {
             mode,
             accept_mcp,

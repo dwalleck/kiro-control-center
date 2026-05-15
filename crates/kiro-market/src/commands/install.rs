@@ -218,7 +218,14 @@ fn run_agent_install(
     if skill_filter.is_some() {
         return InstallAgentsResult::default();
     }
-    MarketplaceService::install_plugin_agents(project, plugin_dir, agent_scan_paths, format, ctx)
+    MarketplaceService::install_plugin_agents(
+        project,
+        plugin_dir,
+        agent_scan_paths,
+        format,
+        &InstallFilter::All,
+        ctx,
+    )
 }
 
 fn run_steering_install(
@@ -413,13 +420,18 @@ fn print_agent_outcome(result: &InstallAgentsResult) {
             }
             // `FailedAgent` is `#[non_exhaustive]`. A future variant
             // shouldn't panic — render the chain-preserved error string
-            // via the common `error()` accessor so the user gets the
-            // actionable payload even when this CLI hasn't yet learned
-            // to render the new variant's per-variant context.
-            other => eprintln!(
-                "  {prefix} Agent install failed: {}",
-                kiro_market_core::error::error_full_chain(other.error()),
-            ),
+            // via the common `error()` accessor when one is available
+            // (variants like `RequestedButNotFound` carry no underlying
+            // AgentError because no install was attempted; for those
+            // we render the variant's Debug shape, which still surfaces
+            // the actionable payload via thiserror Display impls).
+            other => match other.error() {
+                Some(err) => eprintln!(
+                    "  {prefix} Agent install failed: {}",
+                    kiro_market_core::error::error_full_chain(err),
+                ),
+                None => eprintln!("  {prefix} Agent install failed: {other:?}"),
+            },
         }
     }
     for w in &result.warnings {

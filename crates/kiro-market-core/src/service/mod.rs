@@ -703,24 +703,40 @@ pub enum FailedAgent {
         #[cfg_attr(feature = "specta", specta(type = String))]
         error: crate::error::AgentError,
     },
+    /// A name passed in `InstallFilter::Names` did not match any
+    /// discovered + parsed agent. Surfaces typos and stale references
+    /// (e.g., a drawer apply against a catalog snapshot taken before
+    /// the user removed an agent out-of-band) instead of silently
+    /// no-op'ing them. Mirrors `FailedSkill::RequestedButNotFound`
+    /// and `SteeringError::RequestedButNotFound`.
+    ///
+    /// No typed `AgentError` payload because no file was attempted —
+    /// the request itself is what failed. The `error()` accessor returns
+    /// None for this variant; renderers that need a string compose one
+    /// from `name` + `plugin`.
+    RequestedButNotFound {
+        name: crate::validation::AgentName,
+        plugin: crate::validation::PluginName,
+    },
 }
 
 impl FailedAgent {
-    /// Borrow the typed `AgentError` that every variant carries.
+    /// Borrow the typed `AgentError` for variants that carry one.
     ///
-    /// Common-payload accessor so a `#[non_exhaustive]` consumer fallback
-    /// (`other => …`) can render the chain-preserved error string instead
-    /// of dropping it. The match is exhaustive over the variant set —
-    /// adding a future variant without an `error: AgentError` field is
-    /// then a compile error here, which is the right forcing function:
-    /// the wire-format contract is "every failure record carries a typed
-    /// error", and we want the type system to enforce that.
+    /// `RequestedButNotFound` returns `None` because no install was
+    /// attempted — the request itself failed before any file work, so
+    /// there's no underlying `AgentError` to render. Renderers should
+    /// compose the user-facing string from the variant's name/plugin
+    /// fields directly. The match is exhaustive over the variant set;
+    /// a future variant must explicitly land in this accessor's
+    /// match arms.
     #[must_use]
-    pub fn error(&self) -> &crate::error::AgentError {
+    pub fn error(&self) -> Option<&crate::error::AgentError> {
         match self {
             FailedAgent::Agent { error, .. }
             | FailedAgent::UnparseableAgent { error, .. }
-            | FailedAgent::CompanionBundle { error, .. } => error,
+            | FailedAgent::CompanionBundle { error, .. } => Some(error),
+            FailedAgent::RequestedButNotFound { .. } => None,
         }
     }
 }
@@ -1621,18 +1637,25 @@ impl MarketplaceService {
         plugin_dir: &Path,
         scan_paths: &[String],
         format: crate::plugin::PluginFormat,
+        filter: &InstallFilter<'_>,
         ctx: AgentInstallContext<'_>,
     ) -> InstallAgentsResult {
         // I8: exhaustive match on the explicit `Translated` variant
         // (vs. `Option<PluginFormat>::None`) so a future variant
         // (e.g. `Cursor`) forces a compile-time decision here instead
         // of silently routing through the translated path.
+        //
+        // Per-format filter semantics: the filter narrows which DISCOVERED
+        // agents get installed; both inner paths apply it after parse +
+        // before per-agent install. Names not matched at the end surface
+        // as `FailedAgent::RequestedButNotFound`. `InstallFilter::All`
+        // preserves today's whole-plugin behavior.
         match format {
-            crate::plugin::PluginFormat::KiroCli => {
-                Self::install_native_kiro_cli_agents_inner(project, plugin_dir, scan_paths, ctx)
-            }
+            crate::plugin::PluginFormat::KiroCli => Self::install_native_kiro_cli_agents_inner(
+                project, plugin_dir, scan_paths, filter, ctx,
+            ),
             crate::plugin::PluginFormat::Translated => {
-                Self::install_translated_agents_inner(project, plugin_dir, scan_paths, ctx)
+                Self::install_translated_agents_inner(project, plugin_dir, scan_paths, filter, ctx)
             }
         }
     }
@@ -1789,10 +1812,19 @@ impl MarketplaceService {
         project: &crate::project::KiroProject,
         plugin_dir: &Path,
         scan_paths: &[String],
+        filter: &InstallFilter<'_>,
         ctx: AgentInstallContext<'_>,
     ) -> InstallAgentsResult {
         let files = crate::agent::discover::discover_agents_in_dirs(plugin_dir, scan_paths);
         let mut result = InstallAgentsResult::default();
+
+        // Track parsed names for the unmatched-Names pass below. The
+        // join key is the parsed agent name (mirrors the catalog's join
+        // key — see slice 1's S3), NOT the source filename, so this
+        // works for the canonical adversarial fixture (file
+        // `wrong-filename.md` declaring `name: actual-name`).
+        let mut processed: std::collections::HashSet<String> =
+            std::collections::HashSet::with_capacity(files.len());
 
         for path in files {
             let def = match crate::agent::parse_agent_file(&path) {
@@ -1826,6 +1858,15 @@ impl MarketplaceService {
                     continue;
                 }
             };
+
+            // Filter by parsed name. Skip non-matching agents BEFORE
+            // the MCP gate / install attempt — the user explicitly
+            // didn't ask for this one, so even a failed install
+            // shouldn't surface in the result.
+            if !filter_matches(filter, def.name.as_str()) {
+                continue;
+            }
+            processed.insert(def.name.as_str().to_owned());
 
             // MCP opt-in gate (see translated_agent_blocked_by_mcp_gate).
             if translated_agent_blocked_by_mcp_gate(&def, ctx.accept_mcp, &mut result) {
@@ -1907,6 +1948,14 @@ impl MarketplaceService {
             }
         }
 
+        // Surface unmatched names (typos / stale references) so a
+        // drawer apply against a stale catalog doesn't silently
+        // no-op them. Mirrors install_skills's matching block. Only
+        // names that pass AgentName::new are surfaced — invalid
+        // names never reach the drawer's diff because the catalog's
+        // per-item flags went through AgentName::new at parse time.
+        surface_unmatched_agent_names(filter, &processed, ctx.plugin, &mut result);
+
         result
     }
 
@@ -1928,6 +1977,7 @@ impl MarketplaceService {
         project: &crate::project::KiroProject,
         plugin_dir: &Path,
         scan_paths: &[String],
+        filter: &InstallFilter<'_>,
         ctx: AgentInstallContext<'_>,
     ) -> InstallAgentsResult {
         let mut result = InstallAgentsResult::default();
@@ -1954,11 +2004,26 @@ impl MarketplaceService {
             return result;
         }
 
+        // Track names actually attempted so the unmatched-Names pass
+        // below surfaces typos / stale references. `install_one_native_agent`
+        // returns `Some(parsed_name)` when an install was attempted (filter
+        // matched), `None` when it was filtered out or unparseable.
+        let mut processed: std::collections::HashSet<String> =
+            std::collections::HashSet::with_capacity(agent_files.len());
         for f in &agent_files {
-            Self::install_one_native_agent(project, plugin_dir, f, ctx, &mut result);
+            if let Some(name) =
+                Self::install_one_native_agent(project, plugin_dir, f, filter, ctx, &mut result)
+            {
+                processed.insert(name);
+            }
         }
 
-        if !companion_files.is_empty() {
+        // Companion bundle is plugin-scoped, not per-agent. Skip it
+        // entirely when the filter is Names(_) / SingleName because the
+        // user is curating individual agents, not asking for the bundle.
+        // The whole-plugin Install button uses InstallFilter::All and
+        // installs companions normally.
+        if !companion_files.is_empty() && matches!(*filter, InstallFilter::All) {
             Self::install_native_companions_for_plugin(
                 project,
                 plugin_dir,
@@ -1967,6 +2032,8 @@ impl MarketplaceService {
                 &mut result,
             );
         }
+
+        surface_unmatched_agent_names(filter, &processed, ctx.plugin, &mut result);
 
         result
     }
@@ -1979,21 +2046,37 @@ impl MarketplaceService {
         project: &crate::project::KiroProject,
         plugin_dir: &Path,
         file: &crate::agent::DiscoveredNativeFile,
+        filter: &InstallFilter<'_>,
         ctx: AgentInstallContext<'_>,
         result: &mut InstallAgentsResult,
-    ) {
+    ) -> Option<String> {
         let bundle = match crate::agent::parse_native_kiro_agent_file(&file.source, &file.scan_root)
         {
             Ok(b) => b,
             Err(parse_err) => {
                 // Parse failed → no `bundle.name` yet; route as UnparseableAgent.
+                // Surface regardless of filter — a broken file is a
+                // global "this plugin has issues" signal, not specific
+                // to whether the user asked for it. Returns None
+                // because no name was produced (filter tracking is
+                // name-based).
                 result.failed.push(FailedAgent::UnparseableAgent {
                     source_path: file.source.clone(),
                     error: native_parse_failure_to_agent_error(&file.source, parse_err),
                 });
-                return;
+                return None;
             }
         };
+
+        // Filter by parsed name. Skip non-matching agents BEFORE the
+        // MCP gate / install attempt — the user explicitly didn't ask
+        // for this one, so even a failed install shouldn't surface in
+        // the result. Returns None to signal "not attempted, don't
+        // record in processed."
+        if !filter_matches(filter, bundle.name.as_str()) {
+            return None;
+        }
+        let installed_name = bundle.name.as_str().to_owned();
 
         // MCP opt-in gate — warning route, matching the translated path
         // so a user installing both kinds of plugins sees one UX
@@ -2011,7 +2094,7 @@ impl MarketplaceService {
                     agent: bundle.name.to_string(),
                     transports,
                 });
-            return;
+            return Some(installed_name);
         }
 
         let Some(filename) = file.source.file_name().map(std::path::PathBuf::from) else {
@@ -2023,7 +2106,7 @@ impl MarketplaceService {
                     reason: "discovered file has no file-name component".to_owned(),
                 },
             });
-            return;
+            return Some(installed_name);
         };
         let source_hash = match crate::hash::hash_artifact(&file.scan_root, &[filename]) {
             Ok(h) => h,
@@ -2036,7 +2119,7 @@ impl MarketplaceService {
                         source: Box::new(e.into()),
                     },
                 });
-                return;
+                return Some(installed_name);
             }
         };
 
@@ -2048,7 +2131,7 @@ impl MarketplaceService {
             Ok(rp) => rp,
             Err(failed) => {
                 result.failed.push(failed);
-                return;
+                return Some(installed_name);
             }
         };
 
@@ -2075,6 +2158,7 @@ impl MarketplaceService {
                 error: err,
             }),
         }
+        Some(installed_name)
     }
 
     /// Companion install body. Caller (`install_native_kiro_cli_agents_inner`)
@@ -2374,6 +2458,7 @@ impl MarketplaceService {
             &ctx.plugin_dir,
             &ctx.agent_scan_paths,
             ctx.format,
+            &InstallFilter::All,
             AgentInstallContext {
                 mode,
                 accept_mcp,
@@ -3019,6 +3104,62 @@ fn filter_matches(filter: &InstallFilter<'_>, name: &str) -> bool {
     }
 }
 
+/// Surface filter-name misses for agent installs as
+/// [`FailedAgent::RequestedButNotFound`] entries on `result.failed`.
+/// Mirrors the analogous block in `install_skills` (for skills) and
+/// `install_plugin_steering` (for steering); shared between the
+/// translated and native agent install paths so both surface typos
+/// the same way.
+///
+/// Names that don't validate as `AgentName` are dropped silently —
+/// in practice that branch is unreachable because every name reaching
+/// the drawer's diff was already through `AgentName::new` at catalog
+/// parse time. The defensive drop covers the future case where a CLI
+/// caller hand-types a malformed name; the install would have failed
+/// at the catalog read anyway.
+fn surface_unmatched_agent_names(
+    filter: &InstallFilter<'_>,
+    processed: &std::collections::HashSet<String>,
+    plugin: &crate::validation::PluginName,
+    result: &mut InstallAgentsResult,
+) {
+    let push_miss = |name: &str, result: &mut InstallAgentsResult| {
+        let Ok(agent_name) = crate::validation::AgentName::new(name) else {
+            warn!(
+                requested = name,
+                plugin = %plugin.as_str(),
+                "InstallFilter agent name failed AgentName validation; dropping miss"
+            );
+            return;
+        };
+        warn!(
+            agent = name,
+            plugin = %plugin.as_str(),
+            "requested agent not found in plugin"
+        );
+        result.failed.push(FailedAgent::RequestedButNotFound {
+            name: agent_name,
+            plugin: plugin.clone(),
+        });
+    };
+
+    match *filter {
+        InstallFilter::Names(requested) => {
+            for name in requested {
+                if !processed.contains(name) {
+                    push_miss(name, result);
+                }
+            }
+        }
+        InstallFilter::SingleName(name) => {
+            if !processed.contains(name) {
+                push_miss(name, result);
+            }
+        }
+        InstallFilter::All => {}
+    }
+}
+
 /// Map the source kind + link outcome into the public `MarketplaceStorage` signal.
 /// Git sources are always `Cloned` regardless of link result; local paths
 /// map to `Linked` or `Copied`.
@@ -3480,7 +3621,10 @@ mod tests {
         // rendering it should surface that marker — confirming the
         // accessor returned the right variant's error reference, not
         // a stale or wrong one.
-        let rendered = failure.error().to_string();
+        let rendered = failure
+            .error()
+            .expect("rstest cases all use error-bearing variants")
+            .to_string();
         assert!(
             rendered.contains(expected_marker_fragment),
             "FailedAgent::error() must return the variant's inner AgentError; \
@@ -3658,6 +3802,7 @@ mod tests {
             plugin_tmp.path(),
             &["./agents/".to_string()],
             crate::plugin::PluginFormat::Translated,
+            &InstallFilter::All,
             default_install_ctx(&mp("mp"), &pn("plugin-x")),
         );
         let warnings = &result.warnings;
@@ -3731,6 +3876,7 @@ mod tests {
             plugin_tmp.path(),
             &["./agents/".to_string()],
             crate::plugin::PluginFormat::Translated,
+            &InstallFilter::All,
             default_install_ctx(&mp("mp"), &pn("p")),
         );
         assert!(result.installed.is_empty());
@@ -3773,6 +3919,7 @@ mod tests {
             plugin_tmp.path(),
             &["./agents/".to_string()],
             crate::plugin::PluginFormat::Translated,
+            &InstallFilter::All,
             default_install_ctx(&mp("mp"), &pn("p")),
         );
 
@@ -3825,6 +3972,7 @@ mod tests {
             plugin_tmp.path(),
             &["./agents/".to_string()],
             crate::plugin::PluginFormat::Translated,
+            &InstallFilter::All,
             default_install_ctx(&mp("mp"), &pn("p")),
         );
         assert!(result.installed.is_empty());
@@ -3868,6 +4016,7 @@ mod tests {
             plugin_tmp.path(),
             &["./agents/".to_string()],
             crate::plugin::PluginFormat::Translated,
+            &InstallFilter::All,
             // gate must fire — accept_mcp stays false (the helper default).
             default_install_ctx(&mp("mp"), &pn("p")),
         );
@@ -3918,6 +4067,7 @@ mod tests {
             plugin_tmp.path(),
             &["./agents/".to_string()],
             crate::plugin::PluginFormat::Translated,
+            &InstallFilter::All,
             // gate is bypassed — flip accept_mcp via struct-update.
             AgentInstallContext {
                 accept_mcp: true,
@@ -3985,6 +4135,7 @@ mod tests {
             plugin_tmp.path(),
             &["./agents/".to_string()],
             crate::plugin::PluginFormat::Translated,
+            &InstallFilter::All,
             default_install_ctx(&mp("mp"), &pn("p")),
         );
         assert!(result.installed.is_empty(), "MCP agent must be skipped");
@@ -4035,6 +4186,7 @@ mod tests {
             plugin_tmp.path(),
             &["./agents/".to_string()],
             crate::plugin::PluginFormat::Translated,
+            &InstallFilter::All,
             // Force mode + accept_mcp=false (the helper default): the MCP
             // gate still fires; force does not bypass it.
             AgentInstallContext {
@@ -4075,6 +4227,7 @@ mod tests {
             plugin_tmp.path(),
             &["./agents/".to_string()],
             crate::plugin::PluginFormat::Translated,
+            &InstallFilter::All,
             default_install_ctx(&mp("mp"), &pn("p")),
         );
         assert_eq!(r1.installed, vec!["dup".to_string()]);
@@ -4086,6 +4239,7 @@ mod tests {
             plugin_tmp.path(),
             &["./agents/".to_string()],
             crate::plugin::PluginFormat::Translated,
+            &InstallFilter::All,
             default_install_ctx(&mp("mp"), &pn("p")),
         );
         assert!(r2.installed.is_empty());
@@ -4119,6 +4273,7 @@ mod tests {
             plugin_tmp.path(),
             &["./agents/".to_string()],
             crate::plugin::PluginFormat::Translated,
+            &InstallFilter::All,
             AgentInstallContext {
                 version: Some("1.0.0"),
                 ..default_install_ctx(&mp("mp"), &pn("p"))
@@ -4140,6 +4295,7 @@ mod tests {
             plugin_tmp.path(),
             &["./agents/".to_string()],
             crate::plugin::PluginFormat::Translated,
+            &InstallFilter::All,
             AgentInstallContext {
                 mode: InstallMode::Force,
                 version: Some("2.0.0"),
@@ -4204,6 +4360,7 @@ mod tests {
             plugin_tmp.path(),
             &["./agents/".to_string()],
             crate::plugin::PluginFormat::Translated,
+            &InstallFilter::All,
             default_install_ctx(&mp("mp"), &pn("p")),
         );
         assert!(result.installed.is_empty());
@@ -4260,6 +4417,7 @@ mod tests {
             plugin_tmp.path(),
             &["./agents/".to_string()],
             crate::plugin::PluginFormat::KiroCli,
+            &InstallFilter::All,
             default_install_ctx(&mp("marketplace-x"), &pn("p")),
         );
 
@@ -4323,6 +4481,7 @@ mod tests {
             plugin_tmp.path(),
             &["./agents/".to_string()],
             crate::plugin::PluginFormat::KiroCli,
+            &InstallFilter::All,
             // gate fires — accept_mcp stays false (the helper default).
             default_install_ctx(&mp("m"), &pn("p")),
         );
@@ -4378,6 +4537,7 @@ mod tests {
             plugin_tmp.path(),
             &["./agents/".to_string(), "./extras/".to_string()],
             crate::plugin::PluginFormat::KiroCli,
+            &InstallFilter::All,
             default_install_ctx(&mp("m"), &pn("p")),
         );
 
@@ -4453,6 +4613,7 @@ mod tests {
             plugin_tmp.path(),
             &["./agents/".to_string()],
             crate::plugin::PluginFormat::KiroCli,
+            &InstallFilter::All,
             default_install_ctx(&mp("mp"), &pn("p")),
         );
 
@@ -4528,6 +4689,7 @@ mod tests {
             alpha_plugin_dir.path(),
             &["./agents/".to_string()],
             crate::plugin::PluginFormat::KiroCli,
+            &InstallFilter::All,
             default_install_ctx(&market, &alpha),
         );
         assert!(
@@ -4551,6 +4713,7 @@ mod tests {
             beta_plugin_dir.path(),
             &["./agents/".to_string()],
             crate::plugin::PluginFormat::KiroCli,
+            &InstallFilter::All,
             default_install_ctx(&market, &beta),
         );
 
@@ -7896,6 +8059,84 @@ mod tests {
         assert_eq!(
             result.partial_load_warnings[0].tracking_file, "installed-skills.json",
             "warning must name the corrupt tracking file"
+        );
+    }
+
+    /// C4 fence (kiro-zx73 slice A2): `install_plugin_agents` with
+    /// `InstallFilter::Names` joins on the **parsed** agent name (the
+    /// frontmatter `name` for translated dialects, the JSON `name`
+    /// field for native), NOT the source filename. Adversarial
+    /// fixture: agent file `wrong-filename.md` declares
+    /// `name: actual-name` in frontmatter. Two install calls:
+    ///
+    /// - `Names(&["actual-name"])` → installs (parsed name matched)
+    /// - `Names(&["wrong-filename"])` → does NOT install AND surfaces
+    ///   `RequestedButNotFound` (filename was never the join key)
+    ///
+    /// The bug class — implementer joins on the basename — passes
+    /// happy-path fixtures where the filename and frontmatter name
+    /// coincide and silently fails this fixture.
+    #[test]
+    fn install_plugin_agents_names_filter_joins_on_parsed_name() {
+        let plugin_tmp = tempfile::tempdir().expect("plugin tempdir");
+        let agents = plugin_tmp.path().join("agents");
+        std::fs::create_dir_all(&agents).expect("create agents dir");
+        std::fs::write(
+            agents.join("wrong-filename.md"),
+            "---\nname: actual-name\n---\nbody\n",
+        )
+        .expect("write agent md");
+
+        let mp_name = crate::service::test_support::mp("mp");
+        let pn_name = crate::service::test_support::pn("p");
+
+        // First call: filter on parsed name → install succeeds.
+        let project_tmp = tempfile::tempdir().expect("project tempdir");
+        let project = crate::project::KiroProject::new(project_tmp.path().to_path_buf());
+        let names_match = vec!["actual-name".to_string()];
+        let r1 = MarketplaceService::install_plugin_agents(
+            &project,
+            plugin_tmp.path(),
+            &["./agents/".to_string()],
+            crate::plugin::PluginFormat::Translated,
+            &InstallFilter::Names(&names_match),
+            default_install_ctx(&mp_name, &pn_name),
+        );
+        assert_eq!(
+            r1.installed,
+            vec!["actual-name".to_string()],
+            "parsed name matches filter; install proceeds"
+        );
+        assert!(
+            r1.failed.is_empty(),
+            "no failures expected; got {:?}",
+            r1.failed
+        );
+
+        // Second call: filter on FILENAME (the bug class' join key) →
+        // not installed (already done above, but the key point is the
+        // RequestedButNotFound surface here).
+        let project_tmp2 = tempfile::tempdir().expect("project tempdir 2");
+        let project2 = crate::project::KiroProject::new(project_tmp2.path().to_path_buf());
+        let names_filename = vec!["wrong-filename".to_string()];
+        let r2 = MarketplaceService::install_plugin_agents(
+            &project2,
+            plugin_tmp.path(),
+            &["./agents/".to_string()],
+            crate::plugin::PluginFormat::Translated,
+            &InstallFilter::Names(&names_filename),
+            default_install_ctx(&mp_name, &pn_name),
+        );
+        assert!(
+            r2.installed.is_empty(),
+            "filename MUST NOT match the join key; got installed: {:?}",
+            r2.installed
+        );
+        assert_eq!(r2.failed.len(), 1, "wrong-filename surfaces as failure");
+        assert!(
+            matches!(r2.failed[0], FailedAgent::RequestedButNotFound { .. }),
+            "expected RequestedButNotFound, got {:?}",
+            r2.failed[0]
         );
     }
 }

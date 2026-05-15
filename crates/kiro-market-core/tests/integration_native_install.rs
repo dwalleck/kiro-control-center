@@ -19,7 +19,7 @@ use kiro_market_core::plugin::PluginFormat;
 use kiro_market_core::project::{InstallOutcomeKind, KiroProject};
 use kiro_market_core::service::test_support::{mp, pn, temp_service};
 use kiro_market_core::service::{
-    AgentInstallContext, InstallAgentsResult, InstallMode, MarketplaceService,
+    AgentInstallContext, InstallAgentsResult, InstallFilter, InstallMode, MarketplaceService,
 };
 use kiro_market_core::steering::{InstallSteeringResult, SteeringInstallContext};
 use rstest::{fixture, rstest};
@@ -71,6 +71,7 @@ impl IntegrationHarness {
             plugin_dir,
             &ctx.agent_scan_paths,
             ctx.format,
+            &InstallFilter::All,
             install_ctx,
         );
         (ctx.format, result)
