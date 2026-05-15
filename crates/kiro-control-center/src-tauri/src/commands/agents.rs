@@ -125,6 +125,15 @@ fn install_agents_impl(
     accept_mcp: bool,
     project_path: &str,
 ) -> Result<InstallAgentsResult, CommandError> {
+    // See install_steering_files_impl for the rationale — empty `names`
+    // collapses to a silent Ok inside install_plugin_agents because
+    // filter_matches always returns false. Reject at the IPC boundary.
+    if names.is_empty() {
+        return Err(CommandError::new(
+            "install_agents: names list must not be empty",
+            ErrorType::Validation,
+        ));
+    }
     let project_root = validate_kiro_project_path(project_path)?;
     let marketplace = MarketplaceName::new(marketplace)?;
     let plugin = PluginName::new(plugin)?;
@@ -644,6 +653,34 @@ mod tests {
         let dest = std::path::PathBuf::from(&project_path).join(".kiro/agents");
         assert!(dest.join("alpha.json").exists(), "alpha.json must land");
         assert!(!dest.join("beta.json").exists(), "beta MUST NOT install");
+    }
+
+    /// Empty `names` collapses to a silent Ok at the core layer because
+    /// `filter_matches` returns false for every discovered agent.
+    /// Reject at the IPC boundary so a future / non-drawer caller
+    /// doesn't silently no-op. Paired with the analogous fence in
+    /// `commands/steering.rs` and the core-side rstest in
+    /// `service::tests::filter_matches_names_single_equivalence`.
+    #[test]
+    fn install_agents_impl_rejects_empty_names() {
+        let (dir, svc) = temp_service();
+        let project_path = make_kiro_project(dir.path());
+        let err = install_agents_impl(
+            &svc,
+            "mp1",
+            "myplugin",
+            &[],
+            InstallMode::New,
+            false,
+            &project_path,
+        )
+        .expect_err("empty names list must error");
+        assert_eq!(err.error_type, ErrorType::Validation);
+        assert!(
+            err.message.contains("names list must not be empty"),
+            "got {:?}",
+            err.message
+        );
     }
 
     /// Round-trip: install an agent then remove it via the new

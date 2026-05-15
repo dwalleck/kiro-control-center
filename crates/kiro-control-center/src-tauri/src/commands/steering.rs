@@ -116,6 +116,19 @@ fn install_steering_files_impl(
     mode: InstallMode,
     project_path: &str,
 ) -> Result<InstallSteeringResult, CommandError> {
+    // Empty `names` is structurally ambiguous with InstallFilter::All
+    // at the core layer: filter_matches returns false for every item,
+    // and surface_unmatched_names sees no misses to surface — net
+    // result is a silent Ok with empty installed/failed. The drawer's
+    // applyDrawerDiff already short-circuits on empty diffs, so this
+    // boundary rejection is defensive against future / non-drawer
+    // callers, not a behavior change for current ones.
+    if names.is_empty() {
+        return Err(CommandError::new(
+            "install_steering_files: names list must not be empty",
+            ErrorType::Validation,
+        ));
+    }
     let project_root = validate_kiro_project_path(project_path)?;
     let marketplace = MarketplaceName::new(marketplace)?;
     let plugin = PluginName::new(plugin)?;
@@ -647,6 +660,32 @@ mod tests {
         assert!(dest.join("a.md").exists());
         assert!(!dest.join("b.md").exists(), "b.md MUST NOT install");
         assert!(!dest.join("c.md").exists(), "c.md MUST NOT install");
+    }
+
+    /// Empty `names` collapses to a silent Ok at the core layer because
+    /// `filter_matches` returns false for every discovered file. Reject
+    /// at the IPC boundary so a future / non-drawer caller doesn't
+    /// silently no-op. Pair with the rstest in service::tests that
+    /// pins `InstallFilter::Names(&[])` matches nothing.
+    #[test]
+    fn install_steering_files_impl_rejects_empty_names() {
+        let (dir, svc) = temp_service();
+        let project_path = make_kiro_project(dir.path());
+        let err = install_steering_files_impl(
+            &svc,
+            "mp1",
+            "myplugin",
+            &[],
+            InstallMode::New,
+            &project_path,
+        )
+        .expect_err("empty names list must error");
+        assert_eq!(err.error_type, ErrorType::Validation);
+        assert!(
+            err.message.contains("names list must not be empty"),
+            "got {:?}",
+            err.message
+        );
     }
 
     /// Surfaces the typo / stale-reference case the drawer can hit:
