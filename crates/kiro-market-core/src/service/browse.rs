@@ -994,11 +994,9 @@ impl MarketplaceService {
         // marketplace, items ≤ 50 per category. Bound: 50 × 50 × 3 =
         // 7,500 items per call, well under the 10^6 ceiling.
         //
-        // `marketplace_path` is hoisted out of the loop so the inner
-        // `assemble_catalog_entry` doesn't recompute it K times — it's
-        // a single derived path, not a filesystem read, but threading
-        // it down also lets each plugin's `resolve_local_plugin_dir`
-        // share the same base.
+        // `marketplace_path` is hoisted out of the loop so each plugin's
+        // `resolve_local_plugin_dir` shares the same base instead of
+        // recomputing it K times.
         let marketplace_path = self.marketplace_path(marketplace);
         let mut plugins = Vec::with_capacity(plugin_entries.len());
         let mut skipped = Vec::new();
@@ -1048,11 +1046,9 @@ impl MarketplaceService {
         installed_steering: &InstalledSteering,
         installed_agents: &InstalledAgents,
     ) -> Result<PluginCatalogEntry, Error> {
-        // One resolve + manifest load shared across all three per-category
-        // enumerators. Previously each `list_*_for_plugin` did its own
-        // registry parse + plugin lookup + `resolve_local_plugin_dir` +
-        // `load_plugin_manifest`, so the bulk catalog paid 3× per plugin
-        // for inputs the three helpers all want.
+        // Resolve `plugin_dir` and load `plugin.json` once per plugin;
+        // the three per-category helpers all consume the same manifest,
+        // so sharing avoids 3× I/O on the catalog hot path.
         let plugin_dir = self.resolve_local_plugin_dir(plugin_entry, marketplace_path)?;
         let plugin_manifest = load_plugin_manifest(&plugin_dir)?;
         let manifest_ref = plugin_manifest.as_ref();

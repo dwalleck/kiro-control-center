@@ -890,7 +890,18 @@
     // skill/steering/agent disambiguate in the banner (a plugin with a
     // skill, steering file, and agent all named "rules" otherwise
     // renders as "Failed: rules (...), rules (...), rules (...)").
-    function fmtFailed(category: string, f: { name: string; error: string }): string {
+    //
+    // The literal-union parameter + value-position exhaustiveness assert
+    // mirrors `_FAILED_AGENT_KINDS` in format.ts: the `as const satisfies`
+    // catches arm-shape changes; the `Exclude<...> extends never` catches
+    // drift between the array and the inline union below; the value-
+    // position `const _assert: T = true` is what makes the tripwire active.
+    const _FAILURE_CATEGORIES = ["skill", "steering", "agent"] as const satisfies readonly string[];
+    type FailureCategory = (typeof _FAILURE_CATEGORIES)[number];
+    type _AssertFailureCategoryExhaustive =
+      Exclude<"skill" | "steering" | "agent", FailureCategory> extends never ? true : never;
+    const _assertFailureCategoryExhaustive: _AssertFailureCategoryExhaustive = true;
+    function fmtFailed(category: FailureCategory, f: { name: string; error: string }): string {
       return `${category}:${f.name} (${f.error})`;
     }
     const failedParts = [

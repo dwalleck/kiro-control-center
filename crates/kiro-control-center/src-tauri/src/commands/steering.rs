@@ -11,7 +11,7 @@ use std::path::Path;
 use kiro_market_core::project::KiroProject;
 use kiro_market_core::service::{InstallFilter, InstallMode, MarketplaceService};
 use kiro_market_core::steering::{InstallSteeringResult, SteeringInstallContext};
-use kiro_market_core::validation::{validate_relative_path, MarketplaceName, PluginName};
+use kiro_market_core::validation::{MarketplaceName, PluginName, validate_relative_path};
 
 use crate::commands::{make_service, reject_empty_names, validate_kiro_project_path};
 use crate::error::{CommandError, ErrorType};

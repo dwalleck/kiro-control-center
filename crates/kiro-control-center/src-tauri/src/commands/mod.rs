@@ -121,6 +121,22 @@ mod tests {
 
     use super::*;
 
+    /// The `{command}:` prefix is the only reason `reject_empty_names`
+    /// takes a `command` parameter — without pinning it, a refactor
+    /// could silently drop the prefix and make debug logs less useful
+    /// while leaving the per-command "must not be empty" assertions
+    /// in `commands/agents.rs` and `commands/steering.rs` green.
+    #[test]
+    fn reject_empty_names_includes_command_prefix() {
+        let err = reject_empty_names(&[], "install_agents").expect_err("empty must reject");
+        assert_eq!(err.error_type, ErrorType::Validation);
+        assert!(
+            err.message.starts_with("install_agents:"),
+            "error must start with command prefix, got: {}",
+            err.message,
+        );
+    }
+
     /// A real Kiro project directory must round-trip through the
     /// validator and come back as a canonical absolute path.
     #[test]

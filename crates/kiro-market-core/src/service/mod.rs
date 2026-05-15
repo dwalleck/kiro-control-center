@@ -105,8 +105,10 @@ pub struct FailedUpdate {
 /// `install_plugin_agents`) — the matched join key differs by category:
 ///
 /// - skills: `SKILL.md` frontmatter `name` field
-/// - steering: relative path under the scan root (matches
-///   `SteeringItemInfo.name` from the catalog)
+/// - steering: relative path under the scan root, which equals the
+///   basename for the non-recursive `discover_steering_files_in_dirs`
+///   (the only shape produced today, matching `SteeringItemInfo.name`
+///   from the catalog)
 /// - agents: parsed agent identity (matches `AgentItemInfo.name`)
 ///
 /// `All` installs every discovered item. `Names(set)` / `SingleName(name)`

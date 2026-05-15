@@ -37,6 +37,12 @@ export function formatSkippedReason(r: SkippedReason): string {
       return `plugin source is remote: ${r.plugin}`;
     case "no_skills":
       return `plugin declares no skills: ${r.path}`;
+    default: {
+      const _exhaustive: never = r;
+      throw new Error(
+        `unhandled SkippedReason variant: ${JSON.stringify(_exhaustive)}`,
+      );
+    }
   }
 }
 
@@ -45,6 +51,12 @@ export function skillCountLabel(sc: SkillCount): string {
     case "known": return String(sc.count);
     case "remote_not_counted": return "–";
     case "manifest_failed": return "!";
+    default: {
+      const _exhaustive: never = sc;
+      throw new Error(
+        `unhandled SkillCount variant: ${JSON.stringify(_exhaustive)}`,
+      );
+    }
   }
 }
 
@@ -56,6 +68,12 @@ export function skillCountTitle(sc: SkillCount): string | undefined {
       return "Remote plugin — skills cannot be counted without cloning";
     case "manifest_failed":
       return formatSkippedReason(sc.reason);
+    default: {
+      const _exhaustive: never = sc;
+      throw new Error(
+        `unhandled SkillCount variant: ${JSON.stringify(_exhaustive)}`,
+      );
+    }
   }
 }
 
