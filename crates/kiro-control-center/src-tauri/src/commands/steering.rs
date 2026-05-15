@@ -6,13 +6,15 @@
 //! is unit-testable against [`kiro_market_core::service::test_support`]
 //! fixtures without a Tauri runtime.
 
+use std::path::Path;
+
 use kiro_market_core::project::KiroProject;
-use kiro_market_core::service::{InstallMode, MarketplaceService};
+use kiro_market_core::service::{InstallFilter, InstallMode, MarketplaceService};
 use kiro_market_core::steering::{InstallSteeringResult, SteeringInstallContext};
-use kiro_market_core::validation::{MarketplaceName, PluginName};
+use kiro_market_core::validation::{MarketplaceName, PluginName, validate_relative_path};
 
 use crate::commands::{make_service, validate_kiro_project_path};
-use crate::error::CommandError;
+use crate::error::{CommandError, ErrorType};
 
 /// Install every steering file declared by a plugin into the active
 /// project's `.kiro/steering/` directory.
@@ -67,11 +69,108 @@ fn install_plugin_steering_impl(
         &project,
         &ctx.plugin_dir,
         &ctx.steering_scan_paths,
-        // Whole-plugin Tauri command; per-file granularity ships in
-        // commands::steering::install_steering_files (kiro-zx73 slice A3).
-        &kiro_market_core::service::InstallFilter::All,
+        // Whole-plugin Tauri command; per-file granularity ships via
+        // install_steering_files below (kiro-zx73 slice A3).
+        &InstallFilter::All,
         install_ctx,
     ))
+}
+
+/// Per-file steering install: drop into a plugin's discovered steering
+/// set and install only the named files. Mirrors
+/// [`crate::commands::browse::install_skills`] for steering — same
+/// `_impl(svc, ...)` testable shape, same `force` toggle, same wire
+/// shape as the whole-plugin install. Names map to the file's
+/// relative path under the plugin's steering scan root (which equals
+/// the basename for non-recursive discovery, the only shape steering
+/// discover produces today).
+///
+/// Names that don't match any discovered file surface as
+/// `RequestedButNotFound` failures inside `result.failed`, mirroring
+/// the analogous behavior in `install_skills`.
+#[tauri::command]
+#[specta::specta]
+pub async fn install_steering_files(
+    marketplace: String,
+    plugin: String,
+    names: Vec<String>,
+    force: bool,
+    project_path: String,
+) -> Result<InstallSteeringResult, CommandError> {
+    let svc = make_service()?;
+    install_steering_files_impl(
+        &svc,
+        &marketplace,
+        &plugin,
+        &names,
+        InstallMode::from(force),
+        &project_path,
+    )
+}
+
+fn install_steering_files_impl(
+    svc: &MarketplaceService,
+    marketplace: &str,
+    plugin: &str,
+    names: &[String],
+    mode: InstallMode,
+    project_path: &str,
+) -> Result<InstallSteeringResult, CommandError> {
+    let project_root = validate_kiro_project_path(project_path)?;
+    let marketplace = MarketplaceName::new(marketplace)?;
+    let plugin = PluginName::new(plugin)?;
+    let ctx = svc
+        .resolve_plugin_install_context(&marketplace, &plugin)
+        .map_err(CommandError::from)?;
+    let project = KiroProject::new(project_root);
+
+    let install_ctx = SteeringInstallContext {
+        mode,
+        marketplace: &marketplace,
+        plugin: &plugin,
+        version: ctx.version.as_deref(),
+        plugin_dir: &ctx.plugin_dir,
+    };
+
+    Ok(MarketplaceService::install_plugin_steering(
+        &project,
+        &ctx.plugin_dir,
+        &ctx.steering_scan_paths,
+        &InstallFilter::Names(names),
+        install_ctx,
+    ))
+}
+
+/// Remove one steering file from the active project. The `name` is the
+/// filename's relative path under `.kiro/steering/` (matches the
+/// catalog's `SteeringItemInfo.name` field). Validates the path at the
+/// IPC boundary to refuse traversal attacks (`../etc/passwd`) before
+/// reaching `KiroProject::remove_steering_file`'s file-system call.
+///
+/// Mirrors the shape of [`crate::commands::installed::remove_skill`] —
+/// no plugin context needed because steering filenames are unique
+/// under `.kiro/steering/` (same as skill names).
+#[tauri::command]
+#[specta::specta]
+pub async fn remove_steering_file(name: String, project_path: String) -> Result<(), CommandError> {
+    remove_steering_file_impl(&name, &project_path)
+}
+
+fn remove_steering_file_impl(name: &str, project_path: &str) -> Result<(), CommandError> {
+    let project_root = validate_kiro_project_path(project_path)?;
+    // Path-traversal guard: refuse `../`, absolute paths, NUL bytes
+    // before passing to KiroProject::remove_steering_file. The project
+    // method assumes a validated relative path.
+    validate_relative_path(name).map_err(|e| {
+        CommandError::new(
+            format!("invalid steering filename `{name}`: {e}"),
+            ErrorType::Validation,
+        )
+    })?;
+    let project = KiroProject::new(project_root);
+    project
+        .remove_steering_file(Path::new(name))
+        .map_err(CommandError::from)
 }
 
 #[cfg(test)]
@@ -508,6 +607,146 @@ mod tests {
             &project_path,
         )
         .expect_err("NUL byte in plugin name must error");
+        assert_eq!(err.error_type, ErrorType::Validation);
+    }
+
+    // -----------------------------------------------------------------------
+    // install_steering_files_impl (kiro-zx73 slice A3)
+    // -----------------------------------------------------------------------
+
+    /// Tauri-side fence on the per-file steering install. Plugin
+    /// declares 3 steering files; install asks for 1 by name. Asserts
+    /// only that one lands on disk and the other two are NOT present —
+    /// the visible UX promise of the drawer's per-item granularity.
+    #[test]
+    fn install_steering_files_impl_installs_only_named_files() {
+        let (dir, svc) = temp_service();
+        let entries = vec![relative_path_entry("myplugin", "plugins/myplugin")];
+        let marketplace_path = seed_marketplace_with_registry(dir.path(), &svc, "mp1", &entries);
+        let plugin_dir = marketplace_path.join("plugins/myplugin");
+        fs::create_dir_all(&plugin_dir).expect("plugin dir");
+        write_steering_file(&plugin_dir, "steering/a.md", "# a\n");
+        write_steering_file(&plugin_dir, "steering/b.md", "# b\n");
+        write_steering_file(&plugin_dir, "steering/c.md", "# c\n");
+        let project_path = make_kiro_project(dir.path());
+
+        let names = vec!["a.md".to_string()];
+        let result = install_steering_files_impl(
+            &svc,
+            "mp1",
+            "myplugin",
+            &names,
+            InstallMode::New,
+            &project_path,
+        )
+        .expect("install one file");
+
+        assert_eq!(result.installed.len(), 1);
+        assert!(result.failed.is_empty(), "got {:?}", result.failed);
+        let dest = std::path::PathBuf::from(&project_path).join(".kiro/steering");
+        assert!(dest.join("a.md").exists());
+        assert!(!dest.join("b.md").exists(), "b.md MUST NOT install");
+        assert!(!dest.join("c.md").exists(), "c.md MUST NOT install");
+    }
+
+    /// Surfaces the typo / stale-reference case the drawer can hit:
+    /// the user's catalog snapshot included a steering file the plugin
+    /// no longer ships. The install command must NOT silently no-op
+    /// — the failure must reach the BrowseTab banner stack.
+    #[test]
+    fn install_steering_files_impl_unmatched_name_surfaces_failure() {
+        let (dir, svc) = temp_service();
+        let entries = vec![relative_path_entry("myplugin", "plugins/myplugin")];
+        let marketplace_path = seed_marketplace_with_registry(dir.path(), &svc, "mp1", &entries);
+        let plugin_dir = marketplace_path.join("plugins/myplugin");
+        fs::create_dir_all(&plugin_dir).expect("plugin dir");
+        write_steering_file(&plugin_dir, "steering/real.md", "# real\n");
+        let project_path = make_kiro_project(dir.path());
+
+        let names = vec!["phantom.md".to_string()];
+        let result = install_steering_files_impl(
+            &svc,
+            "mp1",
+            "myplugin",
+            &names,
+            InstallMode::New,
+            &project_path,
+        )
+        .expect("call must not error at the impl level");
+
+        assert!(
+            result.installed.is_empty(),
+            "no install should have happened, got {:?}",
+            result.installed
+        );
+        assert_eq!(result.failed.len(), 1);
+        assert!(
+            matches!(
+                &result.failed[0].error,
+                kiro_market_core::steering::SteeringError::RequestedButNotFound { .. }
+            ),
+            "expected RequestedButNotFound, got {:?}",
+            result.failed[0].error
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // remove_steering_file_impl (kiro-zx73 slice A4)
+    // -----------------------------------------------------------------------
+
+    /// Round-trip: install a file via install_steering_files_impl,
+    /// then remove it via remove_steering_file_impl. Verifies the
+    /// install_steering_files → remove_steering_file pipeline the
+    /// drawer's diff math produces is symmetric.
+    #[test]
+    fn remove_steering_file_impl_unlinks_installed_file() {
+        let (dir, svc) = temp_service();
+        let entries = vec![relative_path_entry("myplugin", "plugins/myplugin")];
+        let marketplace_path = seed_marketplace_with_registry(dir.path(), &svc, "mp1", &entries);
+        let plugin_dir = marketplace_path.join("plugins/myplugin");
+        fs::create_dir_all(&plugin_dir).expect("plugin dir");
+        write_steering_file(&plugin_dir, "steering/x.md", "# x\n");
+        let project_path = make_kiro_project(dir.path());
+
+        // Install via the per-file path so the round-trip exercises both.
+        let names = vec!["x.md".to_string()];
+        install_steering_files_impl(
+            &svc,
+            "mp1",
+            "myplugin",
+            &names,
+            InstallMode::New,
+            &project_path,
+        )
+        .expect("install");
+        let dest = std::path::PathBuf::from(&project_path).join(".kiro/steering/x.md");
+        assert!(dest.exists(), "install precondition");
+
+        remove_steering_file_impl("x.md", &project_path).expect("remove");
+        assert!(!dest.exists(), "file must be unlinked after remove");
+
+        // Tracking must also be clear so a subsequent install is treated
+        // as a clean first install (not an idempotent reinstall against
+        // a stale tracking row).
+        let project = KiroProject::new(std::path::PathBuf::from(&project_path));
+        let tracking = project.load_installed_steering().expect("load tracking");
+        assert!(
+            !tracking.files.contains_key(std::path::Path::new("x.md")),
+            "tracking row must be removed alongside the file"
+        );
+    }
+
+    /// IPC-boundary hardening: a path-traversal attempt in the `name`
+    /// argument must be rejected before reaching
+    /// `KiroProject::remove_steering_file`'s file-system call. Without
+    /// this guard, a hostile FE caller could remove
+    /// `.kiro/steering/../../etc/passwd` from the user's tree.
+    #[test]
+    fn remove_steering_file_impl_rejects_path_traversal() {
+        let (dir, _svc) = temp_service();
+        let project_path = make_kiro_project(dir.path());
+        let err = remove_steering_file_impl("../../etc/passwd", &project_path)
+            .expect_err("traversal must error");
         assert_eq!(err.error_type, ErrorType::Validation);
     }
 }

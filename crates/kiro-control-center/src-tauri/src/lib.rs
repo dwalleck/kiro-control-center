@@ -8,7 +8,7 @@
     clippy::too_many_lines
 )]
 
-use tauri_specta::{collect_commands, Builder};
+use tauri_specta::{Builder, collect_commands};
 
 pub mod commands;
 pub mod error;
@@ -35,6 +35,8 @@ fn create_builder() -> Builder<tauri::Wry> {
         commands::kiro_settings::set_kiro_setting,
         commands::kiro_settings::reset_kiro_setting,
         commands::steering::install_plugin_steering,
+        commands::steering::install_steering_files,
+        commands::steering::remove_steering_file,
         commands::agents::install_plugin_agents,
         commands::plugins::install_plugin,
         commands::plugins::list_installed_plugins,
