@@ -418,19 +418,23 @@ fn print_agent_outcome(result: &InstallAgentsResult) {
                     eprintln!("      conflict: {}", conflict.display());
                 }
             }
+            kiro_market_core::service::FailedAgent::RequestedButNotFound { name, plugin } => {
+                eprintln!(
+                    "  {prefix} Agent '{name}' not found in plugin '{plugin}'",
+                    name = name.as_str(),
+                    plugin = plugin.as_str(),
+                );
+            }
             // `FailedAgent` is `#[non_exhaustive]`. A future variant
-            // shouldn't panic — render the chain-preserved error string
-            // via the common `error()` accessor when one is available
-            // (variants like `RequestedButNotFound` carry no underlying
-            // AgentError because no install was attempted; for those
-            // we render the variant's Debug shape, which still surfaces
-            // the actionable payload via thiserror Display impls).
+            // shouldn't panic — render the chain-preserved error when
+            // the variant carries one, falling back to a generic line
+            // that names the variant so the user can report it.
             other => match other.error() {
                 Some(err) => eprintln!(
                     "  {prefix} Agent install failed: {}",
                     kiro_market_core::error::error_full_chain(err),
                 ),
-                None => eprintln!("  {prefix} Agent install failed: {other:?}"),
+                None => eprintln!("  {prefix} Agent install failed (unrendered variant)"),
             },
         }
     }
