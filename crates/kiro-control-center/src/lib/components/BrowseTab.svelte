@@ -6,6 +6,7 @@
     formatSkippedSkill,
     formatSkippedItemsForPlugin,
     formatSteeringWarning,
+    formatInstallWarning,
     formatFailedSkill,
     formatFailedSteeringFile,
     formatFailedAgent,
@@ -728,6 +729,14 @@
     const skillsUnreadable: SkippedSkill[] = [];
     const steeringInstalled: string[] = [];
     const steeringFailed: { name: string; error: string }[] = [];
+    // Steering/agent install paths surface non-fatal warnings
+    // (scan_path_invalid, unmapped_tool, mcp_servers_require_opt_in,
+    // agent_parse_failed) on r.data.warnings. The drawer used to drop
+    // these — a user who hit an MCP gate saw "0 installed, 0 failed"
+    // with no signal an opt-in was required. Accumulate per-category
+    // so the summary banner surfaces them alongside failures.
+    const steeringWarnings: import("$lib/bindings").SteeringWarning[] = [];
+    const agentsWarnings: import("$lib/bindings").InstallWarning[] = [];
     const agentsInstalled: string[] = [];
     const agentsSkipped: string[] = [];
     const agentsFailed: { name: string; error: string }[] = [];
@@ -797,6 +806,9 @@
               error: f.error,
             });
           }
+          if (r.data.warnings) {
+            steeringWarnings.push(...r.data.warnings);
+          }
           return true;
         }
         installError = `Customize apply: steering install failed for ${marketplace}/${plugin}: ${r.error.message}`;
@@ -823,6 +835,9 @@
           agentsSkipped.push(...r.data.skipped);
           for (const f of r.data.failed) {
             agentsFailed.push(formatFailedAgentForBanner(f));
+          }
+          if (r.data.warnings) {
+            agentsWarnings.push(...r.data.warnings);
           }
           return true;
         }
@@ -932,6 +947,19 @@
     }
     if (skillsUnreadable.length > 0) {
       parts.push(`Unreadable: ${skillsUnreadable.map(formatSkippedSkill).join(", ")}`);
+    }
+    // Non-fatal warnings flow into a dedicated banner section so an
+    // MCP-opt-in gate (agentsWarnings) or scan_path_invalid
+    // (steeringWarnings) isn't silently dropped. Mirrors how the
+    // whole-plugin path's runPluginInstall flow renders warnings
+    // (see runPluginInstall → outcome.banner.warning around line
+    // 1137).
+    if (steeringWarnings.length > 0 || agentsWarnings.length > 0) {
+      const warningStrs = [
+        ...steeringWarnings.map(formatSteeringWarning),
+        ...agentsWarnings.map(formatInstallWarning),
+      ];
+      parts.push(`Warnings: ${warningStrs.join(" | ")}`);
     }
 
     const hadSuccess =
