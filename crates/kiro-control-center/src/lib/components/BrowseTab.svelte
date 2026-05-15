@@ -11,6 +11,7 @@
     formatFailedSteeringFile,
     formatFailedAgent,
   } from "$lib/format";
+  import { pluralize } from "$lib/drawer-diff";
   import {
     DELIM,
     pluginKey,
@@ -739,210 +740,174 @@
     const agentsInstalled: string[] = [];
     const agentsSkipped: string[] = [];
     const agentsFailed: { name: string; error: string }[] = [];
-    let skillsRemoved = 0;
-    const skillsRemoveFailed: { name: string; error: string }[] = [];
-    let steeringRemoved = 0;
-    const steeringRemoveFailed: { name: string; error: string }[] = [];
-    let agentsRemoved = 0;
-    const agentsRemoveFailed: { name: string; error: string }[] = [];
 
-    // Per-category install — fire each as an independent Promise so a
-    // failure on one category doesn't abort the others. Each helper
-    // returns true on completion (success or partial failure surfaced
-    // in the accumulators) or sets installError + returns false on a
-    // hard wrapper-level error (the entire batch never ran).
-    async function installSkillsBatch(): Promise<boolean> {
-      if (diff.skills.install.length === 0) return true;
+    // Generic install-batch wrapper. Translates a `commands.*` call into
+    // either the typed success payload (T) or null (empty diff slice OR
+    // a hard wrapper-level error that the caller surfaces via
+    // `installError`). Closure over `installError`, `marketplace`, and
+    // `plugin` so each caller only specifies the category label and the
+    // Tauri call. Locking the error-message wording in one place keeps
+    // the three category strings ("skill", "steering", "agent") from
+    // drifting.
+    async function runInstallBatch<T>(
+      category: "skill" | "steering" | "agent",
+      names: readonly string[],
+      call: () => Promise<
+        { status: "ok"; data: T } | { status: "error"; error: { message: string } }
+      >,
+    ): Promise<T | null> {
+      if (names.length === 0) return null;
       try {
-        const r = await commands.installSkills(
-          marketplace,
-          plugin,
-          diff.skills.install,
-          forceInstall,
-          projectPath,
-        );
-        if (r.status === "ok") {
-          skillsInstalled.push(...r.data.installed);
-          skillsSkipped.push(...r.data.skipped);
-          skillsFailed.push(...r.data.failed);
-          skillsUnreadable.push(...r.data.skipped_skills);
-          return true;
-        }
-        installError = `Customize apply: skill install failed for ${marketplace}/${plugin}: ${r.error.message}`;
-        return false;
+        const r = await call();
+        if (r.status === "ok") return r.data;
+        installError = `Customize apply: ${category} install failed for ${marketplace}/${plugin}: ${r.error.message}`;
+        return null;
       } catch (e) {
         const reason = e instanceof Error ? e.message : String(e);
-        installError = `Customize apply: skill install threw for ${marketplace}/${plugin}: ${reason}`;
-        return false;
+        installError = `Customize apply: ${category} install threw for ${marketplace}/${plugin}: ${reason}`;
+        return null;
       }
     }
-    async function installSteeringBatch(): Promise<boolean> {
-      if (diff.steering.install.length === 0) return true;
-      try {
-        const r = await commands.installSteeringFiles(
+
+    // Run all three install batches in parallel. Each `commands.*` call
+    // is independent (different tracking files, no shared lock). A
+    // wrapper-level failure on one category sets `installError` but
+    // doesn't abort the others — the remove loops below still run
+    // because they're user-requested removals.
+    const [skillsData, steeringData, agentsData] = await Promise.all([
+      runInstallBatch("skill", diff.skills.install, () =>
+        commands.installSkills(marketplace, plugin, diff.skills.install, forceInstall, projectPath),
+      ),
+      runInstallBatch("steering", diff.steering.install, () =>
+        commands.installSteeringFiles(
           marketplace,
           plugin,
           diff.steering.install,
           forceInstall,
           projectPath,
-        );
-        if (r.status === "ok") {
-          // Use the destination basename — that's the user-facing
-          // identifier (matches the catalog's SteeringItemInfo.name
-          // and lives under .kiro/steering/ which has the canonical
-          // separator). `out.source` is the on-disk source path with
-          // mixed `\` / `/` separators because joining a Windows
-          // marketplace base with a Unix-style relative path doesn't
-          // normalize separators — surfacing it would render an
-          // awkward "C:\...kiro-starter-kit\./plugins/..." string in
-          // the success banner. Same fix on the failed side.
-          for (const out of r.data.installed) {
-            steeringInstalled.push(basenameOf(out.destination));
-          }
-          for (const f of r.data.failed) {
-            steeringFailed.push({
-              name: basenameOf(f.source.toString()),
-              error: f.error,
-            });
-          }
-          if (r.data.warnings) {
-            steeringWarnings.push(...r.data.warnings);
-          }
-          return true;
-        }
-        installError = `Customize apply: steering install failed for ${marketplace}/${plugin}: ${r.error.message}`;
-        return false;
-      } catch (e) {
-        const reason = e instanceof Error ? e.message : String(e);
-        installError = `Customize apply: steering install threw for ${marketplace}/${plugin}: ${reason}`;
-        return false;
-      }
-    }
-    async function installAgentsBatch(): Promise<boolean> {
-      if (diff.agents.install.length === 0) return true;
-      try {
-        const r = await commands.installAgents(
+        ),
+      ),
+      runInstallBatch("agent", diff.agents.install, () =>
+        commands.installAgents(
           marketplace,
           plugin,
           diff.agents.install,
           forceInstall,
           /* acceptMcp */ false,
           projectPath,
-        );
-        if (r.status === "ok") {
-          agentsInstalled.push(...r.data.installed);
-          agentsSkipped.push(...r.data.skipped);
-          for (const f of r.data.failed) {
-            agentsFailed.push(formatFailedAgentForBanner(f));
-          }
-          if (r.data.warnings) {
-            agentsWarnings.push(...r.data.warnings);
-          }
-          return true;
-        }
-        installError = `Customize apply: agent install failed for ${marketplace}/${plugin}: ${r.error.message}`;
-        return false;
-      } catch (e) {
-        const reason = e instanceof Error ? e.message : String(e);
-        installError = `Customize apply: agent install threw for ${marketplace}/${plugin}: ${reason}`;
-        return false;
-      }
-    }
-
-    // Run all three install batches in parallel. Promise.all here
-    // because each commands.* call is independent (different tracking
-    // files, no shared lock). If any returns false, installError is
-    // already set; we still continue to the remove loops since those
-    // are user-requested removals that shouldn't block on an install
-    // failure of a different category.
-    await Promise.all([
-      installSkillsBatch(),
-      installSteeringBatch(),
-      installAgentsBatch(),
+        ),
+      ),
     ]);
 
-    // Per-category remove loops in parallel. Each item is its own
-    // Tauri call (no batch remove API); the inner loop is sequential
-    // because the tracking-file lock per category is exclusive.
-    async function removeSkillsLoop() {
-      for (const name of diff.skills.remove) {
+    if (skillsData) {
+      skillsInstalled.push(...skillsData.installed);
+      skillsSkipped.push(...skillsData.skipped);
+      skillsFailed.push(...skillsData.failed);
+      skillsUnreadable.push(...skillsData.skipped_skills);
+    }
+    if (steeringData) {
+      // Use the destination basename — that's the user-facing identifier
+      // (matches the catalog's SteeringItemInfo.name and lives under
+      // .kiro/steering/ which has the canonical separator). `out.source`
+      // is the on-disk source path with mixed `\` / `/` separators
+      // because joining a Windows marketplace base with a Unix-style
+      // relative path doesn't normalize separators — surfacing it would
+      // render an awkward "C:\...kiro-starter-kit\./plugins/..." string
+      // in the success banner. Same fix on the failed side.
+      for (const out of steeringData.installed) {
+        steeringInstalled.push(basenameOf(out.destination));
+      }
+      for (const f of steeringData.failed) {
+        steeringFailed.push({
+          name: basenameOf(f.source),
+          error: f.error,
+        });
+      }
+      steeringWarnings.push(...steeringData.warnings);
+    }
+    if (agentsData) {
+      agentsInstalled.push(...agentsData.installed);
+      agentsSkipped.push(...agentsData.skipped);
+      for (const f of agentsData.failed) {
+        agentsFailed.push(formatFailedAgentForBanner(f));
+      }
+      agentsWarnings.push(...agentsData.warnings);
+    }
+
+    // Per-category remove loops in parallel. Each item is its own Tauri
+    // call (no batch remove API); the inner loop is sequential because
+    // the tracking-file lock per category is exclusive.
+    async function runRemoveLoop<R>(
+      names: readonly string[],
+      remove: (
+        name: string,
+      ) => Promise<
+        { status: "ok"; data: R } | { status: "error"; error: { message: string } }
+      >,
+    ): Promise<{ removed: number; failed: { name: string; error: string }[] }> {
+      let removed = 0;
+      const failed: { name: string; error: string }[] = [];
+      for (const name of names) {
         try {
-          const r = await commands.removeSkill(name, projectPath);
-          if (r.status === "ok") skillsRemoved++;
-          else skillsRemoveFailed.push({ name, error: r.error.message });
+          const r = await remove(name);
+          if (r.status === "ok") removed++;
+          else failed.push({ name, error: r.error.message });
         } catch (e) {
-          skillsRemoveFailed.push({
-            name,
-            error: e instanceof Error ? e.message : String(e),
-          });
+          failed.push({ name, error: e instanceof Error ? e.message : String(e) });
         }
       }
+      return { removed, failed };
     }
-    async function removeSteeringLoop() {
-      for (const name of diff.steering.remove) {
-        try {
-          const r = await commands.removeSteeringFile(name, projectPath);
-          if (r.status === "ok") steeringRemoved++;
-          else steeringRemoveFailed.push({ name, error: r.error.message });
-        } catch (e) {
-          steeringRemoveFailed.push({
-            name,
-            error: e instanceof Error ? e.message : String(e),
-          });
-        }
-      }
-    }
-    async function removeAgentsLoop() {
-      for (const name of diff.agents.remove) {
-        try {
-          const r = await commands.removeAgent(name, projectPath);
-          if (r.status === "ok") agentsRemoved++;
-          else agentsRemoveFailed.push({ name, error: r.error.message });
-        } catch (e) {
-          agentsRemoveFailed.push({
-            name,
-            error: e instanceof Error ? e.message : String(e),
-          });
-        }
-      }
-    }
-    await Promise.all([removeSkillsLoop(), removeSteeringLoop(), removeAgentsLoop()]);
+
+    const [skillsRemoveResult, steeringRemoveResult, agentsRemoveResult] = await Promise.all([
+      runRemoveLoop(diff.skills.remove, (n) => commands.removeSkill(n, projectPath)),
+      runRemoveLoop(diff.steering.remove, (n) => commands.removeSteeringFile(n, projectPath)),
+      runRemoveLoop(diff.agents.remove, (n) => commands.removeAgent(n, projectPath)),
+    ]);
 
     // Compose summary banner. Per-category totals so a mixed apply
     // reads like "Installed: 2 skills, 1 agent | Removed: 1 steering".
+    // "steering" is a mass noun — `plural: null` skips inflection.
     const installedParts: string[] = [];
-    if (skillsInstalled.length > 0) {
-      installedParts.push(
-        `${skillsInstalled.length} skill${skillsInstalled.length === 1 ? "" : "s"} (${skillsInstalled.join(", ")})`,
-      );
-    }
-    if (steeringInstalled.length > 0) {
-      installedParts.push(
-        `${steeringInstalled.length} steering (${steeringInstalled.join(", ")})`,
-      );
-    }
-    if (agentsInstalled.length > 0) {
-      installedParts.push(
-        `${agentsInstalled.length} agent${agentsInstalled.length === 1 ? "" : "s"} (${agentsInstalled.join(", ")})`,
-      );
+    const installedCategories: {
+      items: string[];
+      singular: string;
+      plural: string | null;
+    }[] = [
+      { items: skillsInstalled, singular: "skill", plural: "skills" },
+      { items: steeringInstalled, singular: "steering", plural: null },
+      { items: agentsInstalled, singular: "agent", plural: "agents" },
+    ];
+    for (const c of installedCategories) {
+      if (c.items.length === 0) continue;
+      const word = c.plural === null ? c.singular : pluralize(c.items.length, c.singular, c.plural);
+      installedParts.push(`${c.items.length} ${word} (${c.items.join(", ")})`);
     }
     const skippedTotal = skillsSkipped.length + agentsSkipped.length;
-    const removedTotal = skillsRemoved + steeringRemoved + agentsRemoved;
-    const failedAll = [
-      ...skillsFailed,
-      ...steeringFailed,
-      ...agentsFailed,
-      ...skillsRemoveFailed,
-      ...steeringRemoveFailed,
-      ...agentsRemoveFailed,
+    const removedTotal =
+      skillsRemoveResult.removed + steeringRemoveResult.removed + agentsRemoveResult.removed;
+    // Tag each failure with its category so same-named items across
+    // skill/steering/agent disambiguate in the banner (a plugin with a
+    // skill, steering file, and agent all named "rules" otherwise
+    // renders as "Failed: rules (...), rules (...), rules (...)").
+    function fmtFailed(category: string, f: { name: string; error: string }): string {
+      return `${category}:${f.name} (${f.error})`;
+    }
+    const failedParts = [
+      ...skillsFailed.map((f) => fmtFailed("skill", f)),
+      ...steeringFailed.map((f) => fmtFailed("steering", f)),
+      ...agentsFailed.map((f) => fmtFailed("agent", f)),
+      ...skillsRemoveResult.failed.map((f) => fmtFailed("skill", f)),
+      ...steeringRemoveResult.failed.map((f) => fmtFailed("steering", f)),
+      ...agentsRemoveResult.failed.map((f) => fmtFailed("agent", f)),
     ];
 
     const parts: string[] = [];
     if (installedParts.length > 0) parts.push(`Installed: ${installedParts.join(" | ")}`);
     if (skippedTotal > 0) parts.push(`Already installed: ${skippedTotal}`);
     if (removedTotal > 0) parts.push(`Removed: ${removedTotal}`);
-    if (failedAll.length > 0) {
-      parts.push(`Failed: ${failedAll.map((f) => `${f.name} (${f.error})`).join(", ")}`);
+    if (failedParts.length > 0) {
+      parts.push(`Failed: ${failedParts.join(", ")}`);
     }
     if (skillsUnreadable.length > 0) {
       parts.push(`Unreadable: ${skillsUnreadable.map(formatSkippedSkill).join(", ")}`);
@@ -968,7 +933,7 @@
       || removedTotal > 0;
     if (parts.length === 0) {
       installMessage = `${marketplace}/${plugin}: no changes applied`;
-    } else if (!hadSuccess && failedAll.length > 0) {
+    } else if (!hadSuccess && failedParts.length > 0) {
       installError = `${marketplace}/${plugin}: ${parts.join(" | ")}`;
     } else if (installError === null) {
       // Don't overwrite a hard wrapper error from one of the install
@@ -990,10 +955,6 @@
     closeDrawer();
   }
 
-  // Project a FailedAgent into a flat (name, error) shape for the
-  // banner accumulator. Mirrors formatFailedAgent's switch but pulls
-  // out the name field directly so the banner reads consistently
-  // alongside skills/steering failure lists.
   // Cross-platform path basename. The wire shape from the Rust side
   // is a String, but `out.source` and `out.destination` for steering
   // can carry mixed `\` (Windows base) and `/` (Unix-style relative)
@@ -1002,11 +963,16 @@
   // PathBuf::join doesn't normalize. Splitting on either separator
   // and taking the last non-empty segment gives the canonical
   // basename regardless of how the source path was assembled.
+  const PATH_SEP = /[\\/]/;
   function basenameOf(path: string): string {
-    const segments = path.split(/[\\/]/).filter((seg) => seg.length > 0);
+    const segments = path.split(PATH_SEP).filter((seg) => seg.length > 0);
     return segments.length > 0 ? segments[segments.length - 1] : path;
   }
 
+  // Project a FailedAgent into a flat (name, error) shape for the
+  // banner accumulator. Mirrors formatFailedAgent's switch but pulls
+  // out the name field directly so the banner reads consistently
+  // alongside skills/steering failure lists.
   function formatFailedAgentForBanner(
     f: import("$lib/bindings").FailedAgent_Serialize,
   ): { name: string; error: string } {
@@ -1017,7 +983,7 @@
         // source_path is the file we couldn't parse — show the
         // basename for banner brevity (same separator-normalization
         // story as basenameOf's doc).
-        return { name: basenameOf(f.source_path.toString()), error: f.error };
+        return { name: basenameOf(f.source_path), error: f.error };
       case "companion_bundle":
         return { name: `${f.plugin} (companion bundle)`, error: f.error };
       case "requested_but_not_found":
@@ -1644,8 +1610,9 @@
 <!--
   Customize drawer host. Rendered outside the main BrowseTab flex
   column so its position:fixed overlay isn't constrained by the
-  flex parent. The drawer's onApply receives a skill-only diff
-  (Option A — kiro-zx73 widens to per-item steering/agents).
+  flex parent. The drawer's onApply receives a per-category diff
+  (skills + steering + agents); applyDrawerDiff fans out to one
+  batch install + one remove loop per category.
 -->
 {#if drawerEntry && drawerMarketplace}
   <CustomizeDrawer

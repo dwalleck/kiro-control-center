@@ -6,9 +6,9 @@ use std::sync::Mutex;
 use kiro_market_core::error::error_full_chain;
 use kiro_market_core::file_lock::with_file_lock;
 use kiro_market_core::kiro_settings::{
-    LoadSettingsError, SettingEntry, SettingValue, apply_registered_setting, default_kiro_dir,
-    kiro_settings_path, load_kiro_settings_from, registry, remove_nested, resolve_setting_for_key,
-    resolve_settings, save_kiro_settings_to,
+    apply_registered_setting, default_kiro_dir, kiro_settings_path, load_kiro_settings_from,
+    registry, remove_nested, resolve_setting_for_key, resolve_settings, save_kiro_settings_to,
+    LoadSettingsError, SettingEntry, SettingValue,
 };
 use serde_json::Value as JsonValue;
 

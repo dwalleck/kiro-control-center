@@ -100,12 +100,20 @@ pub struct FailedUpdate {
     pub error: String,
 }
 
-/// Filter applied to a multi-skill install operation.
+/// Filter applied to an install operation. Used by all three per-item
+/// install paths (`install_skills`, `install_plugin_steering`,
+/// `install_plugin_agents`) — the matched join key differs by category:
 ///
-/// `All` installs every discovered skill. `Names(set)` keeps only skills
-/// whose `SKILL.md` frontmatter `name` appears in the set; any names in
-/// the set that are NOT matched at the end are reported as `Failed` (so
-/// the caller can warn the user about typos).
+/// - skills: `SKILL.md` frontmatter `name` field
+/// - steering: relative path under the scan root (matches
+///   `SteeringItemInfo.name` from the catalog)
+/// - agents: parsed agent identity (matches `AgentItemInfo.name`)
+///
+/// `All` installs every discovered item. `Names(set)` / `SingleName(name)`
+/// keep only items whose join key is in the set / equals the name. Any
+/// requested names that don't match a discovered item at the end are
+/// reported as `RequestedButNotFound` failures so the caller can surface
+/// typos and stale references.
 pub enum InstallFilter<'a> {
     All,
     Names(&'a [String]),

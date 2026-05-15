@@ -32,6 +32,26 @@ pub(in crate::commands) fn make_service() -> Result<MarketplaceService, CommandE
     Ok(MarketplaceService::new(cache, GixCliBackend::default()))
 }
 
+/// Reject an empty `names` slice at the IPC boundary. Empty `names`
+/// is structurally ambiguous with `InstallFilter::All` at the core
+/// layer: `filter_matches` returns false for every item and
+/// `surface_unmatched_names` sees no misses to surface — net result
+/// is a silent Ok with empty installed/failed. Callers (drawer
+/// applyDrawerDiff) already short-circuit on empty diffs; this
+/// rejection is defensive against future / non-drawer callers.
+pub(in crate::commands) fn reject_empty_names(
+    names: &[String],
+    command: &str,
+) -> Result<(), CommandError> {
+    if names.is_empty() {
+        return Err(CommandError::new(
+            format!("{command}: names list must not be empty"),
+            ErrorType::Validation,
+        ));
+    }
+    Ok(())
+}
+
 /// Fail-fast validation of a Tauri-supplied `project_path`, returning
 /// the canonical absolute path on success.
 ///

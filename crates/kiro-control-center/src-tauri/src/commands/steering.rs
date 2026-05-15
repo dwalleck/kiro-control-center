@@ -11,9 +11,9 @@ use std::path::Path;
 use kiro_market_core::project::KiroProject;
 use kiro_market_core::service::{InstallFilter, InstallMode, MarketplaceService};
 use kiro_market_core::steering::{InstallSteeringResult, SteeringInstallContext};
-use kiro_market_core::validation::{MarketplaceName, PluginName, validate_relative_path};
+use kiro_market_core::validation::{validate_relative_path, MarketplaceName, PluginName};
 
-use crate::commands::{make_service, validate_kiro_project_path};
+use crate::commands::{make_service, reject_empty_names, validate_kiro_project_path};
 use crate::error::{CommandError, ErrorType};
 
 /// Install every steering file declared by a plugin into the active
@@ -116,19 +116,7 @@ fn install_steering_files_impl(
     mode: InstallMode,
     project_path: &str,
 ) -> Result<InstallSteeringResult, CommandError> {
-    // Empty `names` is structurally ambiguous with InstallFilter::All
-    // at the core layer: filter_matches returns false for every item,
-    // and surface_unmatched_names sees no misses to surface — net
-    // result is a silent Ok with empty installed/failed. The drawer's
-    // applyDrawerDiff already short-circuits on empty diffs, so this
-    // boundary rejection is defensive against future / non-drawer
-    // callers, not a behavior change for current ones.
-    if names.is_empty() {
-        return Err(CommandError::new(
-            "install_steering_files: names list must not be empty",
-            ErrorType::Validation,
-        ));
-    }
+    reject_empty_names(names, "install_steering_files")?;
     let project_root = validate_kiro_project_path(project_path)?;
     let marketplace = MarketplaceName::new(marketplace)?;
     let plugin = PluginName::new(plugin)?;

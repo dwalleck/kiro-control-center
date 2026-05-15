@@ -8,7 +8,7 @@
     clippy::too_many_lines
 )]
 
-use tauri_specta::{Builder, collect_commands};
+use tauri_specta::{collect_commands, Builder};
 
 pub mod commands;
 pub mod error;

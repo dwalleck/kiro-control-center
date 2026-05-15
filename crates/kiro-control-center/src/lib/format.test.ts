@@ -22,14 +22,15 @@ import {
   formatSkippedSkillsForPlugin,
 } from "./format";
 
-// Field names + structure tracked from bindings.ts (see plan
-// "Source-of-truth references"):
-//  - InstallSkillsResult:             bindings.ts:667-686
-//  - InstallSteeringResult_Serialize: bindings.ts:699-703
-//  - InstallAgentsResult_Serialize:   bindings.ts:522-560
-//  - FailedSkill:                     bindings.ts:352-356
-//  - InstalledSteeringOutcome:        bindings.ts:853-859
-//  - InstallOutcomeKind:              bindings.ts:568-581
+// Field names + structure tracked from bindings.ts. Line numbers
+// omitted because bindings.ts is auto-regenerated and they rot;
+// search by type name:
+//  - InstallSkillsResult
+//  - InstallSteeringResult_Serialize
+//  - InstallAgentsResult_Serialize
+//  - FailedSkill
+//  - InstalledSteeringOutcome
+//  - InstallOutcomeKind
 function emptyInstallResult(): InstallPluginResult_Serialize {
   return {
     marketplace: "acme" as MarketplaceName,

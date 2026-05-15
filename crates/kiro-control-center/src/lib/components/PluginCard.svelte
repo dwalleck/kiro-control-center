@@ -4,6 +4,7 @@
     PluginUpdateFailure,
     PluginUpdateInfo,
   } from "$lib/bindings";
+  import { pluralize } from "$lib/drawer-diff";
   import { actionUpdateLabel, kindLabel } from "$lib/stores/plugin-updates";
   import type { BrowseAction } from "$lib/stores/plugin-updates";
 
@@ -110,18 +111,17 @@
 
   // Per-category subline: only show categories that have items, so an
   // agent-less plugin doesn't read "5 skills · 0 steering · 0 agents."
+  // "steering" is a mass noun — no plural inflection.
   const categorySummary = $derived.by(() => {
     const parts: string[] = [];
     if (entry.skills.length > 0) {
-      parts.push(`${entry.skills.length} skill${entry.skills.length === 1 ? "" : "s"}`);
+      parts.push(`${entry.skills.length} ${pluralize(entry.skills.length, "skill", "skills")}`);
     }
     if (entry.steering.length > 0) {
-      parts.push(
-        `${entry.steering.length} steering`,
-      );
+      parts.push(`${entry.steering.length} steering`);
     }
     if (entry.agents.length > 0) {
-      parts.push(`${entry.agents.length} agent${entry.agents.length === 1 ? "" : "s"}`);
+      parts.push(`${entry.agents.length} ${pluralize(entry.agents.length, "agent", "agents")}`);
     }
     return parts.length === 0 ? "no items" : parts.join(" · ");
   });

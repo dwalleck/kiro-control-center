@@ -242,12 +242,10 @@ export function formatSkippedSkillsForPlugin(list: readonly SkippedSkill[]): str
   // dozens of malformed SKILL.md files is a real failure mode, but
   // the banner isn't the right place to dump the whole list.
   const MAX = 5;
-  const parts = list.slice(0, MAX).map(formatSkippedSkill);
-  const overflow = list.length - parts.length;
-  const joined = parts.join("; ");
-  return overflow > 0
-    ? `${list.length} skill(s) failed to load — ${joined}; +${overflow} more`
-    : `${list.length} skill(s) failed to load — ${joined}`;
+  const joined = list.slice(0, MAX).map(formatSkippedSkill).join("; ");
+  const overflow = Math.max(0, list.length - MAX);
+  const suffix = overflow > 0 ? `; +${overflow} more` : "";
+  return `${list.length} skill(s) failed to load — ${joined}${suffix}`;
 }
 
 // Render a plugin's `entry.skipped_items` as a compact banner body —
@@ -290,12 +288,9 @@ export function formatSkippedItemsForPlugin(items: readonly SkippedItem[]): stri
   if (steering.length > 0) {
     const MAX = 3;
     const detail = steering.slice(0, MAX).map(formatSteeringWarning).join("; ");
-    const overflow = steering.length - Math.min(steering.length, MAX);
-    parts.push(
-      overflow > 0
-        ? `${steering.length} steering warning(s) — ${detail}; +${overflow} more`
-        : `${steering.length} steering warning(s) — ${detail}`,
-    );
+    const overflow = Math.max(0, steering.length - MAX);
+    const suffix = overflow > 0 ? `; +${overflow} more` : "";
+    parts.push(`${steering.length} steering warning(s) — ${detail}${suffix}`);
   }
   if (agents.length > 0) {
     const MAX = 3;
@@ -303,12 +298,9 @@ export function formatSkippedItemsForPlugin(items: readonly SkippedItem[]): stri
       .slice(0, MAX)
       .map((a) => `${a.source_path}: ${a.reason}`)
       .join("; ");
-    const overflow = agents.length - Math.min(agents.length, MAX);
-    parts.push(
-      overflow > 0
-        ? `${agents.length} agent(s) failed to parse — ${detail}; +${overflow} more`
-        : `${agents.length} agent(s) failed to parse — ${detail}`,
-    );
+    const overflow = Math.max(0, agents.length - MAX);
+    const suffix = overflow > 0 ? `; +${overflow} more` : "";
+    parts.push(`${agents.length} agent(s) failed to parse — ${detail}${suffix}`);
   }
   return parts.join(" | ");
 }

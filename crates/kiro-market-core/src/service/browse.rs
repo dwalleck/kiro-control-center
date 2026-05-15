@@ -887,43 +887,13 @@ impl MarketplaceService {
             })?;
         let plugin_dir = self.resolve_local_plugin_dir(plugin_entry, &marketplace_path)?;
         let manifest = load_plugin_manifest(&plugin_dir)?;
-        let scan_paths = steering_scan_paths_for_plugin(manifest.as_ref());
-
-        // Loop budget: O(steering_files_per_plugin). Production scale ≤20
-        // files per plugin (CLAUDE.md plugins ship 1–5; observed max ≈8).
-        let (discovered, warnings) = discover_steering_files_in_dirs(&plugin_dir, &scan_paths);
-        let mut steering = Vec::with_capacity(discovered.len());
-        for f in &discovered {
-            // Skip discovered files whose source filename isn't valid UTF-8.
-            // Returning a `SteeringItemInfo` with a lossy String would lie
-            // about the install join key (which uses the raw OsStr); rather
-            // than fabricate a placeholder name we drop the entry — the
-            // upstream discover path already validated the parent scan dir,
-            // so a non-UTF-8 leaf here is a degenerate filesystem case, not
-            // user-visible content.
-            let Some(name) = f.source.file_name().and_then(|s| s.to_str()) else {
-                debug!(
-                    path = %f.source.display(),
-                    "skipping discovered steering file with non-UTF-8 filename"
-                );
-                continue;
-            };
-            steering.push(SteeringItemInfo {
-                name: name.to_owned(),
-                plugin: plugin.to_owned(),
-                marketplace: marketplace.to_owned(),
-                // Name-only match would mis-attribute a tracking entry
-                // owned by a DIFFERENT plugin/marketplace as if it were
-                // this plugin's. The drawer would then show the item
-                // checked, and Apply with an uncheck would remove the
-                // OTHER plugin's file. Pin ownership before declaring
-                // installed.
-                installed: installed.files.get(Path::new(name)).is_some_and(|meta| {
-                    meta.plugin.as_str() == plugin && meta.marketplace.as_str() == marketplace
-                }),
-            });
-        }
-        Ok(PluginSteeringResult { steering, warnings })
+        Ok(list_steering_with_manifest(
+            marketplace,
+            plugin,
+            &plugin_dir,
+            manifest.as_ref(),
+            installed,
+        ))
     }
 
     /// List every agent declared by a single plugin, cross-referenced
@@ -972,75 +942,13 @@ impl MarketplaceService {
             })?;
         let plugin_dir = self.resolve_local_plugin_dir(plugin_entry, &marketplace_path)?;
         let manifest = load_plugin_manifest(&plugin_dir)?;
-        let scan_paths = agent_scan_paths_for_plugin(manifest.as_ref());
-
-        let mut agents = Vec::new();
-        let mut skipped = Vec::new();
-
-        // Loop budget: O(markdown_agents_per_plugin × parse_cost).
-        // Production scale ≤10 markdown agents per plugin; per-agent
-        // parse ≤5ms (frontmatter YAML).
-        for path in discover_agents_in_dirs(&plugin_dir, &scan_paths) {
-            match parse_agent_file(&path) {
-                Ok(def) => agents.push(AgentItemInfo {
-                    name: def.name.as_str().to_owned(),
-                    description: def.description,
-                    plugin: plugin.to_owned(),
-                    marketplace: marketplace.to_owned(),
-                    // Ownership-scoped match — see the analogous comment on
-                    // SteeringItemInfo above. Two plugins shipping an agent
-                    // with the same name must not see each other's tracking.
-                    installed: installed.agents.get(def.name.as_str()).is_some_and(|meta| {
-                        meta.plugin.as_str() == plugin && meta.marketplace.as_str() == marketplace
-                    }),
-                    dialect: def.dialect,
-                }),
-                Err(e) => skipped.push(AgentParseSkip {
-                    plugin: plugin.to_owned(),
-                    source_path: path,
-                    reason: error_full_chain(&e),
-                }),
-            }
-        }
-
-        // Loop budget: O(native_agents_per_plugin × parse_cost). Same
-        // production scale as the markdown loop above; native parse
-        // additionally validates JSON shape + size cap.
-        for discovered in discover_native_kiro_agents_in_dirs(&plugin_dir, &scan_paths) {
-            match parse_native_kiro_agent_file(&discovered.source, &discovered.scan_root) {
-                Ok(bundle) => agents.push(AgentItemInfo {
-                    name: bundle.name.as_str().to_owned(),
-                    // NativeAgentBundle has no description field — native
-                    // agents declare metadata in the `description` JSON
-                    // field but the parser doesn't surface it (the
-                    // install layer doesn't need it). UI gets None for
-                    // native agents until the parser is widened.
-                    description: None,
-                    plugin: plugin.to_owned(),
-                    marketplace: marketplace.to_owned(),
-                    // Ownership-scoped match — same rationale as the
-                    // markdown branch above. Native and translated agents
-                    // share the same .kiro/agents/ tracking namespace, so
-                    // a name collision across plugins is possible across
-                    // dialect boundaries too.
-                    installed: installed
-                        .agents
-                        .get(bundle.name.as_str())
-                        .is_some_and(|meta| {
-                            meta.plugin.as_str() == plugin
-                                && meta.marketplace.as_str() == marketplace
-                        }),
-                    dialect: AgentDialect::Native,
-                }),
-                Err(e) => skipped.push(AgentParseSkip {
-                    plugin: plugin.to_owned(),
-                    source_path: discovered.source,
-                    reason: error_full_chain(&e),
-                }),
-            }
-        }
-
-        Ok(PluginAgentsResult { agents, skipped })
+        Ok(list_agents_with_manifest(
+            marketplace,
+            plugin,
+            &plugin_dir,
+            manifest.as_ref(),
+            installed,
+        ))
     }
 
     /// Bulk per-marketplace catalog read: assemble [`PluginCatalogView`]
@@ -1085,12 +993,20 @@ impl MarketplaceService {
         // K = plugin_entries.len(). Production scale K ≤ 50 plugins per
         // marketplace, items ≤ 50 per category. Bound: 50 × 50 × 3 =
         // 7,500 items per call, well under the 10^6 ceiling.
+        //
+        // `marketplace_path` is hoisted out of the loop so the inner
+        // `assemble_catalog_entry` doesn't recompute it K times — it's
+        // a single derived path, not a filesystem read, but threading
+        // it down also lets each plugin's `resolve_local_plugin_dir`
+        // share the same base.
+        let marketplace_path = self.marketplace_path(marketplace);
         let mut plugins = Vec::with_capacity(plugin_entries.len());
         let mut skipped = Vec::new();
 
         for plugin_entry in plugin_entries {
             match self.assemble_catalog_entry(
                 marketplace,
+                &marketplace_path,
                 plugin_entry,
                 installed_skills,
                 installed_steering,
@@ -1126,17 +1042,42 @@ impl MarketplaceService {
     fn assemble_catalog_entry(
         &self,
         marketplace: &str,
+        marketplace_path: &Path,
         plugin_entry: &PluginEntry,
         installed_skills: &InstalledSkills,
         installed_steering: &InstalledSteering,
         installed_agents: &InstalledAgents,
     ) -> Result<PluginCatalogEntry, Error> {
-        let skills_result =
-            self.list_skills_for_plugin(marketplace, &plugin_entry.name, installed_skills)?;
-        let steering_result =
-            self.list_steering_for_plugin(marketplace, &plugin_entry.name, installed_steering)?;
-        let agents_result =
-            self.list_agents_for_plugin(marketplace, &plugin_entry.name, installed_agents)?;
+        // One resolve + manifest load shared across all three per-category
+        // enumerators. Previously each `list_*_for_plugin` did its own
+        // registry parse + plugin lookup + `resolve_local_plugin_dir` +
+        // `load_plugin_manifest`, so the bulk catalog paid 3× per plugin
+        // for inputs the three helpers all want.
+        let plugin_dir = self.resolve_local_plugin_dir(plugin_entry, marketplace_path)?;
+        let plugin_manifest = load_plugin_manifest(&plugin_dir)?;
+        let manifest_ref = plugin_manifest.as_ref();
+
+        let skills_result = list_skills_with_manifest(
+            plugin_entry,
+            &plugin_dir,
+            manifest_ref,
+            marketplace,
+            installed_skills,
+        );
+        let steering_result = list_steering_with_manifest(
+            marketplace,
+            &plugin_entry.name,
+            &plugin_dir,
+            manifest_ref,
+            installed_steering,
+        );
+        let agents_result = list_agents_with_manifest(
+            marketplace,
+            &plugin_entry.name,
+            &plugin_dir,
+            manifest_ref,
+            installed_agents,
+        );
 
         // Aggregate per-category skip channels into the union
         // SkippedItem vector. Order: skills first, then steering, then
@@ -1371,7 +1312,33 @@ fn collect_skills_for_plugin_into(
 ) -> Result<(), Error> {
     let plugin_dir = service.resolve_local_plugin_dir(plugin_entry, marketplace_path)?;
     let plugin_manifest = load_plugin_manifest(&plugin_dir)?;
-    let skill_dirs = discover_skills_for_plugin(&plugin_dir, plugin_manifest.as_ref());
+    collect_skills_with_manifest(
+        plugin_entry,
+        &plugin_dir,
+        plugin_manifest.as_ref(),
+        marketplace_name,
+        installed,
+        out,
+        skipped_skills,
+    );
+    Ok(())
+}
+
+/// Same per-skill semantics as [`collect_skills_for_plugin_into`] but
+/// assumes the caller has already resolved `plugin_dir` and loaded the
+/// manifest. Used by [`MarketplaceService::assemble_catalog_entry`] to
+/// share one resolution across all three per-category enumerators
+/// (skills + steering + agents) instead of paying it three times.
+fn collect_skills_with_manifest(
+    plugin_entry: &PluginEntry,
+    plugin_dir: &Path,
+    plugin_manifest: Option<&PluginManifest>,
+    marketplace_name: &str,
+    installed: &InstalledSkills,
+    out: &mut Vec<SkillInfo>,
+    skipped_skills: &mut Vec<SkippedSkill>,
+) {
+    let skill_dirs = discover_skills_for_plugin(plugin_dir, plugin_manifest);
     out.reserve(skill_dirs.len());
 
     // Dedup tracker: first-seen `name` wins; subsequent dirs declaring
@@ -1476,8 +1443,168 @@ fn collect_skills_for_plugin_into(
             installed: is_installed,
         });
     }
+}
 
-    Ok(())
+/// Per-plugin skill listing with the manifest pre-loaded. Builds a
+/// fresh [`PluginSkillsResult`] by delegating to
+/// [`collect_skills_with_manifest`]. Used by
+/// [`MarketplaceService::assemble_catalog_entry`] so the bulk catalog
+/// path doesn't re-resolve `plugin_dir` / re-load `plugin.json` once
+/// per category enumerator.
+fn list_skills_with_manifest(
+    plugin_entry: &PluginEntry,
+    plugin_dir: &Path,
+    plugin_manifest: Option<&PluginManifest>,
+    marketplace_name: &str,
+    installed: &InstalledSkills,
+) -> PluginSkillsResult {
+    let mut skills = Vec::new();
+    let mut skipped_skills = Vec::new();
+    collect_skills_with_manifest(
+        plugin_entry,
+        plugin_dir,
+        plugin_manifest,
+        marketplace_name,
+        installed,
+        &mut skills,
+        &mut skipped_skills,
+    );
+    PluginSkillsResult {
+        skills,
+        skipped_skills,
+    }
+}
+
+/// Per-plugin steering listing with the manifest pre-loaded. Same
+/// contract as [`MarketplaceService::list_steering_for_plugin`] (no
+/// `Err` arm — discovery warnings land in
+/// [`PluginSteeringResult::warnings`]), but the caller owns dir /
+/// manifest resolution.
+fn list_steering_with_manifest(
+    marketplace_name: &str,
+    plugin_name: &str,
+    plugin_dir: &Path,
+    plugin_manifest: Option<&PluginManifest>,
+    installed: &InstalledSteering,
+) -> PluginSteeringResult {
+    let scan_paths = steering_scan_paths_for_plugin(plugin_manifest);
+    let (discovered, warnings) = discover_steering_files_in_dirs(plugin_dir, &scan_paths);
+    let mut steering = Vec::with_capacity(discovered.len());
+    for f in &discovered {
+        // Skip discovered files whose source filename isn't valid UTF-8.
+        // Returning a `SteeringItemInfo` with a lossy String would lie
+        // about the install join key (which uses the raw OsStr); rather
+        // than fabricate a placeholder name we drop the entry — the
+        // upstream discover path already validated the parent scan dir,
+        // so a non-UTF-8 leaf here is a degenerate filesystem case, not
+        // user-visible content.
+        let Some(name) = f.source.file_name().and_then(|s| s.to_str()) else {
+            debug!(
+                path = %f.source.display(),
+                "skipping discovered steering file with non-UTF-8 filename"
+            );
+            continue;
+        };
+        steering.push(SteeringItemInfo {
+            name: name.to_owned(),
+            plugin: plugin_name.to_owned(),
+            marketplace: marketplace_name.to_owned(),
+            // Name-only match would mis-attribute a tracking entry
+            // owned by a DIFFERENT plugin/marketplace as if it were
+            // this plugin's. The drawer would then show the item
+            // checked, and Apply with an uncheck would remove the
+            // OTHER plugin's file. Pin ownership before declaring
+            // installed.
+            installed: installed.files.get(Path::new(name)).is_some_and(|meta| {
+                meta.plugin.as_str() == plugin_name && meta.marketplace.as_str() == marketplace_name
+            }),
+        });
+    }
+    PluginSteeringResult { steering, warnings }
+}
+
+/// Per-plugin agent listing with the manifest pre-loaded. Covers BOTH
+/// translated dialects (markdown frontmatter via [`parse_agent_file`])
+/// AND native Kiro agents (JSON via [`parse_native_kiro_agent_file`]) —
+/// same as [`MarketplaceService::list_agents_for_plugin`], but the
+/// caller owns dir / manifest resolution.
+fn list_agents_with_manifest(
+    marketplace_name: &str,
+    plugin_name: &str,
+    plugin_dir: &Path,
+    plugin_manifest: Option<&PluginManifest>,
+    installed: &InstalledAgents,
+) -> PluginAgentsResult {
+    let scan_paths = agent_scan_paths_for_plugin(plugin_manifest);
+
+    let mut agents = Vec::new();
+    let mut skipped = Vec::new();
+
+    // Loop budget: O(markdown_agents_per_plugin × parse_cost).
+    // Production scale ≤10 markdown agents per plugin; per-agent
+    // parse ≤5ms (frontmatter YAML).
+    for path in discover_agents_in_dirs(plugin_dir, &scan_paths) {
+        match parse_agent_file(&path) {
+            Ok(def) => agents.push(AgentItemInfo {
+                name: def.name.as_str().to_owned(),
+                description: def.description,
+                plugin: plugin_name.to_owned(),
+                marketplace: marketplace_name.to_owned(),
+                // Ownership-scoped match — see the analogous comment on
+                // SteeringItemInfo above. Two plugins shipping an agent
+                // with the same name must not see each other's tracking.
+                installed: installed.agents.get(def.name.as_str()).is_some_and(|meta| {
+                    meta.plugin.as_str() == plugin_name
+                        && meta.marketplace.as_str() == marketplace_name
+                }),
+                dialect: def.dialect,
+            }),
+            Err(e) => skipped.push(AgentParseSkip {
+                plugin: plugin_name.to_owned(),
+                source_path: path,
+                reason: error_full_chain(&e),
+            }),
+        }
+    }
+
+    // Loop budget: O(native_agents_per_plugin × parse_cost). Same
+    // production scale as the markdown loop above; native parse
+    // additionally validates JSON shape + size cap.
+    for discovered in discover_native_kiro_agents_in_dirs(plugin_dir, &scan_paths) {
+        match parse_native_kiro_agent_file(&discovered.source, &discovered.scan_root) {
+            Ok(bundle) => agents.push(AgentItemInfo {
+                name: bundle.name.as_str().to_owned(),
+                // NativeAgentBundle has no description field — native
+                // agents declare metadata in the `description` JSON
+                // field but the parser doesn't surface it (the
+                // install layer doesn't need it). UI gets None for
+                // native agents until the parser is widened.
+                description: None,
+                plugin: plugin_name.to_owned(),
+                marketplace: marketplace_name.to_owned(),
+                // Ownership-scoped match — same rationale as the
+                // markdown branch above. Native and translated agents
+                // share the same .kiro/agents/ tracking namespace, so
+                // a name collision across plugins is possible across
+                // dialect boundaries too.
+                installed: installed
+                    .agents
+                    .get(bundle.name.as_str())
+                    .is_some_and(|meta| {
+                        meta.plugin.as_str() == plugin_name
+                            && meta.marketplace.as_str() == marketplace_name
+                    }),
+                dialect: AgentDialect::Native,
+            }),
+            Err(e) => skipped.push(AgentParseSkip {
+                plugin: plugin_name.to_owned(),
+                source_path: discovered.source,
+                reason: error_full_chain(&e),
+            }),
+        }
+    }
+
+    PluginAgentsResult { agents, skipped }
 }
 
 /// Best-effort label for a skill whose real (frontmatter) name is
