@@ -2685,9 +2685,32 @@ impl MarketplaceService {
     /// marketplace shipping a multi-GB `plugin.json` cannot OOM the
     /// process before serde sees a byte.
     fn load_plugin_manifest(plugin_dir: &Path) -> Result<ManifestState, Error> {
-        let manifest_path = plugin_dir.join("plugin.json");
+        // Primary path: plugin.json directly under the resolved plugin
+        // dir (the kiro-market-native layout). Fallback path:
+        // .claude-plugin/plugin.json (the Claude Code marketplace
+        // convention — the same `.claude-plugin/` namespace where
+        // marketplace.json lives, see MARKETPLACE_MANIFEST_PATH). The
+        // fallback unblocks update checks for marketplaces like
+        // gilfoyle that ship in Claude Code format with `source: "./"`
+        // pointing at the marketplace root. See discover_plugins'
+        // explicit `.claude-plugin/` skip — that's NAME discovery
+        // (treating .claude-plugin/ as marketplace-internal, not as a
+        // plugin to install). This fallback is the ALREADY-NAMED
+        // plugin's manifest read, where reading marketplace-internal
+        // metadata is the right thing to do.
+        //
+        // Symlink defense applies to whichever path we ultimately
+        // read from (C5 security fix).
+        let primary = plugin_dir.join("plugin.json");
+        let fallback = plugin_dir.join(".claude-plugin/plugin.json");
+        let Some(manifest_path) = Self::resolve_plugin_manifest_path(&primary, &fallback)? else {
+            return Ok(ManifestState::Unreadable {
+                reason: "plugin.json missing in marketplace cache (also checked .claude-plugin/plugin.json)".to_owned(),
+            });
+        };
 
-        // Symlink defense: refuse to follow symlinks (C5 security fix).
+        // Symlink defense on the resolved path. Resolved-path-only —
+        // earlier stat'd both candidates as part of resolution.
         match fs::symlink_metadata(&manifest_path) {
             Ok(m) if m.file_type().is_symlink() => {
                 warn!(
@@ -2699,11 +2722,6 @@ impl MarketplaceService {
                 });
             }
             Ok(_) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                return Ok(ManifestState::Unreadable {
-                    reason: "plugin.json missing in marketplace cache".to_owned(),
-                });
-            }
             Err(e) => {
                 return Err(PluginError::CacheManifestReadFailed {
                     path: manifest_path,
@@ -2732,6 +2750,31 @@ impl MarketplaceService {
             }
             .into()),
         }
+    }
+
+    /// Pick the plugin manifest path to use. Returns the primary path
+    /// if it exists; otherwise the fallback path if THAT exists;
+    /// otherwise None (no manifest). Propagates non-NotFound I/O
+    /// errors immediately so the caller can surface a real reason
+    /// instead of treating "permission denied" as "missing".
+    fn resolve_plugin_manifest_path(
+        primary: &Path,
+        fallback: &Path,
+    ) -> Result<Option<PathBuf>, Error> {
+        for candidate in [primary, fallback] {
+            match fs::symlink_metadata(candidate) {
+                Ok(_) => return Ok(Some(candidate.to_path_buf())),
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    return Err(PluginError::CacheManifestReadFailed {
+                        path: candidate.to_path_buf(),
+                        source: e,
+                    }
+                    .into());
+                }
+            }
+        }
+        Ok(None)
     }
 
     /// Scan all tracking entries for `(marketplace, plugin)` and compare

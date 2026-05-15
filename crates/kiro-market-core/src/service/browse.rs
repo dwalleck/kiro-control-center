@@ -1651,7 +1651,24 @@ fn skipped_reason_from_manifest_error(
 ///   failure (permission denied, transient I/O, etc.). Classified as
 ///   plugin-level so bulk listings skip the plugin rather than aborting.
 fn load_plugin_manifest(plugin_dir: &Path) -> Result<Option<PluginManifest>, Error> {
-    let manifest_path = plugin_dir.join("plugin.json");
+    // Primary path: plugin.json directly under the plugin dir
+    // (kiro-market-native layout). Fallback: .claude-plugin/plugin.json
+    // (Claude Code marketplace convention). Mirrors the same fallback
+    // applied to service::mod::load_plugin_manifest's catalog-side
+    // counterpart — a marketplace shipped in Claude Code format with
+    // `source: "./"` puts both metadata files under .claude-plugin/,
+    // and the catalog must read whichever exists so version /
+    // declared scan paths flow through to the install layer.
+    let primary = plugin_dir.join("plugin.json");
+    let fallback = plugin_dir.join(".claude-plugin/plugin.json");
+    let Some(manifest_path) = resolve_browse_manifest_path(&primary, &fallback)? else {
+        debug!(
+            primary = %primary.display(),
+            fallback = %fallback.display(),
+            "plugin.json not found at either location, using defaults"
+        );
+        return Ok(None);
+    };
 
     // Refuse to follow symlinks. plugin_dir lives inside a cloned
     // (untrusted) repository; a symlinked plugin.json could leak host
@@ -1666,13 +1683,6 @@ fn load_plugin_manifest(plugin_dir: &Path) -> Result<Option<PluginManifest>, Err
             return Ok(None);
         }
         Ok(_) => {}
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            debug!(
-                path = %manifest_path.display(),
-                "plugin.json not found, using defaults"
-            );
-            return Ok(None);
-        }
         Err(e) => {
             warn!(
                 path = %manifest_path.display(),
@@ -1726,6 +1736,35 @@ fn load_plugin_manifest(plugin_dir: &Path) -> Result<Option<PluginManifest>, Err
             .into())
         }
     }
+}
+
+/// Pick the plugin-manifest path. Tries the kiro-market-native primary
+/// path first; on a clean `NotFound`, tries the Claude Code-format
+/// fallback under `.claude-plugin/`. Any other I/O error (permission
+/// denied, transient I/O) propagates immediately so the caller can
+/// surface a real reason instead of treating it as missing. Returns
+/// `None` when neither candidate exists. Mirrors the analogous helper
+/// in `service::mod` used by the update-detection path.
+fn resolve_browse_manifest_path(primary: &Path, fallback: &Path) -> Result<Option<PathBuf>, Error> {
+    for candidate in [primary, fallback] {
+        match fs::symlink_metadata(candidate) {
+            Ok(_) => return Ok(Some(candidate.to_path_buf())),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                warn!(
+                    path = %candidate.display(),
+                    error = %e,
+                    "failed to stat plugin.json candidate"
+                );
+                return Err(PluginError::ManifestReadFailed {
+                    path: candidate.to_path_buf(),
+                    source: e,
+                }
+                .into());
+            }
+        }
+    }
+    Ok(None)
 }
 
 // ---------------------------------------------------------------------------
@@ -2170,6 +2209,69 @@ mod tests {
         assert!(
             matches!(err, Error::Plugin(PluginError::ManifestReadFailed { .. })),
             "expected ManifestReadFailed for cap-exceeded, got: {err:?}"
+        );
+    }
+
+    /// Claude Code-format marketplace fallback. User-reported bug from
+    /// terax-ai with the gilfoyle marketplace: kiro-market expected
+    /// `plugin.json` at the plugin's resolved root but gilfoyle puts
+    /// it under `.claude-plugin/plugin.json` (Claude Code convention,
+    /// same place as marketplace.json). Without the fallback, the
+    /// catalog would silently skip the manifest (defaulting to scan
+    /// paths) and the update-check would error with
+    /// `manifest_unreadable`. With the fallback, both code paths read
+    /// the manifest from `.claude-plugin/plugin.json` and the plugin
+    /// works end-to-end.
+    #[test]
+    fn load_plugin_manifest_falls_back_to_claude_plugin_dir() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let plugin_dir = tmp.path().join("plugin");
+        let claude_dir = plugin_dir.join(".claude-plugin");
+        fs::create_dir_all(&claude_dir).expect("create .claude-plugin/");
+        // Manifest only at the Claude-format path; nothing at the root.
+        fs::write(
+            claude_dir.join("plugin.json"),
+            br#"{"name":"alpha","version":"1.0.0"}"#,
+        )
+        .expect("write claude-format plugin.json");
+        // Defensive: make sure there's NOT one at the root, otherwise
+        // the test would pass for the wrong reason.
+        assert!(!plugin_dir.join("plugin.json").exists());
+
+        let manifest = load_plugin_manifest(&plugin_dir)
+            .expect("manifest read should succeed via .claude-plugin/ fallback")
+            .expect("manifest should be Some, not None");
+        assert_eq!(manifest.name, "alpha");
+        assert_eq!(manifest.version.as_deref(), Some("1.0.0"));
+    }
+
+    /// Regression guard: when BOTH paths exist, the root-level
+    /// `plugin.json` wins. Pins the precedence so a future "fall
+    /// through to whichever has the higher version" refactor doesn't
+    /// silently change which manifest is authoritative.
+    #[test]
+    fn load_plugin_manifest_prefers_root_when_both_exist() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let plugin_dir = tmp.path().join("plugin");
+        let claude_dir = plugin_dir.join(".claude-plugin");
+        fs::create_dir_all(&claude_dir).expect("create .claude-plugin/");
+        fs::write(
+            plugin_dir.join("plugin.json"),
+            br#"{"name":"root-wins","version":"2.0.0"}"#,
+        )
+        .expect("write root plugin.json");
+        fs::write(
+            claude_dir.join("plugin.json"),
+            br#"{"name":"fallback-loses","version":"1.0.0"}"#,
+        )
+        .expect("write claude-format plugin.json");
+
+        let manifest = load_plugin_manifest(&plugin_dir)
+            .expect("manifest read")
+            .expect("manifest Some");
+        assert_eq!(
+            manifest.name, "root-wins",
+            "root-level plugin.json must take precedence over .claude-plugin/ fallback"
         );
     }
 
