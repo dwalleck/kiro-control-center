@@ -125,6 +125,33 @@ export const commands = {
 	 */
 	installPluginSteering: (marketplace: string, plugin: string, force: boolean, projectPath: string) => typedError<InstallSteeringResult_Serialize, CommandError>(__TAURI_INVOKE("install_plugin_steering", { marketplace, plugin, force, projectPath })),
 	/**
+	 *  Per-file steering install: drop into a plugin's discovered steering
+	 *  set and install only the named files. Mirrors
+	 *  [`crate::commands::browse::install_skills`] for steering — same
+	 *  `_impl(svc, ...)` testable shape, same `force` toggle, same wire
+	 *  shape as the whole-plugin install. Names map to the file's
+	 *  relative path under the plugin's steering scan root (which equals
+	 *  the basename for non-recursive discovery, the only shape steering
+	 *  discover produces today).
+	 * 
+	 *  Names that don't match any discovered file surface as
+	 *  `RequestedButNotFound` failures inside `result.failed`, mirroring
+	 *  the analogous behavior in `install_skills`.
+	 */
+	installSteeringFiles: (marketplace: string, plugin: string, names: string[], force: boolean, projectPath: string) => typedError<InstallSteeringResult_Serialize, CommandError>(__TAURI_INVOKE("install_steering_files", { marketplace, plugin, names, force, projectPath })),
+	/**
+	 *  Remove one steering file from the active project. The `name` is the
+	 *  filename's relative path under `.kiro/steering/` (matches the
+	 *  catalog's `SteeringItemInfo.name` field). Validates the path at the
+	 *  IPC boundary to refuse traversal attacks (`../etc/passwd`) before
+	 *  reaching `KiroProject::remove_steering_file`'s file-system call.
+	 * 
+	 *  Mirrors the shape of [`crate::commands::installed::remove_skill`] —
+	 *  no plugin context needed because steering filenames are unique
+	 *  under `.kiro/steering/` (same as skill names).
+	 */
+	removeSteeringFile: (name: string, projectPath: string) => typedError<null, CommandError>(__TAURI_INVOKE("remove_steering_file", { name, projectPath })),
+	/**
 	 *  Install every agent declared by a plugin into the active project's
 	 *  `.kiro/agents/` directory.
 	 * 
@@ -135,6 +162,31 @@ export const commands = {
 	 *  runtime.
 	 */
 	installPluginAgents: (marketplace: string, plugin: string, force: boolean, acceptMcp: boolean, projectPath: string) => typedError<InstallAgentsResult_Serialize, CommandError>(__TAURI_INVOKE("install_plugin_agents", { marketplace, plugin, force, acceptMcp, projectPath })),
+	/**
+	 *  Per-agent install: drop into a plugin's discovered agent set and
+	 *  install only the named agents. Mirrors
+	 *  [`crate::commands::steering::install_steering_files`] for agents —
+	 *  same `_impl(svc, ...)` testable shape and same wire shape as the
+	 *  whole-plugin install.
+	 * 
+	 *  Names are the **parsed** agent identity (frontmatter `name` for
+	 *  translated dialects, JSON `name` field for native), NOT source
+	 *  filenames — pinned by the slice-A2 fence
+	 *  `install_plugin_agents_names_filter_joins_on_parsed_name`.
+	 *  Unmatched names surface as `FailedAgent::RequestedButNotFound`
+	 *  inside `result.failed`.
+	 */
+	installAgents: (marketplace: string, plugin: string, names: string[], force: boolean, acceptMcp: boolean, projectPath: string) => typedError<InstallAgentsResult_Serialize, CommandError>(__TAURI_INVOKE("install_agents", { marketplace, plugin, names, force, acceptMcp, projectPath })),
+	/**
+	 *  Remove one agent from the active project. The `name` is the parsed
+	 *  agent identity (matches the catalog's `AgentItemInfo.name`).
+	 *  Routes through `AgentName::new` at the IPC boundary so a malformed
+	 *  name is rejected before reaching `KiroProject::remove_agent`'s
+	 *  filesystem call. Mirrors
+	 *  [`crate::commands::installed::remove_skill`] — no plugin context
+	 *  needed because agent names are unique under `.kiro/agents/`.
+	 */
+	removeAgent: (name: string, projectPath: string) => typedError<null, CommandError>(__TAURI_INVOKE("remove_agent", { name, projectPath })),
 	/**
 	 *  Install every skill, steering file, and agent declared by a plugin
 	 *  into the active project's `.kiro/` tree in one call.
@@ -431,7 +483,7 @@ export type FailedAgent_Deserialize =
  *  and `SteeringError::RequestedButNotFound`.
  * 
  *  No typed `AgentError` payload because no file was attempted —
- *  the request itself is what failed. The error() accessor returns
+ *  the request itself is what failed. The `error()` accessor returns
  *  None for this variant; renderers that need a string compose one
  *  from `name` + `plugin`.
  */
@@ -494,7 +546,7 @@ export type FailedAgent_Serialize =
  *  and `SteeringError::RequestedButNotFound`.
  * 
  *  No typed `AgentError` payload because no file was attempted —
- *  the request itself is what failed. The error() accessor returns
+ *  the request itself is what failed. The `error()` accessor returns
  *  None for this variant; renderers that need a string compose one
  *  from `name` + `plugin`.
  */

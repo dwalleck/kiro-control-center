@@ -129,6 +129,26 @@ mod tests {
             );
         }
 
+        // kiro-zx73 commands — per-item steering/agent install/remove.
+        // The drawer's apply-diff path (BrowseTab.applyDrawerDiff) calls
+        // these directly; if they vanish from bindings.ts, the drawer's
+        // Apply silently does nothing on the affected category. Lock
+        // the four wire signatures here so a regen drift doesn't
+        // strand the FE.
+        for cmd in &[
+            "installSteeringFiles:",
+            "removeSteeringFile:",
+            "installAgents:",
+            "removeAgent:",
+        ] {
+            assert!(
+                bindings.contains(cmd),
+                "bindings.ts must export `{cmd}` (kiro-zx73) — missing. \
+                 If this fires after backend changes, regenerate via \
+                 `cargo test -p kiro-control-center --lib generate_types -- --exact --ignored`."
+            );
+        }
+
         // The wire surface MUST NOT carry chrono types (specta's
         // chrono feature is off in this crate; one accidental
         // `DateTime<Utc>` on a derived struct would fail to compile,
