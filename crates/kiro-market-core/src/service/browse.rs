@@ -1060,9 +1060,10 @@ impl MarketplaceService {
     /// fail S7's compile-time assertion that the wrapper passes
     /// pre-loaded sets.
     ///
-    /// The empty `skipped_items` field on each [`PluginCatalogEntry`]
-    /// is populated by S6 (per-item skip aggregation); this slice
-    /// scaffolds the iteration shape and leaves the field empty.
+    /// `skipped_items` on each [`PluginCatalogEntry`] aggregates the
+    /// three per-category skip channels: malformed skill frontmatter,
+    /// steering discovery warnings, and agent parse failures. Plugin-
+    /// level failures still land in [`PluginCatalogView::skipped`].
     ///
     /// # Errors
     ///

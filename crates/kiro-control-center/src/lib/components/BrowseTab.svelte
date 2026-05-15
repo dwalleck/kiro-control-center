@@ -153,27 +153,28 @@
   });
 
   // Detects the install-time cross-plugin ownership-conflict failure
-  // class. The Rust side surfaces these as
-  // SteeringError::PathOwnedByOtherPlugin and the analogous agent /
-  // companion-bundle variants, all of which carry the suffix
-  // "pass --force to transfer ownership" in the rendered Display
-  // (stable thiserror impls). When this fires, the user's only path
-  // forward is the existing forceInstall toggle — without the hint
-  // below they'd see the failures and have no idea where to act.
+  // class so the UI can surface the forceInstall remediation hint.
+  // The Rust side surfaces these as SteeringError::PathOwnedByOtherPlugin
+  // and the analogous agent / companion-bundle variants, all of which
+  // carry the suffix "pass --force to transfer ownership" in their
+  // Display impls.
   //
-  // String-matching the rendered error is brittle in the abstract but
-  // safe here: these error strings have stable Display impls per
-  // CLAUDE.md's structural-error rule, and the substring is specific
-  // enough that an unrelated "force" mention can't false-positive.
+  // Substring-matching the rendered error is a temporary heuristic
+  // until the underlying error types gain structured `kind` fields.
+  // CLAUDE.md explicitly prefers typed enum variants over reason-String
+  // sentinels when callers branch on the semantic — which is what this
+  // function does. The structural fix is tracked: for steering, by the
+  // FailedSteeringFile tagged-enum restructure in rivets-xzrk; for the
+  // skill side, by the harmonization task in rivets-deph. Once both
+  // land, this function disappears in favor of `f.kind === "ownership_conflict"`
+  // checks against the typed variants.
   //
   // The detection covers BOTH banner surfaces:
   //   - installResult — set by the whole-plugin Install button via
   //     runPluginInstall → commands.installPlugin → InstallPluginResult.
   //   - installError / installMessage — set by the drawer's Apply path
   //     (applyDrawerDiff composes per-category failure strings into
-  //     these). The drawer doesn't populate installResult, so without
-  //     covering these surfaces too the hint never fires for drawer-
-  //     driven installs (the user's reported gap from terax-ai smoke).
+  //     these).
   function failureMentionsOwnership(s: string): boolean {
     return s.includes("--force to transfer");
   }
@@ -234,10 +235,8 @@
   // The Plugins-view grid pairs each catalog entry with its
   // marketplace name. PluginCard consumes the full catalog entry
   // directly so it can derive its three-state stripe and "X of Y
-  // installed" badge from per-item flags — slice 3 dropped the
-  // intermediate PluginInfo synthesis the cache swap (slice 2) had
-  // briefly used as scaffolding. Broken-manifest plugins still live
-  // in view.skipped and surface as banners (see fetchCatalogFor);
+  // installed" badge from per-item flags. Broken-manifest plugins
+  // live in view.skipped and surface as banners (see fetchCatalogFor);
   // they don't reach this derived list.
   let availablePlugins = $derived.by(() => {
     const out: { marketplace: string; entry: PluginCatalogEntryView }[] = [];
