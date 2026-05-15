@@ -775,6 +775,73 @@ mod tests {
         );
     }
 
+    /// Drawer Apply can re-call install_steering_files against
+    /// unchanged checkboxes — the user toggles, undoes the toggle, hits
+    /// Apply. In InstallMode::New the second call must be an idempotent
+    /// no-op: nothing in `installed`, the file lands in `skipped` (the
+    /// outcome kind is Idempotent, surfaced via the existing
+    /// SteeringInstallOutcome shape on the wire). A regression here
+    /// would corrupt tracking by re-writing the same file with a fresh
+    /// timestamp, or re-emit the install warning banner on no-op apply.
+    /// Companion to install_plugin_steering_impl_new_mode_surfaces_content_changed_in_failed
+    /// which covers the changed-source case; this one covers
+    /// unchanged-source.
+    #[test]
+    fn install_steering_files_impl_idempotent_reinstall_is_noop() {
+        let (dir, svc) = temp_service();
+        let entries = vec![relative_path_entry("myplugin", "plugins/myplugin")];
+        let marketplace_path = seed_marketplace_with_registry(dir.path(), &svc, "mp1", &entries);
+        let plugin_dir = marketplace_path.join("plugins/myplugin");
+        fs::create_dir_all(&plugin_dir).expect("plugin dir");
+        write_steering_file(&plugin_dir, "steering/x.md", "# x\n");
+        let project_path = make_kiro_project(dir.path());
+        let names = vec!["x.md".to_string()];
+
+        // First install — must succeed.
+        let r1 = install_steering_files_impl(
+            &svc,
+            "mp1",
+            "myplugin",
+            &names,
+            InstallMode::New,
+            &project_path,
+        )
+        .expect("first install");
+        assert_eq!(r1.installed.len(), 1);
+        assert!(r1.failed.is_empty(), "{:?}", r1.failed);
+
+        // Second install with unchanged source must NOT re-install and
+        // must NOT fail — the per-file path must classify the
+        // tracking row as idempotent.
+        let r2 = install_steering_files_impl(
+            &svc,
+            "mp1",
+            "myplugin",
+            &names,
+            InstallMode::New,
+            &project_path,
+        )
+        .expect("second install must not error");
+        assert!(
+            r2.failed.is_empty(),
+            "idempotent reinstall must not fail, got {:?}",
+            r2.failed
+        );
+        assert_eq!(
+            r2.installed.len(),
+            1,
+            "idempotent reinstall surfaces the file in installed with kind=Idempotent",
+        );
+        assert!(
+            matches!(
+                r2.installed[0].kind,
+                kiro_market_core::project::InstallOutcomeKind::Idempotent,
+            ),
+            "second install must report Idempotent, got {:?}",
+            r2.installed[0].kind,
+        );
+    }
+
     /// IPC-boundary hardening: a path-traversal attempt in the `name`
     /// argument must be rejected before reaching
     /// `KiroProject::remove_steering_file`'s file-system call. Without

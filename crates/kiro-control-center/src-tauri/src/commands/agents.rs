@@ -726,6 +726,69 @@ mod tests {
         );
     }
 
+    /// Drawer Apply can re-call install_agents against unchanged
+    /// agents — the user toggles, undoes, hits Apply. Second call must
+    /// be idempotent: nothing in `failed`, the agent surfaces as
+    /// `skipped` (already-installed semantic). Companion to
+    /// install_plugin_agents_impl_new_mode_surfaces_content_changed_in_failed
+    /// which covers the changed-source case; this is the unchanged
+    /// twin.
+    #[test]
+    fn install_agents_impl_idempotent_reinstall_is_noop() {
+        let (dir, svc) = temp_service();
+        let entries = vec![relative_path_entry("myplugin", "plugins/myplugin")];
+        let marketplace_path = seed_marketplace_with_registry(dir.path(), &svc, "mp1", &entries);
+        let plugin_dir = marketplace_path.join("plugins/myplugin");
+        let agents = plugin_dir.join("agents");
+        fs::create_dir_all(&agents).expect("create agents dir");
+        fs::write(
+            agents.join("alpha.md"),
+            "---\nname: alpha\ndescription: a\n---\nbody-a",
+        )
+        .expect("write alpha");
+        let project_path = make_kiro_project(dir.path());
+        let names = vec!["alpha".to_string()];
+
+        let r1 = install_agents_impl(
+            &svc,
+            "mp1",
+            "myplugin",
+            &names,
+            InstallMode::New,
+            false,
+            &project_path,
+        )
+        .expect("first install");
+        assert_eq!(r1.installed, vec!["alpha".to_string()]);
+        assert!(r1.failed.is_empty(), "{:?}", r1.failed);
+
+        let r2 = install_agents_impl(
+            &svc,
+            "mp1",
+            "myplugin",
+            &names,
+            InstallMode::New,
+            false,
+            &project_path,
+        )
+        .expect("second install must not error");
+        assert!(
+            r2.failed.is_empty(),
+            "idempotent reinstall must not fail, got {:?}",
+            r2.failed
+        );
+        assert_eq!(
+            r2.skipped,
+            vec!["alpha".to_string()],
+            "second install must report alpha as skipped (already installed)",
+        );
+        assert!(
+            r2.installed.is_empty(),
+            "no new install on idempotent path, got {:?}",
+            r2.installed,
+        );
+    }
+
     /// IPC-boundary hardening: a malformed agent name must be rejected
     /// before reaching `KiroProject::remove_agent`'s filesystem call.
     /// `AgentName::new` rejects NUL bytes, path separators, and other
