@@ -1075,12 +1075,11 @@ impl MarketplaceService {
     pub fn list_plugin_catalog(
         &self,
         marketplace: &str,
+        plugin_entries: &[PluginEntry],
         installed_skills: &InstalledSkills,
         installed_steering: &InstalledSteering,
         installed_agents: &InstalledAgents,
     ) -> Result<PluginCatalogView, Error> {
-        let plugin_entries = self.list_plugin_entries(marketplace)?;
-
         // Loop budget: O(K × (skills + steering + agents)) where
         // K = plugin_entries.len(). Production scale K ≤ 50 plugins per
         // marketplace, items ≤ 50 per category. Bound: 50 × 50 × 3 =
@@ -1088,7 +1087,7 @@ impl MarketplaceService {
         let mut plugins = Vec::with_capacity(plugin_entries.len());
         let mut skipped = Vec::new();
 
-        for plugin_entry in &plugin_entries {
+        for plugin_entry in plugin_entries {
             match self.assemble_catalog_entry(
                 marketplace,
                 plugin_entry,
@@ -3173,9 +3172,11 @@ mod tests {
         let installed_skills = InstalledSkills::default();
         let installed_steering = InstalledSteering::default();
         let installed_agents = InstalledAgents::default();
+        let plugin_entries = svc.list_plugin_entries("mp1").expect("entries");
         let view = svc
             .list_plugin_catalog(
                 "mp1",
+                &plugin_entries,
                 &installed_skills,
                 &installed_steering,
                 &installed_agents,
@@ -3355,9 +3356,11 @@ mod tests {
         )
         .expect("write manifest");
 
+        let plugin_entries = svc.list_plugin_entries("mp1").expect("entries");
         let view = svc
             .list_plugin_catalog(
                 "mp1",
+                &plugin_entries,
                 &InstalledSkills::default(),
                 &InstalledSteering::default(),
                 &InstalledAgents::default(),
@@ -3445,9 +3448,11 @@ mod tests {
         // beta: NO manifest, SKILL.md only under default ./skills/.
         make_plugin_with_skills(&marketplace_path, "beta", &["s2"]);
 
+        let plugin_entries = svc.list_plugin_entries("mp1").expect("entries");
         let view = svc
             .list_plugin_catalog(
                 "mp1",
+                &plugin_entries,
                 &InstalledSkills::default(),
                 &InstalledSteering::default(),
                 &InstalledAgents::default(),

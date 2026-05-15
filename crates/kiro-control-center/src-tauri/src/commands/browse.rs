@@ -398,47 +398,61 @@ fn list_plugin_catalog_for_marketplace_impl(
         )
     })?;
 
+    // Load registry entries ONCE; reuse them for both the catalog call
+    // and the SourceType enrichment below. Pre-fix this method did two
+    // full registry scans (once inside list_plugin_catalog, once for
+    // the source_types map) per request, costing 2K manifest reads at
+    // K=50 plugins instead of K.
+    let entries = svc
+        .list_plugin_entries(marketplace)
+        .map_err(CommandError::from)?;
+
     let view = svc
         .list_plugin_catalog(
             marketplace,
+            &entries,
             &installed_skills,
             &installed_steering,
             &installed_agents,
         )
         .map_err(CommandError::from)?;
 
-    // Build name → SourceType lookup ONCE from the registry. Each
-    // PluginCatalogEntry then enriches via map lookup. Falling back
-    // to SourceType::Relative on missing-name (defensive — shouldn't
-    // happen since list_plugin_catalog enumerates the same registry,
-    // but a future race between registry-reload and catalog-call
-    // shouldn't crash; the relative fallback matches the most common
-    // local-plugin shape).
-    let entries = svc
-        .list_plugin_entries(marketplace)
-        .map_err(CommandError::from)?;
-    let source_types: std::collections::HashMap<String, SourceType> = entries
+    // Index into `entries` by plugin name. Because `list_plugin_catalog`
+    // iterates the SAME slice we just passed in, every catalog entry's
+    // `plugin` is present in this map — no defensive fallback needed.
+    let source_types: std::collections::HashMap<&str, SourceType> = entries
         .iter()
-        .map(|e| (e.name.clone(), plugin_source_type(&e.source)))
+        .map(|e| (e.name.as_str(), plugin_source_type(&e.source)))
         .collect();
 
     let plugins = view
         .plugins
         .into_iter()
-        .map(|e| PluginCatalogEntryView {
-            source_type: source_types
-                .get(&e.plugin)
+        .map(|e| {
+            let source_type = source_types
+                .get(e.plugin.as_str())
                 .cloned()
-                .unwrap_or(SourceType::Relative),
-            marketplace: e.marketplace,
-            plugin: e.plugin,
-            description: e.description,
-            skills: e.skills,
-            steering: e.steering,
-            agents: e.agents,
-            skipped_items: e.skipped_items,
+                .ok_or_else(|| {
+                    CommandError::new(
+                        format!(
+                            "internal invariant: catalog entry '{}' has no matching registry entry",
+                            e.plugin,
+                        ),
+                        ErrorType::Internal,
+                    )
+                })?;
+            Ok(PluginCatalogEntryView {
+                source_type,
+                marketplace: e.marketplace,
+                plugin: e.plugin,
+                description: e.description,
+                skills: e.skills,
+                steering: e.steering,
+                agents: e.agents,
+                skipped_items: e.skipped_items,
+            })
         })
-        .collect();
+        .collect::<Result<Vec<_>, CommandError>>()?;
 
     Ok(PluginCatalogResponseView {
         plugins,
