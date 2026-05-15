@@ -3,16 +3,21 @@
   import { SvelteSet } from "svelte/reactivity";
   import type { PluginCatalogEntryView } from "$lib/bindings";
 
-  /// Diff payload emitted to the BrowseTab apply handler. Skills carry
-  /// install/remove name lists since the catalog and `commands.installSkills`
-  /// / `commands.removeSkill` agree on per-skill identity. Steering and
-  /// agents are absent from this shape because Option A — chosen during
-  /// the BrowseTab redesign falsifiable-design pass — keeps them at
-  /// whole-plugin granularity until kiro-zx73 lands per-item Tauri
-  /// commands. Adding fields here pre-emptively would invite a future
-  /// drawer arm that silently no-ops on apply.
+  /// Diff payload emitted to the BrowseTab apply handler. Per-category
+  /// install/remove name lists. Skills join on frontmatter name (catalog
+  /// `SkillInfo.name`); steering joins on the file's relative path under
+  /// `.kiro/steering/` (catalog `SteeringItemInfo.name`); agents join on
+  /// the parsed agent name (catalog `AgentItemInfo.name`).
+  ///
+  /// All three categories are now per-item granular following kiro-zx73,
+  /// which added the four Tauri commands the BrowseTab apply path uses
+  /// (installSteeringFiles, removeSteeringFile, installAgents, removeAgent).
+  /// The slice-4 noInteractiveItems banner and "read-only" section
+  /// labels are gone because every category now toggles.
   export type CustomizeDrawerDiff = {
     skills: { install: string[]; remove: string[] };
+    steering: { install: string[]; remove: string[] };
+    agents: { install: string[]; remove: string[] };
   };
 
   type Props = {
@@ -28,11 +33,10 @@
 
   let { entry, marketplace, onClose, onApply }: Props = $props();
 
-  // Local skill-selection set — the user-edited "what should be
+  // Per-category selection sets — the user-edited "what should be
   // installed when Apply lands." Seeded from current installed flags
   // so the initial diff is empty; every checkbox toggle is a change
-  // relative to that baseline. Steering/agents are deliberately NOT
-  // tracked here (Option A — see CustomizeDrawerDiff doc).
+  // relative to that baseline.
   //
   // `untrack` makes the "initial-value-only" read explicit — the
   // drawer is destroyed/recreated by the {#if drawerEntry} guard in
@@ -42,72 +46,132 @@
   let selectedSkills = new SvelteSet<string>(
     untrack(() => entry.skills.filter((s) => s.installed).map((s) => s.name)),
   );
-
-  function toggleSkill(name: string) {
-    if (selectedSkills.has(name)) selectedSkills.delete(name);
-    else selectedSkills.add(name);
-  }
+  let selectedSteering = new SvelteSet<string>(
+    untrack(() => entry.steering.filter((s) => s.installed).map((s) => s.name)),
+  );
+  let selectedAgents = new SvelteSet<string>(
+    untrack(() => entry.agents.filter((a) => a.installed).map((a) => a.name)),
+  );
 
   type SectionToggleState = "empty" | "none" | "partial" | "all";
-  const skillsSectionState = $derived.by<SectionToggleState>(() => {
-    if (entry.skills.length === 0) return "empty";
-    if (selectedSkills.size === 0) return "none";
-    if (selectedSkills.size === entry.skills.length) return "all";
-    return "partial";
-  });
 
-  function toggleAllSkills() {
-    if (skillsSectionState === "all") {
-      selectedSkills.clear();
+  function deriveSectionState(
+    items: readonly { name: string }[],
+    selected: SvelteSet<string>,
+  ): SectionToggleState {
+    if (items.length === 0) return "empty";
+    if (selected.size === 0) return "none";
+    if (selected.size === items.length) return "all";
+    return "partial";
+  }
+
+  function toggleItem(set: SvelteSet<string>, name: string) {
+    if (set.has(name)) set.delete(name);
+    else set.add(name);
+  }
+
+  function toggleAll(
+    items: readonly { name: string }[],
+    set: SvelteSet<string>,
+    state: SectionToggleState,
+  ) {
+    if (state === "all") {
+      set.clear();
     } else {
-      selectedSkills.clear();
-      for (const s of entry.skills) selectedSkills.add(s.name);
+      set.clear();
+      for (const i of items) set.add(i.name);
     }
   }
 
-  // Diff vs the original (initial) installed state. Computed from
-  // entry.skills' `installed` flags, NOT from a snapshot of
-  // selectedSkills at mount — those agree at mount and would diverge
+  const skillsSectionState = $derived.by(() =>
+    deriveSectionState(entry.skills, selectedSkills),
+  );
+  const steeringSectionState = $derived.by(() =>
+    deriveSectionState(entry.steering, selectedSteering),
+  );
+  const agentsSectionState = $derived.by(() =>
+    deriveSectionState(entry.agents, selectedAgents),
+  );
+
+  // Diff vs the original (initial) installed state. Computed per-
+  // category from each entry's `installed` flags, NOT from a snapshot
+  // of selectedX at mount — those agree at mount and would diverge
   // pointlessly if the catalog updated underneath the drawer.
-  const diff = $derived.by(() => {
+  function deriveDiff(
+    items: readonly { name: string; installed: boolean }[],
+    selected: SvelteSet<string>,
+  ): { install: string[]; remove: string[] } {
     const install: string[] = [];
     const remove: string[] = [];
-    for (const s of entry.skills) {
-      const willBeChecked = selectedSkills.has(s.name);
-      if (willBeChecked && !s.installed) install.push(s.name);
-      if (!willBeChecked && s.installed) remove.push(s.name);
+    for (const i of items) {
+      const willBeChecked = selected.has(i.name);
+      if (willBeChecked && !i.installed) install.push(i.name);
+      if (!willBeChecked && i.installed) remove.push(i.name);
     }
     return { install, remove };
-  });
+  }
+
+  const diff = $derived.by(() => ({
+    skills: deriveDiff(entry.skills, selectedSkills),
+    steering: deriveDiff(entry.steering, selectedSteering),
+    agents: deriveDiff(entry.agents, selectedAgents),
+  }));
 
   const noChanges = $derived(
-    diff.install.length === 0 && diff.remove.length === 0,
+    diff.skills.install.length === 0
+      && diff.skills.remove.length === 0
+      && diff.steering.install.length === 0
+      && diff.steering.remove.length === 0
+      && diff.agents.install.length === 0
+      && diff.agents.remove.length === 0,
   );
+
+  // Compose the human summary. Pluralizes per-category nouns and
+  // omits zero-count categories so a steering-only diff doesn't
+  // read "install 0 skills, install 1 steering, install 0 agents."
+  function pluralize(n: number, singular: string, plural: string): string {
+    return n === 1 ? singular : plural;
+  }
 
   const summary = $derived.by(() => {
     if (noChanges) return "No changes to apply.";
-    const parts: string[] = [];
-    if (diff.install.length > 0) {
-      const noun = diff.install.length === 1 ? "skill" : "skills";
-      parts.push(`install ${diff.install.length} ${noun}`);
+    const installParts: string[] = [];
+    if (diff.skills.install.length > 0) {
+      installParts.push(
+        `${diff.skills.install.length} ${pluralize(diff.skills.install.length, "skill", "skills")}`,
+      );
     }
-    if (diff.remove.length > 0) {
-      const noun = diff.remove.length === 1 ? "skill" : "skills";
-      parts.push(`remove ${diff.remove.length} ${noun}`);
+    if (diff.steering.install.length > 0) {
+      installParts.push(
+        `${diff.steering.install.length} ${pluralize(diff.steering.install.length, "steering file", "steering files")}`,
+      );
     }
-    return `Apply will ${parts.join(" and ")}.`;
+    if (diff.agents.install.length > 0) {
+      installParts.push(
+        `${diff.agents.install.length} ${pluralize(diff.agents.install.length, "agent", "agents")}`,
+      );
+    }
+    const removeParts: string[] = [];
+    if (diff.skills.remove.length > 0) {
+      removeParts.push(
+        `${diff.skills.remove.length} ${pluralize(diff.skills.remove.length, "skill", "skills")}`,
+      );
+    }
+    if (diff.steering.remove.length > 0) {
+      removeParts.push(
+        `${diff.steering.remove.length} ${pluralize(diff.steering.remove.length, "steering file", "steering files")}`,
+      );
+    }
+    if (diff.agents.remove.length > 0) {
+      removeParts.push(
+        `${diff.agents.remove.length} ${pluralize(diff.agents.remove.length, "agent", "agents")}`,
+      );
+    }
+    const phrases: string[] = [];
+    if (installParts.length > 0) phrases.push(`install ${installParts.join(", ")}`);
+    if (removeParts.length > 0) phrases.push(`remove ${removeParts.join(", ")}`);
+    return `Apply will ${phrases.join(" and ")}.`;
   });
-
-  // True when the drawer has no interactive items — the plugin ships
-  // only steering and/or agents (no skills), so every visible
-  // checkbox is the disabled Option-A surface. Without an explicit
-  // banner, users open Customize and see a wall of grayed-out
-  // checkboxes that reads as "broken" rather than "not yet
-  // supported." Triggers the explanatory banner below.
-  const noInteractiveItems = $derived(
-    entry.skills.length === 0
-      && (entry.steering.length > 0 || entry.agents.length > 0),
-  );
 
   let applying = $state(false);
 
@@ -117,8 +181,16 @@
     try {
       await onApply({
         skills: {
-          install: [...diff.install],
-          remove: [...diff.remove],
+          install: [...diff.skills.install],
+          remove: [...diff.skills.remove],
+        },
+        steering: {
+          install: [...diff.steering.install],
+          remove: [...diff.steering.remove],
+        },
+        agents: {
+          install: [...diff.agents.install],
+          remove: [...diff.agents.remove],
         },
       });
     } finally {
@@ -185,169 +257,145 @@
       </p>
     {/if}
 
-    {#if noInteractiveItems}
-      <!--
-        Skills-less plugin (only steering and/or agents). Without this
-        banner, users open Customize and see only disabled checkboxes,
-        which reads as "drawer broken." The banner names the limitation
-        and points at the remediation.
-      -->
-      <div
-        class="px-4 py-3 text-xs leading-relaxed border-b border-kiro-muted bg-kiro-info/[0.10] text-kiro-info"
-      >
-        This plugin ships only steering and/or agents. Per-item toggling
-        for those categories isn't supported yet — install or update
-        them as a whole using the plugin's <strong>Install</strong> /
-        <strong>Update</strong> button on the card.
-      </div>
-    {/if}
+    <!--
+      kiro-zx73 ships per-item granularity for all three categories.
+      The slice-4 noInteractiveItems banner is gone — there's no longer
+      a "this section is read-only" UX dead-end to explain. Each
+      section's toggle-all header + per-item checkbox is interactive
+      and contributes to the apply-diff.
+    -->
 
     <div class="flex-1 overflow-y-auto py-1">
-      <!-- Skills: per-item interactive (Option A's only granular category). -->
+      {#snippet sectionHeader(
+        label: string,
+        installedCount: number,
+        total: number,
+        state: SectionToggleState,
+        onToggleAll: () => void,
+      )}
+        <button
+          type="button"
+          onclick={onToggleAll}
+          aria-label={`Toggle all ${label}`}
+          class="flex w-full items-center gap-2 px-4 pt-3 pb-1.5 bg-kiro-base border-b border-kiro-muted text-[10px] font-semibold uppercase tracking-wider text-kiro-subtle hover:text-kiro-text-secondary transition-colors cursor-pointer"
+        >
+          <span
+            class="inline-block w-3.5 h-3.5 rounded-sm flex-shrink-0 relative
+              {state === 'none'
+                ? 'bg-transparent border border-kiro-muted'
+                : 'bg-kiro-accent-500 border border-kiro-accent-500'}"
+          >
+            {#if state === "all"}
+              <span
+                class="absolute left-[3px] top-[1px] w-1 h-2 border-r-2 border-b-2 border-white rotate-45"
+              ></span>
+            {:else if state === "partial"}
+              <span class="absolute left-[3px] right-[3px] top-[5px] h-[2px] bg-white"></span>
+            {/if}
+          </span>
+          <span class="flex-1 text-left">{label}</span>
+          <span class="text-[10px] font-medium tracking-normal normal-case text-kiro-text-secondary">
+            {installedCount} / {total}
+          </span>
+        </button>
+      {/snippet}
+
+      {#snippet itemRow(
+        name: string,
+        description: string | null,
+        installed: boolean,
+        checked: boolean,
+        onchange: () => void,
+      )}
+        <label
+          class="flex items-center gap-2 px-4 py-1.5 text-[13px] cursor-pointer transition-colors hover:bg-kiro-accent-900/[0.12] hover:text-kiro-text
+            {checked ? 'text-kiro-text' : 'text-kiro-text-secondary'}"
+        >
+          <input
+            type="checkbox"
+            checked={checked}
+            onchange={onchange}
+            disabled={applying}
+            class="h-3.5 w-3.5 rounded border-kiro-muted text-kiro-accent-500 focus:ring-kiro-accent-500"
+          />
+          <span class="flex-1 min-w-0 truncate" title={description ?? ""}>{name}</span>
+          {#if installed}
+            <span
+              class="inline-flex items-center px-1.5 py-0.5 text-[10px] font-medium rounded-full bg-kiro-success/[0.18] text-kiro-success"
+            >
+              installed
+            </span>
+          {/if}
+        </label>
+      {/snippet}
+
       {#if entry.skills.length > 0}
         {@const installedCount = entry.skills.filter((s) => selectedSkills.has(s.name)).length}
         <section class="mb-2">
-          <button
-            type="button"
-            onclick={toggleAllSkills}
-            aria-label="Toggle all Skills"
-            class="flex w-full items-center gap-2 px-4 pt-3 pb-1.5 bg-kiro-base border-b border-kiro-muted text-[10px] font-semibold uppercase tracking-wider text-kiro-subtle hover:text-kiro-text-secondary transition-colors cursor-pointer"
-          >
-            <span
-              class="inline-block w-3.5 h-3.5 rounded-sm flex-shrink-0 relative
-                {skillsSectionState === 'none'
-                  ? 'bg-transparent border border-kiro-muted'
-                  : 'bg-kiro-accent-500 border border-kiro-accent-500'}"
-            >
-              {#if skillsSectionState === "all"}
-                <span
-                  class="absolute left-[3px] top-[1px] w-1 h-2 border-r-2 border-b-2 border-white rotate-45"
-                ></span>
-              {:else if skillsSectionState === "partial"}
-                <span class="absolute left-[3px] right-[3px] top-[5px] h-[2px] bg-white"></span>
-              {/if}
-            </span>
-            <span class="flex-1 text-left">Skills</span>
-            <span class="text-[10px] font-medium tracking-normal normal-case text-kiro-text-secondary">
-              {installedCount} / {entry.skills.length}
-            </span>
-          </button>
+          {@render sectionHeader(
+            "Skills",
+            installedCount,
+            entry.skills.length,
+            skillsSectionState,
+            () => toggleAll(entry.skills, selectedSkills, skillsSectionState),
+          )}
           <div class="flex flex-col py-1">
             {#each entry.skills as skill (skill.name)}
-              {@const checked = selectedSkills.has(skill.name)}
-              <label
-                class="flex items-center gap-2 px-4 py-1.5 text-[13px] cursor-pointer transition-colors hover:bg-kiro-accent-900/[0.12] hover:text-kiro-text
-                  {checked ? 'text-kiro-text' : 'text-kiro-text-secondary'}"
-              >
-                <input
-                  type="checkbox"
-                  checked={checked}
-                  onchange={() => toggleSkill(skill.name)}
-                  disabled={applying}
-                  class="h-3.5 w-3.5 rounded border-kiro-muted text-kiro-accent-500 focus:ring-kiro-accent-500"
-                />
-                <span class="flex-1 min-w-0 truncate" title={skill.description}>
-                  {skill.name}
-                </span>
-                {#if skill.installed}
-                  <span
-                    class="inline-flex items-center px-1.5 py-0.5 text-[10px] font-medium rounded-full bg-kiro-success/[0.18] text-kiro-success"
-                  >
-                    installed
-                  </span>
-                {/if}
-              </label>
+              {@render itemRow(
+                skill.name,
+                skill.description,
+                skill.installed,
+                selectedSkills.has(skill.name),
+                () => toggleItem(selectedSkills, skill.name),
+              )}
             {/each}
           </div>
         </section>
       {/if}
 
-      <!--
-        Steering and Agents: read-only per Option A. Items render with
-        disabled checkboxes + a tooltip pointing users at the whole-
-        plugin Install action. The visual parity with the Skills
-        section helps users see what an "Install all" would bring in,
-        even when they can't toggle individual items today.
-        kiro-zx73 widens this to per-item commands (matching the
-        Skills surface above).
-      -->
       {#if entry.steering.length > 0}
-        {@const installedCount = entry.steering.filter((s) => s.installed).length}
+        {@const installedCount = entry.steering.filter((s) => selectedSteering.has(s.name)).length}
         <section class="mb-2">
-          <div
-            class="flex w-full items-center gap-2 px-4 pt-3 pb-1.5 bg-kiro-base border-b border-kiro-muted text-[10px] font-semibold uppercase tracking-wider text-kiro-subtle"
-          >
-            <span class="flex-1 text-left">Steering files</span>
-            <span class="text-[10px] font-medium normal-case tracking-normal text-kiro-subtle italic">
-              read-only
-            </span>
-            <span class="text-[10px] font-medium tracking-normal normal-case text-kiro-text-secondary">
-              {installedCount} / {entry.steering.length}
-            </span>
-          </div>
+          {@render sectionHeader(
+            "Steering files",
+            installedCount,
+            entry.steering.length,
+            steeringSectionState,
+            () => toggleAll(entry.steering, selectedSteering, steeringSectionState),
+          )}
           <div class="flex flex-col py-1">
             {#each entry.steering as item (item.name)}
-              <div
-                class="flex items-center gap-2 px-4 py-1.5 text-[13px] text-kiro-text-secondary"
-                title="Per-file steering toggling lands with kiro-zx73; install all steering via the plugin's Install button."
-              >
-                <input
-                  type="checkbox"
-                  checked={item.installed}
-                  disabled
-                  class="h-3.5 w-3.5 rounded border-kiro-muted text-kiro-accent-500 cursor-not-allowed opacity-60"
-                />
-                <span class="flex-1 min-w-0 truncate">{item.name}</span>
-                {#if item.installed}
-                  <span
-                    class="inline-flex items-center px-1.5 py-0.5 text-[10px] font-medium rounded-full bg-kiro-success/[0.18] text-kiro-success"
-                  >
-                    installed
-                  </span>
-                {/if}
-              </div>
+              {@render itemRow(
+                item.name,
+                null,
+                item.installed,
+                selectedSteering.has(item.name),
+                () => toggleItem(selectedSteering, item.name),
+              )}
             {/each}
           </div>
         </section>
       {/if}
 
       {#if entry.agents.length > 0}
-        {@const installedCount = entry.agents.filter((a) => a.installed).length}
+        {@const installedCount = entry.agents.filter((a) => selectedAgents.has(a.name)).length}
         <section class="mb-2">
-          <div
-            class="flex w-full items-center gap-2 px-4 pt-3 pb-1.5 bg-kiro-base border-b border-kiro-muted text-[10px] font-semibold uppercase tracking-wider text-kiro-subtle"
-          >
-            <span class="flex-1 text-left">Agents</span>
-            <span class="text-[10px] font-medium normal-case tracking-normal text-kiro-subtle italic">
-              read-only
-            </span>
-            <span class="text-[10px] font-medium tracking-normal normal-case text-kiro-text-secondary">
-              {installedCount} / {entry.agents.length}
-            </span>
-          </div>
+          {@render sectionHeader(
+            "Agents",
+            installedCount,
+            entry.agents.length,
+            agentsSectionState,
+            () => toggleAll(entry.agents, selectedAgents, agentsSectionState),
+          )}
           <div class="flex flex-col py-1">
             {#each entry.agents as agent (agent.name)}
-              <div
-                class="flex items-center gap-2 px-4 py-1.5 text-[13px] text-kiro-text-secondary"
-                title="Per-agent toggling lands with kiro-zx73; install all agents via the plugin's Install button."
-              >
-                <input
-                  type="checkbox"
-                  checked={agent.installed}
-                  disabled
-                  class="h-3.5 w-3.5 rounded border-kiro-muted text-kiro-accent-500 cursor-not-allowed opacity-60"
-                />
-                <span class="flex-1 min-w-0 truncate" title={agent.description}>
-                  {agent.name}
-                </span>
-                {#if agent.installed}
-                  <span
-                    class="inline-flex items-center px-1.5 py-0.5 text-[10px] font-medium rounded-full bg-kiro-success/[0.18] text-kiro-success"
-                  >
-                    installed
-                  </span>
-                {/if}
-              </div>
+              {@render itemRow(
+                agent.name,
+                agent.description,
+                agent.installed,
+                selectedAgents.has(agent.name),
+                () => toggleItem(selectedAgents, agent.name),
+              )}
             {/each}
           </div>
         </section>

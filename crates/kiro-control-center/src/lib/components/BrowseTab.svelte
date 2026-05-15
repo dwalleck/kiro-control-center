@@ -630,100 +630,250 @@
     }
   }
 
-  // Slice 4: apply the customize drawer's diff. Skills install via
-  // commands.installSkills; skill removes loop commands.removeSkill;
-  // steering/agents are deliberately not in the diff (Option A,
-  // pending kiro-zx73's per-item commands). The install/remove paths
-  // mirror installSelected's surface so the same banner stream
-  // reports the outcome — no separate "drawer apply" banner family.
-  // Closes the drawer and refreshes the catalog before returning so
-  // the next open shows fresh state.
+  // Apply the customize drawer's diff across all three categories
+  // (skills, steering, agents). kiro-zx73 added the four Tauri
+  // commands the steering and agent paths use:
+  //   - commands.installSteeringFiles + commands.removeSteeringFile
+  //   - commands.installAgents + commands.removeAgent
+  // Each category's install is a single batch call; removes loop one
+  // call per item. Per-category outcomes flow into a single combined
+  // summary banner — no separate banner family per category, matching
+  // installSelected's "one banner per user action" UX.
+  //
+  // Refreshes the catalog before closing so the next drawer open
+  // sees fresh per-item flags.
   async function applyDrawerDiff(
     marketplace: string,
     plugin: string,
-    diff: { skills: { install: string[]; remove: string[] } },
+    diff: {
+      skills: { install: string[]; remove: string[] };
+      steering: { install: string[]; remove: string[] };
+      agents: { install: string[]; remove: string[] };
+    },
   ) {
     installError = null;
     installMessage = null;
     installWarning = null;
     installStaleRefresh = null;
 
-    const installedAll: string[] = [];
-    const skippedAll: string[] = [];
-    const failedAll: { name: string; error: string }[] = [];
-    const unreadableAll: SkippedSkill[] = [];
-    let removed = 0;
-    let removeFailed: { name: string; error: string }[] = [];
+    // Per-category outcome accumulators. Each install batch returns
+    // installed + failed lists; each remove loop tracks success count
+    // and per-name failures. Skills additionally surface "skipped"
+    // (already-installed) and "unreadable" (per-skill parse failures
+    // that landed before install attempt).
+    const skillsInstalled: string[] = [];
+    const skillsSkipped: string[] = [];
+    const skillsFailed: { name: string; error: string }[] = [];
+    const skillsUnreadable: SkippedSkill[] = [];
+    const steeringInstalled: string[] = [];
+    const steeringFailed: { name: string; error: string }[] = [];
+    const agentsInstalled: string[] = [];
+    const agentsSkipped: string[] = [];
+    const agentsFailed: { name: string; error: string }[] = [];
+    let skillsRemoved = 0;
+    const skillsRemoveFailed: { name: string; error: string }[] = [];
+    let steeringRemoved = 0;
+    const steeringRemoveFailed: { name: string; error: string }[] = [];
+    let agentsRemoved = 0;
+    const agentsRemoveFailed: { name: string; error: string }[] = [];
 
-    if (diff.skills.install.length > 0) {
+    // Per-category install — fire each as an independent Promise so a
+    // failure on one category doesn't abort the others. Each helper
+    // returns true on completion (success or partial failure surfaced
+    // in the accumulators) or sets installError + returns false on a
+    // hard wrapper-level error (the entire batch never ran).
+    async function installSkillsBatch(): Promise<boolean> {
+      if (diff.skills.install.length === 0) return true;
       try {
-        const result = await commands.installSkills(
+        const r = await commands.installSkills(
           marketplace,
           plugin,
           diff.skills.install,
           forceInstall,
           projectPath,
         );
-        if (result.status === "ok") {
-          installedAll.push(...result.data.installed);
-          skippedAll.push(...result.data.skipped);
-          failedAll.push(...result.data.failed);
-          unreadableAll.push(...result.data.skipped_skills);
-        } else {
-          installError = `Customize apply: install failed for ${marketplace}/${plugin}: ${result.error.message}`;
-          return;
+        if (r.status === "ok") {
+          skillsInstalled.push(...r.data.installed);
+          skillsSkipped.push(...r.data.skipped);
+          skillsFailed.push(...r.data.failed);
+          skillsUnreadable.push(...r.data.skipped_skills);
+          return true;
         }
+        installError = `Customize apply: skill install failed for ${marketplace}/${plugin}: ${r.error.message}`;
+        return false;
       } catch (e) {
         const reason = e instanceof Error ? e.message : String(e);
-        installError = `Customize apply: install threw for ${marketplace}/${plugin}: ${reason}`;
-        return;
+        installError = `Customize apply: skill install threw for ${marketplace}/${plugin}: ${reason}`;
+        return false;
       }
     }
-
-    for (const name of diff.skills.remove) {
+    async function installSteeringBatch(): Promise<boolean> {
+      if (diff.steering.install.length === 0) return true;
       try {
-        const result = await commands.removeSkill(name, projectPath);
-        if (result.status === "ok") {
-          removed++;
-        } else {
-          removeFailed.push({ name, error: result.error.message });
+        const r = await commands.installSteeringFiles(
+          marketplace,
+          plugin,
+          diff.steering.install,
+          forceInstall,
+          projectPath,
+        );
+        if (r.status === "ok") {
+          for (const out of r.data.installed) steeringInstalled.push(out.source.toString());
+          for (const f of r.data.failed) {
+            steeringFailed.push({
+              name: f.source.toString(),
+              error: f.error,
+            });
+          }
+          return true;
         }
+        installError = `Customize apply: steering install failed for ${marketplace}/${plugin}: ${r.error.message}`;
+        return false;
       } catch (e) {
         const reason = e instanceof Error ? e.message : String(e);
-        removeFailed.push({ name, error: reason });
+        installError = `Customize apply: steering install threw for ${marketplace}/${plugin}: ${reason}`;
+        return false;
+      }
+    }
+    async function installAgentsBatch(): Promise<boolean> {
+      if (diff.agents.install.length === 0) return true;
+      try {
+        const r = await commands.installAgents(
+          marketplace,
+          plugin,
+          diff.agents.install,
+          forceInstall,
+          /* acceptMcp */ false,
+          projectPath,
+        );
+        if (r.status === "ok") {
+          agentsInstalled.push(...r.data.installed);
+          agentsSkipped.push(...r.data.skipped);
+          for (const f of r.data.failed) {
+            agentsFailed.push(formatFailedAgentForBanner(f));
+          }
+          return true;
+        }
+        installError = `Customize apply: agent install failed for ${marketplace}/${plugin}: ${r.error.message}`;
+        return false;
+      } catch (e) {
+        const reason = e instanceof Error ? e.message : String(e);
+        installError = `Customize apply: agent install threw for ${marketplace}/${plugin}: ${reason}`;
+        return false;
       }
     }
 
-    // Compose summary banner. Same parts vocabulary as installSelected
-    // (installed / skipped / failed / unreadable) plus removal counts,
-    // so users who read both flows see consistent prose.
+    // Run all three install batches in parallel. Promise.all here
+    // because each commands.* call is independent (different tracking
+    // files, no shared lock). If any returns false, installError is
+    // already set; we still continue to the remove loops since those
+    // are user-requested removals that shouldn't block on an install
+    // failure of a different category.
+    await Promise.all([
+      installSkillsBatch(),
+      installSteeringBatch(),
+      installAgentsBatch(),
+    ]);
+
+    // Per-category remove loops in parallel. Each item is its own
+    // Tauri call (no batch remove API); the inner loop is sequential
+    // because the tracking-file lock per category is exclusive.
+    async function removeSkillsLoop() {
+      for (const name of diff.skills.remove) {
+        try {
+          const r = await commands.removeSkill(name, projectPath);
+          if (r.status === "ok") skillsRemoved++;
+          else skillsRemoveFailed.push({ name, error: r.error.message });
+        } catch (e) {
+          skillsRemoveFailed.push({
+            name,
+            error: e instanceof Error ? e.message : String(e),
+          });
+        }
+      }
+    }
+    async function removeSteeringLoop() {
+      for (const name of diff.steering.remove) {
+        try {
+          const r = await commands.removeSteeringFile(name, projectPath);
+          if (r.status === "ok") steeringRemoved++;
+          else steeringRemoveFailed.push({ name, error: r.error.message });
+        } catch (e) {
+          steeringRemoveFailed.push({
+            name,
+            error: e instanceof Error ? e.message : String(e),
+          });
+        }
+      }
+    }
+    async function removeAgentsLoop() {
+      for (const name of diff.agents.remove) {
+        try {
+          const r = await commands.removeAgent(name, projectPath);
+          if (r.status === "ok") agentsRemoved++;
+          else agentsRemoveFailed.push({ name, error: r.error.message });
+        } catch (e) {
+          agentsRemoveFailed.push({
+            name,
+            error: e instanceof Error ? e.message : String(e),
+          });
+        }
+      }
+    }
+    await Promise.all([removeSkillsLoop(), removeSteeringLoop(), removeAgentsLoop()]);
+
+    // Compose summary banner. Per-category totals so a mixed apply
+    // reads like "Installed: 2 skills, 1 agent | Removed: 1 steering".
+    const installedParts: string[] = [];
+    if (skillsInstalled.length > 0) {
+      installedParts.push(
+        `${skillsInstalled.length} skill${skillsInstalled.length === 1 ? "" : "s"} (${skillsInstalled.join(", ")})`,
+      );
+    }
+    if (steeringInstalled.length > 0) {
+      installedParts.push(
+        `${steeringInstalled.length} steering (${steeringInstalled.join(", ")})`,
+      );
+    }
+    if (agentsInstalled.length > 0) {
+      installedParts.push(
+        `${agentsInstalled.length} agent${agentsInstalled.length === 1 ? "" : "s"} (${agentsInstalled.join(", ")})`,
+      );
+    }
+    const skippedTotal = skillsSkipped.length + agentsSkipped.length;
+    const removedTotal = skillsRemoved + steeringRemoved + agentsRemoved;
+    const failedAll = [
+      ...skillsFailed,
+      ...steeringFailed,
+      ...agentsFailed,
+      ...skillsRemoveFailed,
+      ...steeringRemoveFailed,
+      ...agentsRemoveFailed,
+    ];
+
     const parts: string[] = [];
-    if (installedAll.length > 0) parts.push(`Installed: ${installedAll.join(", ")}`);
-    if (skippedAll.length > 0) parts.push(`Already installed: ${skippedAll.join(", ")}`);
-    if (removed > 0) parts.push(`Removed: ${removed}`);
+    if (installedParts.length > 0) parts.push(`Installed: ${installedParts.join(" | ")}`);
+    if (skippedTotal > 0) parts.push(`Already installed: ${skippedTotal}`);
+    if (removedTotal > 0) parts.push(`Removed: ${removedTotal}`);
     if (failedAll.length > 0) {
       parts.push(`Failed: ${failedAll.map((f) => `${f.name} (${f.error})`).join(", ")}`);
     }
-    if (removeFailed.length > 0) {
-      parts.push(
-        `Remove failed: ${removeFailed.map((f) => `${f.name} (${f.error})`).join(", ")}`,
-      );
-    }
-    if (unreadableAll.length > 0) {
-      parts.push(`Unreadable: ${unreadableAll.map(formatSkippedSkill).join(", ")}`);
+    if (skillsUnreadable.length > 0) {
+      parts.push(`Unreadable: ${skillsUnreadable.map(formatSkippedSkill).join(", ")}`);
     }
 
-    const hadAnyInstall = installedAll.length > 0;
-    const hadAnyRemove = removed > 0;
+    const hadSuccess =
+      skillsInstalled.length > 0
+      || steeringInstalled.length > 0
+      || agentsInstalled.length > 0
+      || removedTotal > 0;
     if (parts.length === 0) {
       installMessage = `${marketplace}/${plugin}: no changes applied`;
-    } else if (
-      !hadAnyInstall &&
-      !hadAnyRemove &&
-      (failedAll.length > 0 || removeFailed.length > 0)
-    ) {
+    } else if (!hadSuccess && failedAll.length > 0) {
       installError = `${marketplace}/${plugin}: ${parts.join(" | ")}`;
-    } else {
+    } else if (installError === null) {
+      // Don't overwrite a hard wrapper error from one of the install
+      // batches — those already set installError for the user.
       installMessage = `${marketplace}/${plugin}: ${parts.join(" | ")}`;
     }
 
@@ -739,6 +889,31 @@
       installError = `Post-apply refresh failed: ${reason}`;
     }
     closeDrawer();
+  }
+
+  // Project a FailedAgent into a flat (name, error) shape for the
+  // banner accumulator. Mirrors formatFailedAgent's switch but pulls
+  // out the name field directly so the banner reads consistently
+  // alongside skills/steering failure lists.
+  function formatFailedAgentForBanner(
+    f: import("$lib/bindings").FailedAgent_Serialize,
+  ): { name: string; error: string } {
+    switch (f.kind) {
+      case "agent":
+        return { name: f.name, error: f.error };
+      case "unparseable_agent":
+        return { name: f.source_path.toString(), error: f.error };
+      case "companion_bundle":
+        return { name: `${f.plugin} (companion bundle)`, error: f.error };
+      case "requested_but_not_found":
+        return { name: f.name, error: `not found in plugin ${f.plugin}` };
+      default: {
+        const _exhaustive: never = f;
+        throw new Error(
+          `unhandled FailedAgent variant in formatFailedAgentForBanner: ${JSON.stringify(_exhaustive)}`,
+        );
+      }
+    }
   }
 
   // Per-plugin in-flight tracker so two plugins can install in parallel
