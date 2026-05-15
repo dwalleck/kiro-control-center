@@ -17,10 +17,10 @@ use kiro_market_core::project::KiroProject;
 use kiro_market_core::service::{
     AgentInstallContext, InstallAgentsResult, InstallFilter, InstallMode, MarketplaceService,
 };
-use kiro_market_core::validation::{MarketplaceName, PluginName};
+use kiro_market_core::validation::{AgentName, MarketplaceName, PluginName};
 
 use crate::commands::{make_service, validate_kiro_project_path};
-use crate::error::CommandError;
+use crate::error::{CommandError, ErrorType};
 
 /// Install every agent declared by a plugin into the active project's
 /// `.kiro/agents/` directory.
@@ -80,6 +80,104 @@ fn install_plugin_agents_impl(
             version: ctx.version.as_deref(),
         },
     ))
+}
+
+/// Per-agent install: drop into a plugin's discovered agent set and
+/// install only the named agents. Mirrors
+/// [`crate::commands::steering::install_steering_files`] for agents —
+/// same `_impl(svc, ...)` testable shape and same wire shape as the
+/// whole-plugin install.
+///
+/// Names are the **parsed** agent identity (frontmatter `name` for
+/// translated dialects, JSON `name` field for native), NOT source
+/// filenames — pinned by the slice-A2 fence
+/// `install_plugin_agents_names_filter_joins_on_parsed_name`.
+/// Unmatched names surface as `FailedAgent::RequestedButNotFound`
+/// inside `result.failed`.
+#[tauri::command]
+#[specta::specta]
+pub async fn install_agents(
+    marketplace: String,
+    plugin: String,
+    names: Vec<String>,
+    force: bool,
+    accept_mcp: bool,
+    project_path: String,
+) -> Result<InstallAgentsResult, CommandError> {
+    let svc = make_service()?;
+    install_agents_impl(
+        &svc,
+        &marketplace,
+        &plugin,
+        &names,
+        InstallMode::from(force),
+        accept_mcp,
+        &project_path,
+    )
+}
+
+fn install_agents_impl(
+    svc: &MarketplaceService,
+    marketplace: &str,
+    plugin: &str,
+    names: &[String],
+    mode: InstallMode,
+    accept_mcp: bool,
+    project_path: &str,
+) -> Result<InstallAgentsResult, CommandError> {
+    let project_root = validate_kiro_project_path(project_path)?;
+    let marketplace = MarketplaceName::new(marketplace)?;
+    let plugin = PluginName::new(plugin)?;
+    let ctx = svc
+        .resolve_plugin_install_context(&marketplace, &plugin)
+        .map_err(CommandError::from)?;
+    let project = KiroProject::new(project_root);
+
+    Ok(MarketplaceService::install_plugin_agents(
+        &project,
+        &ctx.plugin_dir,
+        &ctx.agent_scan_paths,
+        ctx.format,
+        &InstallFilter::Names(names),
+        AgentInstallContext {
+            mode,
+            accept_mcp,
+            marketplace: &marketplace,
+            plugin: &plugin,
+            version: ctx.version.as_deref(),
+        },
+    ))
+}
+
+/// Remove one agent from the active project. The `name` is the parsed
+/// agent identity (matches the catalog's `AgentItemInfo.name`).
+/// Routes through `AgentName::new` at the IPC boundary so a malformed
+/// name is rejected before reaching `KiroProject::remove_agent`'s
+/// filesystem call. Mirrors
+/// [`crate::commands::installed::remove_skill`] — no plugin context
+/// needed because agent names are unique under `.kiro/agents/`.
+#[tauri::command]
+#[specta::specta]
+pub async fn remove_agent(name: String, project_path: String) -> Result<(), CommandError> {
+    remove_agent_impl(&name, &project_path)
+}
+
+fn remove_agent_impl(name: &str, project_path: &str) -> Result<(), CommandError> {
+    let project_root = validate_kiro_project_path(project_path)?;
+    // Parse-don't-validate: route the FFI string through AgentName::new
+    // so a malformed name (path traversal, NUL byte, empty) is rejected
+    // here, not after a project-level validation pass that the FE
+    // can't easily distinguish from "agent not installed."
+    let validated = AgentName::new(name).map_err(|e| {
+        CommandError::new(
+            format!("invalid agent name `{name}`: {e}"),
+            ErrorType::Validation,
+        )
+    })?;
+    let project = KiroProject::new(project_root);
+    project
+        .remove_agent(validated.as_str())
+        .map_err(CommandError::from)
 }
 
 #[cfg(test)]
@@ -493,6 +591,114 @@ mod tests {
             &project_path,
         )
         .expect_err("NUL byte in plugin name must error");
+        assert_eq!(err.error_type, ErrorType::Validation);
+    }
+
+    // -----------------------------------------------------------------------
+    // install_agents_impl + remove_agent_impl (kiro-zx73 slices A5+A6)
+    // -----------------------------------------------------------------------
+
+    /// Tauri-side fence on per-agent install. Plugin ships two
+    /// markdown agents; install one by parsed name. Asserts only that
+    /// one lands in tracking + on disk; the other is NOT installed.
+    /// The bug class — implementer wires the filter parameter but
+    /// the catalog → drawer → command pipeline drops it — fails
+    /// this test.
+    #[test]
+    fn install_agents_impl_installs_only_named_agent() {
+        let (dir, svc) = temp_service();
+        let entries = vec![relative_path_entry("myplugin", "plugins/myplugin")];
+        let marketplace_path = seed_marketplace_with_registry(dir.path(), &svc, "mp1", &entries);
+        let plugin_dir = marketplace_path.join("plugins/myplugin");
+        let agents = plugin_dir.join("agents");
+        fs::create_dir_all(&agents).expect("create agents dir");
+        fs::write(
+            agents.join("alpha.md"),
+            "---\nname: alpha\ndescription: a\n---\nbody-a",
+        )
+        .expect("write alpha");
+        fs::write(
+            agents.join("beta.md"),
+            "---\nname: beta\ndescription: b\n---\nbody-b",
+        )
+        .expect("write beta");
+        let project_path = make_kiro_project(dir.path());
+
+        let names = vec!["alpha".to_string()];
+        let result = install_agents_impl(
+            &svc,
+            "mp1",
+            "myplugin",
+            &names,
+            InstallMode::New,
+            false,
+            &project_path,
+        )
+        .expect("install one agent");
+
+        assert_eq!(result.installed, vec!["alpha".to_string()]);
+        assert!(result.failed.is_empty(), "got {:?}", result.failed);
+        // Translated agents install as `.json` (parsed-and-converted),
+        // not `.md`. Mirrors what install_plugin_agents_impl_installs_default_path_files
+        // asserts at the destination level.
+        let dest = std::path::PathBuf::from(&project_path).join(".kiro/agents");
+        assert!(dest.join("alpha.json").exists(), "alpha.json must land");
+        assert!(!dest.join("beta.json").exists(), "beta MUST NOT install");
+    }
+
+    /// Round-trip: install an agent then remove it via the new
+    /// `remove_agent_impl`. Verifies the install_agents → remove_agent
+    /// pipeline the drawer's diff math will produce.
+    #[test]
+    fn remove_agent_impl_unlinks_installed_agent() {
+        let (dir, svc) = temp_service();
+        let entries = vec![relative_path_entry("myplugin", "plugins/myplugin")];
+        let marketplace_path = seed_marketplace_with_registry(dir.path(), &svc, "mp1", &entries);
+        let plugin_dir = marketplace_path.join("plugins/myplugin");
+        let agents = plugin_dir.join("agents");
+        fs::create_dir_all(&agents).expect("create agents dir");
+        fs::write(
+            agents.join("rev.md"),
+            "---\nname: rev\ndescription: r\n---\nbody",
+        )
+        .expect("write rev");
+        let project_path = make_kiro_project(dir.path());
+
+        let names = vec!["rev".to_string()];
+        install_agents_impl(
+            &svc,
+            "mp1",
+            "myplugin",
+            &names,
+            InstallMode::New,
+            false,
+            &project_path,
+        )
+        .expect("install");
+        let dest = std::path::PathBuf::from(&project_path).join(".kiro/agents/rev.json");
+        assert!(dest.exists(), "install precondition");
+
+        remove_agent_impl("rev", &project_path).expect("remove");
+        assert!(!dest.exists(), "agent file unlinked after remove");
+
+        let project = KiroProject::new(std::path::PathBuf::from(&project_path));
+        let tracking = project.load_installed_agents().expect("load tracking");
+        assert!(
+            !tracking.agents.contains_key("rev"),
+            "tracking row must be removed alongside the file"
+        );
+    }
+
+    /// IPC-boundary hardening: a malformed agent name must be rejected
+    /// before reaching `KiroProject::remove_agent`'s filesystem call.
+    /// `AgentName::new` rejects NUL bytes, path separators, and other
+    /// shapes that would otherwise navigate outside `.kiro/agents/`.
+    #[test]
+    fn remove_agent_impl_rejects_path_traversal_in_name() {
+        let (dir, _svc) = temp_service();
+        let project_path = make_kiro_project(dir.path());
+        let err =
+            remove_agent_impl("../etc/passwd", &project_path).expect_err("traversal must error");
         assert_eq!(err.error_type, ErrorType::Validation);
     }
 }

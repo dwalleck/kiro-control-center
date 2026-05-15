@@ -38,6 +38,8 @@ fn create_builder() -> Builder<tauri::Wry> {
         commands::steering::install_steering_files,
         commands::steering::remove_steering_file,
         commands::agents::install_plugin_agents,
+        commands::agents::install_agents,
+        commands::agents::remove_agent,
         commands::plugins::install_plugin,
         commands::plugins::list_installed_plugins,
         commands::plugins::remove_plugin,
