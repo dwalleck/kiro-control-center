@@ -19,7 +19,7 @@ use kiro_market_core::service::{
 };
 use kiro_market_core::validation::{AgentName, MarketplaceName, PluginName};
 
-use crate::commands::{make_service, validate_kiro_project_path};
+use crate::commands::{make_service, reject_empty_names, validate_kiro_project_path};
 use crate::error::{CommandError, ErrorType};
 
 /// Install every agent declared by a plugin into the active project's
@@ -125,15 +125,7 @@ fn install_agents_impl(
     accept_mcp: bool,
     project_path: &str,
 ) -> Result<InstallAgentsResult, CommandError> {
-    // See install_steering_files_impl for the rationale — empty `names`
-    // collapses to a silent Ok inside install_plugin_agents because
-    // filter_matches always returns false. Reject at the IPC boundary.
-    if names.is_empty() {
-        return Err(CommandError::new(
-            "install_agents: names list must not be empty",
-            ErrorType::Validation,
-        ));
-    }
+    reject_empty_names(names, "install_agents")?;
     let project_root = validate_kiro_project_path(project_path)?;
     let marketplace = MarketplaceName::new(marketplace)?;
     let plugin = PluginName::new(plugin)?;
@@ -653,6 +645,52 @@ mod tests {
         let dest = std::path::PathBuf::from(&project_path).join(".kiro/agents");
         assert!(dest.join("alpha.json").exists(), "alpha.json must land");
         assert!(!dest.join("beta.json").exists(), "beta MUST NOT install");
+    }
+
+    /// Tauri-side fence on the **native** (`kiro-cli`) per-agent install
+    /// path. Mirrors `install_agents_impl_installs_only_named_agent`
+    /// (which exercises the translated markdown path) for the native
+    /// JSON path. The bug class — a future refactor that drops the
+    /// `InstallFilter::Names` branch in the native install loop would
+    /// silently no-op every native filter request while leaving the
+    /// translated path's filter test green — fails this test.
+    #[test]
+    fn install_agents_impl_native_path_filters_by_parsed_json_name() {
+        let (dir, svc) = temp_service();
+        let entries = vec![relative_path_entry("myplugin", "plugins/myplugin")];
+        let marketplace_path = seed_marketplace_with_registry(dir.path(), &svc, "mp1", &entries);
+        let plugin_dir = marketplace_path.join("plugins/myplugin");
+        // write_native_plugin creates plugin.json (format: kiro-cli) +
+        // one agent JSON at `agents/<name>.json`. Add a second native
+        // agent so the filter actually has to choose between two.
+        write_native_plugin(&plugin_dir, "myplugin", br#"{"name":"alpha","prompt":"a"}"#);
+        fs::write(
+            plugin_dir.join("agents/beta.json"),
+            br#"{"name":"beta","prompt":"b"}"#,
+        )
+        .expect("write beta native agent");
+        let project_path = make_kiro_project(dir.path());
+
+        let names = vec!["alpha".to_string()];
+        let result = install_agents_impl(
+            &svc,
+            "mp1",
+            "myplugin",
+            &names,
+            InstallMode::New,
+            false,
+            &project_path,
+        )
+        .expect("install one native agent");
+
+        assert_eq!(result.installed, vec!["alpha".to_string()]);
+        assert!(result.failed.is_empty(), "got {:?}", result.failed);
+        let dest = std::path::PathBuf::from(&project_path).join(".kiro/agents");
+        assert!(dest.join("alpha.json").exists(), "alpha.json must land");
+        assert!(
+            !dest.join("beta.json").exists(),
+            "beta MUST NOT install when filter selects alpha only",
+        );
     }
 
     /// Empty `names` collapses to a silent Ok at the core layer because

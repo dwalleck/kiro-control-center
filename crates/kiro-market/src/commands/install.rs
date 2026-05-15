@@ -244,7 +244,7 @@ fn run_steering_install(
         project,
         plugin_dir,
         steering_scan_paths,
-        &kiro_market_core::service::InstallFilter::All,
+        &InstallFilter::All,
         ctx,
     )
 }
