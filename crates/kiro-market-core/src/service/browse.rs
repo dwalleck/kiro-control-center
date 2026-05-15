@@ -912,7 +912,15 @@ impl MarketplaceService {
                 name: name.to_owned(),
                 plugin: plugin.to_owned(),
                 marketplace: marketplace.to_owned(),
-                installed: installed.files.contains_key(Path::new(name)),
+                // Name-only match would mis-attribute a tracking entry
+                // owned by a DIFFERENT plugin/marketplace as if it were
+                // this plugin's. The drawer would then show the item
+                // checked, and Apply with an uncheck would remove the
+                // OTHER plugin's file. Pin ownership before declaring
+                // installed.
+                installed: installed.files.get(Path::new(name)).is_some_and(|meta| {
+                    meta.plugin.as_str() == plugin && meta.marketplace.as_str() == marketplace
+                }),
             });
         }
         Ok(PluginSteeringResult { steering, warnings })
@@ -979,7 +987,12 @@ impl MarketplaceService {
                     description: def.description,
                     plugin: plugin.to_owned(),
                     marketplace: marketplace.to_owned(),
-                    installed: installed.agents.contains_key(def.name.as_str()),
+                    // Ownership-scoped match — see the analogous comment on
+                    // SteeringItemInfo above. Two plugins shipping an agent
+                    // with the same name must not see each other's tracking.
+                    installed: installed.agents.get(def.name.as_str()).is_some_and(|meta| {
+                        meta.plugin.as_str() == plugin && meta.marketplace.as_str() == marketplace
+                    }),
                     dialect: def.dialect,
                 }),
                 Err(e) => skipped.push(AgentParseSkip {
@@ -1005,7 +1018,18 @@ impl MarketplaceService {
                     description: None,
                     plugin: plugin.to_owned(),
                     marketplace: marketplace.to_owned(),
-                    installed: installed.agents.contains_key(bundle.name.as_str()),
+                    // Ownership-scoped match — same rationale as the
+                    // markdown branch above. Native and translated agents
+                    // share the same .kiro/agents/ tracking namespace, so
+                    // a name collision across plugins is possible across
+                    // dialect boundaries too.
+                    installed: installed
+                        .agents
+                        .get(bundle.name.as_str())
+                        .is_some_and(|meta| {
+                            meta.plugin.as_str() == plugin
+                                && meta.marketplace.as_str() == marketplace
+                        }),
                     dialect: AgentDialect::Native,
                 }),
                 Err(e) => skipped.push(AgentParseSkip {
@@ -1431,7 +1455,19 @@ fn collect_skills_for_plugin_into(
         }
         seen_names.insert(frontmatter.name.clone(), skill_dir.clone());
 
-        let is_installed = installed.skills.contains_key(&frontmatter.name);
+        // Ownership-scoped match. Two plugins shipping a skill with
+        // the same frontmatter name must not see each other's tracking
+        // — otherwise the drawer for plugin B shows plugin A's `s1` as
+        // checked, and Apply with an uncheck removes plugin A's file.
+        // The HashMap is keyed by name alone (one entry per name in
+        // the project), so the install-time AlreadyInstalled guard
+        // prevents two plugins from both having an entry — but the
+        // FIRST plugin's entry persists and the SECOND plugin's
+        // catalog must not claim ownership of it.
+        let is_installed = installed.skills.get(&frontmatter.name).is_some_and(|meta| {
+            meta.plugin.as_str() == plugin_entry.name
+                && meta.marketplace.as_str() == marketplace_name
+        });
         out.push(SkillInfo {
             name: frontmatter.name,
             description: frontmatter.description,
@@ -2468,6 +2504,107 @@ mod tests {
         );
     }
 
+    /// Cross-plugin same-name regression fence. User report: two
+    /// plugins ship a skill named `s1`; plugin A installed it; plugin B
+    /// is browsed via the drawer and shows `s1` as checked; unchecking
+    /// + Apply removes plugin A's `s1`.
+    ///
+    /// Root cause: catalog computed `installed` by name match alone,
+    /// ignoring the tracking entry's plugin/marketplace attribution.
+    /// The fix scopes the match: plugin B's catalog now sees `s1` as
+    /// NOT installed (the tracking entry belongs to plugin A).
+    ///
+    /// Adversarial fixture: tracking attributes "shared" to plugin A
+    /// in marketplace mp1. Plugin B (in the same marketplace) ALSO
+    /// declares a skill named "shared". Plugin A's catalog must show
+    /// it installed; plugin B's catalog must show it NOT installed.
+    #[test]
+    fn list_skills_for_plugin_does_not_attribute_other_plugins_tracking() {
+        let (dir, svc) = temp_service();
+        let entries = vec![
+            relative_path_entry("alpha", "plugins/alpha"),
+            relative_path_entry("beta", "plugins/beta"),
+        ];
+        let marketplace_path = seed_marketplace_with_registry(dir.path(), &svc, "mp1", &entries);
+        make_plugin_with_skills(&marketplace_path, "alpha", &["shared"]);
+        make_plugin_with_skills(&marketplace_path, "beta", &["shared"]);
+
+        // Tracking attributes "shared" to alpha (the plugin that
+        // actually installed it). Beta's catalog reads must NOT claim
+        // ownership of this entry.
+        let installed = installed_with("shared", "alpha", "mp1");
+
+        let alpha_result = svc
+            .list_skills_for_plugin("mp1", "alpha", &installed)
+            .expect("alpha catalog");
+        assert!(
+            alpha_result
+                .skills
+                .iter()
+                .any(|s| s.name == "shared" && s.installed),
+            "alpha's `shared` MUST be installed (alpha owns the tracking entry)"
+        );
+
+        let beta_result = svc
+            .list_skills_for_plugin("mp1", "beta", &installed)
+            .expect("beta catalog");
+        let beta_shared = beta_result
+            .skills
+            .iter()
+            .find(|s| s.name == "shared")
+            .expect("beta also enumerates `shared`");
+        assert!(
+            !beta_shared.installed,
+            "beta's `shared` MUST NOT be installed — the tracking entry \
+             belongs to alpha. Without this guard, opening beta's drawer \
+             would show `shared` checked, and uncheck+Apply would remove \
+             alpha's file."
+        );
+    }
+
+    /// Same shape as the skills test but for a different marketplace
+    /// owning the tracking row. Catches the case where two plugins
+    /// with the same name across different marketplaces collide on the
+    /// shared tracking namespace (`installed-skills.json` is one
+    /// `HashMap` per project, no marketplace-scoped sub-key).
+    #[test]
+    fn list_skills_for_plugin_scopes_match_by_marketplace_too() {
+        let (dir, svc) = temp_service();
+        // Two marketplaces, each with a plugin "p" that ships skill "s".
+        let mp1_path = seed_marketplace_with_registry(
+            dir.path(),
+            &svc,
+            "mp1",
+            &[relative_path_entry("p", "plugins/p")],
+        );
+        let mp2_path = seed_marketplace_with_registry(
+            dir.path(),
+            &svc,
+            "mp2",
+            &[relative_path_entry("p", "plugins/p")],
+        );
+        make_plugin_with_skills(&mp1_path, "p", &["s"]);
+        make_plugin_with_skills(&mp2_path, "p", &["s"]);
+
+        // Tracking attributes "s" to mp1/p. mp2/p must not see it as
+        // installed even though plugin name + skill name both match.
+        let installed = installed_with("s", "p", "mp1");
+
+        let mp2_result = svc
+            .list_skills_for_plugin("mp2", "p", &installed)
+            .expect("mp2/p catalog");
+        let mp2_s = mp2_result
+            .skills
+            .iter()
+            .find(|s| s.name == "s")
+            .expect("mp2/p enumerates `s`");
+        assert!(
+            !mp2_s.installed,
+            "mp2/p's `s` MUST NOT be installed — the tracking entry \
+             belongs to mp1/p. Marketplace name is part of the ownership key."
+        );
+    }
+
     // -----------------------------------------------------------------------
     // list_steering_for_plugin (S2 of BrowseTab redesign — C4 regression fence)
     // -----------------------------------------------------------------------
@@ -2575,6 +2712,55 @@ mod tests {
             by_name.get("règles.md"),
             Some(&true),
             "non-ASCII filename joined losslessly against tracking"
+        );
+    }
+
+    /// Cross-plugin same-name regression fence for steering. Two
+    /// plugins (alpha, beta) ship a steering file with the same
+    /// basename `shared.md`; tracking attributes the file to alpha;
+    /// beta's catalog must NOT show it as installed. Without this
+    /// guard, opening beta's drawer shows shared.md checked, and
+    /// uncheck+Apply removes alpha's file (the user's reported bug
+    /// for the agent case, same shape across all three categories).
+    #[test]
+    fn list_steering_for_plugin_does_not_attribute_other_plugins_tracking() {
+        let (dir, svc) = temp_service();
+        let entries = vec![
+            relative_path_entry("alpha", "plugins/alpha"),
+            relative_path_entry("beta", "plugins/beta"),
+        ];
+        let marketplace_path = seed_marketplace_with_registry(dir.path(), &svc, "mp1", &entries);
+        make_plugin_with_steering(&marketplace_path, "alpha", &["shared.md"]);
+        make_plugin_with_steering(&marketplace_path, "beta", &["shared.md"]);
+
+        // Tracking attributes shared.md to alpha.
+        let installed = installed_steering_with("shared.md", "alpha", "mp1");
+
+        let alpha_result = svc
+            .list_steering_for_plugin("mp1", "alpha", &installed)
+            .expect("alpha catalog");
+        assert!(
+            alpha_result
+                .steering
+                .iter()
+                .any(|s| s.name == "shared.md" && s.installed),
+            "alpha's shared.md MUST be installed (alpha owns the tracking entry)"
+        );
+
+        let beta_result = svc
+            .list_steering_for_plugin("mp1", "beta", &installed)
+            .expect("beta catalog");
+        let beta_shared = beta_result
+            .steering
+            .iter()
+            .find(|s| s.name == "shared.md")
+            .expect("beta also enumerates shared.md");
+        assert!(
+            !beta_shared.installed,
+            "beta's shared.md MUST NOT be installed — the tracking entry \
+             belongs to alpha. Without this guard, opening beta's drawer \
+             would show shared.md checked, and uncheck+Apply would remove \
+             alpha's file."
         );
     }
 
@@ -2706,6 +2892,59 @@ mod tests {
         assert!(
             !by_name.contains_key("helper"),
             "native filename stem MUST NOT appear as the join key either"
+        );
+    }
+
+    /// Cross-plugin same-name regression fence for agents — the
+    /// originally-reported bug. Two plugins (alpha, beta) ship a
+    /// markdown agent with the same parsed name `shared`; tracking
+    /// attributes the agent to alpha; beta's catalog must NOT show it
+    /// installed. Without this guard, opening beta's drawer shows
+    /// `shared` checked, and uncheck+Apply removes alpha's agent file
+    /// (the user's reported bug from the terax-ai project).
+    #[test]
+    fn list_agents_for_plugin_does_not_attribute_other_plugins_tracking() {
+        let (dir, svc) = temp_service();
+        let entries = vec![
+            relative_path_entry("alpha", "plugins/alpha"),
+            relative_path_entry("beta", "plugins/beta"),
+        ];
+        let marketplace_path = seed_marketplace_with_registry(dir.path(), &svc, "mp1", &entries);
+        // Both plugins ship a `shared` markdown agent.
+        make_plugin_with_markdown_agent(&marketplace_path, "alpha", "agent-a.md", "shared");
+        make_plugin_with_markdown_agent(&marketplace_path, "beta", "agent-b.md", "shared");
+
+        // Tracking attributes `shared` to alpha (the plugin that
+        // installed it first — install_agent rejects later collisions
+        // via AlreadyInstalled, so only alpha's tracking entry exists).
+        let installed = installed_agents_with(&["shared"], "alpha", "mp1");
+
+        let alpha_result = svc
+            .list_agents_for_plugin("mp1", "alpha", &installed)
+            .expect("alpha catalog");
+        assert!(
+            alpha_result
+                .agents
+                .iter()
+                .any(|a| a.name == "shared" && a.installed),
+            "alpha's `shared` MUST be installed (alpha owns the tracking entry)"
+        );
+
+        let beta_result = svc
+            .list_agents_for_plugin("mp1", "beta", &installed)
+            .expect("beta catalog");
+        let beta_shared = beta_result
+            .agents
+            .iter()
+            .find(|a| a.name == "shared")
+            .expect("beta also enumerates `shared`");
+        assert!(
+            !beta_shared.installed,
+            "beta's `shared` MUST NOT be installed — the tracking entry \
+             belongs to alpha. Without this guard, opening beta's drawer \
+             would show `shared` checked, and uncheck+Apply would remove \
+             alpha's agent file. (Originally reported against the terax-ai \
+             project where two plugins shipped agents with the same name.)"
         );
     }
 
