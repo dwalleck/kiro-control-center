@@ -27,3 +27,13 @@ __pycache__/
 # the install commands.
 .kiro/installed-agents.json
 .kiro/installed-steering.json
+
+# Stray local test artifacts (Windows builds occasionally drop these at the
+# repo root; not part of the workspace target dir).
+/test_*.exe
+/test_*.pdb
+
+# External design-system handoff (Figma export / similar). Kept locally for
+# reference but not part of the workspace — duplicates real component
+# filenames (BrowseTab.svelte etc.) and would clobber on `git add -A`.
+/Kiro Control Center Design System/
