@@ -85,17 +85,38 @@ pub fn map_claude_tools(source: &[String]) -> (Vec<MappedTool>, Vec<UnmappedTool
     (mapped, unmapped)
 }
 
+/// Look up the Kiro tool name(s) for a Copilot-style bare tool alias.
+///
+/// Copilot aliases are case-insensitive and some map to multiple Kiro
+/// tools (e.g. `search` → `grep` + `glob`). Returns `None` for names
+/// with no Kiro equivalent (internal Copilot concepts like `codebase`).
+///
+/// Reference: <https://docs.github.com/en/copilot/reference/custom-agents-configuration#tool-aliases>
+/// (retrieved 2026-05-15).
+#[must_use]
+fn map_copilot_bare_tool(name: &str) -> Option<&'static [&'static str]> {
+    match name.to_ascii_lowercase().as_str() {
+        "execute" | "shell" | "bash" | "powershell" => Some(&["shell"]),
+        "read" | "notebookread" => Some(&["read"]),
+        "edit" | "multiedit" | "write" | "notebookedit" => Some(&["write"]),
+        "search" | "grep" | "glob" => Some(&["grep", "glob"]),
+        "agent" | "custom-agent" | "task" => Some(&["subagent"]),
+        "web" | "websearch" | "webfetch" => Some(&["web_fetch", "web_search"]),
+        "todo" | "todowrite" => Some(&["todo"]),
+        _ => None,
+    }
+}
+
 /// Map a list of Copilot source tool names to Kiro identifiers.
 ///
 /// Copilot tools use mixed conventions:
-/// - `{server}/*`     → [`MappedTool::McpRef("@{server}")`]        (whole-server access)
-/// - `{server}/{tool}` → [`MappedTool::McpRef("@{server}/{tool}")`] (specific MCP tool)
-/// - bare names (`codebase`, `findTestFiles`) → unmapped ([`UnmappedReason::BareCopilotName`])
+/// - `{server}/*`      → [`MappedTool::McpRef("@{server}")`]        (whole-server access)
+/// - `{server}/{tool}`  → [`MappedTool::McpRef("@{server}/{tool}")`] (specific MCP tool)
+/// - known bare aliases (`read`, `edit`, `search`, `shell`, etc.) → native Kiro tools
+/// - unknown bare names (`codebase`, `findTestFiles`) → unmapped ([`UnmappedReason::BareCopilotName`])
 ///
-/// The bare-name drop is intentional: Copilot's bare names are internal
-/// GitHub Copilot concepts with no reliable Kiro equivalent. Users see the
-/// source tool list in the install output and can restrict the emitted
-/// agent manually if desired.
+/// Reference: <https://docs.github.com/en/copilot/reference/custom-agents-configuration#tool-aliases>
+/// (retrieved 2026-05-15).
 #[must_use]
 pub fn map_copilot_tools(source: &[String]) -> (Vec<MappedTool>, Vec<UnmappedTool>) {
     let mut mapped: Vec<MappedTool> = Vec::new();
@@ -110,6 +131,13 @@ pub fn map_copilot_tools(source: &[String]) -> (Vec<MappedTool>, Vec<UnmappedToo
             let entry = MappedTool::McpRef(kiro);
             if !mapped.contains(&entry) {
                 mapped.push(entry);
+            }
+        } else if let Some(kiro_names) = map_copilot_bare_tool(tool) {
+            for &kiro in kiro_names {
+                let entry = MappedTool::Native(kiro.to_string());
+                if !mapped.contains(&entry) {
+                    mapped.push(entry);
+                }
             }
         } else {
             unmapped.push(UnmappedTool {
@@ -258,5 +286,47 @@ mod tests {
     fn copilot_dedupes_repeated_refs() {
         let (mapped, _) = map_copilot_tools(&["terraform/*".into(), "terraform/*".into()]);
         assert_eq!(mapped, vec![MappedTool::McpRef("@terraform".into())]);
+    }
+
+    #[test]
+    fn copilot_bare_aliases_map_to_native_tools() {
+        let (mapped, unmapped) =
+            map_copilot_tools(&["read".into(), "edit".into(), "shell".into(), "search".into()]);
+        assert!(unmapped.is_empty());
+        assert_eq!(
+            mapped,
+            vec![
+                MappedTool::Native("read".into()),
+                MappedTool::Native("write".into()),
+                MappedTool::Native("shell".into()),
+                MappedTool::Native("grep".into()),
+                MappedTool::Native("glob".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn copilot_bare_aliases_case_insensitive() {
+        let (mapped, _) = map_copilot_tools(&["Read".into(), "SHELL".into()]);
+        assert!(mapped.contains(&MappedTool::Native("read".into())));
+        assert!(mapped.contains(&MappedTool::Native("shell".into())));
+    }
+
+    #[test]
+    fn copilot_mixed_bare_mcp_and_unknown() {
+        let (mapped, unmapped) = map_copilot_tools(&[
+            "read".into(),
+            "terraform/*".into(),
+            "codebase".into(),
+        ]);
+        assert_eq!(
+            mapped,
+            vec![
+                MappedTool::Native("read".into()),
+                MappedTool::McpRef("@terraform".into()),
+            ]
+        );
+        assert_eq!(unmapped.len(), 1);
+        assert_eq!(unmapped[0].source, "codebase");
     }
 }

@@ -1796,7 +1796,8 @@ impl KiroProject {
                 path: source.to_path_buf(),
                 source: src,
             })?;
-        fs::write(&staged_file, &source_bytes).map_err(|src| {
+        let content = crate::steering::strip_yaml_frontmatter(&source_bytes);
+        fs::write(&staged_file, content).map_err(|src| {
             crate::steering::SteeringError::StagingWriteFailed {
                 path: staged_file.clone(),
                 source: src,
