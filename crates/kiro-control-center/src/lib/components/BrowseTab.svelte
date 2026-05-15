@@ -159,43 +159,56 @@
   // (stable thiserror impls). When this fires, the user's only path
   // forward is the existing forceInstall toggle — without the hint
   // below they'd see the failures and have no idea where to act.
+  //
   // String-matching the rendered error is brittle in the abstract but
   // safe here: these error strings have stable Display impls per
   // CLAUDE.md's structural-error rule, and the substring is specific
   // enough that an unrelated "force" mention can't false-positive.
+  //
+  // The detection covers BOTH banner surfaces:
+  //   - installResult — set by the whole-plugin Install button via
+  //     runPluginInstall → commands.installPlugin → InstallPluginResult.
+  //   - installError / installMessage — set by the drawer's Apply path
+  //     (applyDrawerDiff composes per-category failure strings into
+  //     these). The drawer doesn't populate installResult, so without
+  //     covering these surfaces too the hint never fires for drawer-
+  //     driven installs (the user's reported gap from terax-ai smoke).
   function failureMentionsOwnership(s: string): boolean {
     return s.includes("--force to transfer");
   }
-  let installResultHasOwnershipConflict = $derived.by(() => {
-    if (installResult === null) return false;
-    for (const f of installResult.skills.failed) {
-      if (failureMentionsOwnership(f.error)) return true;
-    }
-    for (const f of installResult.steering.failed) {
-      if (failureMentionsOwnership(f.error)) return true;
-    }
-    for (const f of installResult.agents.failed) {
-      // FailedAgent variants either carry an `error: string` field
-      // (agent / unparseable_agent / companion_bundle) or no error
-      // (requested_but_not_found). The ownership-conflict variants
-      // are all in the error-bearing set, so missing-error variants
-      // can't trigger this signal.
-      switch (f.kind) {
-        case "agent":
-        case "unparseable_agent":
-        case "companion_bundle":
-          if (failureMentionsOwnership(f.error)) return true;
-          break;
-        case "requested_but_not_found":
-          break;
-        default: {
-          const _exhaustive: never = f;
-          throw new Error(
-            `unhandled FailedAgent variant: ${JSON.stringify(_exhaustive)}`,
-          );
+  let hasOwnershipConflict = $derived.by(() => {
+    if (installResult !== null) {
+      for (const f of installResult.skills.failed) {
+        if (failureMentionsOwnership(f.error)) return true;
+      }
+      for (const f of installResult.steering.failed) {
+        if (failureMentionsOwnership(f.error)) return true;
+      }
+      for (const f of installResult.agents.failed) {
+        // FailedAgent variants either carry an `error: string` field
+        // (agent / unparseable_agent / companion_bundle) or no error
+        // (requested_but_not_found). The ownership-conflict variants
+        // are all in the error-bearing set, so missing-error variants
+        // can't trigger this signal.
+        switch (f.kind) {
+          case "agent":
+          case "unparseable_agent":
+          case "companion_bundle":
+            if (failureMentionsOwnership(f.error)) return true;
+            break;
+          case "requested_but_not_found":
+            break;
+          default: {
+            const _exhaustive: never = f;
+            throw new Error(
+              `unhandled FailedAgent variant: ${JSON.stringify(_exhaustive)}`,
+            );
+          }
         }
       }
     }
+    if (installError !== null && failureMentionsOwnership(installError)) return true;
+    if (installMessage !== null && failureMentionsOwnership(installMessage)) return true;
     return false;
   });
 
@@ -766,10 +779,21 @@
           projectPath,
         );
         if (r.status === "ok") {
-          for (const out of r.data.installed) steeringInstalled.push(out.source.toString());
+          // Use the destination basename — that's the user-facing
+          // identifier (matches the catalog's SteeringItemInfo.name
+          // and lives under .kiro/steering/ which has the canonical
+          // separator). `out.source` is the on-disk source path with
+          // mixed `\` / `/` separators because joining a Windows
+          // marketplace base with a Unix-style relative path doesn't
+          // normalize separators — surfacing it would render an
+          // awkward "C:\...kiro-starter-kit\./plugins/..." string in
+          // the success banner. Same fix on the failed side.
+          for (const out of r.data.installed) {
+            steeringInstalled.push(basenameOf(out.destination));
+          }
           for (const f of r.data.failed) {
             steeringFailed.push({
-              name: f.source.toString(),
+              name: basenameOf(f.source.toString()),
               error: f.error,
             });
           }
@@ -943,6 +967,19 @@
   // banner accumulator. Mirrors formatFailedAgent's switch but pulls
   // out the name field directly so the banner reads consistently
   // alongside skills/steering failure lists.
+  // Cross-platform path basename. The wire shape from the Rust side
+  // is a String, but `out.source` and `out.destination` for steering
+  // can carry mixed `\` (Windows base) and `/` (Unix-style relative)
+  // separators because the marketplace cache root is a Windows
+  // PathBuf and the manifest's scan paths are Unix-style strings —
+  // PathBuf::join doesn't normalize. Splitting on either separator
+  // and taking the last non-empty segment gives the canonical
+  // basename regardless of how the source path was assembled.
+  function basenameOf(path: string): string {
+    const segments = path.split(/[\\/]/).filter((seg) => seg.length > 0);
+    return segments.length > 0 ? segments[segments.length - 1] : path;
+  }
+
   function formatFailedAgentForBanner(
     f: import("$lib/bindings").FailedAgent_Serialize,
   ): { name: string; error: string } {
@@ -950,7 +987,10 @@
       case "agent":
         return { name: f.name, error: f.error };
       case "unparseable_agent":
-        return { name: f.source_path.toString(), error: f.error };
+        // source_path is the file we couldn't parse — show the
+        // basename for banner brevity (same separator-normalization
+        // story as basenameOf's doc).
+        return { name: basenameOf(f.source_path.toString()), error: f.error };
       case "companion_bundle":
         return { name: `${f.plugin} (companion bundle)`, error: f.error };
       case "requested_but_not_found":
@@ -1351,66 +1391,31 @@
           ? 'bg-kiro-warning/10 border border-kiro-warning/30 text-kiro-warning'
           : 'bg-kiro-error/10 border border-kiro-error/30 text-kiro-error'}"
     >
-      <div class="flex-1 min-w-0">
-        {#if installResultHasOwnershipConflict}
-          <!--
-            Cross-plugin ownership-conflict hint. These failures fire
-            when the install path detects items already owned by a
-            DIFFERENT plugin in the project (typical: installing v2
-            of a plugin where v1 already owns the same agent / steering
-            file / companion bundle). The remediation is the existing
-            `forceInstall` toggle, but it lives at the bottom of the
-            page with no visual link to the failure panel. The button
-            below just flips the toggle; the user still consciously
-            re-clicks Install (no auto-retry) so the ownership-transfer
-            decision stays explicit.
-          -->
-          <div class="mb-2 px-2 py-1.5 rounded bg-current/10 text-xs leading-relaxed">
-            <strong>Some items belong to another plugin</strong> — likely a
-            previous version installed under a different plugin name. To
-            transfer ownership to this plugin, enable
-            <strong>Force reinstall</strong> and click
-            <strong>Install all</strong> again.
-            {#if !forceInstall}
-              <button
-                type="button"
-                onclick={() => (forceInstall = true)}
-                class="ml-1 underline cursor-pointer hover:opacity-100 opacity-90 bg-transparent border-none p-0 text-current text-xs"
-              >
-                Enable Force Reinstall now
-              </button>
-            {:else}
-              <span class="ml-1 italic opacity-90">
-                (Force Reinstall is on — click Install all again.)
-              </span>
-            {/if}
-          </div>
-        {/if}
-        <details
-          open
-        >
-          <summary class="cursor-pointer text-xs opacity-85">
-            Show failures
-          </summary>
-          <div class="mt-2 pl-3 border-l-2 border-current/40 text-xs space-y-1">
-            <!-- Index keys throughout: FailedSkill.name and FailedSteeringFile.source
-                 are not structurally unique on the Rust side (service/mod.rs can push
-                 duplicate FailedSkill::RequestedButNotFound when a Names(_) filter
-                 contains the same name twice), and FailedAgent variants don't share a
-                 single identity field. Svelte's {#each} silently dedupes on key
-                 collision — index keys eliminate that drop risk. -->
-            {#each installResult.skills.failed as f, i (i)}
-              <div><b>Skill failed:</b> {formatFailedSkill(f)}</div>
-            {/each}
-            {#each installResult.steering.failed as f, i (i)}
-              <div><b>Steering failed:</b> {formatFailedSteeringFile(f)}</div>
-            {/each}
-            {#each installResult.agents.failed as f, i (i)}
-              <div><b>Agent failed:</b> {formatFailedAgent(f)}</div>
-            {/each}
-          </div>
-        </details>
-      </div>
+      <details
+        class="flex-1"
+        open
+      >
+        <summary class="cursor-pointer text-xs opacity-85">
+          Show failures
+        </summary>
+        <div class="mt-2 pl-3 border-l-2 border-current/40 text-xs space-y-1">
+          <!-- Index keys throughout: FailedSkill.name and FailedSteeringFile.source
+               are not structurally unique on the Rust side (service/mod.rs can push
+               duplicate FailedSkill::RequestedButNotFound when a Names(_) filter
+               contains the same name twice), and FailedAgent variants don't share a
+               single identity field. Svelte's {#each} silently dedupes on key
+               collision — index keys eliminate that drop risk. -->
+          {#each installResult.skills.failed as f, i (i)}
+            <div><b>Skill failed:</b> {formatFailedSkill(f)}</div>
+          {/each}
+          {#each installResult.steering.failed as f, i (i)}
+            <div><b>Steering failed:</b> {formatFailedSteeringFile(f)}</div>
+          {/each}
+          {#each installResult.agents.failed as f, i (i)}
+            <div><b>Agent failed:</b> {formatFailedAgent(f)}</div>
+          {/each}
+        </div>
+      </details>
       <button
         type="button"
         onclick={() => { installResult = null; installResultPlugin = null; }}
@@ -1419,6 +1424,42 @@
       >
         ×
       </button>
+    </div>
+  {/if}
+
+  {#if hasOwnershipConflict}
+    <!--
+      Standalone ownership-transfer hint. Appears whenever an install
+      surfaces "owned by another plugin" failures, regardless of which
+      banner surface produced them (installResult inline panel from
+      runPluginInstall OR installError/installMessage from the drawer's
+      applyDrawerDiff path). Without the standalone render, the
+      drawer-driven failures didn't get the hint because the inline
+      installResult panel above never rendered for that path.
+      The button just flips the existing forceInstall toggle — the
+      user still consciously re-clicks Install / Apply (no auto-retry)
+      so the ownership-transfer decision stays explicit.
+    -->
+    <div
+      class="mx-4 mt-3 px-4 py-2.5 rounded-md text-sm bg-kiro-info/[0.10] text-kiro-info border border-kiro-info/30 leading-relaxed"
+    >
+      <strong>Some items belong to another plugin</strong> — likely a
+      previous version installed under a different plugin name. To
+      transfer ownership to this plugin, enable
+      <strong>Force reinstall</strong> and try the install again.
+      {#if !forceInstall}
+        <button
+          type="button"
+          onclick={() => (forceInstall = true)}
+          class="ml-1 underline cursor-pointer hover:opacity-100 opacity-90 bg-transparent border-none p-0 text-current text-sm"
+        >
+          Enable Force Reinstall now
+        </button>
+      {:else}
+        <span class="ml-1 italic opacity-90">
+          (Force Reinstall is on — re-run Install / Apply.)
+        </span>
+      {/if}
     </div>
   {/if}
 
