@@ -85,35 +85,60 @@ pub fn map_claude_tools(source: &[String]) -> (Vec<MappedTool>, Vec<UnmappedTool
     (mapped, unmapped)
 }
 
-/// Look up the Kiro tool name(s) for a Copilot-style bare tool alias.
+/// Copilot bare tool alias → Kiro native tool name(s). Each group's first
+/// element is the canonical Copilot alias; alternates (`shell` vs. `bash`
+/// vs. `powershell`) all map to the same Kiro tools. Comparison is
+/// case-insensitive (`Read` and `read` both resolve), but alternates are
+/// listed exactly as they appear in the Copilot docs so a future audit
+/// against the upstream table is straightforward.
 ///
-/// Copilot aliases are case-insensitive and some map to multiple Kiro
-/// tools (e.g. `search` → `grep` + `glob`). Returns `None` for names
-/// with no Kiro equivalent (internal Copilot concepts like `codebase`).
+/// Internal Copilot concepts with no reliable Kiro equivalent
+/// (`codebase`, `findTestFiles`, `usages`, `problems`, `testFailure`,
+/// `runCommands`, `runTasks`, `editFiles`, …) are intentionally absent
+/// — `map_copilot_tools` reports them as [`UnmappedReason::BareCopilotName`]
+/// so the user sees them in the install output and can choose to restrict
+/// the emitted agent manually.
 ///
 /// Reference: <https://docs.github.com/en/copilot/reference/custom-agents-configuration#tool-aliases>
 /// (retrieved 2026-05-15).
+const COPILOT_BARE_TOOL_GROUPS: &[(&[&str], &[&str])] = &[
+    (&["execute", "shell", "bash", "powershell"], &["shell"]),
+    (&["read", "notebookread"], &["read"]),
+    (&["edit", "multiedit", "write", "notebookedit"], &["write"]),
+    (&["search", "grep", "glob"], &["grep", "glob"]),
+    (&["agent", "custom-agent", "task"], &["subagent"]),
+    (
+        &["web", "websearch", "webfetch"],
+        &["web_fetch", "web_search"],
+    ),
+    (&["todo", "todowrite"], &["todo"]),
+];
+
+/// Look up the Kiro tool name(s) for a Copilot-style bare tool alias.
+///
+/// Returns `None` for names with no Kiro equivalent. See
+/// [`COPILOT_BARE_TOOL_GROUPS`] for the full alias table and the
+/// intentional-unmapped policy.
 #[must_use]
 fn map_copilot_bare_tool(name: &str) -> Option<&'static [&'static str]> {
-    match name.to_ascii_lowercase().as_str() {
-        "execute" | "shell" | "bash" | "powershell" => Some(&["shell"]),
-        "read" | "notebookread" => Some(&["read"]),
-        "edit" | "multiedit" | "write" | "notebookedit" => Some(&["write"]),
-        "search" | "grep" | "glob" => Some(&["grep", "glob"]),
-        "agent" | "custom-agent" | "task" => Some(&["subagent"]),
-        "web" | "websearch" | "webfetch" => Some(&["web_fetch", "web_search"]),
-        "todo" | "todowrite" => Some(&["todo"]),
-        _ => None,
-    }
+    COPILOT_BARE_TOOL_GROUPS
+        .iter()
+        .find(|(aliases, _)| aliases.iter().any(|a| a.eq_ignore_ascii_case(name)))
+        .map(|(_, kiro)| *kiro)
 }
 
 /// Map a list of Copilot source tool names to Kiro identifiers.
 ///
 /// Copilot tools use mixed conventions:
-/// - `{server}/*`      → [`MappedTool::McpRef("@{server}")`]        (whole-server access)
-/// - `{server}/{tool}`  → [`MappedTool::McpRef("@{server}/{tool}")`] (specific MCP tool)
-/// - known bare aliases (`read`, `edit`, `search`, `shell`, etc.) → native Kiro tools
-/// - unknown bare names (`codebase`, `findTestFiles`) → unmapped ([`UnmappedReason::BareCopilotName`])
+/// - `{server}/*` → [`MappedTool::McpRef("@{server}")`] (whole-server access)
+/// - `{server}/{tool}` → [`MappedTool::McpRef("@{server}/{tool}")`] (specific MCP tool)
+/// - known bare aliases (`read`, `edit`, `search`, `shell`, …) → native Kiro tools
+/// - unknown bare names (`codebase`, `findTestFiles`, …) → unmapped ([`UnmappedReason::BareCopilotName`])
+///
+/// Unknown bare names are dropped *intentionally*: they represent internal
+/// Copilot concepts (IDE problem-pane, test-runner integrations) with no
+/// reliable Kiro equivalent. Users see them in the install output and can
+/// restrict the emitted agent manually if desired.
 ///
 /// Reference: <https://docs.github.com/en/copilot/reference/custom-agents-configuration#tool-aliases>
 /// (retrieved 2026-05-15).
@@ -290,8 +315,12 @@ mod tests {
 
     #[test]
     fn copilot_bare_aliases_map_to_native_tools() {
-        let (mapped, unmapped) =
-            map_copilot_tools(&["read".into(), "edit".into(), "shell".into(), "search".into()]);
+        let (mapped, unmapped) = map_copilot_tools(&[
+            "read".into(),
+            "edit".into(),
+            "shell".into(),
+            "search".into(),
+        ]);
         assert!(unmapped.is_empty());
         assert_eq!(
             mapped,
@@ -314,11 +343,8 @@ mod tests {
 
     #[test]
     fn copilot_mixed_bare_mcp_and_unknown() {
-        let (mapped, unmapped) = map_copilot_tools(&[
-            "read".into(),
-            "terraform/*".into(),
-            "codebase".into(),
-        ]);
+        let (mapped, unmapped) =
+            map_copilot_tools(&["read".into(), "terraform/*".into(), "codebase".into()]);
         assert_eq!(
             mapped,
             vec![
@@ -328,5 +354,60 @@ mod tests {
         );
         assert_eq!(unmapped.len(), 1);
         assert_eq!(unmapped[0].source, "codebase");
+    }
+
+    #[test]
+    fn copilot_bare_web_alias_expands_to_two_native_tools() {
+        let (mapped, unmapped) = map_copilot_tools(&["web".into()]);
+        assert!(unmapped.is_empty());
+        assert_eq!(
+            mapped,
+            vec![
+                MappedTool::Native("web_fetch".into()),
+                MappedTool::Native("web_search".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn copilot_bare_agent_alias_maps_to_subagent() {
+        let (mapped, unmapped) =
+            map_copilot_tools(&["agent".into(), "custom-agent".into(), "task".into()]);
+        assert!(unmapped.is_empty());
+        assert_eq!(mapped, vec![MappedTool::Native("subagent".into())]);
+    }
+
+    #[test]
+    fn copilot_bare_todo_alias_maps_to_todo() {
+        let (mapped, unmapped) = map_copilot_tools(&["todo".into(), "TodoWrite".into()]);
+        assert!(unmapped.is_empty());
+        assert_eq!(mapped, vec![MappedTool::Native("todo".into())]);
+    }
+
+    #[test]
+    fn copilot_cross_alias_dedupes_to_same_native() {
+        // `shell`, `bash`, `execute`, and `powershell` all map to Kiro's
+        // `shell`; the result must contain a single entry.
+        let (mapped, _) = map_copilot_tools(&[
+            "shell".into(),
+            "bash".into(),
+            "execute".into(),
+            "powershell".into(),
+        ]);
+        assert_eq!(mapped, vec![MappedTool::Native("shell".into())]);
+    }
+
+    #[test]
+    fn copilot_bare_search_and_grep_dedupe_via_grep_glob_pair() {
+        // `search`, `grep`, and `glob` all map to the (grep, glob) pair.
+        // Mixed input must still produce exactly that pair without dupes.
+        let (mapped, _) = map_copilot_tools(&["search".into(), "grep".into(), "glob".into()]);
+        assert_eq!(
+            mapped,
+            vec![
+                MappedTool::Native("grep".into()),
+                MappedTool::Native("glob".into()),
+            ]
+        );
     }
 }
