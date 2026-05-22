@@ -1155,7 +1155,22 @@ impl KiroProject {
 
         let mut rows: Vec<UserAgentRow> = Vec::new();
         for entry in fs::read_dir(&dir)? {
-            let entry = entry?;
+            // Per-DirEntry failures (e.g., racy delete mid-iteration,
+            // permission flip on a single file) warn-and-continue — same
+            // discipline as the fs::read and serde_json::from_slice
+            // handlers below. A single broken directory entry must not
+            // abort the whole list-page payload. Surfaced by
+            // gemini-code-assist review on PR #120.
+            let entry = match entry {
+                Ok(e) => e,
+                Err(e) => {
+                    warn!(
+                        error = %e,
+                        "skipping directory entry that failed to read in list_user_agents",
+                    );
+                    continue;
+                }
+            };
             let path = entry.path();
             if path.extension().and_then(|s| s.to_str()) != Some("json") {
                 continue;
@@ -1185,12 +1200,14 @@ impl KiroProject {
             let name = value
                 .get("name")
                 .and_then(serde_json::Value::as_str)
-                .map(String::from)
-                .unwrap_or_else(|| {
-                    path.file_stem()
-                        .and_then(|s| s.to_str())
-                        .map_or_else(String::new, String::from)
-                });
+                .map_or_else(
+                    || {
+                        path.file_stem()
+                            .and_then(|s| s.to_str())
+                            .map_or_else(String::new, String::from)
+                    },
+                    String::from,
+                );
             let lineage = tracking.agents.get(&name).map(|m| UserAgentLineage {
                 marketplace: m.marketplace.to_string(),
                 plugin: m.plugin.to_string(),
@@ -1435,6 +1452,12 @@ impl KiroProject {
     ///   exhausts the sanity cap.
     /// - I/O / JSON errors from the read or atomic write.
     pub fn duplicate_user_agent(&self, source_name: &str) -> crate::error::Result<String> {
+        // Sanity cap kept inside the fn body to stay co-located with the
+        // single use site that depends on it. Top-of-fn placement
+        // satisfies clippy::items_after_statements while preserving the
+        // contract's locality.
+        const SANITY_CAP: u32 = 10_000;
+
         let source = Self::validate_user_agent_name(source_name)?;
         let agents_dir = self.agents_dir();
         let source_path = agents_dir.join(format!("{}.json", source.as_str()));
@@ -1446,7 +1469,6 @@ impl KiroProject {
         }
         let source_bytes = fs::read(&source_path)?;
 
-        const SANITY_CAP: u32 = 10_000;
         let mut target_name: Option<String> = None;
         for k in 1..=SANITY_CAP {
             let candidate = if k == 1 {
