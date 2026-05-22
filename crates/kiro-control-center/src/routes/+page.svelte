@@ -10,6 +10,7 @@
   import BrowseTab from "$lib/components/BrowseTab.svelte";
   import InstalledTab from "$lib/components/InstalledTab.svelte";
   import MarketplacesTab from "$lib/components/MarketplacesTab.svelte";
+  import AgentsTab from "$lib/components/AgentsTab.svelte";
   import ProjectPicker from "$lib/components/ProjectPicker.svelte";
   import ProjectDropdown from "$lib/components/ProjectDropdown.svelte";
   import ScanRootsPanel from "$lib/components/ScanRootsPanel.svelte";
@@ -114,6 +115,8 @@
               }
             }}
           />
+        {:else if activeTab === "Agents"}
+          <AgentsTab projectPath={store.projectPath} />
         {:else if activeTab === "Kiro Settings"}
           <SettingsView
             {allEntries}
