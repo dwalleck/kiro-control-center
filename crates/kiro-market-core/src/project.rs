@@ -15,6 +15,7 @@ use tracing::{debug, warn};
 use crate::agent::tools::MappedTool;
 use crate::agent::{AgentDefinition, AgentDialect};
 use crate::error::{AgentError, SkillError};
+use crate::user_agent::{UserAgentLineage, UserAgentRow};
 use crate::validation;
 use crate::validation::{MarketplaceName, PluginName, RelativePath};
 
@@ -1107,6 +1108,130 @@ impl KiroProject {
         let json = serde_json::to_string_pretty(installed)?;
         crate::cache::atomic_write(&path, json.as_bytes())?;
         Ok(())
+    }
+
+    // -- user-authored agents (Workflows > Agents view) --------------------
+
+    /// Build the list-page payload for the Control Center
+    /// `Workflows > Agents` view (slice 1).
+    ///
+    /// Reads every `*.json` file in [`Self::agents_dir`], projects each
+    /// to a [`UserAgentRow`], and attaches marketplace lineage from
+    /// [`Self::load_installed_agents`] when the agent's name is tracked.
+    ///
+    /// **Untyped JSON.** This method parses each file via
+    /// `serde_json::from_slice::<serde_json::Value>` — NOT
+    /// [`crate::agent::parse_native::parse_native_kiro_agent_file`]. The
+    /// install path's security checks (symlink refusal, 1 MiB byte cap,
+    /// required `name` field) are appropriate when copying untrusted
+    /// marketplace bytes verbatim; the list path operates on files the
+    /// user already owns and would only be hampered by them. Pinned by
+    /// design claim C2 and the no-name fixture at
+    /// `.agents-view/probe/fixture/`.
+    ///
+    /// **Creates the agents directory** if absent (load-bearing — a
+    /// missing dir would otherwise yield `NotFound`). Empty list
+    /// returned when the dir exists but contains no `*.json`.
+    ///
+    /// Files that fail JSON parsing are logged (`tracing::warn!`) and
+    /// excluded from the payload (spec decision #13).
+    /// Orphan tracking entries (name in `installed-agents.json` but
+    /// file absent on disk) are excluded by construction — the loop
+    /// iterates files, not tracking keys (spec decision #12).
+    /// When the JSON's `name` field is absent, the row's name falls
+    /// back to the filename stem (spec decision #14).
+    ///
+    /// Output is sorted by `name` ascending for stable comparison
+    /// against the prove-it-prototype probe.py.
+    ///
+    /// # Errors
+    ///
+    /// I/O failure reading the agents directory or the tracking file.
+    pub fn list_user_agents(&self) -> crate::error::Result<Vec<UserAgentRow>> {
+        let dir = self.agents_dir();
+        fs::create_dir_all(&dir)?;
+
+        let tracking = self.load_installed_agents()?;
+
+        let mut rows: Vec<UserAgentRow> = Vec::new();
+        for entry in fs::read_dir(&dir)? {
+            let entry = entry?;
+            let path = entry.path();
+            if path.extension().and_then(|s| s.to_str()) != Some("json") {
+                continue;
+            }
+            let bytes = match fs::read(&path) {
+                Ok(b) => b,
+                Err(e) => {
+                    warn!(
+                        path = %path.display(),
+                        error = %e,
+                        "skipping unreadable agent file in list_user_agents",
+                    );
+                    continue;
+                }
+            };
+            let value: serde_json::Value = match serde_json::from_slice(&bytes) {
+                Ok(v) => v,
+                Err(e) => {
+                    warn!(
+                        path = %path.display(),
+                        error = %e,
+                        "skipping unparseable agent file in list_user_agents (spec D13)",
+                    );
+                    continue;
+                }
+            };
+            let name = value
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .map(String::from)
+                .unwrap_or_else(|| {
+                    path.file_stem()
+                        .and_then(|s| s.to_str())
+                        .map_or_else(String::new, String::from)
+                });
+            let lineage = tracking.agents.get(&name).map(|m| UserAgentLineage {
+                marketplace: m.marketplace.to_string(),
+                plugin: m.plugin.to_string(),
+                version: m.version.clone(),
+            });
+            rows.push(UserAgentRow {
+                name,
+                description: value
+                    .get("description")
+                    .and_then(serde_json::Value::as_str)
+                    .map(String::from),
+                model: value
+                    .get("model")
+                    .and_then(serde_json::Value::as_str)
+                    .map(String::from),
+                tools_count: value
+                    .get("tools")
+                    .and_then(serde_json::Value::as_array)
+                    .map_or(0, Vec::len),
+                mcp_count: value
+                    .get("mcpServers")
+                    .and_then(serde_json::Value::as_object)
+                    .map_or(0, serde_json::Map::len),
+                resources_count: value
+                    .get("resources")
+                    .and_then(serde_json::Value::as_array)
+                    .map_or(0, Vec::len),
+                hooks_count: value
+                    .get("hooks")
+                    .and_then(serde_json::Value::as_object)
+                    .map_or(0, |o| {
+                        o.values()
+                            .filter_map(serde_json::Value::as_array)
+                            .map(Vec::len)
+                            .sum()
+                    }),
+                lineage,
+            });
+        }
+        rows.sort_by(|a, b| a.name.cmp(&b.name));
+        Ok(rows)
     }
 
     // -- steering installation ---------------------------------------------
@@ -8460,5 +8585,198 @@ mod tests {
             .kiro_dir()
             .join("agents/prompts/a.md");
         assert_eq!(fs::read(&dest).expect("read installed"), b"from-b");
+    }
+
+    // -- list_user_agents (S3 stress fixture, mirrors probe fixture) -------
+
+    /// S3 stress fixture: a project containing
+    /// - a user-authored agent file (no tracking entry)
+    /// - a marketplace-tracked agent file (tracking entry present)
+    /// - a JSON file with NO `name` field (would crash a strict parser)
+    /// - an orphan tracking entry (name in tracking, no file on disk)
+    ///
+    /// list_user_agents must produce exactly 3 rows (the orphan is
+    /// excluded), sorted by name, with lineage on the tracked one,
+    /// `name` falling back to filename stem on the no-name file, and
+    /// counts derived from JSON contents. Mirrors
+    /// `.agents-view/probe/fixture/` so the prove-it-prototype probe.py
+    /// can serve as the cross-cutting oracle.
+    #[test]
+    fn list_user_agents_matches_probe_fixture() {
+        use chrono::Utc;
+        let (_dir, project) = temp_project();
+        std::fs::create_dir_all(project.kiro_dir().join("agents")).expect("agents dir");
+
+        // (1) Marketplace-tracked agent + tracking entry.
+        std::fs::write(
+            project.kiro_dir().join("agents/marketplace-tracked.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "$schema": "../agent-schema.json",
+                "name": "marketplace-tracked",
+                "description": "Installed via marketplace, tracking entry present",
+                "model": "claude-opus-4-7",
+                "prompt": "file://prompts/marketplace-tracked.md",
+                "tools": ["fs_read", "grep", "code"],
+                "allowedTools": ["fs_read", "grep", "code"],
+                "mcpServers": {
+                    "kiro-docs": { "type": "stdio", "command": "kiro-docs-mcp", "args": [] },
+                },
+                "resources": [
+                    "file://AGENTS.md",
+                    { "type": "knowledgeBase", "source": "file://docs/", "name": "kiro-docs", "indexType": "best" }
+                ],
+                "hooks": { "SessionStart": [{ "command": "echo hello" }] },
+                "keyboardShortcut": "ctrl+shift+m",
+            }))
+            .expect("ser tracked agent"),
+        )
+        .expect("write tracked agent");
+
+        // (2) User-authored agent file (no tracking entry).
+        std::fs::write(
+            project.kiro_dir().join("agents/user-authored.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "$schema": "../agent-schema.json",
+                "name": "user-authored",
+                "description": "Hand-written agent with no marketplace lineage",
+                "model": "claude-sonnet-4-6",
+                "prompt": "You are a helpful local assistant.",
+                "tools": ["fs_read", "execute_bash"],
+                "allowedTools": ["fs_read"],
+                "mcpServers": {},
+                "resources": ["file://README.md"],
+                "hooks": {},
+            }))
+            .expect("ser user-authored"),
+        )
+        .expect("write user-authored");
+
+        // (3) No-name file — name field absent. Would crash parse_native;
+        // serde_json::Value tolerates it. Falls back to filename stem.
+        std::fs::write(
+            project.kiro_dir().join("agents/no-name.json"),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "$schema": "../agent-schema.json",
+                "description": "Has no name field",
+                "model": null,
+                "tools": ["fs_read"],
+                "mcpServers": {},
+                "resources": [],
+            }))
+            .expect("ser no-name"),
+        )
+        .expect("write no-name");
+
+        // Tracking file: includes the tracked agent AND an orphan entry.
+        let now = Utc::now();
+        std::fs::write(
+            project.kiro_dir().join(INSTALLED_AGENTS_FILE),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "agents": {
+                    "marketplace-tracked": {
+                        "marketplace": "fixture-market",
+                        "plugin": "fixture-plugin",
+                        "version": "1.2.3",
+                        "installed_at": now,
+                        "dialect": "native",
+                        "source_path": "agents/marketplace-tracked.json",
+                        "source_hash": "blake3:0000000000000000000000000000000000000000000000000000000000000000",
+                        "installed_hash": "blake3:0000000000000000000000000000000000000000000000000000000000000000",
+                    },
+                    "orphan-tracking": {
+                        "marketplace": "fixture-market",
+                        "plugin": "fixture-plugin",
+                        "version": "1.2.3",
+                        "installed_at": now,
+                        "dialect": "native",
+                        "source_path": "agents/orphan-tracking.json",
+                        "source_hash": "blake3:1111111111111111111111111111111111111111111111111111111111111111",
+                        "installed_hash": "blake3:1111111111111111111111111111111111111111111111111111111111111111",
+                    },
+                },
+                "native_companions": {},
+            }))
+            .expect("ser tracking"),
+        )
+        .expect("write tracking");
+
+        let rows = project.list_user_agents().expect("list_user_agents");
+
+        // Orphan excluded → exactly 3 rows.
+        assert_eq!(rows.len(), 3, "expected 3 rows, orphan must be excluded");
+
+        // Sorted by name ascending.
+        let names: Vec<&str> = rows.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["marketplace-tracked", "no-name", "user-authored"]
+        );
+
+        // Row 0: marketplace-tracked — has lineage.
+        let r0 = &rows[0];
+        assert_eq!(r0.name, "marketplace-tracked");
+        assert_eq!(
+            r0.description.as_deref(),
+            Some("Installed via marketplace, tracking entry present")
+        );
+        assert_eq!(r0.model.as_deref(), Some("claude-opus-4-7"));
+        assert_eq!(r0.tools_count, 3);
+        assert_eq!(r0.mcp_count, 1);
+        assert_eq!(r0.resources_count, 2);
+        assert_eq!(r0.hooks_count, 1);
+        let lin = r0.lineage.as_ref().expect("tracked row has lineage");
+        assert_eq!(lin.marketplace, "fixture-market");
+        assert_eq!(lin.plugin, "fixture-plugin");
+        assert_eq!(lin.version.as_deref(), Some("1.2.3"));
+
+        // Row 1: no-name — filename stem fallback, no lineage.
+        let r1 = &rows[1];
+        assert_eq!(r1.name, "no-name", "name falls back to filename stem (D14)");
+        assert!(r1.lineage.is_none());
+        assert!(r1.model.is_none(), "no-name's model is JSON null");
+        assert_eq!(r1.tools_count, 1);
+
+        // Row 2: user-authored — no lineage.
+        let r2 = &rows[2];
+        assert_eq!(r2.name, "user-authored");
+        assert!(r2.lineage.is_none());
+        assert_eq!(r2.tools_count, 2);
+        assert_eq!(r2.resources_count, 1);
+    }
+
+    #[test]
+    fn list_user_agents_creates_missing_agents_dir() {
+        let (_dir, project) = temp_project();
+        // No .kiro/ at all initially. list_user_agents must create the
+        // agents dir and return an empty list, not error.
+        let rows = project.list_user_agents().expect("empty list ok");
+        assert!(rows.is_empty());
+        assert!(
+            project.kiro_dir().join("agents").is_dir(),
+            "agents_dir created on view open (D9)"
+        );
+    }
+
+    #[test]
+    fn list_user_agents_skips_unparseable_json() {
+        let (_dir, project) = temp_project();
+        std::fs::create_dir_all(project.kiro_dir().join("agents")).expect("agents dir");
+        // Write malformed JSON. Must be skipped, not crash the whole list.
+        std::fs::write(
+            project.kiro_dir().join("agents/broken.json"),
+            b"{ this is not valid json",
+        )
+        .expect("write broken");
+        std::fs::write(
+            project.kiro_dir().join("agents/good.json"),
+            br#"{"name": "good", "tools": []}"#,
+        )
+        .expect("write good");
+
+        let rows = project
+            .list_user_agents()
+            .expect("list ok despite broken file");
+        let names: Vec<&str> = rows.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(names, vec!["good"], "broken.json silently dropped (D13)");
     }
 }
