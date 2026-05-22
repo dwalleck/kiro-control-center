@@ -1238,17 +1238,18 @@ impl KiroProject {
                 return None;
             }
         };
-        let name = value
-            .get("name")
-            .and_then(serde_json::Value::as_str)
-            .map_or_else(
-                || {
-                    path.file_stem()
-                        .and_then(|s| s.to_str())
-                        .map_or_else(String::new, String::from)
-                },
-                String::from,
-            );
+        // Canonical identity = filename stem (NOT the JSON `name` field).
+        // The spec D14 decision was reversed after claude[bot]'s PR #120
+        // review: when filename and JSON-name drift, downstream CRUD ops
+        // (delete/duplicate/save) compute paths from this `name` field and
+        // would mis-key the filesystem on drifted rows. Using the filename
+        // stem keeps row identity consistent with the path the CRUD ops
+        // will hit. Drift-visibility as a UI affordance is tracked at
+        // rivets-78io.
+        let name = path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .map_or_else(String::new, String::from);
         let lineage = tracking.agents.get(&name).map(|m| UserAgentLineage {
             marketplace: m.marketplace.to_string(),
             plugin: m.plugin.to_string(),
@@ -1312,6 +1313,7 @@ impl KiroProject {
         draft_bytes: &[u8],
     ) -> crate::error::Result<()> {
         let name = Self::validate_user_agent_name(draft_name)?;
+        Self::enforce_draft_json_name_matches(draft_bytes, &name)?;
         let agents_dir = self.agents_dir();
         let target = agents_dir.join(format!("{}.json", name.as_str()));
         // Run the collision check + write under the same lock as
@@ -1399,6 +1401,13 @@ impl KiroProject {
     ) -> crate::error::Result<SaveOutcome> {
         let from = Self::validate_user_agent_name(from_name)?;
         let target = Self::validate_user_agent_name(draft_name)?;
+        // Enforce filename==JSON-name BEFORE the file lock + writes.
+        // claude[bot] PR #120 review surfaced the gap: list_user_agents
+        // now uses filename stem as canonical identity, so any save that
+        // would land bytes whose JSON `name` field disagrees with the
+        // target filename creates immediate drift between display and
+        // file contents. Reject early.
+        Self::enforce_draft_json_name_matches(draft_bytes, &target)?;
         let agents_dir = self.agents_dir();
         let from_path = agents_dir.join(format!("{}.json", from.as_str()));
         let target_path = agents_dir.join(format!("{}.json", target.as_str()));
@@ -1406,7 +1415,12 @@ impl KiroProject {
 
         crate::file_lock::with_file_lock(&self.agent_tracking_path(), || {
             // (1) Collision check happens BEFORE any write.
-            if is_rename && target_path.exists() {
+            // `symlink_metadata` (not `Path::exists`) so a dangling
+            // symlink at the rename target registers as a collision
+            // rather than a free slot the `atomic_write` rename would
+            // silently replace. Mirrors the discipline in
+            // `create_user_agent` for the same threat model.
+            if is_rename && fs::symlink_metadata(&target_path).is_ok() {
                 return Err(AgentError::NameCollision {
                     name: target.clone().into_inner(),
                 }
@@ -1663,6 +1677,52 @@ impl KiroProject {
             };
             AgentError::InvalidName { reason }.into()
         })
+    }
+
+    /// Enforce that the JSON `name` field inside `draft_bytes` equals
+    /// the validated filename-stem identity that `create_user_agent` /
+    /// `save_user_agent` are about to write to.
+    ///
+    /// Closes the drift gap surfaced by claude[bot]'s PR #120 review:
+    /// `list_user_agents` keys the row's identity off the filename stem
+    /// (canonical), and downstream CRUD ops compute paths from that
+    /// identity. Without this check, the UI could save bytes whose
+    /// internal `name` field disagrees with the file's path on disk —
+    /// the row would display its filename, but kiro-cli's runtime would
+    /// see a different name inside the JSON.
+    ///
+    /// Rejects both mismatch (different name) and absence (no name
+    /// field). `serde_json::from_slice` failure (non-JSON bytes) is also
+    /// rejected — defense-in-depth against an IPC wrapper that someday
+    /// forgets to call `validate_draft_json_payload`.
+    ///
+    /// # Errors
+    /// - [`AgentError::InvalidName`] when the JSON parses but `name`
+    ///   is absent / non-string / mismatched.
+    /// - `serde_json::Error` (via the workspace `Error`) when the bytes
+    ///   are not parseable as JSON.
+    fn enforce_draft_json_name_matches(
+        draft_bytes: &[u8],
+        expected: &validation::AgentName,
+    ) -> crate::error::Result<()> {
+        let value: serde_json::Value = serde_json::from_slice(draft_bytes)?;
+        match value.get("name").and_then(serde_json::Value::as_str) {
+            Some(n) if n == expected.as_str() => Ok(()),
+            Some(n) => Err(AgentError::InvalidName {
+                reason: format!(
+                    "draft JSON `name` field is `{n}` but must equal the agent's filename stem `{}`",
+                    expected.as_str()
+                ),
+            }
+            .into()),
+            None => Err(AgentError::InvalidName {
+                reason: format!(
+                    "draft JSON is missing required `name` field (expected `{}` to match filename stem)",
+                    expected.as_str()
+                ),
+            }
+            .into()),
+        }
     }
 
     // -- steering installation ---------------------------------------------
@@ -9267,11 +9327,14 @@ mod tests {
         let (_dir, project) = temp_project();
         std::fs::create_dir_all(project.kiro_dir().join("agents")).expect("agents dir");
         let target = project.kiro_dir().join("agents/foo.json");
-        std::fs::write(&target, b"ORIGINAL_BYTES").expect("seed file");
+        std::fs::write(&target, br#"{"name": "foo", "marker": "ORIGINAL"}"#).expect("seed file");
         let before = std::fs::read(&target).expect("read pre");
 
         let err = project
-            .create_user_agent("foo", b"REPLACEMENT_BYTES_SHOULD_NOT_LAND")
+            .create_user_agent(
+                "foo",
+                br#"{"name": "foo", "marker": "REPLACEMENT_SHOULD_NOT_LAND"}"#,
+            )
             .expect_err("must collide");
         assert!(
             matches!(
@@ -9285,6 +9348,84 @@ mod tests {
         assert_eq!(before, after, "existing file must NOT be overwritten");
     }
 
+    /// New name-enforcement (Finding B from PR #120 claude[bot] review):
+    /// `create_user_agent` rejects bytes whose embedded JSON `name` field
+    /// disagrees with the filename argument. Without this gate the UI
+    /// could plant a file at `<foo>.json` whose `name` field says
+    /// `"bar"`, after which `list_user_agents` (which uses filename stem
+    /// as canonical identity) would surface a row indistinguishable from
+    /// a `<foo>` user-authored agent — kiro-cli's runtime would still
+    /// read the embedded `"bar"` though, splitting display from
+    /// behavior. Reject early.
+    #[test]
+    fn create_user_agent_rejects_draft_json_name_mismatch() {
+        let (_dir, project) = temp_project();
+        std::fs::create_dir_all(project.kiro_dir().join("agents")).expect("agents dir");
+
+        let err = project
+            .create_user_agent("foo", br#"{"name": "bar"}"#)
+            .expect_err("JSON name != filename must be rejected");
+        assert!(
+            matches!(
+                err,
+                crate::error::Error::Agent(AgentError::InvalidName { .. })
+            ),
+            "expected InvalidName for name-mismatch, got {err:?}"
+        );
+        // No file landed.
+        assert!(!project.kiro_dir().join("agents/foo.json").exists());
+        assert!(!project.kiro_dir().join("agents/bar.json").exists());
+    }
+
+    /// Sibling of the mismatch test: draft JSON missing the `name`
+    /// field is also rejected. Without this, an editor that "forgot"
+    /// to serialise the name would silently produce a row that
+    /// renders the filename stem but has no internal identity that
+    /// kiro-cli could load — same display-vs-behavior split as the
+    /// mismatch case above.
+    #[test]
+    fn create_user_agent_rejects_draft_missing_name_field() {
+        let (_dir, project) = temp_project();
+        std::fs::create_dir_all(project.kiro_dir().join("agents")).expect("agents dir");
+
+        let err = project
+            .create_user_agent("foo", br#"{"description": "no name field"}"#)
+            .expect_err("missing JSON name field must be rejected");
+        assert!(matches!(
+            err,
+            crate::error::Error::Agent(AgentError::InvalidName { .. })
+        ));
+        assert!(!project.kiro_dir().join("agents/foo.json").exists());
+    }
+
+    /// Same enforcement applied at the save boundary: an in-place save
+    /// whose draft JSON's `name` field disagrees with `draft_name`
+    /// gets rejected before any file write. Pre-existing content is
+    /// untouched.
+    #[test]
+    fn save_user_agent_rejects_draft_json_name_mismatch() {
+        let (_dir, project) = temp_project();
+        let agents = project.kiro_dir().join("agents");
+        std::fs::create_dir_all(&agents).expect("agents dir");
+        std::fs::write(agents.join("foo.json"), br#"{"name": "foo"}"#).expect("seed");
+
+        let err = project
+            .save_user_agent("foo", "foo", br#"{"name": "bar"}"#, false)
+            .expect_err("draft.name != draft_name must be rejected");
+        assert!(
+            matches!(
+                err,
+                crate::error::Error::Agent(AgentError::InvalidName { .. })
+            ),
+            "expected InvalidName for name-mismatch, got {err:?}"
+        );
+        assert_eq!(
+            std::fs::read(agents.join("foo.json")).expect("read post"),
+            br#"{"name": "foo"}"#,
+            "rejected save must not modify the existing file",
+        );
+    }
+
     // -- save_user_agent --------------------------------------------------
 
     /// In-place edit: `from_name == draft_name`, no rename, untracked.
@@ -9295,12 +9436,13 @@ mod tests {
         let (_dir, project) = temp_project();
         std::fs::create_dir_all(project.kiro_dir().join("agents")).expect("agents dir");
         let foo = project.kiro_dir().join("agents/foo.json");
-        std::fs::write(&foo, b"v1").expect("seed v1");
+        std::fs::write(&foo, br#"{"name": "foo", "v": "1"}"#).expect("seed v1");
 
+        let v2 = br#"{"name": "foo", "v": "2"}"#;
         project
-            .save_user_agent("foo", "foo", b"v2", false)
+            .save_user_agent("foo", "foo", v2, false)
             .expect("save in-place");
-        assert_eq!(std::fs::read(&foo).expect("read"), b"v2");
+        assert_eq!(std::fs::read(&foo).expect("read"), v2);
         // No bar.json created.
         assert!(!project.kiro_dir().join("agents/bar.json").exists());
         // No tracking file written (no detach, no existing tracking).
@@ -9315,13 +9457,14 @@ mod tests {
         std::fs::create_dir_all(project.kiro_dir().join("agents")).expect("agents dir");
         let foo = project.kiro_dir().join("agents/foo.json");
         let bar = project.kiro_dir().join("agents/bar.json");
-        std::fs::write(&foo, b"old").expect("seed foo");
+        std::fs::write(&foo, br#"{"name": "foo"}"#).expect("seed foo");
 
+        let renamed_bytes = br#"{"name": "bar"}"#;
         project
-            .save_user_agent("foo", "bar", b"renamed", false)
+            .save_user_agent("foo", "bar", renamed_bytes, false)
             .expect("save rename");
         assert!(!foo.exists(), "old file must be unlinked");
-        assert_eq!(std::fs::read(&bar).expect("read bar"), b"renamed");
+        assert_eq!(std::fs::read(&bar).expect("read bar"), renamed_bytes);
     }
 
     /// Rename collision (adversarial): pre-write `foo` AND `bar` with
@@ -9334,13 +9477,22 @@ mod tests {
         std::fs::create_dir_all(project.kiro_dir().join("agents")).expect("agents dir");
         let foo = project.kiro_dir().join("agents/foo.json");
         let bar = project.kiro_dir().join("agents/bar.json");
-        std::fs::write(&foo, b"FOO_ORIGINAL").expect("seed foo");
-        std::fs::write(&bar, b"BAR_ORIGINAL_DO_NOT_CORRUPT").expect("seed bar");
+        std::fs::write(&foo, br#"{"name": "foo", "marker": "FOO_ORIGINAL"}"#).expect("seed foo");
+        std::fs::write(
+            &bar,
+            br#"{"name": "bar", "marker": "BAR_ORIGINAL_DO_NOT_CORRUPT"}"#,
+        )
+        .expect("seed bar");
         let foo_before = std::fs::read(&foo).expect("read foo pre");
         let bar_before = std::fs::read(&bar).expect("read bar pre");
 
         let err = project
-            .save_user_agent("foo", "bar", b"WOULD_OVERWRITE_BAR", false)
+            .save_user_agent(
+                "foo",
+                "bar",
+                br#"{"name": "bar", "marker": "WOULD_OVERWRITE_BAR"}"#,
+                false,
+            )
             .expect_err("rename onto existing bar must collide");
         assert!(
             matches!(
@@ -9362,7 +9514,7 @@ mod tests {
         let (_dir, project) = temp_project();
         std::fs::create_dir_all(project.kiro_dir().join("agents")).expect("agents dir");
         let agent_path = project.kiro_dir().join("agents/m-agent.json");
-        std::fs::write(&agent_path, b"v1").expect("seed file");
+        std::fs::write(&agent_path, br#"{"name": "m-agent"}"#).expect("seed file");
 
         let now = Utc::now();
         std::fs::write(
@@ -9386,10 +9538,11 @@ mod tests {
         )
         .expect("write tracking");
 
+        let edited = br#"{"name": "m-agent", "edited": true}"#;
         project
-            .save_user_agent("m-agent", "m-agent", b"v2-edited", true)
+            .save_user_agent("m-agent", "m-agent", edited, true)
             .expect("save with detach");
-        assert_eq!(std::fs::read(&agent_path).expect("post"), b"v2-edited");
+        assert_eq!(std::fs::read(&agent_path).expect("post"), edited);
         let tracking = project.load_installed_agents().expect("load tracking post");
         assert!(
             !tracking.agents.contains_key("m-agent"),
@@ -9406,7 +9559,7 @@ mod tests {
         let (_dir, project) = temp_project();
         std::fs::create_dir_all(project.kiro_dir().join("agents")).expect("agents dir");
         let agent_path = project.kiro_dir().join("agents/m-agent.json");
-        std::fs::write(&agent_path, b"v1").expect("seed");
+        std::fs::write(&agent_path, br#"{"name": "m-agent"}"#).expect("seed");
 
         let now = Utc::now();
         std::fs::write(
@@ -9431,7 +9584,12 @@ mod tests {
         .expect("write tracking");
 
         project
-            .save_user_agent("m-agent", "m-agent", b"v2", false)
+            .save_user_agent(
+                "m-agent",
+                "m-agent",
+                br#"{"name": "m-agent", "v": 2}"#,
+                false,
+            )
             .expect("save no-detach");
         let tracking = project.load_installed_agents().expect("load post");
         assert!(
@@ -9450,10 +9608,10 @@ mod tests {
         let (_dir, project) = temp_project();
         let agents_dir = project.kiro_dir().join("agents");
         std::fs::create_dir_all(&agents_dir).expect("agents dir");
-        std::fs::write(agents_dir.join("foo.json"), b"v1").expect("write foo");
+        std::fs::write(agents_dir.join("foo.json"), br#"{"name": "foo"}"#).expect("write foo");
 
         let outcome = project
-            .save_user_agent("foo", "bar", b"v2", false)
+            .save_user_agent("foo", "bar", br#"{"name": "bar"}"#, false)
             .expect("save rename");
         assert!(
             outcome.orphan_left_behind.is_none(),
@@ -9478,13 +9636,14 @@ mod tests {
         // capture branch.
         std::fs::create_dir(agents_dir.join("foo.json")).expect("foo as dir");
 
+        let new_bytes = br#"{"name": "bar", "v": "new"}"#;
         let outcome = project
-            .save_user_agent("foo", "bar", b"new content", false)
+            .save_user_agent("foo", "bar", new_bytes, false)
             .expect("save rename succeeds even when old unlink fails");
         // New file landed.
         assert_eq!(
             std::fs::read(agents_dir.join("bar.json")).expect("read bar"),
-            b"new content",
+            new_bytes,
         );
         // And the orphan path is reported.
         let orphan = outcome
@@ -9811,6 +9970,59 @@ mod tests {
                     if name == "foo"
             ),
             "expected NameCollision, got {err:?}"
+        );
+    }
+
+    /// Sibling regression for `save_user_agent`'s rename path. Asymmetry
+    /// was caught by claude[bot] review on PR #120 — the create-side test
+    /// covered dangling-symlink-as-collision but the rename target was
+    /// guarded with `Path::exists()` (follows symlinks → reports false for
+    /// dangling), so `atomic_write`'s internal `fs::rename` would silently
+    /// replace the symlink with regular-file content. Fixed by switching
+    /// to `fs::symlink_metadata` for the collision check; this test
+    /// pins the contract.
+    #[cfg(unix)]
+    #[test]
+    fn save_user_agent_rename_treats_symlink_at_target_as_collision() {
+        let (dir, project) = temp_project();
+        let agents_dir = project.kiro_dir().join("agents");
+        std::fs::create_dir_all(&agents_dir).expect("agents dir");
+        // Source we'll attempt to rename FROM — a regular file.
+        std::fs::write(agents_dir.join("foo.json"), b"original-foo").expect("seed foo");
+        let foo_pre = std::fs::read(agents_dir.join("foo.json")).expect("read pre");
+        // Dangling symlink at the rename TARGET — Path::exists() would
+        // say false; the buggy code path replaces it without warning.
+        let dangling = dir.path().join("nowhere");
+        std::os::unix::fs::symlink(&dangling, agents_dir.join("bar.json"))
+            .expect("create dangling symlink at target");
+        assert!(
+            !agents_dir.join("bar.json").exists(),
+            "test precondition: dangling symlink reports exists()==false",
+        );
+
+        let err = project
+            .save_user_agent("foo", "bar", br#"{"name": "bar"}"#, false)
+            .expect_err("rename onto dangling symlink must collide");
+        assert!(
+            matches!(
+                err,
+                crate::error::Error::Agent(AgentError::NameCollision { ref name })
+                    if name == "bar"
+            ),
+            "expected NameCollision for `bar`, got {err:?}"
+        );
+        // Source file untouched.
+        assert_eq!(
+            std::fs::read(agents_dir.join("foo.json")).expect("read post"),
+            foo_pre,
+        );
+        // Symlink at target intact (still a symlink, not replaced by a
+        // regular file).
+        let bar_md = std::fs::symlink_metadata(agents_dir.join("bar.json")).expect("stat bar.json");
+        assert!(
+            bar_md.file_type().is_symlink(),
+            "symlink at rename target must NOT be replaced; file type now: {:?}",
+            bar_md.file_type(),
         );
     }
 

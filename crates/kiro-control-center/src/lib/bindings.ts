@@ -1962,10 +1962,13 @@ export type UserAgentLineage = {
  */
 export type UserAgentRow = {
 	/**
-	 *  Agent identity. Sourced from the JSON file's `name` field when
-	 *  present, else falls back to the filename stem. Save path
-	 *  enforces these always match; list path is tolerant of
-	 *  pre-existing drift.
+	 *  Agent identity. Always the filename stem of
+	 *  `.kiro/agents/<name>.json` (canonical identity for CRUD ops).
+	 *  The JSON file's `name` field is NOT used for this value —
+	 *  `create_user_agent` and `save_user_agent` enforce that the
+	 *  JSON `name` equals the filename stem at write time, so drift
+	 *  between display and path cannot be introduced via the UI.
+	 *  See spec D14 in `.agents-view/spec.md` for the rationale.
 	 */
 	name: string,
 	// Human-only label; not shown to the model.

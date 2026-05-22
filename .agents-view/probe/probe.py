@@ -34,7 +34,13 @@ def main(project):
     rows = []
     for jf in sorted(agents_dir.glob("*.json")):
         agent = json.loads(jf.read_text(encoding="utf-8"))
-        name = agent.get("name", jf.stem)
+        # 2026-05-22 update (spec D14 revision): row identity is the
+        # filename stem, not the JSON `name` field. Original probe used
+        # `agent.get("name", jf.stem)` to mirror the now-superseded
+        # "JSON name first, stem fallback" policy. Switched to always
+        # using the stem so the probe stays in lockstep with the Rust
+        # binary. See PR #120 / kiro-78io.
+        name = jf.stem
         track = tracking.get(name)
         rows.append({
             "name": name,
