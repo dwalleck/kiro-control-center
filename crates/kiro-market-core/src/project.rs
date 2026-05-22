@@ -1374,6 +1374,37 @@ impl KiroProject {
         })
     }
 
+    /// Delete a user-visible agent. Tracking-aware:
+    ///
+    /// - If `name` has an [`InstalledAgents`] entry, delegates to
+    ///   [`Self::remove_agent`] (file lock + tracking update + dual-file
+    ///   unlink with rollback on unlink failure).
+    /// - Otherwise, `fs::remove_file` directly on
+    ///   `<agents_dir>/<name>.json`. Idempotent on
+    ///   `ErrorKind::NotFound` so a manual filesystem delete between
+    ///   list-refresh and click doesn't surface a spurious error.
+    ///
+    /// Slice S6 of agents-view, design claim C5.
+    ///
+    /// # Errors
+    /// - [`AgentError::InvalidName`] if `name` fails validation.
+    /// - Whatever [`Self::remove_agent`] returns for the tracked branch.
+    /// - I/O for non-`NotFound` filesystem failures on the untracked
+    ///   branch.
+    pub fn delete_user_agent(&self, name: &str) -> crate::error::Result<()> {
+        let name = Self::validate_user_agent_name(name)?;
+        let installed = self.load_installed_agents()?;
+        if installed.agents.contains_key(name.as_str()) {
+            return self.remove_agent(name.as_str());
+        }
+        let target = self.agents_dir().join(format!("{}.json", name.as_str()));
+        match fs::remove_file(&target) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(e.into()),
+        }
+    }
+
     /// Shared name-validation helper for the user-authored save/delete/
     /// duplicate paths. Maps the validation error to the agent surface's
     /// `InvalidName` variant rather than letting the workspace `Error`
@@ -9155,6 +9186,77 @@ mod tests {
             tracking.agents.contains_key("m-agent"),
             "detach=false must preserve the tracking entry"
         );
+    }
+
+    // -- delete_user_agent (S6 stress fixture, 3 cases) --------------------
+
+    /// S6 case 1 — untracked delete: file present, no tracking entry.
+    /// File goes away; tracking unchanged.
+    #[test]
+    fn delete_user_agent_untracked_removes_file_only() {
+        let (_dir, project) = temp_project();
+        std::fs::create_dir_all(project.kiro_dir().join("agents")).expect("agents dir");
+        let target = project.kiro_dir().join("agents/foo.json");
+        std::fs::write(&target, b"hi").expect("seed");
+
+        project.delete_user_agent("foo").expect("delete ok");
+        assert!(!target.exists(), "file must be removed");
+        // No tracking file ever existed.
+        assert!(!project.kiro_dir().join(INSTALLED_AGENTS_FILE).exists());
+    }
+
+    /// S6 case 2 — tracked delete: install a marketplace agent into
+    /// tracking + file, call delete, assert BOTH the file and the
+    /// tracking entry are gone. Bug class defeated: delete that drops
+    /// only the file leaves a phantom tracking entry.
+    #[test]
+    fn delete_user_agent_tracked_removes_file_and_tracking() {
+        use chrono::Utc;
+        let (_dir, project) = temp_project();
+        std::fs::create_dir_all(project.kiro_dir().join("agents")).expect("agents dir");
+        let target = project.kiro_dir().join("agents/m-agent.json");
+        std::fs::write(&target, b"v1").expect("seed");
+
+        let now = Utc::now();
+        std::fs::write(
+            project.kiro_dir().join(INSTALLED_AGENTS_FILE),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "agents": {
+                    "m-agent": {
+                        "marketplace": "mp",
+                        "plugin": "p",
+                        "version": "1.0.0",
+                        "installed_at": now,
+                        "dialect": "native",
+                        "source_path": "agents/m-agent.json",
+                        "source_hash": "blake3:0000000000000000000000000000000000000000000000000000000000000000",
+                        "installed_hash": "blake3:0000000000000000000000000000000000000000000000000000000000000000",
+                    }
+                },
+                "native_companions": {},
+            }))
+            .expect("ser"),
+        )
+        .expect("write tracking");
+
+        project.delete_user_agent("m-agent").expect("delete ok");
+        assert!(!target.exists(), "file gone");
+        let tracking = project.load_installed_agents().expect("load");
+        assert!(
+            !tracking.agents.contains_key("m-agent"),
+            "tracking entry gone"
+        );
+    }
+
+    /// S6 case 3 — idempotent on missing file: no file, no tracking,
+    /// delete returns Ok(()).
+    #[test]
+    fn delete_user_agent_idempotent_on_missing_file() {
+        let (_dir, project) = temp_project();
+        // No agents/ dir at all.
+        project
+            .delete_user_agent("ghost")
+            .expect("delete of nonexistent must be Ok(())");
     }
 
     #[test]
