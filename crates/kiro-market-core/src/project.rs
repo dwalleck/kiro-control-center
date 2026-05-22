@@ -1405,6 +1405,84 @@ impl KiroProject {
         }
     }
 
+    /// Duplicate a user-visible agent into a freshly-named sibling.
+    ///
+    /// Walks `<source>-copy`, `<source>-copy-2`, `<source>-copy-3`, ...
+    /// finding the smallest unused suffix. The duplicate is **always
+    /// user-authored** — never carries marketplace lineage even if the
+    /// source has it (spec B10).
+    ///
+    /// The JSON's `name` field is rewritten to the new name so the
+    /// file is self-consistent with its filename. All other fields are
+    /// preserved verbatim from the source.
+    ///
+    /// Slice S7 of agents-view, design claim C6.
+    ///
+    /// # Loop budget
+    /// The collision walker iterates up to a sanity cap of 10,000.
+    /// Production-scale expectation is N ≤ 10 (a user duplicating an
+    /// agent more than ten times is unusual). The 10k cap exists to
+    /// guarantee termination on adversarial inputs, not as a
+    /// hot-path scale — hitting it returns
+    /// [`AgentError::DuplicateNameSpaceExhausted`], not silent
+    /// truncation.
+    ///
+    /// # Errors
+    /// - [`AgentError::InvalidName`] if `source_name` fails validation.
+    /// - [`AgentError::DuplicateSourceNotFound`] if the source file is
+    ///   absent on disk.
+    /// - [`AgentError::DuplicateNameSpaceExhausted`] if the walker
+    ///   exhausts the sanity cap.
+    /// - I/O / JSON errors from the read or atomic write.
+    pub fn duplicate_user_agent(&self, source_name: &str) -> crate::error::Result<String> {
+        let source = Self::validate_user_agent_name(source_name)?;
+        let agents_dir = self.agents_dir();
+        let source_path = agents_dir.join(format!("{}.json", source.as_str()));
+        if !source_path.exists() {
+            return Err(AgentError::DuplicateSourceNotFound {
+                name: source.into_inner(),
+            }
+            .into());
+        }
+        let source_bytes = fs::read(&source_path)?;
+
+        const SANITY_CAP: u32 = 10_000;
+        let mut target_name: Option<String> = None;
+        for k in 1..=SANITY_CAP {
+            let candidate = if k == 1 {
+                format!("{}-copy", source.as_str())
+            } else {
+                format!("{}-copy-{}", source.as_str(), k)
+            };
+            let candidate_path = agents_dir.join(format!("{candidate}.json"));
+            if !candidate_path.exists() {
+                target_name = Some(candidate);
+                break;
+            }
+        }
+        let target_name = target_name.ok_or_else(|| AgentError::DuplicateNameSpaceExhausted {
+            source_name: source.clone().into_inner(),
+            cap: SANITY_CAP,
+        })?;
+
+        // Rewrite the JSON's `name` field so the file is self-consistent
+        // with its new filename. Other fields preserved verbatim.
+        let mut value: serde_json::Value = serde_json::from_slice(&source_bytes)?;
+        if let Some(obj) = value.as_object_mut() {
+            obj.insert(
+                "name".to_string(),
+                serde_json::Value::String(target_name.clone()),
+            );
+        }
+        let new_bytes = serde_json::to_vec_pretty(&value)?;
+
+        let target_path = agents_dir.join(format!("{target_name}.json"));
+        crate::cache::atomic_write(&target_path, &new_bytes)?;
+        // Intentionally NOT inserted into InstalledAgents — duplicate
+        // is always user-authored regardless of source lineage.
+        Ok(target_name)
+    }
+
     /// Shared name-validation helper for the user-authored save/delete/
     /// duplicate paths. Maps the validation error to the agent surface's
     /// `InvalidName` variant rather than letting the workspace `Error`
@@ -9257,6 +9335,129 @@ mod tests {
         project
             .delete_user_agent("ghost")
             .expect("delete of nonexistent must be Ok(())");
+    }
+
+    // -- duplicate_user_agent (S7 stress fixture, 4 cases) ------------------
+
+    /// S7 case 1 — `-copy` slot free: simplest happy path.
+    #[test]
+    fn duplicate_user_agent_creates_copy_when_slot_free() {
+        let (_dir, project) = temp_project();
+        std::fs::create_dir_all(project.kiro_dir().join("agents")).expect("agents dir");
+        let foo = project.kiro_dir().join("agents/foo.json");
+        std::fs::write(&foo, br#"{"name": "foo", "tools": ["x"]}"#).expect("seed");
+
+        let new_name = project.duplicate_user_agent("foo").expect("dup ok");
+        assert_eq!(new_name, "foo-copy");
+        let new_path = project.kiro_dir().join("agents/foo-copy.json");
+        assert!(new_path.is_file());
+        // The new file's `name` field is rewritten to match the new filename.
+        let val: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&new_path).expect("read")).expect("parse");
+        assert_eq!(val["name"], serde_json::json!("foo-copy"));
+        // Other fields preserved verbatim.
+        assert_eq!(val["tools"], serde_json::json!(["x"]));
+    }
+
+    /// S7 case 2 — chain occupied (adversarial): foo, foo-copy,
+    /// foo-copy-2 all present. The walker must pick foo-copy-3, NOT
+    /// overwrite any existing file. Bug class defeated: naive "always
+    /// use -copy" implementation.
+    #[test]
+    fn duplicate_user_agent_walks_to_next_free_name() {
+        let (_dir, project) = temp_project();
+        std::fs::create_dir_all(project.kiro_dir().join("agents")).expect("agents dir");
+        for fname in &["foo.json", "foo-copy.json", "foo-copy-2.json"] {
+            std::fs::write(
+                project.kiro_dir().join("agents").join(fname),
+                format!(r#"{{"name": "{}"}}"#, fname.trim_end_matches(".json")).as_bytes(),
+            )
+            .expect("seed");
+        }
+        // Capture pre-state byte content of the existing files; they
+        // must NOT change.
+        let pre_copy = std::fs::read(project.kiro_dir().join("agents/foo-copy.json")).expect("r");
+        let pre_copy2 =
+            std::fs::read(project.kiro_dir().join("agents/foo-copy-2.json")).expect("r");
+
+        let new_name = project.duplicate_user_agent("foo").expect("dup ok");
+        assert_eq!(new_name, "foo-copy-3");
+        assert!(project.kiro_dir().join("agents/foo-copy-3.json").is_file());
+
+        // Existing files untouched.
+        assert_eq!(
+            std::fs::read(project.kiro_dir().join("agents/foo-copy.json")).expect("r"),
+            pre_copy
+        );
+        assert_eq!(
+            std::fs::read(project.kiro_dir().join("agents/foo-copy-2.json")).expect("r"),
+            pre_copy2
+        );
+    }
+
+    /// S7 case 3 — source missing: returns DuplicateSourceNotFound.
+    #[test]
+    fn duplicate_user_agent_returns_source_not_found() {
+        let (_dir, project) = temp_project();
+        let err = project
+            .duplicate_user_agent("ghost")
+            .expect_err("must fail");
+        assert!(
+            matches!(
+                err,
+                crate::error::Error::Agent(AgentError::DuplicateSourceNotFound { ref name })
+                    if name == "ghost"
+            ),
+            "expected DuplicateSourceNotFound for ghost, got {err:?}"
+        );
+    }
+
+    /// S7 case 4 — marketplace-tracked source: duplicate is NEVER
+    /// inserted into InstalledAgents. The source's tracking entry is
+    /// preserved; the new copy is user-authored.
+    #[test]
+    fn duplicate_user_agent_strips_marketplace_lineage() {
+        use chrono::Utc;
+        let (_dir, project) = temp_project();
+        std::fs::create_dir_all(project.kiro_dir().join("agents")).expect("agents dir");
+        std::fs::write(
+            project.kiro_dir().join("agents/m-agent.json"),
+            br#"{"name": "m-agent"}"#,
+        )
+        .expect("seed file");
+        let now = Utc::now();
+        std::fs::write(
+            project.kiro_dir().join(INSTALLED_AGENTS_FILE),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "agents": {
+                    "m-agent": {
+                        "marketplace": "mp",
+                        "plugin": "p",
+                        "version": "1.0.0",
+                        "installed_at": now,
+                        "dialect": "native",
+                        "source_path": "agents/m-agent.json",
+                        "source_hash": "blake3:0000000000000000000000000000000000000000000000000000000000000000",
+                        "installed_hash": "blake3:0000000000000000000000000000000000000000000000000000000000000000",
+                    }
+                },
+                "native_companions": {},
+            }))
+            .expect("ser"),
+        )
+        .expect("write tracking");
+
+        let new_name = project.duplicate_user_agent("m-agent").expect("dup");
+        assert_eq!(new_name, "m-agent-copy");
+
+        let tracking = project.load_installed_agents().expect("load");
+        // Source's lineage preserved.
+        assert!(tracking.agents.contains_key("m-agent"));
+        // Copy has NO lineage.
+        assert!(
+            !tracking.agents.contains_key("m-agent-copy"),
+            "duplicate must NOT carry marketplace lineage"
+        );
     }
 
     #[test]
