@@ -1,7 +1,7 @@
-// Pure-logic helpers for the Agents list page (Workflows > Agents).
-// Slice S10 of agents-view slice 1. Per CLAUDE.md vitest discipline,
-// testable logic lives in non-`.svelte.ts` modules; the AgentsTab
-// component (slice S12) is the dumb consumer of these helpers.
+// Pure-logic helpers for the Agents list page. Extracted from
+// `AgentsTab.svelte` per CLAUDE.md's vitest discipline: testable
+// logic lives in non-`.svelte.ts` modules so the component stays a
+// dumb consumer.
 
 import type { UserAgentLineage, UserAgentRow } from "$lib/bindings";
 
@@ -9,9 +9,9 @@ import type { UserAgentLineage, UserAgentRow } from "$lib/bindings";
  * Filter agent rows by a free-text query.
  *
  * Empty query returns a fresh copy of every row. Non-empty matches
- * case-insensitively against `name`, `description`, and `model`. Per
- * spec B4: no debounce, filter state is component-local. Per design
- * input shapes: tolerant of `null` description and model.
+ * case-insensitively against `name`, `description`, and `model`. No
+ * debounce; filter state is component-local. Tolerant of `null`
+ * description and model.
  */
 export function filterAgentRows(
   rows: readonly UserAgentRow[],
@@ -45,10 +45,59 @@ export function formatLineageBadge(
 
 /**
  * Display string for the model chip. `"Use default"` when null —
- * matches the design's placeholder for agents with no explicit
- * model override (every existing agent in `.kiro/agents/` has
- * `model: null`, surfaced as probe finding 4).
+ * empirically, every agent in `.kiro/agents/` ships with
+ * `model: null` so a sensible placeholder is the common case.
  */
 export function formatModelChip(model: string | null): string {
   return model ?? "Use default";
+}
+
+/**
+ * Discriminated union for the Agents tab's view mode. Pulled into a
+ * shared module so the exhaustiveness guard in [`headerLabel`] has
+ * a single canonical type to enumerate.
+ */
+export type AgentsTabMode =
+  | { kind: "list" }
+  | { kind: "new" }
+  | { kind: "edit"; row: UserAgentRow };
+
+/**
+ * Per the CLAUDE.md TS-discipline rule, a `switch (mode.kind)` with a
+ * `never`-typed default arm. A chained ternary would silently fall
+ * through if a third arm landed without explicit handling.
+ *
+ * Tripwire: the `_AssertExhaustive` type alias resolves to `never`
+ * iff every `AgentsTabMode` arm is enumerated in `_KINDS`; the
+ * value-position `_assert: _AssertExhaustive = true` makes that
+ * fire at compile time when a future contributor adds a fourth
+ * `mode.kind` without updating both arrays.
+ */
+const _KINDS = ["list", "new", "edit"] as const satisfies ReadonlyArray<
+  AgentsTabMode["kind"]
+>;
+type _AssertExhaustive =
+  Exclude<AgentsTabMode["kind"], (typeof _KINDS)[number]> extends never
+    ? true
+    : never;
+const _assert: _AssertExhaustive = true;
+void _assert;
+
+export function headerLabel(mode: AgentsTabMode): string {
+  switch (mode.kind) {
+    case "list":
+      return "Agents";
+    case "new":
+      return "New agent";
+    case "edit":
+      return `Editing ${mode.row.name}`;
+    default: {
+      const _exhaustive: never = mode;
+      throw new Error(
+        `headerLabel: unhandled AgentsTabMode arm ${JSON.stringify(
+          _exhaustive,
+        )}`,
+      );
+    }
+  }
 }

@@ -1,25 +1,20 @@
 <script lang="ts">
-  // Workflows > Agents — list page (slice S12) + mode swap to editor
-  // (slice S13 fills in the editor branch). Spec behaviors B1, B3-B6,
-  // B10-B12 (B7-B9, B13 require the editor in S13).
+  // Workflows > Agents — list page with mode swap to an editor
+  // placeholder (the editor itself is future scope).
 
-  import { onMount } from "svelte";
   import { commands } from "$lib/bindings";
   import type { UserAgentRow } from "$lib/bindings";
   import {
     filterAgentRows,
     formatLineageBadge,
     formatModelChip,
+    headerLabel,
+    type AgentsTabMode,
   } from "$lib/agent-list-helpers";
 
   let { projectPath }: { projectPath: string } = $props();
 
-  type Mode =
-    | { kind: "list" }
-    | { kind: "new" }
-    | { kind: "edit"; row: UserAgentRow };
-
-  let mode: Mode = $state({ kind: "list" });
+  let mode: AgentsTabMode = $state({ kind: "list" });
   let rows: UserAgentRow[] = $state([]);
   let loading: boolean = $state(true);
   let loadError: string | null = $state(null);
@@ -72,10 +67,8 @@
     const label = row.lineage
       ? `Delete the marketplace-installed agent “${row.name}”? The tracking entry will also be removed.`
       : `Delete the agent “${row.name}”?`;
-    // window.confirm is the Control Center's current confirm
-    // affordance (per design "Things to watch out for" item 6 — the
-    // design references a future replacement). Acceptable for slice
-    // S12; visual upgrade is reviewer-deferred.
+    // `window.confirm` is the placeholder affordance until the
+    // Control Center grows a confirmation modal.
     if (!confirm(label)) return;
     actionError = null;
     try {
@@ -91,8 +84,10 @@
     }
   }
 
-  onMount(refresh);
-
+  // `$effect` fires on initial mount AND whenever `projectPath`
+  // changes — no separate `onMount(refresh)` needed; that would
+  // double-invoke `listUserAgents` on mount and race the two
+  // results on slow connections.
   $effect(() => {
     void projectPath;
     refresh();
@@ -148,7 +143,7 @@
           <p class="text-sm text-kiro-error">{loadError}</p>
         </div>
       {:else if rows.length === 0}
-        <!-- Spec B3: design's empty state -->
+        <!-- Empty state -->
         <div class="flex flex-col items-center justify-center h-full text-kiro-subtle gap-3">
           <svg class="w-10 h-10 text-kiro-accent-800" fill="none" stroke="currentColor" viewBox="0 0 24 24">
             <path stroke-linecap="round" stroke-linejoin="round" stroke-width="1.5"
@@ -254,9 +249,9 @@
     {/if}
   </div>
 {:else}
-  <!-- Editor branch placeholder. Slice S13 replaces this with
-       AgentEditor.svelte. Until then, render a back-link + a
-       "Coming in S13" notice so the navigation flow is functional. -->
+  <!-- Editor branch placeholder. Renders a back-link + a
+       "not yet available" notice so the navigation flow is
+       functional until the editor component lands. -->
   <div class="flex flex-col h-full">
     <div class="flex items-center gap-3 px-4 py-3 border-b border-kiro-muted">
       <button
@@ -267,11 +262,11 @@
         ‹ Agents
       </button>
       <span class="text-sm text-kiro-text font-medium">
-        {mode.kind === "new" ? "New agent" : `Editing ${mode.row.name}`}
+        {headerLabel(mode)}
       </span>
     </div>
     <div class="flex-1 flex items-center justify-center text-kiro-subtle">
-      <p class="text-sm">Editor lands in slice S13 (kiro-vgnw and onward fill out the section panels).</p>
+      <p class="text-sm">Editor not yet available.</p>
     </div>
   </div>
 {/if}

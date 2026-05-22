@@ -116,6 +116,51 @@ pub(in crate::commands) fn validate_kiro_project_path(
     Ok(canonical)
 }
 
+/// Byte cap for draft agent JSON payloads accepted at the IPC
+/// boundary. Generously sized for any reasonable hand-authored agent
+/// (typical files are under 10 KiB) while bounding the memory
+/// footprint a renderer can ask the backend to allocate via a single
+/// `create_user_agent` / `save_user_agent` call.
+pub(in crate::commands) const DRAFT_JSON_BYTE_CAP: usize = 1024 * 1024;
+
+/// Fail-fast IPC-boundary guard for the `draft_json` payload accepted
+/// by `create_user_agent` and `save_user_agent`. Caps the byte length
+/// and parses the payload as JSON so a compromised or buggy renderer
+/// cannot:
+///
+/// - DoS the backend by writing arbitrarily-large files into
+///   `.kiro/agents/` (and through that, fill the disk on the user's
+///   machine), or
+/// - persist non-JSON bytes that the list endpoint's `serde_json`
+///   parse then silently skips — leaving a file invisible to the UI
+///   that wrote it.
+///
+/// The parse runs `serde_json::from_slice::<serde_json::Value>` which
+/// only validates well-formedness, not schema conformance. Schema-level
+/// checks (required fields, field types) live deeper in core; here we
+/// only assert "this is JSON" because anything else means the renderer
+/// is broken or hostile.
+pub(in crate::commands) fn validate_draft_json_payload(
+    draft_json: &str,
+) -> Result<(), CommandError> {
+    if draft_json.len() > DRAFT_JSON_BYTE_CAP {
+        return Err(CommandError::new(
+            format!(
+                "draft_json exceeds {DRAFT_JSON_BYTE_CAP}-byte cap (got {} bytes)",
+                draft_json.len()
+            ),
+            ErrorType::Validation,
+        ));
+    }
+    serde_json::from_slice::<serde_json::Value>(draft_json.as_bytes()).map_err(|e| {
+        CommandError::new(
+            format!("draft_json is not valid JSON: {e}"),
+            ErrorType::ParseError,
+        )
+    })?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use std::fs;
@@ -242,6 +287,77 @@ mod tests {
             err.message.contains(".kiro"),
             "error must mention .kiro/, got: {}",
             err.message,
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // validate_draft_json_payload
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn validate_draft_json_payload_accepts_valid_object() {
+        validate_draft_json_payload(r#"{"name": "ok", "tools": []}"#)
+            .expect("valid object payload must pass");
+    }
+
+    /// Non-object roots (array, scalar) are still valid JSON, so the
+    /// IPC-boundary guard accepts them — schema-level shape checks
+    /// live in core. This pins the "well-formedness only" contract.
+    #[test]
+    fn validate_draft_json_payload_accepts_any_valid_json() {
+        validate_draft_json_payload("[]").expect("array root is valid JSON");
+        validate_draft_json_payload("null").expect("null is valid JSON");
+        validate_draft_json_payload("42").expect("number is valid JSON");
+    }
+
+    #[test]
+    fn validate_draft_json_payload_rejects_malformed_json() {
+        let err =
+            validate_draft_json_payload("{ not json").expect_err("malformed JSON must reject");
+        assert_eq!(err.error_type, ErrorType::ParseError);
+        assert!(
+            err.message.contains("not valid JSON"),
+            "error must mention JSON validity, got: {}",
+            err.message,
+        );
+    }
+
+    /// Defense-in-depth: a renderer that pastes (or programmatically
+    /// submits) bytes beyond the cap must be refused at the wrapper
+    /// before any filesystem work.
+    #[test]
+    fn validate_draft_json_payload_rejects_oversized_input() {
+        // Build a well-formed JSON object whose total byte length
+        // exceeds the cap by padding a string field. The cap check
+        // must fire BEFORE the parse check; otherwise a hostile
+        // renderer could spend the parser's time on a huge but
+        // well-formed payload.
+        let padding = "x".repeat(DRAFT_JSON_BYTE_CAP);
+        let oversized = format!(r#"{{"name": "{padding}"}}"#);
+        assert!(oversized.len() > DRAFT_JSON_BYTE_CAP);
+
+        let err =
+            validate_draft_json_payload(&oversized).expect_err("oversized payload must reject");
+        assert_eq!(err.error_type, ErrorType::Validation);
+        assert!(
+            err.message.contains("cap"),
+            "error must mention the byte cap, got: {}",
+            err.message,
+        );
+    }
+
+    /// A payload that is BOTH oversized AND malformed must surface
+    /// the size error, not the parse error — the cap check is
+    /// cheaper and runs first by design.
+    #[test]
+    fn validate_draft_json_payload_size_check_runs_before_parse() {
+        let oversized_malformed = "x".repeat(DRAFT_JSON_BYTE_CAP + 1);
+        let err = validate_draft_json_payload(&oversized_malformed)
+            .expect_err("oversized payload must reject");
+        assert_eq!(
+            err.error_type,
+            ErrorType::Validation,
+            "size check (Validation) must fire before parse check (ParseError)",
         );
     }
 }

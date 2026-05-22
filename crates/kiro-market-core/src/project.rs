@@ -15,7 +15,7 @@ use tracing::{debug, warn};
 use crate::agent::tools::MappedTool;
 use crate::agent::{AgentDefinition, AgentDialect};
 use crate::error::{AgentError, SkillError};
-use crate::user_agent::{UserAgentLineage, UserAgentRow};
+use crate::user_agent::{SaveOutcome, UserAgentLineage, UserAgentRow};
 use crate::validation;
 use crate::validation::{MarketplaceName, PluginName, RelativePath};
 
@@ -581,6 +581,14 @@ const INSTALLED_AGENTS_FILE: &str = "installed-agents.json";
 /// Name of the steering tracking file inside `.kiro/`.
 const INSTALLED_STEERING_FILE: &str = "installed-steering.json";
 
+/// Byte cap on the source file accepted by
+/// [`KiroProject::duplicate_user_agent`]. Bounds the memory footprint
+/// of the unbounded `fs::read` against a hand-pasted multi-GB file in
+/// `.kiro/agents/`. 1 MiB matches the cap the install-side native
+/// parser uses for marketplace bytes — agents larger than this are
+/// orders of magnitude beyond any plausible hand-authored shape.
+const DUPLICATE_SOURCE_BYTE_CAP: u64 = 1024 * 1024;
+
 /// Recursively copy a directory tree from `src` to `dest`.
 ///
 /// Creates `dest` and all intermediate directories. Files are copied
@@ -1110,10 +1118,10 @@ impl KiroProject {
         Ok(())
     }
 
-    // -- user-authored agents (Workflows > Agents view) --------------------
+    // -- user-authored agents -----------------------------------------------
 
-    /// Build the list-page payload for the Control Center
-    /// `Workflows > Agents` view (slice 1).
+    /// Build the list payload of every user-visible agent under
+    /// `.kiro/agents/`.
     ///
     /// Reads every `*.json` file in [`Self::agents_dir`], projects each
     /// to a [`UserAgentRow`], and attaches marketplace lineage from
@@ -1125,24 +1133,21 @@ impl KiroProject {
     /// install path's security checks (symlink refusal, 1 MiB byte cap,
     /// required `name` field) are appropriate when copying untrusted
     /// marketplace bytes verbatim; the list path operates on files the
-    /// user already owns and would only be hampered by them. Pinned by
-    /// design claim C2 and the no-name fixture at
-    /// `.agents-view/probe/fixture/`.
+    /// user already owns and would only be hampered by them.
     ///
     /// **Creates the agents directory** if absent (load-bearing — a
     /// missing dir would otherwise yield `NotFound`). Empty list
     /// returned when the dir exists but contains no `*.json`.
     ///
     /// Files that fail JSON parsing are logged (`tracing::warn!`) and
-    /// excluded from the payload (spec decision #13).
+    /// excluded from the payload.
     /// Orphan tracking entries (name in `installed-agents.json` but
     /// file absent on disk) are excluded by construction — the loop
-    /// iterates files, not tracking keys (spec decision #12).
+    /// iterates files, not tracking keys.
     /// When the JSON's `name` field is absent, the row's name falls
-    /// back to the filename stem (spec decision #14).
+    /// back to the filename stem.
     ///
-    /// Output is sorted by `name` ascending for stable comparison
-    /// against the prove-it-prototype probe.py.
+    /// Output is sorted by `name` ascending.
     ///
     /// # Errors
     ///
@@ -1157,10 +1162,9 @@ impl KiroProject {
         for entry in fs::read_dir(&dir)? {
             // Per-DirEntry failures (e.g., racy delete mid-iteration,
             // permission flip on a single file) warn-and-continue — same
-            // discipline as the fs::read and serde_json::from_slice
-            // handlers below. A single broken directory entry must not
-            // abort the whole list-page payload. Surfaced by
-            // gemini-code-assist review on PR #120.
+            // discipline as `try_project_user_agent_row` below applies to
+            // the metadata / read / parse pipeline. A single broken
+            // directory entry must not abort the whole list-page payload.
             let entry = match entry {
                 Ok(e) => e,
                 Err(e) => {
@@ -1175,80 +1179,114 @@ impl KiroProject {
             if path.extension().and_then(|s| s.to_str()) != Some("json") {
                 continue;
             }
-            let bytes = match fs::read(&path) {
-                Ok(b) => b,
-                Err(e) => {
-                    warn!(
-                        path = %path.display(),
-                        error = %e,
-                        "skipping unreadable agent file in list_user_agents",
-                    );
-                    continue;
-                }
-            };
-            let value: serde_json::Value = match serde_json::from_slice(&bytes) {
-                Ok(v) => v,
-                Err(e) => {
-                    warn!(
-                        path = %path.display(),
-                        error = %e,
-                        "skipping unparseable agent file in list_user_agents (spec D13)",
-                    );
-                    continue;
-                }
-            };
-            let name = value
-                .get("name")
-                .and_then(serde_json::Value::as_str)
-                .map_or_else(
-                    || {
-                        path.file_stem()
-                            .and_then(|s| s.to_str())
-                            .map_or_else(String::new, String::from)
-                    },
-                    String::from,
-                );
-            let lineage = tracking.agents.get(&name).map(|m| UserAgentLineage {
-                marketplace: m.marketplace.to_string(),
-                plugin: m.plugin.to_string(),
-                version: m.version.clone(),
-            });
-            rows.push(UserAgentRow {
-                name,
-                description: value
-                    .get("description")
-                    .and_then(serde_json::Value::as_str)
-                    .map(String::from),
-                model: value
-                    .get("model")
-                    .and_then(serde_json::Value::as_str)
-                    .map(String::from),
-                tools_count: value
-                    .get("tools")
-                    .and_then(serde_json::Value::as_array)
-                    .map_or(0, Vec::len),
-                mcp_count: value
-                    .get("mcpServers")
-                    .and_then(serde_json::Value::as_object)
-                    .map_or(0, serde_json::Map::len),
-                resources_count: value
-                    .get("resources")
-                    .and_then(serde_json::Value::as_array)
-                    .map_or(0, Vec::len),
-                hooks_count: value
-                    .get("hooks")
-                    .and_then(serde_json::Value::as_object)
-                    .map_or(0, |o| {
-                        o.values()
-                            .filter_map(serde_json::Value::as_array)
-                            .map(Vec::len)
-                            .sum()
-                    }),
-                lineage,
-            });
+            if let Some(row) = Self::try_project_user_agent_row(&path, &tracking) {
+                rows.push(row);
+            }
         }
         rows.sort_by(|a, b| a.name.cmp(&b.name));
         Ok(rows)
+    }
+
+    /// Project a single `.kiro/agents/<name>.json` file into a
+    /// [`UserAgentRow`]. Returns `None` on any per-file failure
+    /// (symlink, unreadable, malformed JSON) after logging a warning,
+    /// so the caller can keep iterating — a single broken file must
+    /// not break the whole list payload.
+    ///
+    /// Symlinks are refused: `fs::read` would otherwise follow a link
+    /// to any file the process can read, and those bytes would flow
+    /// into the wire payload (or, on parse failure, leave a
+    /// measurable side channel via the warn-and-skip path).
+    fn try_project_user_agent_row(path: &Path, tracking: &InstalledAgents) -> Option<UserAgentRow> {
+        let metadata = match fs::symlink_metadata(path) {
+            Ok(m) => m,
+            Err(e) => {
+                warn!(
+                    path = %path.display(),
+                    error = %e,
+                    "skipping agent file whose metadata is unreadable in list_user_agents",
+                );
+                return None;
+            }
+        };
+        if metadata.file_type().is_symlink() {
+            warn!(
+                path = %path.display(),
+                "skipping symlinked agent file in list_user_agents (refused for safety)",
+            );
+            return None;
+        }
+        let bytes = match fs::read(path) {
+            Ok(b) => b,
+            Err(e) => {
+                warn!(
+                    path = %path.display(),
+                    error = %e,
+                    "skipping unreadable agent file in list_user_agents",
+                );
+                return None;
+            }
+        };
+        let value: serde_json::Value = match serde_json::from_slice(&bytes) {
+            Ok(v) => v,
+            Err(e) => {
+                warn!(
+                    path = %path.display(),
+                    error = %e,
+                    "skipping unparseable agent file in list_user_agents",
+                );
+                return None;
+            }
+        };
+        let name = value
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .map_or_else(
+                || {
+                    path.file_stem()
+                        .and_then(|s| s.to_str())
+                        .map_or_else(String::new, String::from)
+                },
+                String::from,
+            );
+        let lineage = tracking.agents.get(&name).map(|m| UserAgentLineage {
+            marketplace: m.marketplace.to_string(),
+            plugin: m.plugin.to_string(),
+            version: m.version.clone(),
+        });
+        Some(UserAgentRow {
+            name,
+            description: value
+                .get("description")
+                .and_then(serde_json::Value::as_str)
+                .map(String::from),
+            model: value
+                .get("model")
+                .and_then(serde_json::Value::as_str)
+                .map(String::from),
+            tools_count: value
+                .get("tools")
+                .and_then(serde_json::Value::as_array)
+                .map_or(0, Vec::len),
+            mcp_count: value
+                .get("mcpServers")
+                .and_then(serde_json::Value::as_object)
+                .map_or(0, serde_json::Map::len),
+            resources_count: value
+                .get("resources")
+                .and_then(serde_json::Value::as_array)
+                .map_or(0, Vec::len),
+            hooks_count: value
+                .get("hooks")
+                .and_then(serde_json::Value::as_object)
+                .map_or(0, |o| {
+                    o.values()
+                        .filter_map(serde_json::Value::as_array)
+                        .map(Vec::len)
+                        .sum()
+                }),
+            lineage,
+        })
     }
 
     /// Atomically write a new user-authored agent JSON file.
@@ -1264,8 +1302,6 @@ impl KiroProject {
     /// mid-write leaves the target either fully written or fully
     /// absent.
     ///
-    /// Slice S4 of the agents-view feature, design claim C3.
-    ///
     /// # Errors
     /// - [`AgentError::InvalidName`] — name fails validation.
     /// - [`AgentError::NameCollision`] — `<agents_dir>/<name>.json` already exists.
@@ -1278,18 +1314,30 @@ impl KiroProject {
         let name = Self::validate_user_agent_name(draft_name)?;
         let agents_dir = self.agents_dir();
         let target = agents_dir.join(format!("{}.json", name.as_str()));
-        if target.exists() {
-            return Err(AgentError::NameCollision {
-                name: name.into_inner(),
+        // Run the collision check + write under the same lock as
+        // `save_user_agent` / `remove_agent` / `install_native_agent`
+        // so two concurrent creates (or a create racing an install)
+        // serialise. Without the lock both callers could observe a
+        // missing target and race their `atomic_write` rename — one
+        // set of bytes would silently win and the other caller would
+        // see `Ok(())` despite having lost its content.
+        crate::file_lock::with_file_lock(&self.agent_tracking_path(), || {
+            // `symlink_metadata` (not `Path::exists`) so a dangling
+            // symlink registers as a collision rather than a free
+            // slot the `atomic_write` rename would silently replace.
+            if fs::symlink_metadata(&target).is_ok() {
+                return Err(AgentError::NameCollision {
+                    name: name.clone().into_inner(),
+                }
+                .into());
             }
-            .into());
-        }
-        fs::create_dir_all(&agents_dir)?;
-        // atomic_write requires an absolute path; agents_dir() builds
-        // from the project root which is absolute by construction
-        // (KiroProject::new stores an absolute path).
-        crate::cache::atomic_write(&target, draft_bytes)?;
-        Ok(())
+            fs::create_dir_all(&agents_dir)?;
+            // atomic_write requires an absolute path; agents_dir()
+            // builds from the project root which is absolute by
+            // construction (KiroProject::new stores an absolute path).
+            crate::cache::atomic_write(&target, draft_bytes)?;
+            Ok(())
+        })
     }
 
     /// Save an edited user-authored agent. One method, three orthogonal
@@ -1330,7 +1378,13 @@ impl KiroProject {
     ///   links — falls into the existing `ContentChangedRequiresForce`
     ///   path on the next marketplace install attempt.
     ///
-    /// Slice S5 of agents-view, design claim C4.
+    /// # Returns
+    /// A [`SaveOutcome`] carrying `orphan_left_behind: Some(path)` iff
+    /// step (3)'s unlink failed with a non-`NotFound` error. The save
+    /// is still successful when this is set — the new file is in
+    /// place — but the UI must surface the orphan so the user can
+    /// delete it manually. Without this channel the duplicate file
+    /// silently shows up in the next list refresh with no explanation.
     ///
     /// # Errors
     /// - [`AgentError::InvalidName`] for either name.
@@ -1342,7 +1396,7 @@ impl KiroProject {
         draft_name: &str,
         draft_bytes: &[u8],
         detach: bool,
-    ) -> crate::error::Result<()> {
+    ) -> crate::error::Result<SaveOutcome> {
         let from = Self::validate_user_agent_name(from_name)?;
         let target = Self::validate_user_agent_name(draft_name)?;
         let agents_dir = self.agents_dir();
@@ -1361,7 +1415,10 @@ impl KiroProject {
             fs::create_dir_all(&agents_dir)?;
             // (2) Atomic write of the new content under the (possibly new) name.
             crate::cache::atomic_write(&target_path, draft_bytes)?;
-            // (3) Unlink old file iff renaming. Best-effort.
+            // (3) Unlink old file iff renaming. Best-effort, but on a
+            //     non-NotFound failure we capture the path so the
+            //     caller can surface it as a warning.
+            let mut orphan_left_behind: Option<String> = None;
             if is_rename {
                 match fs::remove_file(&from_path) {
                     Ok(()) => {}
@@ -1377,6 +1434,7 @@ impl KiroProject {
                             error = %e,
                             "save_user_agent: failed to unlink old file post-rename; new file is in place, old is orphaned"
                         );
+                        orphan_left_behind = Some(from_path.display().to_string());
                     }
                 }
             }
@@ -1387,7 +1445,7 @@ impl KiroProject {
                     self.write_agent_tracking(&installed)?;
                 }
             }
-            Ok(())
+            Ok(SaveOutcome { orphan_left_behind })
         })
     }
 
@@ -1401,8 +1459,6 @@ impl KiroProject {
     ///   `ErrorKind::NotFound` so a manual filesystem delete between
     ///   list-refresh and click doesn't surface a spurious error.
     ///
-    /// Slice S6 of agents-view, design claim C5.
-    ///
     /// # Errors
     /// - [`AgentError::InvalidName`] if `name` fails validation.
     /// - Whatever [`Self::remove_agent`] returns for the tracked branch.
@@ -1410,16 +1466,27 @@ impl KiroProject {
     ///   branch.
     pub fn delete_user_agent(&self, name: &str) -> crate::error::Result<()> {
         let name = Self::validate_user_agent_name(name)?;
-        let installed = self.load_installed_agents()?;
-        if installed.agents.contains_key(name.as_str()) {
-            return self.remove_agent(name.as_str());
-        }
-        let target = self.agents_dir().join(format!("{}.json", name.as_str()));
-        match fs::remove_file(&target) {
-            Ok(()) => Ok(()),
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(e.into()),
-        }
+        // Acquire the tracking lock ONCE and decide the branch inside
+        // it. Reading tracking outside the lock would race a concurrent
+        // `install_native_agent`: T1 reads no tracking, T2 takes the
+        // lock and writes both file + tracking entry, T1 unlinks the
+        // file under the untracked branch — leaving a phantom tracking
+        // entry.
+        crate::file_lock::with_file_lock(
+            &self.agent_tracking_path(),
+            || -> crate::error::Result<()> {
+                let installed = self.load_installed_agents()?;
+                if installed.agents.contains_key(name.as_str()) {
+                    return self.remove_agent_locked(name.as_str());
+                }
+                let target = self.agents_dir().join(format!("{}.json", name.as_str()));
+                match fs::remove_file(&target) {
+                    Ok(()) => Ok(()),
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+                    Err(e) => Err(e.into()),
+                }
+            },
+        )
     }
 
     /// Duplicate a user-visible agent into a freshly-named sibling.
@@ -1427,13 +1494,11 @@ impl KiroProject {
     /// Walks `<source>-copy`, `<source>-copy-2`, `<source>-copy-3`, ...
     /// finding the smallest unused suffix. The duplicate is **always
     /// user-authored** — never carries marketplace lineage even if the
-    /// source has it (spec B10).
+    /// source has it.
     ///
     /// The JSON's `name` field is rewritten to the new name so the
     /// file is self-consistent with its filename. All other fields are
     /// preserved verbatim from the source.
-    ///
-    /// Slice S7 of agents-view, design claim C6.
     ///
     /// # Loop budget
     /// The collision walker iterates up to a sanity cap of 10,000.
@@ -1448,6 +1513,15 @@ impl KiroProject {
     /// - [`AgentError::InvalidName`] if `source_name` fails validation.
     /// - [`AgentError::DuplicateSourceNotFound`] if the source file is
     ///   absent on disk.
+    /// - [`AgentError::DuplicateSourceSymlinked`] if the source path is
+    ///   a symlink. Refused so the duplicate cannot ingest bytes from
+    ///   an arbitrary host file into a regular file under
+    ///   `.kiro/agents/`.
+    /// - [`AgentError::DuplicateSourceNotAFile`] if the source path
+    ///   exists but is not a regular file (e.g. a directory).
+    /// - [`AgentError::DuplicateSourceTooLarge`] if the source exceeds
+    ///   [`DUPLICATE_SOURCE_BYTE_CAP`]. Bounds the memory footprint of
+    ///   the unbounded `fs::read` call.
     /// - [`AgentError::DuplicateNameSpaceExhausted`] if the walker
     ///   exhausts the sanity cap.
     /// - I/O / JSON errors from the read or atomic write.
@@ -1461,48 +1535,100 @@ impl KiroProject {
         let source = Self::validate_user_agent_name(source_name)?;
         let agents_dir = self.agents_dir();
         let source_path = agents_dir.join(format!("{}.json", source.as_str()));
-        if !source_path.exists() {
-            return Err(AgentError::DuplicateSourceNotFound {
-                name: source.into_inner(),
-            }
-            .into());
-        }
-        let source_bytes = fs::read(&source_path)?;
 
-        let mut target_name: Option<String> = None;
-        for k in 1..=SANITY_CAP {
-            let candidate = if k == 1 {
-                format!("{}-copy", source.as_str())
-            } else {
-                format!("{}-copy-{}", source.as_str(), k)
+        // Run source-inspection, collision walker, and atomic write
+        // under the same lock used by save_user_agent /
+        // create_user_agent / remove_agent. Two concurrent duplicates
+        // of the same source would otherwise race on the candidate
+        // slot — both observe `foo-copy` free, both atomic_write,
+        // and the second silently overwrites the first.
+        crate::file_lock::with_file_lock(&self.agent_tracking_path(), || {
+            // Inspect the link itself (not its target) so the
+            // not-found / symlink classifications don't depend on the
+            // target's readability. A `Path::exists()` would
+            // both follow the link AND collapse missing-source +
+            // missing-target into one branch.
+            let source_metadata = match fs::symlink_metadata(&source_path) {
+                Ok(m) => m,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    return Err(AgentError::DuplicateSourceNotFound {
+                        name: source.into_inner(),
+                    }
+                    .into());
+                }
+                Err(e) => return Err(e.into()),
             };
-            let candidate_path = agents_dir.join(format!("{candidate}.json"));
-            if !candidate_path.exists() {
-                target_name = Some(candidate);
-                break;
+            let file_type = source_metadata.file_type();
+            if file_type.is_symlink() {
+                return Err(AgentError::DuplicateSourceSymlinked {
+                    name: source.into_inner(),
+                }
+                .into());
             }
-        }
-        let target_name = target_name.ok_or_else(|| AgentError::DuplicateNameSpaceExhausted {
-            source_name: source.clone().into_inner(),
-            cap: SANITY_CAP,
-        })?;
+            if !file_type.is_file() {
+                // Catches directories (`<name>.json/`), block/char
+                // devices, sockets, FIFOs — anything `fs::read`
+                // can't sensibly slurp.
+                return Err(AgentError::DuplicateSourceNotAFile {
+                    name: source.into_inner(),
+                }
+                .into());
+            }
+            // Size cap BEFORE the unbounded `fs::read`. Without this,
+            // a multi-GB file hand-pasted into `.kiro/agents/` would
+            // OOM the process.
+            let size = source_metadata.len();
+            if size > DUPLICATE_SOURCE_BYTE_CAP {
+                return Err(AgentError::DuplicateSourceTooLarge {
+                    name: source.into_inner(),
+                    size,
+                    cap: DUPLICATE_SOURCE_BYTE_CAP,
+                }
+                .into());
+            }
+            let source_bytes = fs::read(&source_path)?;
 
-        // Rewrite the JSON's `name` field so the file is self-consistent
-        // with its new filename. Other fields preserved verbatim.
-        let mut value: serde_json::Value = serde_json::from_slice(&source_bytes)?;
-        if let Some(obj) = value.as_object_mut() {
-            obj.insert(
-                "name".to_string(),
-                serde_json::Value::String(target_name.clone()),
-            );
-        }
-        let new_bytes = serde_json::to_vec_pretty(&value)?;
+            let mut target_name: Option<String> = None;
+            for k in 1..=SANITY_CAP {
+                let candidate = if k == 1 {
+                    format!("{}-copy", source.as_str())
+                } else {
+                    format!("{}-copy-{}", source.as_str(), k)
+                };
+                let candidate_path = agents_dir.join(format!("{candidate}.json"));
+                // `symlink_metadata` so a dangling symlink at the
+                // candidate path is treated as taken (we can't
+                // safely overwrite it) instead of as a free slot.
+                if fs::symlink_metadata(&candidate_path).is_err() {
+                    target_name = Some(candidate);
+                    break;
+                }
+            }
+            let target_name =
+                target_name.ok_or_else(|| AgentError::DuplicateNameSpaceExhausted {
+                    source_name: source.clone().into_inner(),
+                    cap: SANITY_CAP,
+                })?;
 
-        let target_path = agents_dir.join(format!("{target_name}.json"));
-        crate::cache::atomic_write(&target_path, &new_bytes)?;
-        // Intentionally NOT inserted into InstalledAgents — duplicate
-        // is always user-authored regardless of source lineage.
-        Ok(target_name)
+            // Rewrite the JSON's `name` field so the file is
+            // self-consistent with its new filename. Other fields
+            // preserved verbatim.
+            let mut value: serde_json::Value = serde_json::from_slice(&source_bytes)?;
+            if let Some(obj) = value.as_object_mut() {
+                obj.insert(
+                    "name".to_string(),
+                    serde_json::Value::String(target_name.clone()),
+                );
+            }
+            let new_bytes = serde_json::to_vec_pretty(&value)?;
+
+            let target_path = agents_dir.join(format!("{target_name}.json"));
+            crate::cache::atomic_write(&target_path, &new_bytes)?;
+            // Intentionally NOT inserted into InstalledAgents —
+            // duplicate is always user-authored regardless of source
+            // lineage.
+            Ok(target_name)
+        })
     }
 
     /// Shared name-validation helper for the user-authored save/delete/
@@ -1511,13 +1637,31 @@ impl KiroProject {
     /// chain swallow it as `Validation(_)`.
     fn validate_user_agent_name(name: &str) -> crate::error::Result<validation::AgentName> {
         validation::AgentName::new(name).map_err(|e| {
-            AgentError::InvalidName {
-                reason: match e {
-                    crate::error::ValidationError::InvalidName { reason, .. } => reason,
-                    other => other.to_string(),
-                },
-            }
-            .into()
+            // Explicit enumeration over every `ValidationError`
+            // variant — no `_ =>` arm. A future variant in
+            // `crate::error::ValidationError` must force a compile
+            // error here so the classification decision is made
+            // deliberately rather than silently collapsed via
+            // `to_string()` (which would drop any future source
+            // chain). Mirrors the CLAUDE.md classifier-exhaustiveness
+            // discipline for error projections.
+            //
+            // `ValidationError` is `#[non_exhaustive]` for external
+            // crates; inside this crate we still match exhaustively
+            // so adding a variant breaks compilation here.
+            let reason = match e {
+                crate::error::ValidationError::InvalidName { reason, .. } => reason,
+                crate::error::ValidationError::InvalidRelativePath { path, reason } => {
+                    // `AgentName::new` does not emit this variant
+                    // today (it routes through `validate_name`, not
+                    // `validate_relative_path`). If a future change
+                    // ever rewires it, surface the structured fields
+                    // explicitly rather than the Display rendering of
+                    // the whole `ValidationError`.
+                    format!("relative path `{path}`: {reason}")
+                }
+            };
+            AgentError::InvalidName { reason }.into()
         })
     }
 
@@ -1797,67 +1941,76 @@ impl KiroProject {
     /// - I/O / JSON failures from loading or writing the tracking file.
     pub fn remove_agent(&self, name: &str) -> crate::error::Result<()> {
         validation::validate_name(name)?;
-
         let tracking_path = self.agent_tracking_path();
         crate::file_lock::with_file_lock(&tracking_path, || -> crate::error::Result<()> {
-            let mut installed = self.load_installed_agents()?;
-            let saved_meta =
-                installed
-                    .agents
-                    .remove(name)
-                    .ok_or_else(|| AgentError::NotInstalled {
-                        name: name.to_owned(),
-                    })?;
+            self.remove_agent_locked(name)
+        })
+    }
 
-            let json_target = self.agents_dir().join(format!("{name}.json"));
-            let prompt_target = self.agent_prompts_dir().join(format!("{name}.md"));
+    /// Inner body of [`Self::remove_agent`], assuming the caller already
+    /// holds the agent tracking lock. Extracted so
+    /// [`Self::delete_user_agent`] can acquire the lock once, read
+    /// tracking inside it, and branch into either this helper or a
+    /// direct `fs::remove_file` without releasing and re-acquiring —
+    /// `with_file_lock` is not reentrant (it would deadlock until the
+    /// 10s timeout).
+    fn remove_agent_locked(&self, name: &str) -> crate::error::Result<()> {
+        let mut installed = self.load_installed_agents()?;
+        let saved_meta = installed
+            .agents
+            .remove(name)
+            .ok_or_else(|| AgentError::NotInstalled {
+                name: name.to_owned(),
+            })?;
 
-            // Update tracking BEFORE unlinking so a crash between the
-            // two leaves stray on-disk files (harmless) rather than a
-            // phantom tracking entry.
-            self.write_agent_tracking(&installed)?;
+        let json_target = self.agents_dir().join(format!("{name}.json"));
+        let prompt_target = self.agent_prompts_dir().join(format!("{name}.md"));
 
-            for path in [&json_target, &prompt_target] {
-                match fs::remove_file(path) {
-                    Ok(()) => {}
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                        debug!(
-                            path = %path.display(),
-                            "agent file already absent on disk; tracking entry was orphan"
-                        );
-                    }
-                    Err(e) => {
-                        // I4: restore tracking on non-NotFound fs
-                        // failure. The dual-file unlink can be
-                        // half-successful — one file unlinked, the
-                        // other failed. Restoring tracking keeps the
-                        // file system consistent with tracking, even
-                        // though the on-disk state is now partial.
-                        // The caller can retry or inspect.
+        // Update tracking BEFORE unlinking so a crash between the
+        // two leaves stray on-disk files (harmless) rather than a
+        // phantom tracking entry.
+        self.write_agent_tracking(&installed)?;
+
+        for path in [&json_target, &prompt_target] {
+            match fs::remove_file(path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    debug!(
+                        path = %path.display(),
+                        "agent file already absent on disk; tracking entry was orphan"
+                    );
+                }
+                Err(e) => {
+                    // I4: restore tracking on non-NotFound fs
+                    // failure. The dual-file unlink can be
+                    // half-successful — one file unlinked, the
+                    // other failed. Restoring tracking keeps the
+                    // file system consistent with tracking, even
+                    // though the on-disk state is now partial.
+                    // The caller can retry or inspect.
+                    warn!(
+                        agent = name,
+                        path = %path.display(),
+                        error = %e,
+                        "failed to unlink agent file after tracking update; \
+                         restoring tracking entry"
+                    );
+                    installed.agents.insert(name.to_owned(), saved_meta);
+                    if let Err(restore_err) = self.write_agent_tracking(&installed) {
                         warn!(
                             agent = name,
-                            path = %path.display(),
-                            error = %e,
-                            "failed to unlink agent file after tracking update; \
-                             restoring tracking entry"
+                            error = %restore_err,
+                            "failed to restore agent tracking entry — \
+                             agent may be untracked on disk"
                         );
-                        installed.agents.insert(name.to_owned(), saved_meta);
-                        if let Err(restore_err) = self.write_agent_tracking(&installed) {
-                            warn!(
-                                agent = name,
-                                error = %restore_err,
-                                "failed to restore agent tracking entry — \
-                                 agent may be untracked on disk"
-                            );
-                        }
-                        return Err(e.into());
                     }
+                    return Err(e.into());
                 }
             }
+        }
 
-            debug!(agent = name, "agent removed");
-            Ok(())
-        })
+        debug!(agent = name, "agent removed");
+        Ok(())
     }
 
     /// Remove the `native_companions` tracking entry for a given
@@ -8874,9 +9027,9 @@ mod tests {
         assert_eq!(fs::read(&dest).expect("read installed"), b"from-b");
     }
 
-    // -- list_user_agents (S3 stress fixture, mirrors probe fixture) -------
+    // -- list_user_agents --------------------------------------------------
 
-    /// S3 stress fixture: a project containing
+    /// A project containing
     /// - a user-authored agent file (no tracking entry)
     /// - a marketplace-tracked agent file (tracking entry present)
     /// - a JSON file with NO `name` field (would crash a strict parser)
@@ -9040,13 +9193,13 @@ mod tests {
         assert!(rows.is_empty());
         assert!(
             project.kiro_dir().join("agents").is_dir(),
-            "agents_dir created on view open (D9)"
+            "agents_dir created on view open"
         );
     }
 
-    // -- create_user_agent (S4 stress fixture) -----------------------------
+    // -- create_user_agent --------------------------------------------------
 
-    /// S4 happy path: create writes the file atomically, and a
+    /// Happy path: create writes the file atomically, and a
     /// subsequent list_user_agents call sees it.
     #[test]
     fn create_user_agent_writes_atomically_and_lists() {
@@ -9067,8 +9220,8 @@ mod tests {
         assert_eq!(names, vec!["new-agent"]);
     }
 
-    /// S4 validation: empty name is rejected by validate_name (no
-    /// `.json` file written).
+    /// Empty name is rejected by validate_name (no `.json` file
+    /// written).
     #[test]
     fn create_user_agent_rejects_empty_name() {
         let (_dir, project) = temp_project();
@@ -9084,11 +9237,10 @@ mod tests {
         );
     }
 
-    /// S4 validation: path-separator name is rejected (path safety).
-    /// Note: the spec's UI-side regex (^[a-z0-9][a-z0-9-]*$) lives in
-    /// the frontend (slice S14). The backend's validate_name rejects
-    /// path-unsafe inputs only — matches the design bundle's "name
-    /// regex is a UI affordance only" rule.
+    /// Path-separator name is rejected (path safety). Note: the
+    /// stricter UI-side regex (`^[a-z0-9][a-z0-9-]*$`) lives in the
+    /// frontend; the backend's `validate_name` only rejects
+    /// path-unsafe inputs.
     #[test]
     fn create_user_agent_rejects_path_separator() {
         let (_dir, project) = temp_project();
@@ -9106,10 +9258,10 @@ mod tests {
         }
     }
 
-    /// S4 collision: pre-write a file, call create with the same name,
-    /// assert NameCollision AND the existing file's bytes are unchanged.
+    /// Pre-write a file, call create with the same name, assert
+    /// `NameCollision` AND the existing file's bytes are unchanged.
     /// Bug class this defeats: a naive `fs::write` (or `atomic_write`
-    /// without a prior `Path::exists` guard) would silently overwrite.
+    /// without a prior existence guard) would silently overwrite.
     #[test]
     fn create_user_agent_rejects_existing_collision_without_overwrite() {
         let (_dir, project) = temp_project();
@@ -9133,11 +9285,11 @@ mod tests {
         assert_eq!(before, after, "existing file must NOT be overwritten");
     }
 
-    // -- save_user_agent (S5 stress fixture, 5 cases) ----------------------
+    // -- save_user_agent --------------------------------------------------
 
-    /// S5 case 1 — in-place edit: from_name == draft.name, no rename,
-    /// untracked. Overwrites file content; no other file appears; no
-    /// tracking mutation.
+    /// In-place edit: `from_name == draft_name`, no rename, untracked.
+    /// Overwrites file content; no other file appears; no tracking
+    /// mutation.
     #[test]
     fn save_user_agent_in_place_overwrites() {
         let (_dir, project) = temp_project();
@@ -9155,8 +9307,8 @@ mod tests {
         assert!(!project.kiro_dir().join(INSTALLED_AGENTS_FILE).exists());
     }
 
-    /// S5 case 2 — rename, no collision: from_name != draft.name,
-    /// target free. New file appears with new content; old file gone.
+    /// Rename, no collision: `from_name != draft_name`, target free.
+    /// New file appears with new content; old file gone.
     #[test]
     fn save_user_agent_rename_writes_new_then_unlinks_old() {
         let (_dir, project) = temp_project();
@@ -9172,10 +9324,10 @@ mod tests {
         assert_eq!(std::fs::read(&bar).expect("read bar"), b"renamed");
     }
 
-    /// S5 case 3 — rename collision (adversarial): pre-write foo AND
-    /// bar with DIFFERENT content. Save("foo" -> "bar", ...) must
-    /// return NameCollision AND BOTH files unchanged. Bug class
-    /// defeated: write-before-collision-check, which would corrupt bar.
+    /// Rename collision (adversarial): pre-write `foo` AND `bar` with
+    /// DIFFERENT content. `save("foo" -> "bar", ...)` must return
+    /// `NameCollision` AND both files unchanged. Bug class defeated:
+    /// write-before-collision-check, which would corrupt `bar`.
     #[test]
     fn save_user_agent_rename_collision_leaves_both_unchanged() {
         let (_dir, project) = temp_project();
@@ -9202,8 +9354,8 @@ mod tests {
         assert_eq!(std::fs::read(&bar).expect("post bar"), bar_before);
     }
 
-    /// S5 case 4 — detach=true on a tracked agent: the InstalledAgents
-    /// entry is removed AND the file has the new content.
+    /// `detach=true` on a tracked agent: the `InstalledAgents` entry
+    /// is removed AND the file has the new content.
     #[test]
     fn save_user_agent_detach_removes_tracking_entry() {
         use chrono::Utc;
@@ -9245,9 +9397,9 @@ mod tests {
         );
     }
 
-    /// S5 case 5 — detach=false on a tracked agent: tracking entry is
-    /// PRESERVED. This is the "edit-but-stay-linked" path. The new
-    /// content lands; tracking is unmodified.
+    /// `detach=false` on a tracked agent: tracking entry is PRESERVED.
+    /// This is the "edit-but-stay-linked" path. The new content lands;
+    /// tracking is unmodified.
     #[test]
     fn save_user_agent_no_detach_preserves_tracking() {
         use chrono::Utc;
@@ -9288,9 +9440,65 @@ mod tests {
         );
     }
 
-    // -- delete_user_agent (S6 stress fixture, 3 cases) --------------------
+    /// Happy-path renames must report `orphan_left_behind = None`.
+    /// Pins the contract that the field only triggers on partial
+    /// failure — a future regression that always returns
+    /// `Some(from_path)` would force the UI to render a spurious
+    /// warning on every successful rename.
+    #[test]
+    fn save_user_agent_rename_returns_no_orphan_on_clean_unlink() {
+        let (_dir, project) = temp_project();
+        let agents_dir = project.kiro_dir().join("agents");
+        std::fs::create_dir_all(&agents_dir).expect("agents dir");
+        std::fs::write(agents_dir.join("foo.json"), b"v1").expect("write foo");
 
-    /// S6 case 1 — untracked delete: file present, no tracking entry.
+        let outcome = project
+            .save_user_agent("foo", "bar", b"v2", false)
+            .expect("save rename");
+        assert!(
+            outcome.orphan_left_behind.is_none(),
+            "clean rename must not report an orphan, got {:?}",
+            outcome.orphan_left_behind
+        );
+    }
+
+    /// When the post-rename unlink fails (here: `foo.json` is a
+    /// directory, not a file), the save still succeeds (the new
+    /// `bar.json` is in place) but the outcome carries the orphan
+    /// path so the UI can surface a warning. Without this channel
+    /// the duplicate file silently shows up in the next list refresh.
+    #[test]
+    fn save_user_agent_rename_reports_orphan_when_old_unlink_fails() {
+        let (_dir, project) = temp_project();
+        let agents_dir = project.kiro_dir().join("agents");
+        std::fs::create_dir_all(&agents_dir).expect("agents dir");
+        // Make `foo.json` a directory so `remove_file` fails with a
+        // non-NotFound error (EISDIR on Unix, PermissionDenied on
+        // Windows). Both register as non-NotFound under the orphan
+        // capture branch.
+        std::fs::create_dir(agents_dir.join("foo.json")).expect("foo as dir");
+
+        let outcome = project
+            .save_user_agent("foo", "bar", b"new content", false)
+            .expect("save rename succeeds even when old unlink fails");
+        // New file landed.
+        assert_eq!(
+            std::fs::read(agents_dir.join("bar.json")).expect("read bar"),
+            b"new content",
+        );
+        // And the orphan path is reported.
+        let orphan = outcome
+            .orphan_left_behind
+            .expect("non-NotFound unlink failure must surface as orphan_left_behind");
+        assert!(
+            orphan.ends_with("foo.json") || orphan.ends_with("foo.json\\"),
+            "orphan path must point at the source file, got: {orphan}",
+        );
+    }
+
+    // -- delete_user_agent ------------------------------------------------
+
+    /// Untracked delete: file present, no tracking entry.
     /// File goes away; tracking unchanged.
     #[test]
     fn delete_user_agent_untracked_removes_file_only() {
@@ -9305,7 +9513,7 @@ mod tests {
         assert!(!project.kiro_dir().join(INSTALLED_AGENTS_FILE).exists());
     }
 
-    /// S6 case 2 — tracked delete: install a marketplace agent into
+    /// Tracked delete: install a marketplace agent into
     /// tracking + file, call delete, assert BOTH the file and the
     /// tracking entry are gone. Bug class defeated: delete that drops
     /// only the file leaves a phantom tracking entry.
@@ -9348,7 +9556,7 @@ mod tests {
         );
     }
 
-    /// S6 case 3 — idempotent on missing file: no file, no tracking,
+    /// Idempotent on missing file: no file, no tracking,
     /// delete returns Ok(()).
     #[test]
     fn delete_user_agent_idempotent_on_missing_file() {
@@ -9359,9 +9567,9 @@ mod tests {
             .expect("delete of nonexistent must be Ok(())");
     }
 
-    // -- duplicate_user_agent (S7 stress fixture, 4 cases) ------------------
+    // -- duplicate_user_agent ----------------------------------------------
 
-    /// S7 case 1 — `-copy` slot free: simplest happy path.
+    /// `-copy` slot free: simplest happy path.
     #[test]
     fn duplicate_user_agent_creates_copy_when_slot_free() {
         let (_dir, project) = temp_project();
@@ -9381,7 +9589,7 @@ mod tests {
         assert_eq!(val["tools"], serde_json::json!(["x"]));
     }
 
-    /// S7 case 2 — chain occupied (adversarial): foo, foo-copy,
+    /// Chain occupied (adversarial): foo, foo-copy,
     /// foo-copy-2 all present. The walker must pick foo-copy-3, NOT
     /// overwrite any existing file. Bug class defeated: naive "always
     /// use -copy" implementation.
@@ -9417,7 +9625,7 @@ mod tests {
         );
     }
 
-    /// S7 case 3 — source missing: returns DuplicateSourceNotFound.
+    /// Source missing: returns `DuplicateSourceNotFound`.
     #[test]
     fn duplicate_user_agent_returns_source_not_found() {
         let (_dir, project) = temp_project();
@@ -9434,7 +9642,7 @@ mod tests {
         );
     }
 
-    /// S7 case 4 — marketplace-tracked source: duplicate is NEVER
+    /// Marketplace-tracked source: duplicate is NEVER
     /// inserted into InstalledAgents. The source's tracking entry is
     /// preserved; the new copy is user-authored.
     #[test]
@@ -9503,5 +9711,173 @@ mod tests {
             .expect("list ok despite broken file");
         let names: Vec<&str> = rows.iter().map(|r| r.name.as_str()).collect();
         assert_eq!(names, vec!["good"], "broken.json silently dropped (D13)");
+    }
+
+    /// `list_user_agents` must NOT follow symlinks in `.kiro/agents/`.
+    /// A symlinked entry could point at any file the process can read;
+    /// its bytes would otherwise flow into the wire payload (or leak
+    /// via the warn-skip side channel on a parse failure).
+    #[cfg(unix)]
+    #[test]
+    fn list_user_agents_refuses_symlinked_entries() {
+        let (dir, project) = temp_project();
+        let agents_dir = project.kiro_dir().join("agents");
+        std::fs::create_dir_all(&agents_dir).expect("agents dir");
+        // Real agent, present alongside.
+        std::fs::write(
+            agents_dir.join("real.json"),
+            br#"{"name": "real", "tools": []}"#,
+        )
+        .expect("write real");
+        // Sensitive-host-file analogue: any readable file outside agents/.
+        let secret = dir.path().join("secret.txt");
+        std::fs::write(&secret, b"sensitive bytes").expect("write secret");
+        // Plant a symlink at agents/leak.json pointing at the secret.
+        std::os::unix::fs::symlink(&secret, agents_dir.join("leak.json")).expect("create symlink");
+
+        let rows = project.list_user_agents().expect("list ok");
+        let names: Vec<&str> = rows.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec!["real"],
+            "symlinked agent entry must be silently dropped, not followed",
+        );
+    }
+
+    /// `duplicate_user_agent` must refuse a symlinked source rather than
+    /// following the link and copying its target's bytes into a regular
+    /// file under `.kiro/agents/`. The reviewer's exploit chain
+    /// (plant symlink → click Duplicate → contents land in a regular
+    /// file accessible via list/read) is defeated by the type-level
+    /// `DuplicateSourceSymlinked` rejection.
+    #[cfg(unix)]
+    #[test]
+    fn duplicate_user_agent_refuses_symlinked_source() {
+        let (dir, project) = temp_project();
+        let agents_dir = project.kiro_dir().join("agents");
+        std::fs::create_dir_all(&agents_dir).expect("agents dir");
+        let secret = dir.path().join("secret.txt");
+        std::fs::write(&secret, b"sensitive bytes").expect("write secret");
+        std::os::unix::fs::symlink(&secret, agents_dir.join("innocent.json"))
+            .expect("create symlink");
+
+        let err = project
+            .duplicate_user_agent("innocent")
+            .expect_err("symlinked source must be refused");
+        assert!(
+            matches!(
+                err,
+                crate::error::Error::Agent(AgentError::DuplicateSourceSymlinked { ref name })
+                    if name == "innocent"
+            ),
+            "expected DuplicateSourceSymlinked, got {err:?}"
+        );
+        // And the copy must not exist on disk.
+        assert!(
+            !agents_dir.join("innocent-copy.json").exists(),
+            "duplicate file must not be created from a symlinked source",
+        );
+    }
+
+    /// `create_user_agent` must treat a pre-existing symlink at the
+    /// target path as a `NameCollision`, not as a free slot it can
+    /// silently overwrite. Without `symlink_metadata`, `Path::exists`
+    /// would return `false` for a dangling symlink and the
+    /// `atomic_write` rename would replace the link with a regular
+    /// file whose contents come from a renderer that thought the name
+    /// was free.
+    #[cfg(unix)]
+    #[test]
+    fn create_user_agent_treats_symlink_at_target_as_collision() {
+        let (dir, project) = temp_project();
+        let agents_dir = project.kiro_dir().join("agents");
+        std::fs::create_dir_all(&agents_dir).expect("agents dir");
+        // Dangling symlink — Path::exists() would say false.
+        let dangling = dir.path().join("nowhere");
+        std::os::unix::fs::symlink(&dangling, agents_dir.join("foo.json"))
+            .expect("create dangling symlink");
+        assert!(
+            !agents_dir.join("foo.json").exists(),
+            "test precondition: dangling symlink reports exists()==false",
+        );
+
+        let err = project
+            .create_user_agent("foo", br#"{"name": "foo"}"#)
+            .expect_err("dangling symlink must register as a collision");
+        assert!(
+            matches!(
+                err,
+                crate::error::Error::Agent(AgentError::NameCollision { ref name })
+                    if name == "foo"
+            ),
+            "expected NameCollision, got {err:?}"
+        );
+    }
+
+    /// `duplicate_user_agent` must refuse a source path that exists but
+    /// is not a regular file (a directory at `<name>.json/` is the most
+    /// plausible accidental shape — for example a hand-edit gone wrong).
+    /// `fs::read` would otherwise fail with an `IsADirectory` error and
+    /// bubble up as a generic Io variant — the typed
+    /// `DuplicateSourceNotAFile` variant lets the UI surface a
+    /// specific message.
+    #[test]
+    fn duplicate_user_agent_refuses_directory_source() {
+        let (_dir, project) = temp_project();
+        let agents_dir = project.kiro_dir().join("agents");
+        std::fs::create_dir_all(&agents_dir).expect("agents dir");
+        // Source path is a directory, not a regular file.
+        std::fs::create_dir(agents_dir.join("weird.json")).expect("dir at source path");
+
+        let err = project
+            .duplicate_user_agent("weird")
+            .expect_err("directory source must be refused");
+        assert!(
+            matches!(
+                err,
+                crate::error::Error::Agent(AgentError::DuplicateSourceNotAFile { ref name })
+                    if name == "weird"
+            ),
+            "expected DuplicateSourceNotAFile, got {err:?}"
+        );
+        assert!(
+            !agents_dir.join("weird-copy.json").exists(),
+            "no duplicate file should be created when source is rejected",
+        );
+    }
+
+    /// `duplicate_user_agent` must refuse a source file whose size
+    /// exceeds `DUPLICATE_SOURCE_BYTE_CAP`. The cap bounds the
+    /// `fs::read` allocation against a hand-pasted large file.
+    #[test]
+    fn duplicate_user_agent_refuses_oversized_source() {
+        let (_dir, project) = temp_project();
+        let agents_dir = project.kiro_dir().join("agents");
+        std::fs::create_dir_all(&agents_dir).expect("agents dir");
+        // Build a file one byte over the cap. Contents don't need to
+        // be JSON — the size check fires before the read.
+        let oversized: Vec<u8> = vec![b'x'; (DUPLICATE_SOURCE_BYTE_CAP as usize) + 1];
+        std::fs::write(agents_dir.join("big.json"), &oversized).expect("write big");
+
+        let err = project
+            .duplicate_user_agent("big")
+            .expect_err("oversized source must be refused");
+        assert!(
+            matches!(
+                &err,
+                crate::error::Error::Agent(AgentError::DuplicateSourceTooLarge {
+                    name,
+                    size,
+                    cap,
+                }) if name == "big"
+                    && *size == (DUPLICATE_SOURCE_BYTE_CAP + 1)
+                    && *cap == DUPLICATE_SOURCE_BYTE_CAP
+            ),
+            "expected DuplicateSourceTooLarge with size=cap+1, got {err:?}"
+        );
+        assert!(
+            !agents_dir.join("big-copy.json").exists(),
+            "no duplicate file should be created when source is oversized",
+        );
     }
 }

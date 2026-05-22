@@ -446,6 +446,27 @@ pub enum AgentError {
     #[error("cannot duplicate `{name}`: source file not found")]
     DuplicateSourceNotFound { name: String },
 
+    /// The source agent for a duplicate operation is a symlink. Refused
+    /// because following the link would copy bytes from an arbitrary
+    /// host file into a regular file under `.kiro/agents/`, exposing
+    /// them to subsequent reads via the list endpoint.
+    #[error("cannot duplicate `{name}`: source is a symlink (refused)")]
+    DuplicateSourceSymlinked { name: String },
+
+    /// The source agent for a duplicate operation is not a regular
+    /// file (e.g. a directory `<agents_dir>/<name>.json/`). Refused
+    /// because `fs::read` would fail unpredictably and any partial
+    /// write would leave inconsistent state.
+    #[error("cannot duplicate `{name}`: source is not a regular file (refused)")]
+    DuplicateSourceNotAFile { name: String },
+
+    /// The source agent file exceeds the byte cap accepted by the
+    /// duplicate path. Without this cap a hand-edited multi-GB file in
+    /// `.kiro/agents/` could OOM the process via the unbounded
+    /// `fs::read` call.
+    #[error("cannot duplicate `{name}`: source is {size} bytes, exceeds cap of {cap}")]
+    DuplicateSourceTooLarge { name: String, size: u64, cap: u64 },
+
     /// The duplicate name-walker exceeded its sanity cap without finding
     /// a free `<source_name>-copy[-N]` slot. Indicates either an absurd
     /// pre-existing chain or a bug in the walker.

@@ -1,30 +1,20 @@
-//! User-authored agent CRUD commands for the
-//! `Workflows > Agents` view in Control Center.
+//! User-authored agent CRUD commands.
 //!
 //! **PROJECT-ONLY** — none of the wrappers in this module construct or
 //! accept a [`kiro_market_core::service::MarketplaceService`]. Per
 //! CLAUDE.md "Tauri command handlers", project-only commands inline
 //! the body in the wrapper (no `_impl(svc, ...)` pattern).
-//!
-//! Design claim C7 in `.agents-view/design-slice-1.md`. The CI gate
-//! tracked at rivets-6g6r will enforce the no-MarketplaceService
-//! invariant; until then, the manual grep
-//! `grep -E '(make_service|MarketplaceService)' agents_authoring.rs`
-//! is the fence. Both should return no matches against this file.
 
 use tracing::debug;
 
 use kiro_market_core::project::KiroProject;
-use kiro_market_core::user_agent::UserAgentRow;
+use kiro_market_core::user_agent::{SaveOutcome, UserAgentRow};
 
-use crate::commands::validate_kiro_project_path;
+use crate::commands::{validate_draft_json_payload, validate_kiro_project_path};
 use crate::error::CommandError;
 
 /// List every JSON-parseable agent in `.kiro/agents/` for the given
 /// project. Auto-creates the directory if absent.
-///
-/// Slice S8 wrapper around
-/// [`KiroProject::list_user_agents`] (slice S3, design claim C1+C2).
 #[tauri::command]
 #[specta::specta]
 pub async fn list_user_agents(project_path: String) -> Result<Vec<UserAgentRow>, CommandError> {
@@ -49,6 +39,7 @@ pub async fn create_user_agent(
     project_path: String,
 ) -> Result<(), CommandError> {
     let project_root = validate_kiro_project_path(&project_path)?;
+    validate_draft_json_payload(&draft_json)?;
     let project = KiroProject::new(project_root);
     project
         .create_user_agent(&name, draft_json.as_bytes())
@@ -73,19 +64,21 @@ pub async fn save_user_agent(
     draft_json: String,
     detach: bool,
     project_path: String,
-) -> Result<(), CommandError> {
+) -> Result<SaveOutcome, CommandError> {
     let project_root = validate_kiro_project_path(&project_path)?;
+    validate_draft_json_payload(&draft_json)?;
     let project = KiroProject::new(project_root);
-    project
+    let outcome = project
         .save_user_agent(&from_name, &draft_name, draft_json.as_bytes(), detach)
         .map_err(CommandError::from)?;
     debug!(
         from = %from_name,
         to = %draft_name,
         detach,
+        orphan = ?outcome.orphan_left_behind,
         "user agent saved"
     );
-    Ok(())
+    Ok(outcome)
 }
 
 /// Delete a user-visible agent. Tracking-aware: agents with marketplace
@@ -130,9 +123,9 @@ pub async fn duplicate_user_agent(
 mod tests {
     use super::*;
 
-    // The wrappers are thin pass-throughs around KiroProject methods
-    // whose own test coverage is comprehensive (S3-S7 stress fixtures).
-    // These tests confirm the wrapper plumbing — project_path
+    // The wrappers are thin pass-throughs around `KiroProject` methods
+    // whose own test coverage is comprehensive (see `project.rs` unit
+    // tests). These tests confirm the wrapper plumbing — project_path
     // validation + error mapping — without re-testing the core
     // semantics.
 
@@ -154,7 +147,8 @@ mod tests {
         std::fs::create_dir(dir.path().join(".kiro")).expect("mk .kiro");
         let path = dir.path().to_string_lossy().to_string();
 
-        // No agents/ subdir, no file — must be Ok(()) per S6 case 3.
+        // No agents/ subdir, no file — must be Ok(()) (idempotent
+        // on `NotFound`).
         delete_user_agent("ghost".to_string(), path.clone())
             .await
             .expect("idempotent delete via wrapper");
@@ -168,5 +162,62 @@ mod tests {
 
         let rows = list_user_agents(path).await.expect("list ok");
         assert!(rows.is_empty());
+    }
+
+    /// `create_user_agent`'s wrapper must reject malformed JSON BEFORE
+    /// touching the filesystem. Pins that `validate_draft_json_payload`
+    /// is wired in — a future refactor that drops the call would let
+    /// non-JSON bytes land in `.kiro/agents/<name>.json` where the list
+    /// endpoint would then silently skip them.
+    #[tokio::test]
+    async fn create_user_agent_rejects_malformed_draft_json_at_wrapper() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(dir.path().join(".kiro/agents")).expect("mk .kiro/agents");
+        let path = dir.path().to_string_lossy().to_string();
+
+        let err = create_user_agent("victim".to_string(), "{ not valid json".to_string(), path)
+            .await
+            .expect_err("malformed draft_json must be refused at the wrapper");
+        assert_eq!(err.error_type, crate::error::ErrorType::ParseError);
+        // And no file landed on disk.
+        assert!(
+            !dir.path().join(".kiro/agents/victim.json").exists(),
+            "wrapper rejection must happen before any FS write",
+        );
+    }
+
+    /// `save_user_agent`'s wrapper must reject malformed JSON BEFORE
+    /// touching the filesystem. Same shape as the create_user_agent
+    /// test above; pins the same wiring on the save path.
+    #[tokio::test]
+    async fn save_user_agent_rejects_malformed_draft_json_at_wrapper() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(dir.path().join(".kiro/agents")).expect("mk .kiro/agents");
+        std::fs::write(
+            dir.path().join(".kiro/agents/existing.json"),
+            br#"{"name": "existing"}"#,
+        )
+        .expect("seed existing agent");
+        let path = dir.path().to_string_lossy().to_string();
+        let pre_bytes =
+            std::fs::read(dir.path().join(".kiro/agents/existing.json")).expect("read pre-state");
+
+        let err = save_user_agent(
+            "existing".to_string(),
+            "existing".to_string(),
+            "{ not valid json".to_string(),
+            false,
+            path,
+        )
+        .await
+        .expect_err("malformed draft_json must be refused at the wrapper");
+        assert_eq!(err.error_type, crate::error::ErrorType::ParseError);
+        // And the existing file was not touched.
+        let post_bytes =
+            std::fs::read(dir.path().join(".kiro/agents/existing.json")).expect("read post-state");
+        assert_eq!(
+            pre_bytes, post_bytes,
+            "wrapper rejection must happen before any FS write",
+        );
     }
 }

@@ -4,6 +4,8 @@ import {
   filterAgentRows,
   formatLineageBadge,
   formatModelChip,
+  headerLabel,
+  type AgentsTabMode,
 } from "$lib/agent-list-helpers";
 
 // Test fixture: covers the four field-presence shapes the filter
@@ -110,11 +112,44 @@ describe("formatLineageBadge", () => {
 });
 
 describe("formatModelChip", () => {
-  it("returns 'Use default' for null model (probe finding 4)", () => {
+  it("returns 'Use default' for null model", () => {
     expect(formatModelChip(null)).toBe("Use default");
   });
 
   it("returns the model string when present", () => {
     expect(formatModelChip("claude-sonnet-4-6")).toBe("claude-sonnet-4-6");
+  });
+});
+
+describe("headerLabel", () => {
+  it("renders the list mode label", () => {
+    const mode: AgentsTabMode = { kind: "list" };
+    expect(headerLabel(mode)).toBe("Agents");
+  });
+
+  it("renders the new-agent mode label", () => {
+    const mode: AgentsTabMode = { kind: "new" };
+    expect(headerLabel(mode)).toBe("New agent");
+  });
+
+  // Pins the previously-ternaried "Editing ${row.name}" arm. A naive
+  // chained ternary would produce this string for ANY non-"new" mode
+  // (including "list" if the surrounding `if` regressed); the switch
+  // routes through `mode.kind === "edit"` only.
+  it("renders the edit-agent mode label with the row name", () => {
+    const mode: AgentsTabMode = {
+      kind: "edit",
+      row: {
+        name: "code-reviewer",
+        description: null,
+        model: null,
+        tools_count: 0,
+        mcp_count: 0,
+        resources_count: 0,
+        hooks_count: 0,
+        lineage: null,
+      },
+    };
+    expect(headerLabel(mode)).toBe("Editing code-reviewer");
   });
 });

@@ -1,27 +1,27 @@
-//! User-authored agent surface for the kiro-control-center
-//! "Workflows > Agents" view.
+//! User-authored agent wire shapes consumed by the
+//! `list_user_agents` / `save_user_agent` / `delete_user_agent` /
+//! `duplicate_user_agent` Tauri commands.
 //!
 //! Distinct from the marketplace-install path
-//! ([`crate::agent::parse_native`]): this module carries the
-//! list/save/delete/duplicate wire shapes the UI consumes. The list
-//! payload is computed in [`crate::project::KiroProject::list_user_agents`]
-//! via untyped JSON (`serde_json::Value`) — not the strict native-agent
-//! parser whose symlink/hardlink/byte-cap checks are appropriate for
-//! install-time copy-in, not display-time projection. See design claim
-//! C2 in `.agents-view/design-slice-1.md`.
+//! ([`crate::agent::parse_native`]): the list payload is computed in
+//! [`crate::project::KiroProject::list_user_agents`] via untyped JSON
+//! (`serde_json::Value`) — not the strict native-agent parser whose
+//! symlink/hardlink/byte-cap checks are appropriate for install-time
+//! copy-in of marketplace bytes, not for displaying files the user
+//! already owns.
 
 use serde::Serialize;
 
 /// One row of the Agents list-page payload. Serialized as the response
-/// of the `list_user_agents` Tauri command. See spec behavior B1.
+/// of the `list_user_agents` Tauri command.
 #[derive(Clone, Debug, Serialize)]
 #[cfg_attr(feature = "specta", derive(specta::Type))]
 #[non_exhaustive]
 pub struct UserAgentRow {
     /// Agent identity. Sourced from the JSON file's `name` field when
-    /// present, else falls back to the filename stem (spec decision
-    /// #14). Save path enforces these always match; list path is
-    /// tolerant of pre-existing drift.
+    /// present, else falls back to the filename stem. Save path
+    /// enforces these always match; list path is tolerant of
+    /// pre-existing drift.
     pub name: String,
     /// Human-only label; not shown to the model.
     pub description: Option<String>,
@@ -49,6 +49,32 @@ pub struct UserAgentLineage {
     pub marketplace: String,
     pub plugin: String,
     pub version: Option<String>,
+}
+
+/// Non-fatal outcome data returned by
+/// [`crate::project::KiroProject::save_user_agent`]. The save itself
+/// has already succeeded by the time the caller sees this value —
+/// the fields describe partial-success conditions the UI may want to
+/// surface as a warning.
+///
+/// Currently the only such condition is a rename whose new-file write
+/// succeeded but whose old-file unlink failed (the new file is in
+/// place; the old one is an orphan on disk). Without this channel the
+/// rename appears fully successful but the list endpoint silently
+/// shows both files until the user notices and deletes the orphan
+/// manually.
+#[derive(Clone, Debug, Default, Serialize)]
+#[cfg_attr(feature = "specta", derive(specta::Type))]
+#[non_exhaustive]
+pub struct SaveOutcome {
+    /// On a rename, the path of an old file whose unlink failed after
+    /// the new file was atomically written. `None` for the in-place
+    /// edit path, for renames where the old file was successfully
+    /// removed, and for renames where the old file was already absent
+    /// (`ErrorKind::NotFound`). The path is serialized as a string for
+    /// the FFI; the UI's only legitimate use is to display it back to
+    /// the user.
+    pub orphan_left_behind: Option<String>,
 }
 
 impl UserAgentRow {
@@ -81,12 +107,13 @@ impl UserAgentRow {
 mod tests {
     use super::*;
 
-    /// S2 stress fixture: round-trip a fully-populated row through serde.
-    /// The Unicode name + counts at `usize` boundary values are designed
-    /// to fail if a future contributor "tightens" the types to `u32` or
-    /// to a non-Unicode-safe string. The Option fields are exercised in
-    /// both `Some` and `None` shapes (lineage `Some`; description/model/
-    /// version each `None`) so the field-presence matrix gets coverage.
+    /// Round-trip a fully-populated row through serde. The Unicode
+    /// name + counts at `usize` boundary values are designed to fail
+    /// if a future contributor "tightens" the types to `u32` or to a
+    /// non-Unicode-safe string. The `Option` fields are exercised in
+    /// both `Some` and `None` shapes (lineage `Some`; description /
+    /// model / version each `None`) so the field-presence matrix gets
+    /// coverage.
     #[test]
     fn user_agent_row_serializes_to_expected_wire_shape() {
         let row = UserAgentRow {

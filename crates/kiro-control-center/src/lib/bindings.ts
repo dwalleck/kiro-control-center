@@ -190,9 +190,6 @@ export const commands = {
 	/**
 	 *  List every JSON-parseable agent in `.kiro/agents/` for the given
 	 *  project. Auto-creates the directory if absent.
-	 * 
-	 *  Slice S8 wrapper around
-	 *  [`KiroProject::list_user_agents`] (slice S3, design claim C1+C2).
 	 */
 	listUserAgents: (projectPath: string) => typedError<UserAgentRow[], CommandError>(__TAURI_INVOKE("list_user_agents", { projectPath })),
 	/**
@@ -214,7 +211,7 @@ export const commands = {
 	 *  in-place; differ for rename). `detach=true` drops the
 	 *  `InstalledAgents` entry for `from_name` if present.
 	 */
-	saveUserAgent: (fromName: string, draftName: string, draftJson: string, detach: boolean, projectPath: string) => typedError<null, CommandError>(__TAURI_INVOKE("save_user_agent", { fromName, draftName, draftJson, detach, projectPath })),
+	saveUserAgent: (fromName: string, draftName: string, draftJson: string, detach: boolean, projectPath: string) => typedError<SaveOutcome, CommandError>(__TAURI_INVOKE("save_user_agent", { fromName, draftName, draftJson, detach, projectPath })),
 	/**
 	 *  Delete a user-visible agent. Tracking-aware: agents with marketplace
 	 *  lineage take the full `remove_agent` path (file lock + tracking
@@ -1488,6 +1485,33 @@ export type RemoveSteeringResult = {
 };
 
 /**
+ *  Non-fatal outcome data returned by
+ *  [`crate::project::KiroProject::save_user_agent`]. The save itself
+ *  has already succeeded by the time the caller sees this value —
+ *  the fields describe partial-success conditions the UI may want to
+ *  surface as a warning.
+ * 
+ *  Currently the only such condition is a rename whose new-file write
+ *  succeeded but whose old-file unlink failed (the new file is in
+ *  place; the old one is an orphan on disk). Without this channel the
+ *  rename appears fully successful but the list endpoint silently
+ *  shows both files until the user notices and deletes the orphan
+ *  manually.
+ */
+export type SaveOutcome = {
+	/**
+	 *  On a rename, the path of an old file whose unlink failed after
+	 *  the new file was atomically written. `None` for the in-place
+	 *  edit path, for renames where the old file was successfully
+	 *  removed, and for renames where the old file was already absent
+	 *  (`ErrorKind::NotFound`). The path is serialized as a string for
+	 *  the FFI; the UI's only legitimate use is to display it back to
+	 *  the user.
+	 */
+	orphan_left_behind: string | null,
+};
+
+/**
  *  Top-level category for a Kiro CLI setting.
  * 
  *  Categories are a **UI grouping** used by the settings UI to organize
@@ -1934,14 +1958,14 @@ export type UserAgentLineage = {
 
 /**
  *  One row of the Agents list-page payload. Serialized as the response
- *  of the `list_user_agents` Tauri command. See spec behavior B1.
+ *  of the `list_user_agents` Tauri command.
  */
 export type UserAgentRow = {
 	/**
 	 *  Agent identity. Sourced from the JSON file's `name` field when
-	 *  present, else falls back to the filename stem (spec decision
-	 *  #14). Save path enforces these always match; list path is
-	 *  tolerant of pre-existing drift.
+	 *  present, else falls back to the filename stem. Save path
+	 *  enforces these always match; list path is tolerant of
+	 *  pre-existing drift.
 	 */
 	name: string,
 	// Human-only label; not shown to the model.

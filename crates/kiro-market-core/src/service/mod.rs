@@ -793,6 +793,9 @@ fn companion_conflicts_from_error(err: &crate::error::AgentError) -> Vec<std::pa
         | AgentError::InvalidName { .. }
         | AgentError::NameCollision { .. }
         | AgentError::DuplicateSourceNotFound { .. }
+        | AgentError::DuplicateSourceSymlinked { .. }
+        | AgentError::DuplicateSourceNotAFile { .. }
+        | AgentError::DuplicateSourceTooLarge { .. }
         | AgentError::DuplicateNameSpaceExhausted { .. } => Vec::new(),
     }
 }
@@ -3837,6 +3840,22 @@ mod tests {
             source: Box::new(crate::error::Error::Io(std::io::Error::from(
                 std::io::ErrorKind::Other,
             ))),
+        },
+        Vec::new(),
+    )]
+    #[case::duplicate_source_symlinked(
+        AgentError::DuplicateSourceSymlinked { name: REVIEWER.to_owned() },
+        Vec::new(),
+    )]
+    #[case::duplicate_source_not_a_file(
+        AgentError::DuplicateSourceNotAFile { name: REVIEWER.to_owned() },
+        Vec::new(),
+    )]
+    #[case::duplicate_source_too_large(
+        AgentError::DuplicateSourceTooLarge {
+            name: REVIEWER.to_owned(),
+            size: 2_000_000,
+            cap: 1_048_576,
         },
         Vec::new(),
     )]
