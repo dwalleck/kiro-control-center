@@ -18,6 +18,103 @@ become individual commits for reviewable bisection.
 
 ---
 
+## Amendments (after S1–S12 landed, before S13 starts)
+
+Hardening landed in the working tree after S12 shipped extends the IPC
+contract beyond what S13–S17 originally specified. Three surface changes
+the frontend slices must thread through:
+
+### A1 — `SaveOutcome` wire-format type (replaces `()` on `saveUserAgent`)
+
+`saveUserAgent` now returns `SaveOutcome` instead of `null`:
+
+```ts
+// bindings.ts
+export type SaveOutcome = {
+  /** Path of an old file whose unlink failed after the new file was
+      atomically written. None for in-place save / successful rename. */
+  orphan_left_behind?: string | null;
+};
+```
+
+The save itself succeeded by the time the caller sees this — the field
+describes a *partial-success warning*. The only condition that produces
+a non-null `orphan_left_behind` is a rename where the new write succeeded
+but the old-file unlink failed (the new file is in place; the old is an
+orphan on disk).
+
+**Affects S13, S16:** the editor's save handler must consume
+`SaveOutcome` (not discard `void`) and pass `orphan_left_behind` up to
+`AgentsTab` so its toast banner can render the warning. Without this
+plumb-through the rename appears fully successful but the list endpoint
+silently shows both files until the user notices.
+
+### A2 — `validate_draft_json_payload` IPC guard
+
+`createUserAgent` and `saveUserAgent` wrappers now reject malformed /
+oversized payloads at the IPC boundary BEFORE touching the filesystem:
+
+- Byte cap: 1 MiB. Exceeds → `CommandError { error_type: Validation }`.
+- JSON syntax: `serde_json::from_slice::<Value>` must parse. Fails →
+  `CommandError { error_type: ParseError }`.
+
+Schema-level checks (required fields, field types) stay deeper in core
+— the IPC guard only asserts "well-formed JSON of plausible size."
+Implementation: `commands/mod.rs::validate_draft_json_payload`.
+
+**Affects S13, S17:** the editor's save handler can rely on
+pre-FS rejection for malformed input — surfaced as `CommandError`
+with a distinguishable `error_type`. S17's e2e should add a case
+exercising the rejection (e.g., set the prompt to bytes that produce
+unparseable JSON via a deliberate intermediate state) and assert
+no file lands on disk.
+
+### A3 — `AgentsTabMode` + `headerLabel` moved into the shared helpers
+
+`AgentsTabMode` (the discriminated union for the tab's view mode) and
+`headerLabel(mode)` now live in
+`crates/kiro-control-center/src/lib/agent-list-helpers.ts` rather than
+inline in `AgentsTab.svelte`. The helper carries a value-position
+exhaustiveness tripwire (`_AssertExhaustive`) per CLAUDE.md's
+discriminator-pushdown discipline.
+
+**Affects S13:** the editor consumes the existing `AgentsTabMode` type
+from the helpers module — it does not re-define `type Mode = ...`
+inline. New `mode.kind` arms (if any are introduced later) update the
+helpers module's `_KINDS` array; the tripwire fires if not.
+
+### A4 — Three new `AgentError` duplicate-hardening variants
+
+`AgentError` gained three variants for `duplicate_user_agent`'s
+filesystem hardening (parity with `parse_native`'s install-time
+discipline):
+
+- `DuplicateSourceSymlinked { name }`
+- `DuplicateSourceNotAFile { name }`
+- `DuplicateSourceTooLarge { name, size, cap }`
+
+These propagate through the existing `CommandError::from` conversion;
+the frontend renders them via the same error-banner pipe as
+`DuplicateSourceNotFound`. No wire-format change beyond the error
+message text.
+
+**Affects S17 only weakly:** an exhaustive Playwright run could
+exercise the symlink-refusal path, but the test rig would need a
+symlink in `.kiro/agents/`. Out of scope for slice-1 e2e unless the
+test fixture explicitly creates one. Listed for completeness.
+
+### Slice impact summary
+
+| Slice | Changed by | Action |
+|---|---|---|
+| S13 | A1, A3 | Save handler consumes `SaveOutcome`; reuse imported `AgentsTabMode` |
+| S14 | (none) | Unchanged |
+| S15 | (none) | Unchanged — prompt-mode logic doesn't touch save/IPC contract |
+| S16 | A1 | Modal still returns `SaveChoice`; the *post*-save `SaveOutcome` handling lives in S13's parent. S16's contract is unchanged but documented here for adjacency |
+| S17 | A2 | Add malformed-`draft_json` rejection case |
+
+---
+
 ## Backend (Rust, in `crates/kiro-market-core/` and `crates/kiro-control-center/src-tauri/`)
 
 ### S1 — Vendor `agent-spec.json` into the workspace
@@ -814,10 +911,28 @@ placeholders catch this.
 
 **Code (advisory):** See `AgentEditor.jsx` in the design bundle (the `AgentEditor` top-level component). Section rail renders all 7 entries; the active-section state is `$state<SectionId>("identity")`; non-implemented sections set `disabled` on the button.
 
+> **Amendment 2026-05-22 (per amendments A1, A3 above):**
+> - The save handler awaits `commands.saveUserAgent(...)` and receives a
+>   `SaveOutcome` (not `null`). On success, the editor invokes its
+>   `onSave(outcome)` parent callback (from `AgentsTab`) so the parent
+>   can render `outcome.orphan_left_behind`, when set, as a non-fatal
+>   warning toast alongside the success message. Dropping the
+>   `outcome` on the floor silently hides the rename-orphan condition.
+> - The editor does NOT re-define `type Mode = ...` inline. It receives
+>   `mode: AgentsTabMode` from the parent (or its own equivalent prop)
+>   and reuses the type imported from `$lib/agent-list-helpers`.
+> - For wrapper-level `ParseError` from `validate_draft_json_payload`:
+>   surface the message in the editor's inline error banner (above the
+>   panel body). Should never fire from the editor's own emitted JSON
+>   under normal use — if it does, the bug is in this slice's
+>   serializer, not the user's input.
+
 **Verification:**
 - [ ] Renders without TS errors
 - [ ] Cancel button discards (calls parent callback; no autosave per B13)
 - [ ] Save button calls parent with the draft + `from_name` + `detach`
+- [ ] **(post-amendment A1)** Save handler awaits `SaveOutcome` and forwards `orphan_left_behind` to the parent
+- [ ] **(post-amendment A3)** No inline `type Mode = ...` re-definition; imports `AgentsTabMode` from helpers
 - [ ] Disabled sections are visible but not clickable
 - [ ] **LOC overage** acknowledged: ~180 LOC, mostly markup
 
@@ -943,6 +1058,13 @@ export function buildSaveParams(choice: SaveChoice, fromName: string, draftJson:
 - [ ] Modal renders only when the row has lineage
 - [ ] Two clearly-labeled buttons; choice routes through `buildSaveParams`
 
+> **Amendment 2026-05-22 (per A1):**
+> The modal's contract is unchanged — it returns a `SaveChoice` to the
+> editor. Post-save `SaveOutcome` handling (rendering
+> `orphan_left_behind` warnings) is S13's responsibility, not S16's.
+> Documented here for adjacency so a future reader looking at the save
+> flow sees both halves.
+
 ---
 
 ### S17 — Playwright e2e CRUD round-trip
@@ -981,6 +1103,28 @@ env var convention isn't set up for agents-view fixtures yet).
 - [ ] Test passes against a clean tmpdir project
 - [ ] Each filesystem assertion runs after the corresponding UI action
 - [ ] Test handles the marketplace-agent case in a separate `test.describe` block (assert keep-linked vs detach pathways)
+
+> **Amendment 2026-05-22 (per A2):**
+> Add a `test.describe("IPC validation rejects malformed input")` block:
+> 1. Drive the editor into a state where save would emit non-JSON
+>    bytes (e.g., directly poke `commands.saveUserAgent` via
+>    `page.evaluate` with `draftJson = "{ not json"`), assert the
+>    promise rejects with `error_type === "ParseError"`, and assert no
+>    file lands at `<project>/.kiro/agents/<name>.json`.
+> 2. Repeat for `commands.createUserAgent`.
+>
+> If the editor's own serializer can never emit non-JSON (which it
+> shouldn't), this case exercises the wrapper guard directly via
+> `page.evaluate`, not via the UI. That's intentional — the
+> wrapper's job is to defend against a compromised or buggy
+> renderer, not against the legitimate happy path the editor
+> drives.
+>
+> Symlink-refusal cases for `duplicateUserAgent` (A4 variants) are
+> not added to slice-1 e2e — they require fixture setup
+> (creating a symlink inside the tmpdir) that's platform-fiddly on
+> Windows. The unit tests in `project.rs` cover the same shape and
+> are the canonical regression fence.
 
 ---
 
