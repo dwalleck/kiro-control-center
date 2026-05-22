@@ -1,4 +1,4 @@
-export type Tab = "Browse" | "Installed" | "Marketplaces" | "Kiro Settings";
+export type Tab = "Browse" | "Installed" | "Marketplaces" | "Agents" | "Kiro Settings";
 
 export interface SettingCategory {
   key: string;
