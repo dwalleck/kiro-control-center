@@ -1234,6 +1234,52 @@ impl KiroProject {
         Ok(rows)
     }
 
+    /// Atomically write a new user-authored agent JSON file.
+    ///
+    /// Validates `draft_name` via [`crate::validation::AgentName::new`]
+    /// (path-safety: no path separators, no `..`, no NUL / control
+    /// characters; existing `validate_name` rules) and rejects an
+    /// existing-file collision with [`AgentError::NameCollision`]
+    /// **before** writing. The runtime existence check is load-bearing:
+    /// silent overwrite would lose the prior user-authored content.
+    ///
+    /// Write goes through [`crate::cache::atomic_write`] so a crash
+    /// mid-write leaves the target either fully written or fully
+    /// absent.
+    ///
+    /// Slice S4 of the agents-view feature, design claim C3.
+    ///
+    /// # Errors
+    /// - [`AgentError::InvalidName`] — name fails validation.
+    /// - [`AgentError::NameCollision`] — `<agents_dir>/<name>.json` already exists.
+    /// - I/O / JSON errors during the write.
+    pub fn create_user_agent(
+        &self,
+        draft_name: &str,
+        draft_bytes: &[u8],
+    ) -> crate::error::Result<()> {
+        let name = validation::AgentName::new(draft_name).map_err(|e| AgentError::InvalidName {
+            reason: match e {
+                crate::error::ValidationError::InvalidName { reason, .. } => reason,
+                other => other.to_string(),
+            },
+        })?;
+        let agents_dir = self.agents_dir();
+        let target = agents_dir.join(format!("{}.json", name.as_str()));
+        if target.exists() {
+            return Err(AgentError::NameCollision {
+                name: name.into_inner(),
+            }
+            .into());
+        }
+        fs::create_dir_all(&agents_dir)?;
+        // atomic_write requires an absolute path; agents_dir() builds
+        // from the project root which is absolute by construction
+        // (KiroProject::new stores an absolute path).
+        crate::cache::atomic_write(&target, draft_bytes)?;
+        Ok(())
+    }
+
     // -- steering installation ---------------------------------------------
 
     /// The `.kiro/steering/` directory.
@@ -8755,6 +8801,95 @@ mod tests {
             project.kiro_dir().join("agents").is_dir(),
             "agents_dir created on view open (D9)"
         );
+    }
+
+    // -- create_user_agent (S4 stress fixture) -----------------------------
+
+    /// S4 happy path: create writes the file atomically, and a
+    /// subsequent list_user_agents call sees it.
+    #[test]
+    fn create_user_agent_writes_atomically_and_lists() {
+        let (_dir, project) = temp_project();
+        let bytes = br#"{"name": "new-agent", "tools": []}"#;
+        project
+            .create_user_agent("new-agent", bytes)
+            .expect("create ok");
+
+        let target = project.kiro_dir().join("agents/new-agent.json");
+        assert!(target.is_file());
+        assert_eq!(std::fs::read(&target).expect("read"), bytes);
+        // No .tmp file lingers from atomic_write.
+        assert!(!project.kiro_dir().join("agents/new-agent.tmp").exists());
+
+        let rows = project.list_user_agents().expect("list");
+        let names: Vec<&str> = rows.iter().map(|r| r.name.as_str()).collect();
+        assert_eq!(names, vec!["new-agent"]);
+    }
+
+    /// S4 validation: empty name is rejected by validate_name (no
+    /// `.json` file written).
+    #[test]
+    fn create_user_agent_rejects_empty_name() {
+        let (_dir, project) = temp_project();
+        let err = project
+            .create_user_agent("", br#"{}"#)
+            .expect_err("must reject");
+        assert!(
+            matches!(
+                err,
+                crate::error::Error::Agent(AgentError::InvalidName { .. })
+            ),
+            "expected AgentError::InvalidName, got {err:?}"
+        );
+    }
+
+    /// S4 validation: path-separator name is rejected (path safety).
+    /// Note: the spec's UI-side regex (^[a-z0-9][a-z0-9-]*$) lives in
+    /// the frontend (slice S14). The backend's validate_name rejects
+    /// path-unsafe inputs only — matches the design bundle's "name
+    /// regex is a UI affordance only" rule.
+    #[test]
+    fn create_user_agent_rejects_path_separator() {
+        let (_dir, project) = temp_project();
+        let err = project
+            .create_user_agent("foo/bar", br#"{}"#)
+            .expect_err("must reject path separator");
+        assert!(matches!(
+            err,
+            crate::error::Error::Agent(AgentError::InvalidName { .. })
+        ));
+        // And the agents dir was NOT polluted.
+        let agents = project.kiro_dir().join("agents");
+        if agents.is_dir() {
+            assert!(std::fs::read_dir(&agents).expect("read").next().is_none());
+        }
+    }
+
+    /// S4 collision: pre-write a file, call create with the same name,
+    /// assert NameCollision AND the existing file's bytes are unchanged.
+    /// Bug class this defeats: a naive `fs::write` (or `atomic_write`
+    /// without a prior `Path::exists` guard) would silently overwrite.
+    #[test]
+    fn create_user_agent_rejects_existing_collision_without_overwrite() {
+        let (_dir, project) = temp_project();
+        std::fs::create_dir_all(project.kiro_dir().join("agents")).expect("agents dir");
+        let target = project.kiro_dir().join("agents/foo.json");
+        std::fs::write(&target, b"ORIGINAL_BYTES").expect("seed file");
+        let before = std::fs::read(&target).expect("read pre");
+
+        let err = project
+            .create_user_agent("foo", b"REPLACEMENT_BYTES_SHOULD_NOT_LAND")
+            .expect_err("must collide");
+        assert!(
+            matches!(
+                err,
+                crate::error::Error::Agent(AgentError::NameCollision { ref name }) if name == "foo"
+            ),
+            "expected NameCollision for `foo`, got {err:?}"
+        );
+
+        let after = std::fs::read(&target).expect("read post");
+        assert_eq!(before, after, "existing file must NOT be overwritten");
     }
 
     #[test]

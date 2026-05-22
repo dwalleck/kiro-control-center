@@ -785,7 +785,15 @@ fn companion_conflicts_from_error(err: &crate::error::AgentError) -> Vec<std::pa
         | AgentError::ContentChangedRequiresForce { .. }
         | AgentError::MultipleScanRootsNotSupported { .. }
         | AgentError::SourceHardlinked { .. }
-        | AgentError::InstallFailed { .. } => Vec::new(),
+        | AgentError::InstallFailed { .. }
+        // User-authored save/duplicate failures (slice S4+ of agents-view):
+        // these arise in the Workflows > Agents authoring surface, never in
+        // the marketplace install pipeline, so they cannot produce
+        // companion-file conflicts.
+        | AgentError::InvalidName { .. }
+        | AgentError::NameCollision { .. }
+        | AgentError::DuplicateSourceNotFound { .. }
+        | AgentError::DuplicateNameSpaceExhausted { .. } => Vec::new(),
     }
 }
 
