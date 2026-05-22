@@ -1258,12 +1258,7 @@ impl KiroProject {
         draft_name: &str,
         draft_bytes: &[u8],
     ) -> crate::error::Result<()> {
-        let name = validation::AgentName::new(draft_name).map_err(|e| AgentError::InvalidName {
-            reason: match e {
-                crate::error::ValidationError::InvalidName { reason, .. } => reason,
-                other => other.to_string(),
-            },
-        })?;
+        let name = Self::validate_user_agent_name(draft_name)?;
         let agents_dir = self.agents_dir();
         let target = agents_dir.join(format!("{}.json", name.as_str()));
         if target.exists() {
@@ -1278,6 +1273,121 @@ impl KiroProject {
         // (KiroProject::new stores an absolute path).
         crate::cache::atomic_write(&target, draft_bytes)?;
         Ok(())
+    }
+
+    /// Save an edited user-authored agent. One method, three orthogonal
+    /// shapes:
+    ///
+    /// - **In-place edit** (`from_name == draft_name`, no rename) —
+    ///   overwrites `<from_name>.json` with `draft_bytes`.
+    /// - **Rename** (`from_name != draft_name`) — atomically writes
+    ///   `<draft_name>.json`, then best-effort unlinks `<from_name>.json`.
+    /// - **Detach** (`detach == true`) — removes the `from_name` entry
+    ///   from `InstalledAgents::agents` if present, persisting the
+    ///   tracking file. No-op if the agent has no tracking entry.
+    ///
+    /// All work runs under [`crate::file_lock::with_file_lock`] on the
+    /// agent tracking path, the same lock used by `install_native_agent`
+    /// and `remove_agent`. Serialises concurrent saves on the same
+    /// project.
+    ///
+    /// Ordering inside the lock (file-first, symmetric with
+    /// `install_native_agent`):
+    /// 1. Collision check: if `from_name != draft_name` AND
+    ///    `<draft_name>.json` exists, return `NameCollision`. **No
+    ///    writes.** Defeats the bug class of "write before checking
+    ///    target."
+    /// 2. Atomic write of `<draft_name>.json`.
+    /// 3. If renaming, unlink `<from_name>.json`. `NotFound` is fine
+    ///    (the caller may have stale state); other I/O errors are
+    ///    logged and swallowed — the new file is correctly in place
+    ///    and the old one is at worst an orphan.
+    /// 4. If `detach`, drop the `from_name` entry from tracking and
+    ///    re-persist. No-op if no entry exists.
+    ///
+    /// Crash semantics:
+    /// - Crash between (2) and (3): both files exist with new content
+    ///   under the new name and old content under the old. The next
+    ///   save would either rename again or remove the old.
+    /// - Crash between (3) and (4): file renamed but tracking still
+    ///   links — falls into the existing `ContentChangedRequiresForce`
+    ///   path on the next marketplace install attempt.
+    ///
+    /// Slice S5 of agents-view, design claim C4.
+    ///
+    /// # Errors
+    /// - [`AgentError::InvalidName`] for either name.
+    /// - [`AgentError::NameCollision`] on rename target collision.
+    /// - I/O / JSON errors from the write or tracking update.
+    pub fn save_user_agent(
+        &self,
+        from_name: &str,
+        draft_name: &str,
+        draft_bytes: &[u8],
+        detach: bool,
+    ) -> crate::error::Result<()> {
+        let from = Self::validate_user_agent_name(from_name)?;
+        let target = Self::validate_user_agent_name(draft_name)?;
+        let agents_dir = self.agents_dir();
+        let from_path = agents_dir.join(format!("{}.json", from.as_str()));
+        let target_path = agents_dir.join(format!("{}.json", target.as_str()));
+        let is_rename = from.as_str() != target.as_str();
+
+        crate::file_lock::with_file_lock(&self.agent_tracking_path(), || {
+            // (1) Collision check happens BEFORE any write.
+            if is_rename && target_path.exists() {
+                return Err(AgentError::NameCollision {
+                    name: target.clone().into_inner(),
+                }
+                .into());
+            }
+            fs::create_dir_all(&agents_dir)?;
+            // (2) Atomic write of the new content under the (possibly new) name.
+            crate::cache::atomic_write(&target_path, draft_bytes)?;
+            // (3) Unlink old file iff renaming. Best-effort.
+            if is_rename {
+                match fs::remove_file(&from_path) {
+                    Ok(()) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                        debug!(
+                            path = %from_path.display(),
+                            "save_user_agent: old file already absent on rename"
+                        );
+                    }
+                    Err(e) => {
+                        warn!(
+                            path = %from_path.display(),
+                            error = %e,
+                            "save_user_agent: failed to unlink old file post-rename; new file is in place, old is orphaned"
+                        );
+                    }
+                }
+            }
+            // (4) Detach from marketplace tracking if requested.
+            if detach {
+                let mut installed = self.load_installed_agents()?;
+                if installed.agents.remove(from.as_str()).is_some() {
+                    self.write_agent_tracking(&installed)?;
+                }
+            }
+            Ok(())
+        })
+    }
+
+    /// Shared name-validation helper for the user-authored save/delete/
+    /// duplicate paths. Maps the validation error to the agent surface's
+    /// `InvalidName` variant rather than letting the workspace `Error`
+    /// chain swallow it as `Validation(_)`.
+    fn validate_user_agent_name(name: &str) -> crate::error::Result<validation::AgentName> {
+        validation::AgentName::new(name).map_err(|e| {
+            AgentError::InvalidName {
+                reason: match e {
+                    crate::error::ValidationError::InvalidName { reason, .. } => reason,
+                    other => other.to_string(),
+                },
+            }
+            .into()
+        })
     }
 
     // -- steering installation ---------------------------------------------
@@ -8890,6 +9000,161 @@ mod tests {
 
         let after = std::fs::read(&target).expect("read post");
         assert_eq!(before, after, "existing file must NOT be overwritten");
+    }
+
+    // -- save_user_agent (S5 stress fixture, 5 cases) ----------------------
+
+    /// S5 case 1 — in-place edit: from_name == draft.name, no rename,
+    /// untracked. Overwrites file content; no other file appears; no
+    /// tracking mutation.
+    #[test]
+    fn save_user_agent_in_place_overwrites() {
+        let (_dir, project) = temp_project();
+        std::fs::create_dir_all(project.kiro_dir().join("agents")).expect("agents dir");
+        let foo = project.kiro_dir().join("agents/foo.json");
+        std::fs::write(&foo, b"v1").expect("seed v1");
+
+        project
+            .save_user_agent("foo", "foo", b"v2", false)
+            .expect("save in-place");
+        assert_eq!(std::fs::read(&foo).expect("read"), b"v2");
+        // No bar.json created.
+        assert!(!project.kiro_dir().join("agents/bar.json").exists());
+        // No tracking file written (no detach, no existing tracking).
+        assert!(!project.kiro_dir().join(INSTALLED_AGENTS_FILE).exists());
+    }
+
+    /// S5 case 2 — rename, no collision: from_name != draft.name,
+    /// target free. New file appears with new content; old file gone.
+    #[test]
+    fn save_user_agent_rename_writes_new_then_unlinks_old() {
+        let (_dir, project) = temp_project();
+        std::fs::create_dir_all(project.kiro_dir().join("agents")).expect("agents dir");
+        let foo = project.kiro_dir().join("agents/foo.json");
+        let bar = project.kiro_dir().join("agents/bar.json");
+        std::fs::write(&foo, b"old").expect("seed foo");
+
+        project
+            .save_user_agent("foo", "bar", b"renamed", false)
+            .expect("save rename");
+        assert!(!foo.exists(), "old file must be unlinked");
+        assert_eq!(std::fs::read(&bar).expect("read bar"), b"renamed");
+    }
+
+    /// S5 case 3 — rename collision (adversarial): pre-write foo AND
+    /// bar with DIFFERENT content. Save("foo" -> "bar", ...) must
+    /// return NameCollision AND BOTH files unchanged. Bug class
+    /// defeated: write-before-collision-check, which would corrupt bar.
+    #[test]
+    fn save_user_agent_rename_collision_leaves_both_unchanged() {
+        let (_dir, project) = temp_project();
+        std::fs::create_dir_all(project.kiro_dir().join("agents")).expect("agents dir");
+        let foo = project.kiro_dir().join("agents/foo.json");
+        let bar = project.kiro_dir().join("agents/bar.json");
+        std::fs::write(&foo, b"FOO_ORIGINAL").expect("seed foo");
+        std::fs::write(&bar, b"BAR_ORIGINAL_DO_NOT_CORRUPT").expect("seed bar");
+        let foo_before = std::fs::read(&foo).expect("read foo pre");
+        let bar_before = std::fs::read(&bar).expect("read bar pre");
+
+        let err = project
+            .save_user_agent("foo", "bar", b"WOULD_OVERWRITE_BAR", false)
+            .expect_err("rename onto existing bar must collide");
+        assert!(
+            matches!(
+                err,
+                crate::error::Error::Agent(AgentError::NameCollision { ref name }) if name == "bar"
+            ),
+            "expected NameCollision for `bar`, got {err:?}"
+        );
+        // CRITICAL: both pre/post byte-equality assertions.
+        assert_eq!(std::fs::read(&foo).expect("post foo"), foo_before);
+        assert_eq!(std::fs::read(&bar).expect("post bar"), bar_before);
+    }
+
+    /// S5 case 4 — detach=true on a tracked agent: the InstalledAgents
+    /// entry is removed AND the file has the new content.
+    #[test]
+    fn save_user_agent_detach_removes_tracking_entry() {
+        use chrono::Utc;
+        let (_dir, project) = temp_project();
+        std::fs::create_dir_all(project.kiro_dir().join("agents")).expect("agents dir");
+        let agent_path = project.kiro_dir().join("agents/m-agent.json");
+        std::fs::write(&agent_path, b"v1").expect("seed file");
+
+        let now = Utc::now();
+        std::fs::write(
+            project.kiro_dir().join(INSTALLED_AGENTS_FILE),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "agents": {
+                    "m-agent": {
+                        "marketplace": "mp",
+                        "plugin": "p",
+                        "version": "1.0.0",
+                        "installed_at": now,
+                        "dialect": "native",
+                        "source_path": "agents/m-agent.json",
+                        "source_hash": "blake3:0000000000000000000000000000000000000000000000000000000000000000",
+                        "installed_hash": "blake3:0000000000000000000000000000000000000000000000000000000000000000",
+                    }
+                },
+                "native_companions": {},
+            }))
+            .expect("ser"),
+        )
+        .expect("write tracking");
+
+        project
+            .save_user_agent("m-agent", "m-agent", b"v2-edited", true)
+            .expect("save with detach");
+        assert_eq!(std::fs::read(&agent_path).expect("post"), b"v2-edited");
+        let tracking = project.load_installed_agents().expect("load tracking post");
+        assert!(
+            !tracking.agents.contains_key("m-agent"),
+            "detach=true must remove the tracking entry"
+        );
+    }
+
+    /// S5 case 5 — detach=false on a tracked agent: tracking entry is
+    /// PRESERVED. This is the "edit-but-stay-linked" path. The new
+    /// content lands; tracking is unmodified.
+    #[test]
+    fn save_user_agent_no_detach_preserves_tracking() {
+        use chrono::Utc;
+        let (_dir, project) = temp_project();
+        std::fs::create_dir_all(project.kiro_dir().join("agents")).expect("agents dir");
+        let agent_path = project.kiro_dir().join("agents/m-agent.json");
+        std::fs::write(&agent_path, b"v1").expect("seed");
+
+        let now = Utc::now();
+        std::fs::write(
+            project.kiro_dir().join(INSTALLED_AGENTS_FILE),
+            serde_json::to_vec_pretty(&serde_json::json!({
+                "agents": {
+                    "m-agent": {
+                        "marketplace": "mp",
+                        "plugin": "p",
+                        "version": "1.0.0",
+                        "installed_at": now,
+                        "dialect": "native",
+                        "source_path": "agents/m-agent.json",
+                        "source_hash": "blake3:0000000000000000000000000000000000000000000000000000000000000000",
+                        "installed_hash": "blake3:0000000000000000000000000000000000000000000000000000000000000000",
+                    }
+                },
+                "native_companions": {},
+            }))
+            .expect("ser"),
+        )
+        .expect("write tracking");
+
+        project
+            .save_user_agent("m-agent", "m-agent", b"v2", false)
+            .expect("save no-detach");
+        let tracking = project.load_installed_agents().expect("load post");
+        assert!(
+            tracking.agents.contains_key("m-agent"),
+            "detach=false must preserve the tracking entry"
+        );
     }
 
     #[test]
