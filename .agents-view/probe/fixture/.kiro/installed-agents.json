@@ -1,0 +1,25 @@
+{
+  "agents": {
+    "marketplace-tracked": {
+      "marketplace": "fixture-market",
+      "plugin": "fixture-plugin",
+      "version": "1.2.3",
+      "installed_at": "2026-05-15T10:00:00.000000Z",
+      "dialect": "native",
+      "source_path": "agents/marketplace-tracked.json",
+      "source_hash": "blake3:0000000000000000000000000000000000000000000000000000000000000000",
+      "installed_hash": "blake3:0000000000000000000000000000000000000000000000000000000000000000"
+    },
+    "orphan-tracking": {
+      "marketplace": "fixture-market",
+      "plugin": "fixture-plugin",
+      "version": "1.2.3",
+      "installed_at": "2026-05-15T10:00:01.000000Z",
+      "dialect": "native",
+      "source_path": "agents/orphan-tracking.json",
+      "source_hash": "blake3:1111111111111111111111111111111111111111111111111111111111111111",
+      "installed_hash": "blake3:1111111111111111111111111111111111111111111111111111111111111111"
+    }
+  },
+  "native_companions": {}
+}

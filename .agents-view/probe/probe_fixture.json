@@ -1,0 +1,26 @@
+[
+  {
+    "description": "Installed via marketplace, tracking entry present",
+    "hooks_count": 1,
+    "lineage": {
+      "marketplace": "fixture-market",
+      "plugin": "fixture-plugin",
+      "version": "1.2.3"
+    },
+    "mcp_count": 1,
+    "model": "claude-opus-4-7",
+    "name": "marketplace-tracked",
+    "resources_count": 2,
+    "tools_count": 3
+  },
+  {
+    "description": "Hand-written agent with no marketplace lineage",
+    "hooks_count": 0,
+    "lineage": null,
+    "mcp_count": 0,
+    "model": "claude-sonnet-4-6",
+    "name": "user-authored",
+    "resources_count": 1,
+    "tools_count": 2
+  }
+]

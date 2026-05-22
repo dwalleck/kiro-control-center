@@ -1,0 +1,8 @@
+{
+  "$schema": "../agent-schema.json",
+  "description": "Has no name field — parse_native would reject this; serde_json::Value should accept it",
+  "model": null,
+  "tools": ["fs_read"],
+  "mcpServers": {},
+  "resources": []
+}

@@ -1,0 +1,12 @@
+{
+  "$schema": "../agent-schema.json",
+  "name": "user-authored",
+  "description": "Hand-written agent with no marketplace lineage",
+  "model": "claude-sonnet-4-6",
+  "prompt": "You are a helpful local assistant.",
+  "tools": ["fs_read", "execute_bash"],
+  "allowedTools": ["fs_read"],
+  "mcpServers": {},
+  "resources": ["file://README.md"],
+  "hooks": {}
+}
