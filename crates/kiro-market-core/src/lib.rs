@@ -20,6 +20,7 @@ pub mod skill;
 pub mod steering;
 #[cfg(any(test, feature = "test-support"))]
 pub mod test_utils;
+pub mod user_agent;
 pub mod validation;
 
 /// Path to the marketplace manifest within a marketplace repository.

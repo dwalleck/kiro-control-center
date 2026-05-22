@@ -1,0 +1,100 @@
+[
+  {
+    "description": "General-purpose code reviewer. Covers project-guideline compliance, bug detection, code quality, and any concern not handled by a specialist. Runs standalone or as part of the orchestrated review.",
+    "hooks_count": 0,
+    "lineage": {
+      "marketplace": "kiro-starter-kit",
+      "plugin": "kiro-code-reviewer-v2",
+      "version": "0.1.0"
+    },
+    "mcp_count": 0,
+    "model": null,
+    "name": "code-reviewer",
+    "resources_count": 5,
+    "tools_count": 5
+  },
+  {
+    "description": "Simplifies recently-modified code for clarity and maintainability while preserving exact functionality. Runs last in the review sequence as a polish step. Modifies code \u2014 does not produce findings.",
+    "hooks_count": 0,
+    "lineage": {
+      "marketplace": "kiro-starter-kit",
+      "plugin": "kiro-code-reviewer-v2",
+      "version": "0.1.0"
+    },
+    "mcp_count": 0,
+    "model": null,
+    "name": "code-simplifier",
+    "resources_count": 5,
+    "tools_count": 6
+  },
+  {
+    "description": "Audits code comments for accuracy, completeness, and long-term maintainability. Cross-references every claim in a comment against the actual code to catch stale or misleading documentation. Advisory only \u2014 does not modify code.",
+    "hooks_count": 0,
+    "lineage": {
+      "marketplace": "kiro-starter-kit",
+      "plugin": "kiro-code-reviewer-v2",
+      "version": "0.1.0"
+    },
+    "mcp_count": 0,
+    "model": null,
+    "name": "comment-analyzer",
+    "resources_count": 5,
+    "tools_count": 5
+  },
+  {
+    "description": "Reviews PR test coverage and quality. Focuses on behavioral coverage, test resilience to refactoring, assertion specificity, and coverage of error paths and edge cases for the PR's changes.",
+    "hooks_count": 0,
+    "lineage": {
+      "marketplace": "kiro-starter-kit",
+      "plugin": "kiro-code-reviewer-v2",
+      "version": "0.1.0"
+    },
+    "mcp_count": 0,
+    "model": null,
+    "name": "pr-test-analyzer",
+    "resources_count": 5,
+    "tools_count": 5
+  },
+  {
+    "description": "Orchestrates comprehensive PR reviews by coordinating specialized review agents. Selects applicable specialists, batches them (\u22644 parallel), verifies Critical/Important findings via LSP, enforces evidence standards, aggregates findings, and decides the final verdict.",
+    "hooks_count": 0,
+    "lineage": {
+      "marketplace": "kiro-starter-kit",
+      "plugin": "kiro-code-reviewer-v2",
+      "version": "0.1.0"
+    },
+    "mcp_count": 0,
+    "model": null,
+    "name": "review-orchestrator",
+    "resources_count": 5,
+    "tools_count": 7
+  },
+  {
+    "description": "Audits error-handling code for silent failures, inadequate catch blocks, and user-hostile error messages. Specialized in catch-block specificity, fallback scrutiny, and user-facing error message quality.",
+    "hooks_count": 0,
+    "lineage": {
+      "marketplace": "kiro-starter-kit",
+      "plugin": "kiro-code-reviewer-v2",
+      "version": "0.1.0"
+    },
+    "mcp_count": 0,
+    "model": null,
+    "name": "silent-failure-hunter",
+    "resources_count": 5,
+    "tools_count": 5
+  },
+  {
+    "description": "Analyzes type design for invariant strength, encapsulation, and practical usefulness. Produces per-type ratings across four design dimensions and flags types whose invariants are weak, inconsistent, or under-enforced.",
+    "hooks_count": 0,
+    "lineage": {
+      "marketplace": "kiro-starter-kit",
+      "plugin": "kiro-code-reviewer-v2",
+      "version": "0.1.0"
+    },
+    "mcp_count": 0,
+    "model": null,
+    "name": "type-design-analyzer",
+    "resources_count": 5,
+    "tools_count": 5
+  }
+]

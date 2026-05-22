@@ -423,6 +423,62 @@ pub enum AgentError {
         #[source]
         source: Box<crate::error::Error>,
     },
+
+    // -----------------------------------------------------------------
+    // User-authored agent surface (Control Center "Workflows > Agents")
+    // create / save / duplicate failures. Distinct from the install
+    // surface above: there is no marketplace plugin context, the user
+    // is authoring agents directly.
+    // -----------------------------------------------------------------
+    /// The draft's `name` violates the [`crate::validation::AgentName`]
+    /// regex (empty, leading hyphen, uppercase, etc.). Carries the
+    /// validator's reason so the UI surfaces the actionable detail.
+    #[error("agent name is invalid: {reason}")]
+    InvalidName { reason: String },
+
+    /// A file already exists at the target `<name>.json` path on create
+    /// or rename. The target file is not modified. The user must pick a
+    /// different name or delete the existing agent first.
+    #[error("an agent named `{name}` already exists at the target path")]
+    NameCollision { name: String },
+
+    /// The source agent for a duplicate operation does not exist on disk.
+    #[error("cannot duplicate `{name}`: source file not found")]
+    DuplicateSourceNotFound { name: String },
+
+    /// The source agent for a duplicate operation is a symlink. Refused
+    /// because following the link would copy bytes from an arbitrary
+    /// host file into a regular file under `.kiro/agents/`, exposing
+    /// them to subsequent reads via the list endpoint.
+    #[error("cannot duplicate `{name}`: source is a symlink (refused)")]
+    DuplicateSourceSymlinked { name: String },
+
+    /// The source agent for a duplicate operation is not a regular
+    /// file (e.g. a directory `<agents_dir>/<name>.json/`). Refused
+    /// because `fs::read` would fail unpredictably and any partial
+    /// write would leave inconsistent state.
+    #[error("cannot duplicate `{name}`: source is not a regular file (refused)")]
+    DuplicateSourceNotAFile { name: String },
+
+    /// The source agent file exceeds the byte cap accepted by the
+    /// duplicate path. Without this cap a hand-edited multi-GB file in
+    /// `.kiro/agents/` could OOM the process via the unbounded
+    /// `fs::read` call.
+    #[error("cannot duplicate `{name}`: source is {size} bytes, exceeds cap of {cap}")]
+    DuplicateSourceTooLarge { name: String, size: u64, cap: u64 },
+
+    /// The duplicate name-walker exceeded its sanity cap without finding
+    /// a free `<source_name>-copy[-N]` slot. Indicates either an absurd
+    /// pre-existing chain or a bug in the walker.
+    ///
+    /// Field is named `source_name` rather than `source` because
+    /// thiserror reserves the `source` field name for `Error::source()`
+    /// chaining; a `String` cannot satisfy that bound.
+    #[error(
+        "exhausted the duplicate-name search space for source `{source_name}` \
+         (tried up to `-copy-{cap}`)"
+    )]
+    DuplicateNameSpaceExhausted { source_name: String, cap: u32 },
 }
 
 // ---------------------------------------------------------------------------

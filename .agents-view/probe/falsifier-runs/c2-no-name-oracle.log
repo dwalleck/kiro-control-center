@@ -1,0 +1,36 @@
+[
+  {
+    "name": "marketplace-tracked",
+    "description": "Installed via marketplace, tracking entry present",
+    "model": "claude-opus-4-7",
+    "tools_count": 3,
+    "mcp_count": 1,
+    "resources_count": 2,
+    "hooks_count": 1,
+    "lineage": {
+      "marketplace": "fixture-market",
+      "plugin": "fixture-plugin",
+      "version": "1.2.3"
+    }
+  },
+  {
+    "name": "no-name",
+    "description": "Has no name field — parse_native would reject this; serde_json::Value should accept it",
+    "model": null,
+    "tools_count": 1,
+    "mcp_count": 0,
+    "resources_count": 0,
+    "hooks_count": 0,
+    "lineage": null
+  },
+  {
+    "name": "user-authored",
+    "description": "Hand-written agent with no marketplace lineage",
+    "model": "claude-sonnet-4-6",
+    "tools_count": 2,
+    "mcp_count": 0,
+    "resources_count": 1,
+    "hooks_count": 0,
+    "lineage": null
+  }
+]

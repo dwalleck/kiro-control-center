@@ -18,6 +18,7 @@
   const navGroups: { label: string; items: { id: Tab; hasSubItems?: boolean }[] }[] = [
     { label: "Skills", items: [{ id: "Browse" }, { id: "Installed" }] },
     { label: "Sources", items: [{ id: "Marketplaces" }] },
+    { label: "Workflows", items: [{ id: "Agents" }] },
     { label: "Configuration", items: [{ id: "Kiro Settings", hasSubItems: true }] },
   ];
 </script>
