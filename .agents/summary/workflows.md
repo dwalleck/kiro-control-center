@@ -1,211 +1,232 @@
 # Workflows
 
-## Add Marketplace
+<!-- tags: workflows, processes, sequences -->
+
+## 1. Add Marketplace
 
 ```mermaid
 sequenceDiagram
     participant User
-    participant Frontend as CLI/Desktop
+    participant CLI/UI
     participant Service as MarketplaceService
     participant Cache as CacheDir
-    participant Git as GitBackend
+    participant Git
 
-    User->>Frontend: add "owner/repo"
-    Frontend->>Service: add(opts)
-    Service->>Cache: detect(source)
-    Cache-->>Service: MarketplaceSource::GitHubShorthand
-    Service->>Service: Check InsecureHttpPolicy
-    Service->>Cache: add_known_marketplace(name, source)
-    Service->>Git: clone_repo(url, dest, options)
-    Git-->>Service: sha
-    Service->>Service: Try read marketplace.json
-    alt manifest exists
-        Service->>Service: Parse plugin entries from manifest
-    else no manifest
-        Service->>Service: Scan for plugin.json at depth 1-3
+    User->>CLI/UI: marketplace add <source>
+    CLI/UI->>Service: add(source, opts)
+    Service->>Cache: detect source type (GitHub/git URL/local)
+    alt local path
+        Service->>Cache: create_local_link (symlink/junction/copy)
+    else remote
+        Service->>Git: clone_repo(url, dest, opts)
+        Git-->>Service: cloned
     end
-    Service->>Cache: write_plugin_registry(entries)
-    Service-->>Frontend: MarketplaceAddResult
-    Frontend-->>User: "Added with N plugins"
+    Service->>Cache: register_known_marketplace_unlocked
+    Service->>Service: build_registry_entries (scan + manifest merge)
+    Service->>Cache: write_plugin_registry
+    Service-->>CLI/UI: MarketplaceAddResult { plugins }
 ```
 
-**Key behaviors:**
-- Local paths use symlinks/junctions instead of cloning
-- Duplicate marketplace names are rejected
-- `http://` URLs rejected unless `InsecureHttpPolicy::Allow`
-- Failed clones trigger `DirCleanupGuard` to remove partial state
-- Plugin registry is persisted for fast subsequent lookups
+**Key details:**
+- Source detection in `cache.rs::detect()` — handles GitHub shorthand (`owner/repo`), HTTPS/SSH URLs, local paths, file URLs
+- `http://` rejected unless `allow_insecure_http: true`
+- Duplicate marketplace names return an error
+- Plugin registry is written atomically
 
 ---
 
-## Install Skills
+## 2. Plugin Install (Full)
 
 ```mermaid
 sequenceDiagram
     participant User
-    participant Frontend as CLI/Desktop
+    participant CLI/UI
     participant Service as MarketplaceService
+    participant Browse as service/browse.rs
     participant Project as KiroProject
-    participant FS as File System
+    participant FS
 
-    User->>Frontend: install "plugin@marketplace"
-    Frontend->>Service: resolve_plugin_install_context()
-    Service->>Service: Find marketplace in cache
-    Service->>Service: Resolve plugin directory
-    Service->>Service: Read plugin.json (or use defaults)
-    Service-->>Frontend: PluginInstallContext
-
-    Frontend->>Service: install_skills(context, project, filter, mode)
-    loop Each skill directory
-        Service->>Service: Parse SKILL.md frontmatter
-        Service->>Service: Validate name
-        Service->>Project: install_skill_from_dir(name, source)
-        Project->>FS: Acquire file lock
-        Project->>FS: Check for existing skill
-        alt exists and not force
-            Project-->>Service: Error (duplicate)
-        else
-            Project->>FS: Copy skill dir to .kiro/skills/{name}/
-            Project->>FS: Update installed-skills.json
-            Project-->>Service: OK
-        end
+    User->>CLI/UI: install plugin@marketplace
+    CLI/UI->>Service: install_plugin(ctx)
+    Service->>Browse: resolve_plugin_install_context
+    Browse->>FS: read plugin.json (if present)
+    Browse-->>Service: PluginInstallContext { skill_dirs, agent_paths, steering_paths, format, version }
+    Service->>Service: install_skills(...)
+    loop each skill dir
+        Service->>FS: read SKILL.md frontmatter
+        Service->>Project: install_skill_from_dir (hash check → stage → promote)
     end
-    Service-->>Frontend: InstallSkillsResult
+    Service->>Service: install_plugin_agents(...)
+    loop each agent file
+        Service->>FS: parse agent (Claude/Copilot/Native dispatch)
+        Service->>Project: install_agent (stage → promote → write tracking)
+    end
+    Service->>Service: install_plugin_steering(...)
+    loop each steering file
+        Service->>Project: install_steering_file (hash check → stage → promote)
+    end
+    Service-->>CLI/UI: InstallPluginResult { skills, agents, steering }
 ```
 
-**Key behaviors:**
-- Skills are copied (not linked) to `.kiro/skills/{name}/SKILL.md`
-- Multi-file skills with companion `.md` references are merged into single file
-- File lock serializes concurrent installs of the same skill name
-- `--force` overwrites existing; removes stale files from prior version
-- Source and installed content hashes (BLAKE3) tracked for change detection
+**Key details:**
+- `InstallMode::Force` overwrites existing; default mode rejects duplicates
+- BLAKE3 hashes compared: if source hash matches installed hash, install is skipped (idempotent)
+- MCP agents blocked unless `accept_mcp: true`
+- `DirCleanupGuard` ensures staging dirs are removed on failure
+- Tracking files updated atomically under `fs4` lock
 
 ---
 
-## Install Agents
-
-```mermaid
-sequenceDiagram
-    participant Service as MarketplaceService
-    participant Agent as Agent Module
-    participant Project as KiroProject
-    participant FS as File System
-
-    Service->>Agent: discover_agents_in_dirs(scan_paths)
-    Agent-->>Service: Vec<DiscoveredFile>
-
-    alt format == "kiro-cli" (native)
-        loop Each .json agent file
-            Service->>Agent: parse_native_kiro_agent_file()
-            Service->>Service: Check for MCP servers
-            alt has MCP and !accept_mcp
-                Service->>Service: Add to warnings (skipped)
-            else
-                Service->>Project: install_native_agent(source, name)
-                Project->>FS: Copy JSON verbatim + track hashes
-            end
-        end
-    else translated (Claude/Copilot)
-        loop Each .md/.agent.md file
-            Service->>Agent: parse_agent_file()
-            Agent-->>Service: AgentDefinition
-            Service->>Agent: map tools to Kiro equivalents
-            Service->>Service: Check for MCP servers
-            alt has MCP and !accept_mcp
-                Service->>Service: Add to warnings (skipped)
-            else
-                Service->>Agent: build_kiro_json(definition)
-                Service->>Project: install_agent(json, prompt, name)
-                Project->>FS: Write .kiro/agents/{name}.json
-                Project->>FS: Write .kiro/agents/prompts/{name}.md
-                Project->>FS: Update installed-agents.json
-            end
-        end
-    end
-```
-
-**Key behaviors:**
-- MCP-bearing agents require explicit `--accept-mcp` opt-in
-- Native agents (format: "kiro-cli") are copied verbatim
-- Translated agents produce JSON config + prompt markdown
-- Tool names are mapped between dialects (unmapped tools generate warnings)
-- Companion files (native) are tracked separately for cross-plugin collision detection
-- RAII rollback removes partial writes if tracking update fails
-
----
-
-## Update Marketplace
+## 3. Skill Install (Detail)
 
 ```mermaid
 flowchart TD
-    Start["update(name?)"] --> Check{name provided?}
-    Check -->|yes| Single["Find marketplace by name"]
-    Check -->|no| All["Load all known marketplaces"]
-    Single --> Pull
-    All --> Pull["For each: pull_repo()"]
-    Pull --> Regen["Regenerate plugin registry"]
-    Regen --> Result["UpdateResult<br/>{updated, failed, skipped}"]
+    A[install_skill_from_dir] --> B{Force mode?}
+    B -->|No| C{Already installed?}
+    C -->|Yes, same hash| D[Skip — idempotent]
+    C -->|Yes, different hash| E[Error: ContentChangedRequiresForce]
+    C -->|No| F[Stage files to tempdir]
+    B -->|Yes| F
+    F --> G[copy_dir_recursive — skips symlinks/hardlinks]
+    G --> H[Compute BLAKE3 hashes]
+    H --> I[Write tracking entry under fs4 lock]
+    I --> J[Move staged files to .kiro/skills/name/]
+    J --> K[defuse DirCleanupGuard]
 ```
-
-**Key behaviors:**
-- Local (linked) marketplaces are skipped (no remote to pull from)
-- Pull failures are recorded but don't abort other updates
-- Plugin registry is regenerated after successful pull
 
 ---
 
-## Cache Prune
+## 4. Agent Conversion (Translated Format)
 
 ```mermaid
 flowchart TD
-    Start["prune_orphans(mode)"] --> Dirs["Scan marketplace dirs"]
-    Dirs --> OrphanDirs["Remove dirs not in known-marketplaces.json"]
-    Start --> Staging["Scan for _pending_* dirs"]
-    Staging --> RemoveStaging["Remove stale staging dirs"]
-    Start --> Registries["Scan registries/ dir"]
-    Registries --> OrphanReg["Remove .json files for unknown marketplaces"]
-    Start --> Locks["Scan for .lock files"]
-    Locks --> StaleLocks["Remove locks whose target dir is gone"]
-    
-    OrphanDirs --> Report["PruneReport"]
-    RemoveStaging --> Report
-    OrphanReg --> Report
-    StaleLocks --> Report
+    A[Agent file discovered] --> B{Detect dialect}
+    B -->|.agent.md suffix| C[parse_copilot_agent]
+    B -->|plain .md| D[parse_claude_agent]
+    B -->|.json| E[parse_native_kiro_agent_file]
+    C --> F[Extract name, tools, MCP servers]
+    D --> F
+    E --> G[NativeAgentBundle — write verbatim]
+    F --> H{Has MCP servers?}
+    H -->|Yes, accept_mcp=false| I[Warning — skip agent]
+    H -->|Yes, accept_mcp=true| J[map tools to Kiro format]
+    H -->|No| J
+    J --> K[build_kiro_json — emit JSON + prompt URI]
+    K --> L[Write .kiro/agents/name.json]
+    K --> M[Write .kiro/agents/prompts/name.md]
+    L --> N[Update installed-agents.json under lock]
+    M --> N
 ```
+
+**Tool mapping:**
+- Claude tools → `allowedTools` (Kiro native tool names)
+- Copilot MCP refs → `tools` (MCP server references)
+- Copilot bare names → dropped with `UnmappedReason`
+- Deduplication applied (e.g., `Edit` + `Write` → `Write` only)
 
 ---
 
-## Project Discovery (Desktop App)
+## 5. Update Detection
 
 ```mermaid
 sequenceDiagram
-    participant UI as Svelte Frontend
-    participant Tauri as Tauri Backend
-    participant FS as File System
+    participant UI
+    participant Service as MarketplaceService
+    participant Project as KiroProject
+    participant FS
 
-    UI->>Tauri: discover_projects()
-    Tauri->>Tauri: Load scan roots from settings
-    loop Each scan root
-        Tauri->>FS: Walk directories (max depth, skip hidden/build)
-        FS-->>Tauri: Directories containing .kiro/
+    UI->>Service: detect_plugin_updates(project)
+    Service->>Project: installed_plugins() — load all tracking files
+    loop each installed plugin
+        Service->>FS: load plugin.json (current version)
+        Service->>Service: scan_plugin_for_content_drift
+        alt version bumped
+            Service-->>UI: PluginUpdateInfo { signal: VersionBumped }
+        else content hash changed (no version bump)
+            Service-->>UI: PluginUpdateInfo { signal: ContentDrift }
+        else up to date
+            Note over Service: skip
+        end
     end
-    Tauri-->>UI: DiscoveredProject[]
-    UI->>UI: Display in ProjectPicker
-    User->>UI: Select project
-    UI->>Tauri: set_active_project(path)
+    Service-->>UI: DetectUpdatesResult { updates, failures }
+```
+
+**Key details:**
+- Version comparison: string equality (not semver)
+- Content drift: re-hashes source files and compares to stored `source_hash`
+- Structured sources (git subdir, git URL) return a failure (cannot check locally)
+- Partial load warnings (corrupt tracking entries) are surfaced alongside results
+
+---
+
+## 6. Browse / Plugin Catalog
+
+```mermaid
+sequenceDiagram
+    participant UI
+    participant Cmd as commands/browse.rs
+    participant Service as MarketplaceService
+    participant Browse as service/browse.rs
+    participant Project as KiroProject
+
+    UI->>Cmd: list_plugin_catalog_for_marketplace(marketplace, project_path)
+    Cmd->>Service: list_plugin_catalog(marketplace, project)
+    Service->>Browse: list_plugin_entries (from registry)
+    loop each plugin
+        Browse->>Browse: count_skills_for_plugin
+        Browse->>Browse: list_skills_with_manifest
+        Browse->>Browse: list_agents_with_manifest
+        Browse->>Browse: list_steering_with_manifest
+        Browse->>Project: check installed tracking (mark installed=true)
+        Browse-->>Service: PluginCatalogEntry
+    end
+    Service-->>Cmd: PluginCatalogView
+    Cmd-->>UI: PluginCatalogResponseView (with SourceType enrichment)
+```
+
+**Key details:**
+- `SkippedItem` captures plugins/skills that could not be enumerated (with reason)
+- `SkillCount` can be `Known(n)`, `Remote` (structured source), or `ManifestFailed`
+- Installed flags are set by cross-referencing tracking files
+
+---
+
+## 7. Marketplace Update
+
+```mermaid
+sequenceDiagram
+    participant User
+    participant Service as MarketplaceService
+    participant Cache as CacheDir
+    participant Git
+
+    User->>Service: update(name=None)
+    Service->>Cache: load_known_marketplaces
+    loop each marketplace (or named one)
+        Service->>Git: pull_repo(marketplace_path)
+        alt pull succeeds
+            Service->>Service: regenerate_plugin_registry
+            Service->>Cache: write_plugin_registry
+        else pull fails
+            Service-->>User: FailedUpdate { name, error }
+        end
+    end
+    Service-->>User: UpdateResult { updated, failed }
 ```
 
 ---
 
-## Typed IPC Flow (Desktop)
+## 8. Remove Plugin
 
 ```mermaid
-flowchart LR
-    Svelte["Svelte Component"] -->|"commands.listMarketplaces()"| Bindings["bindings.ts<br/>(auto-generated)"]
-    Bindings -->|"invoke('list_marketplaces')"| Tauri["Tauri IPC"]
-    Tauri -->|"deserialize args"| Handler["Rust Command Handler"]
-    Handler -->|"call"| Core["kiro-market-core"]
-    Core -->|"Result<T, Error>"| Handler
-    Handler -->|"serialize response"| Tauri
-    Tauri -->|"typed response"| Svelte
+flowchart TD
+    A[remove_plugin marketplace+plugin] --> B[Load all tracking files under lock]
+    B --> C[Remove matching skills from .kiro/skills/]
+    C --> D[Remove matching agents from .kiro/agents/]
+    D --> E[Remove matching steering from .kiro/steering/]
+    E --> F[Remove native companions entry]
+    F --> G[Write updated tracking files]
+    G --> H[RemovePluginResult — counts removed + failures]
 ```
+
+Partial failures are collected (not fatal): files that fail to unlink are recorded in `failures` but the rest of the removal proceeds.

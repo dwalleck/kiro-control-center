@@ -1,176 +1,148 @@
 # Interfaces
 
+<!-- tags: api, ipc, cli, interfaces -->
+
 ## Tauri IPC Commands
 
-All commands are registered in `src-tauri/src/lib.rs` via `tauri-specta`. TypeScript bindings are auto-generated in `src/lib/bindings.ts`.
+All commands registered in `src-tauri/src/lib.rs` via `tauri-specta`. TypeScript bindings auto-generated to `src/lib/bindings.ts`. Commands return `Result<T, CommandError>`.
 
-### Browse Commands
+### Browse (`commands/browse.rs`)
 
-| Command | Parameters | Returns | Purpose |
-|---------|-----------|---------|---------|
-| `list_marketplaces` | — | `MarketplaceInfo[]` | List registered marketplaces with metadata |
-| `list_plugins` | `marketplace: string` | `PluginInfo[]` | List plugins in a marketplace |
-| `list_available_skills` | `marketplace: string, plugin: string` | `PluginSkillsResult` | List skills for a specific plugin |
-| `list_all_skills_for_marketplace` | `marketplace: string` | `BulkSkillsResult` | List all skills across all plugins in a marketplace |
-| `install_skills` | `marketplace, plugin, skills?, force?, accept_mcp?` | `InstallResult` | Install skills/agents from a plugin |
-| `get_project_info` | — | `ProjectInfo` | Get active project path and status |
+| Command | Key Parameters | Returns |
+|---|---|---|
+| `list_marketplaces` | — | `Vec<MarketplaceInfo>` |
+| `list_plugins` | `marketplace: String` | `Vec<PluginInfo>` |
+| `list_available_skills` | `marketplace, plugin: String` | `PluginSkillsResult` |
+| `list_all_skills_for_marketplace` | `marketplace: String` | `BulkSkillsResult` |
+| `list_plugin_catalog_for_marketplace` | `marketplace, project_path: String` | `PluginCatalogResponseView` |
+| `install_skills` | `marketplace, plugin, project_path: String; skill_names: Vec<String>; force: bool` | `InstallSkillsResult` |
+| `get_project_info` | `project_path: String` | `ProjectInfo` |
 
-### Installed Commands
+### Installed (`commands/installed.rs`)
 
-| Command | Parameters | Returns | Purpose |
-|---------|-----------|---------|---------|
-| `list_installed_skills` | — | `InstalledSkillInfo[]` | List skills installed in active project |
-| `remove_skill` | `name: string` | — | Remove an installed skill |
+| Command | Key Parameters | Returns |
+|---|---|---|
+| `list_installed_skills` | `project_path: String` | `Vec<InstalledSkillInfo>` |
+| `remove_skill` | `project_path, skill_name: String` | `()` |
 
-### Marketplace Commands
+### Plugins (`commands/plugins.rs`)
 
-| Command | Parameters | Returns | Purpose |
-|---------|-----------|---------|---------|
-| `add_marketplace` | `source: string` | `MarketplaceAddResult` | Register a new marketplace |
-| `remove_marketplace` | `name: string` | — | Unregister a marketplace |
-| `update_marketplace` | `name?: string` | `UpdateResult` | Pull latest from remote |
+| Command | Key Parameters | Returns |
+|---|---|---|
+| `install_plugin` | `marketplace, plugin, project_path: String; force, accept_mcp: bool` | `InstallPluginResult` |
+| `list_installed_plugins` | `project_path: String` | `InstalledPluginsView` |
+| `remove_plugin` | `marketplace, plugin, project_path: String` | `RemovePluginResult` |
+| `detect_plugin_updates` | `project_path: String` | `DetectUpdatesResult` |
 
-### Settings Commands
+### Agents (`commands/agents.rs`)
 
-| Command | Parameters | Returns | Purpose |
-|---------|-----------|---------|---------|
-| `get_settings` | — | `Settings` | Load app settings |
-| `save_scan_roots` | `roots: string[]` | — | Save project scan root paths |
-| `discover_projects` | — | `DiscoveredProject[]` | Scan for Kiro projects |
-| `set_active_project` | `path: string` | — | Set the active project |
+| Command | Key Parameters | Returns |
+|---|---|---|
+| `install_plugin_agents` | `marketplace, plugin, project_path: String; force, accept_mcp: bool; names: Option<Vec<String>>` | `InstallAgentsResult` |
+| `install_agents` | `marketplace, plugin, project_path: String; agent_names: Vec<String>; force, accept_mcp: bool` | `InstallAgentsResult` |
+| `remove_agent` | `project_path, agent_name: String` | `()` |
 
-### Kiro Settings Commands
+### Steering (`commands/steering.rs`)
 
-| Command | Parameters | Returns | Purpose |
-|---------|-----------|---------|---------|
-| `get_kiro_settings` | — | `ResolvedSettings` | Load `.kiro/settings.json` with defaults |
-| `set_kiro_setting` | `key: string, value: JsonValue` | — | Set a setting value |
-| `reset_kiro_setting` | `key: string` | — | Remove a setting (revert to default) |
+| Command | Key Parameters | Returns |
+|---|---|---|
+| `install_plugin_steering` | `marketplace, plugin, project_path: String; force: bool; names: Option<Vec<String>>` | `InstallSteeringResult` |
+| `install_steering_files` | `marketplace, plugin, project_path: String; file_names: Vec<String>; force: bool` | `InstallSteeringResult` |
+| `remove_steering_file` | `project_path, rel: String` | `()` |
 
----
+### Marketplaces (`commands/marketplaces.rs`)
 
-## CLI Interface (kiro-market)
+| Command | Key Parameters | Returns |
+|---|---|---|
+| `add_marketplace` | `source: String; allow_insecure_http: bool` | `MarketplaceAddResult` |
+| `remove_marketplace` | `name: String` | `()` |
+| `update_marketplace` | `name: Option<String>` | `UpdateResult` |
 
-```
-kiro-market [OPTIONS] <COMMAND>
+### Settings (`commands/settings.rs`, `commands/kiro_settings.rs`)
 
-Commands:
-  marketplace   Manage marketplace sources
-    add <source> [--protocol https|ssh] [--allow-insecure-http]
-    list
-    update [name]
-    remove <name>
-  search [query]
-  install <plugin@marketplace> [--skill <name>] [--force] [--accept-mcp]
-  list
-  update [plugin_ref]
-  remove <skill-name>
-  info <plugin@marketplace>
-  cache
-    prune [--dry-run]
-
-Options:
-  -v, -vv, -vvv    Increase verbosity
-  --version        Show version
-  --help           Show help
-```
-
-**Plugin reference format:** `plugin@marketplace` (split on first `@`)
+| Command | Key Parameters | Returns |
+|---|---|---|
+| `get_settings` | — | `Settings` |
+| `save_scan_roots` | `roots: Vec<String>` | `()` |
+| `discover_projects` | `roots: Vec<String>` | `Vec<DiscoveredProject>` |
+| `set_active_project` | `project_path: String` | `()` |
+| `get_kiro_settings` | `project_path: String` | `Vec<SettingEntry>` |
+| `set_kiro_setting` | `project_path, key: String; value: serde_json::Value` | `()` |
+| `reset_kiro_setting` | `project_path, key: String` | `()` |
 
 ---
 
-## Core Library Public API
+## CLI Commands (`kiro-market`)
 
-### MarketplaceService<G: GitBackend>
+Plugin reference format: `plugin@marketplace` (split on first `@`).
 
-```rust
-// Marketplace lifecycle
-fn add(opts: MarketplaceAddOptions) -> Result<MarketplaceAddResult>
-fn remove(name: &str) -> Result<()>
-fn update(name: Option<&str>) -> Result<UpdateResult>
-fn list() -> Result<Vec<KnownMarketplace>>
+| Command | Notable Flags | Description |
+|---|---|---|
+| `marketplace add <source>` | `--protocol ssh\|https`, `--allow-insecure-http` | Add marketplace |
+| `marketplace list` | — | List registered marketplaces |
+| `marketplace update [name]` | — | Pull updates (all or named) |
+| `marketplace remove <name>` | — | Remove marketplace |
+| `search [query]` | — | Search skills by name/description |
+| `install <plugin@marketplace>` | `--skill <name>`, `--force`, `--accept-mcp` | Install skills and agents |
+| `info <plugin@marketplace>` | — | Show plugin details |
+| `list` | — | List installed skills in current project |
+| `remove <skill-name>` | — | Remove installed skill |
+| `cache prune` | `--dry-run` | Remove orphaned clones and stale staging dirs |
 
-// Plugin operations
-fn list_plugin_entries(marketplace: &str) -> Result<Vec<PluginEntry>>
-fn marketplace_path(name: &str) -> PathBuf
+---
 
-// Skill browsing
-fn list_skills_for_plugin(marketplace, plugin, installed) -> Result<PluginSkillsResult>
-fn list_all_skills(marketplace, installed) -> BulkSkillsResult
-fn count_skills_for_plugin(marketplace, plugin) -> SkillCount
+## MarketplaceService Rust API
 
-// Installation
-fn install_skills(context, project, filter, mode) -> InstallSkillsResult
-fn install_plugin_agents(context, project, accept_mcp, mode) -> InstallAgentsResult
-fn install_plugin_steering(context, project, mode) -> InstallSteeringResult
-```
-
-### KiroProject
+`crates/kiro-market-core/src/service/mod.rs`. Generic over `G: GitBackend`.
 
 ```rust
-fn new(kiro_dir: PathBuf) -> Self
-fn install_skill_from_dir(name, source_dir, version?, marketplace?, plugin?) -> Result<()>
-fn install_skill_from_dir_force(name, source_dir, ...) -> Result<()>
-fn remove_skill(name: &str) -> Result<()>
-fn load_installed() -> Result<InstalledSkills>
-fn install_agent(definition, marketplace, plugin, mode) -> Result<()>
-fn install_native_agent(source, name, marketplace, plugin, mode) -> Result<InstalledNativeAgentOutcome>
-fn install_steering_file(source, name, marketplace, plugin, mode) -> Result<()>
-```
-
-### CacheDir
-
-```rust
-fn default_location() -> PathBuf  // ~/.cache/kiro-market/
-fn detect(source: &str) -> MarketplaceSource
-fn add_known_marketplace(name, source, protocol?) -> Result<()>
-fn remove_known_marketplace(name: &str) -> Result<()>
-fn load_known_marketplaces() -> Result<Vec<KnownMarketplace>>
-fn prune_orphans(mode: PruneMode) -> Result<PruneReport>
-```
-
-### GitBackend Trait
-
-```rust
-trait GitBackend {
-    fn clone_repo(url: &str, dest: &Path, options: &CloneOptions) -> Result<String>;
-    fn pull_repo(path: &Path) -> Result<String>;
-    fn verify_sha(path: &Path, expected: &str) -> Result<()>;
+impl<G: GitBackend> MarketplaceService<G> {
+    pub fn new(cache: CacheDir, git: G) -> Self
+    pub fn add(&self, source: &str, opts: MarketplaceAddOptions) -> Result<MarketplaceAddResult>
+    pub fn remove(&self, name: &MarketplaceName) -> Result<()>
+    pub fn update(&self, name: Option<&MarketplaceName>) -> Result<UpdateResult>
+    pub fn list(&self) -> Result<Vec<PluginBasicInfo>>
+    pub fn list_plugin_entries(&self, marketplace: &MarketplaceName) -> Result<Vec<PluginEntry>>
+    pub fn install_plugin(&self, ctx: AgentInstallContext) -> Result<InstallPluginResult>
+    pub fn install_skills(&self, ...) -> Result<InstallSkillsResult>
+    pub fn install_plugin_agents(&self, ...) -> Result<InstallAgentsResult>
+    pub fn install_plugin_steering(&self, ...) -> Result<InstallSteeringResult>
+    pub fn detect_plugin_updates(&self, project: &KiroProject) -> Result<DetectUpdatesResult>
+    pub fn list_plugin_catalog(&self, marketplace: &MarketplaceName, project: &KiroProject) -> Result<PluginCatalogView>
 }
 ```
 
+## GitBackend Trait
+
+```rust
+pub trait GitBackend {
+    fn clone_repo(&self, url: &str, dest: &Path, opts: CloneOptions) -> Result<(), GitError>;
+    fn pull_repo(&self, path: &Path) -> Result<(), GitError>;
+    fn verify_sha(&self, path: &Path, expected: &str) -> Result<(), GitError>;
+}
+```
+
+Production implementation: `GixCliBackend` (gix primary, CLI fallback). Test implementations in `service::test_support` (feature `test-support`).
+
 ---
 
-## File Format Interfaces
+## Error Wire Format
 
-### marketplace.json (in marketplace repos)
+`CommandError` serializes to JSON for the frontend:
 
 ```json
 {
-  "plugins": [
-    {
-      "name": "plugin-name",
-      "description": "Optional description",
-      "path": "./relative/path",
-      "source": { "github": "owner/repo" }  // or git_url, or relative path
-    }
-  ]
+  "type": "validation" | "not_found" | "parse_error" | "internal" | "unknown",
+  "message": "human-readable string"
 }
 ```
 
-### plugin.json (in plugin directories)
+`ErrorType` mapping: `ValidationError` → `validation`, `serde_json::Error` → `parse_error`, core `Error` variants → mapped by kind, everything else → `internal`.
 
-```json
-{
-  "name": "plugin-name",
-  "description": "Optional",
-  "skills": ["./skills/"],
-  "agents": ["./agents/"],
-  "steering": ["./steering/"],
-  "format": "kiro-cli"  // optional, triggers native agent handling
-}
-```
+---
 
-### .kiro/settings.json
+## Shared Command Helpers (`commands/mod.rs`)
 
-Typed key-value store with dotted paths (e.g., `"editor.tabSize"`). Schema defined in `kiro_settings.rs` registry.
+- `validate_kiro_project_path(path)` — canonicalizes, rejects non-existent, non-dir, symlinked, or missing `.kiro/` subdir paths
+- `reject_empty_names(names, prefix)` — returns validation error if any name is empty/whitespace
+- `make_service()` — constructs `MarketplaceService<GixCliBackend>` with default cache location
