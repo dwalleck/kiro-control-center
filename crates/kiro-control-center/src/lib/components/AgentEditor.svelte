@@ -18,7 +18,7 @@
   // the editor's contract with the IPC layer is unchanged.
 
   import { commands } from "$lib/bindings";
-  import type { CommandError, UserAgentRow } from "$lib/bindings";
+  import type { UserAgentRow } from "$lib/bindings";
   import type { AgentsTabMode } from "$lib/agent-list-helpers";
 
   // The editor only handles `new` and `edit` modes. The parent's
@@ -27,6 +27,25 @@
   // `mode.kind` correctly inside the effect / template without a
   // runtime guard that would never fire.
   type EditorMode = Exclude<AgentsTabMode, { kind: "list" }>;
+
+  // Compile-time exhaustiveness tripwire on EditorMode's `kind` arms.
+  // Mirrors the canonical pattern in `agent-list-helpers.ts` (`_KINDS` /
+  // `_AssertExhaustive` for `AgentsTabMode`). If a future
+  // `AgentsTabMode` arm passes through `Exclude<…, { kind: "list" }>`
+  // and lands here without `_EDITOR_MODE_KINDS` being updated, the
+  // value-position `_assertEditorMode = true` fails to compile —
+  // forcing the implementer to add an explicit case in the `switch`
+  // statements below rather than silently routing through the
+  // `default` never-arm at runtime.
+  const _EDITOR_MODE_KINDS = ["new", "edit"] as const satisfies ReadonlyArray<
+    EditorMode["kind"]
+  >;
+  type _AssertEditorModeExhaustive =
+    Exclude<EditorMode["kind"], (typeof _EDITOR_MODE_KINDS)[number]> extends never
+      ? true
+      : never;
+  const _assertEditorMode: _AssertEditorModeExhaustive = true;
+  void _assertEditorMode;
 
   type Props = {
     mode: EditorMode;
@@ -45,6 +64,27 @@
     | "resources"
     | "hooks"
     | "advanced";
+
+  // Compile-time exhaustiveness tripwire on `SectionId`. Same pattern
+  // as `_EDITOR_MODE_KINDS` above. If `SectionId` gains an eighth arm
+  // and `SECTIONS` (or `_SECTION_IDS`) isn't updated, this fails to
+  // compile — preventing the silent omission where a new section
+  // type lands but the rail doesn't render it.
+  const _SECTION_IDS = [
+    "identity",
+    "prompt",
+    "tools",
+    "mcp",
+    "resources",
+    "hooks",
+    "advanced",
+  ] as const satisfies ReadonlyArray<SectionId>;
+  type _AssertSectionIdExhaustive =
+    Exclude<SectionId, (typeof _SECTION_IDS)[number]> extends never
+      ? true
+      : never;
+  const _assertSectionId: _AssertSectionIdExhaustive = true;
+  void _assertSectionId;
 
   // Section rail definition. `enabled: false` rows are visible but
   // unclickable — disabled-section placeholders prevent the slice-N
@@ -65,33 +105,60 @@
     { id: "advanced", label: "Advanced", enabled: false, note: "Slice 6" },
   ] as const;
 
-  // The draft is the in-memory editable JSON. We store it as a
-  // `Record<string, unknown>` rather than a typed shape because the
-  // schema is evolving (slices 2-6 add fields) — the component must
-  // round-trip unknown fields verbatim so saving an existing agent
-  // doesn't lose data the panels haven't surfaced yet.
-  let draft: Record<string, unknown> = $state({});
+  // The draft is the in-memory editable JSON. The shape is `name:
+  // string` (always present, the canonical identity per spec D14)
+  // intersected with an open record so panels in slices 2-6 can
+  // round-trip any field they don't yet surface — saving an existing
+  // agent must not lose schema fields the editor doesn't render.
+  type Draft = { name: string } & Record<string, unknown>;
+  let draft: Draft = $state({ name: "" });
   let originalName: string = $state("");
   let section: SectionId = $state("identity");
   let loading: boolean = $state(false);
   let loadError: string | null = $state(null);
+  // **Separate from `loadError`.** The banner text (`loadError`) can
+  // be dismissed by the user; this flag cannot. After a load failure
+  // the in-memory `draft` is a synthetic stub that does NOT reflect
+  // the file on disk — clicking Save would `JSON.stringify` the stub
+  // and overwrite the user's content with `{"name": "<stem>"}`,
+  // losing every field the panels haven't surfaced. Save is gated on
+  // `!loadFailed` to defeat this one-click data-loss path. Per S13
+  // review C2 (silent-failure-hunter).
+  let loadFailed: boolean = $state(false);
   let saving: boolean = $state(false);
   let saveError: string | null = $state(null);
 
-  // Frontend mirror of the backend's `AgentName` regex
-  // (`^[a-z0-9][a-z0-9-]*$`). The regex must match the Rust validator
-  // in `validate_user_agent_name` — drift would let the UI accept
-  // names the backend rejects, surfacing as a confusing IPC error
-  // after a Save click. Tracked at design-slice-1.md § C3 / spec D14.
+  // Token guard against last-write-wins between concurrent loads.
+  // Each `$effect` invocation increments this; post-await writes
+  // check that the token still matches the current invocation before
+  // mutating `draft` / `loadError`. Latent today (the parent unmounts
+  // the editor on cancel/save so an in-flight load can't outlive a
+  // mode flip) but turns into a real race once S14+ adds in-editor
+  // refresh. Per S13 review I3.
+  let loadToken = 0;
+
+  // Frontend agent-name validation. **NOTE — this regex is a UX
+  // strictness layer, NOT parity with the backend.** The Rust
+  // `validate_name` (validation.rs:550) accepts a wider set than
+  // this regex — including uppercase, underscores, internal
+  // whitespace, and leading dots (e.g. "Terraform Agent",
+  // "my_plugin", ".hidden"). A user editing an existing
+  // marketplace-installed agent whose name doesn't match this
+  // strict regex cannot save without renaming. The deeper policy
+  // question (loosen frontend / split new-vs-edit semantics /
+  // document strictness as intentional) is tracked at **kiro-k9ok**
+  // and decided in S14 scope. The strict shape here matches the
+  // React design reference's `^[a-z0-9][a-z0-9-]*$/i` (without the
+  // `/i` flag — uppercase is a real divergence from the React
+  // reference too) and the kebab-case convention used by other
+  // Kiro plugin assets.
   const AGENT_NAME_REGEX = /^[a-z0-9][a-z0-9-]*$/;
 
   let isNew = $derived(mode.kind === "new");
   let editingRow: UserAgentRow | null = $derived(
     mode.kind === "edit" ? mode.row : null,
   );
-  let draftName = $derived(
-    typeof draft.name === "string" ? draft.name : "",
-  );
+  let draftName = $derived(draft.name);
   let titleLabel = $derived(
     isNew ? "New agent" : draftName || originalName || "Untitled agent",
   );
@@ -99,60 +166,112 @@
   // Load existing JSON on mount for edit mode. New mode starts from
   // an empty object — `name` is filled by the user via Identity (S14).
   $effect(() => {
-    if (mode.kind === "new") {
-      draft = {};
-      originalName = "";
-      loading = false;
-      loadError = null;
-      return;
-    }
-    // Edit mode: pull the file's bytes via the new IPC command so
-    // the prompt / tools / etc. round-trip verbatim through save,
-    // not just the summary fields available on UserAgentRow.
-    const row = mode.row;
-    originalName = row.name;
-    loading = true;
+    // Reset all transient state at effect entry. Without these
+    // resets, a stale `saveError` from a prior mount could attach
+    // to a different agent's draft on a future direct-mode-transition
+    // flow. Latent today (parent unmounts editor on cancel/save) but
+    // defensive against future direct-transition flows. Per S13
+    // review I2.
     loadError = null;
-    void (async () => {
-      try {
-        const result = await commands.loadUserAgentJson(
-          row.name,
-          projectPath,
-        );
-        if (result.status === "ok") {
-          try {
-            const parsed: unknown = JSON.parse(result.data);
-            draft =
-              parsed && typeof parsed === "object" && !Array.isArray(parsed)
-                ? (parsed as Record<string, unknown>)
-                : { name: row.name };
-          } catch (parseErr) {
-            // Malformed JSON on disk. Surface and keep the editor
-            // open with a minimal draft so the user can still rename
-            // and overwrite if they want; refusing to load would
-            // strand them with no way to fix the file from the UI.
-            loadError =
-              parseErr instanceof Error
-                ? `Could not parse agent JSON: ${parseErr.message}`
-                : "Could not parse agent JSON";
-            draft = { name: row.name };
-          }
-        } else {
-          loadError = describeCommandError(result.error);
-          draft = { name: row.name };
-        }
-      } catch (e) {
-        loadError = e instanceof Error ? e.message : String(e);
-        draft = { name: row.name };
-      } finally {
-        loading = false;
-      }
-    })();
-  });
+    saveError = null;
+    loadFailed = false;
+    saving = false;
 
-  function describeCommandError(err: CommandError): string {
-    return err.message;
-  }
+    // Increment the load token so any previous in-flight load's
+    // post-await write becomes a no-op. Per S13 review I3.
+    const token = ++loadToken;
+
+    switch (mode.kind) {
+      case "new": {
+        draft = { name: "" };
+        originalName = "";
+        loading = false;
+        return;
+      }
+      case "edit": {
+        const row = mode.row;
+        originalName = row.name;
+        loading = true;
+        void (async () => {
+          try {
+            const result = await commands.loadUserAgentJson(
+              row.name,
+              projectPath,
+            );
+            // If a newer effect invocation has started while this
+            // load was in flight, drop the result silently — the
+            // newer effect owns `draft` / `loadError` from this
+            // point on.
+            if (token !== loadToken) return;
+            if (result.status === "ok") {
+              try {
+                const parsed: unknown = JSON.parse(result.data);
+                if (
+                  parsed &&
+                  typeof parsed === "object" &&
+                  !Array.isArray(parsed)
+                ) {
+                  const obj = parsed as Record<string, unknown>;
+                  draft = {
+                    ...obj,
+                    name:
+                      typeof obj.name === "string" ? obj.name : row.name,
+                  };
+                } else {
+                  // Top-level wasn't an object (a JSON array or
+                  // primitive). Treat as a parse failure rather than
+                  // silently dropping into a synthetic-draft state
+                  // the user might Save over.
+                  loadError =
+                    "Agent file is not a JSON object; refusing to load.";
+                  loadFailed = true;
+                  draft = { name: row.name };
+                }
+              } catch (parseErr) {
+                // Malformed JSON on disk. The synthetic-draft
+                // fallback (`{ name: row.name }`) keeps the editor
+                // open so the user sees the error and can navigate
+                // away — but `loadFailed` blocks Save so a single
+                // dismiss-then-click can't overwrite their content
+                // with the stub. Fixed by S13 review C2.
+                loadError =
+                  parseErr instanceof Error
+                    ? `Could not parse agent JSON: ${parseErr.message}`
+                    : "Could not parse agent JSON";
+                loadFailed = true;
+                draft = { name: row.name };
+              }
+            } else {
+              loadError = result.error.message;
+              loadFailed = true;
+              draft = { name: row.name };
+            }
+          } catch (e) {
+            if (token !== loadToken) return;
+            loadError = e instanceof Error ? e.message : String(e);
+            loadFailed = true;
+            draft = { name: row.name };
+          } finally {
+            if (token === loadToken) {
+              loading = false;
+            }
+          }
+        })();
+        return;
+      }
+      default: {
+        // Exhaustiveness sentinel — `_EDITOR_MODE_KINDS` above pins
+        // this at compile time. If a third arm slips past the
+        // tripwire (e.g., behind a casting bug) the throw makes the
+        // failure loud rather than letting a future arm route
+        // through the previous-arm's behavior.
+        const _exhaustive: never = mode;
+        throw new Error(
+          `AgentEditor.$effect: unhandled mode arm ${JSON.stringify(_exhaustive)}`,
+        );
+      }
+    }
+  });
 
   function trySetDraftName(value: string) {
     draft = { ...draft, name: value };
@@ -168,6 +287,16 @@
 
   async function handleSave() {
     if (saving) return;
+    // Refuse to save when the load left us with a synthetic-draft
+    // stub. The dismiss button on the load-error banner clears the
+    // banner text but NOT this gate — defeats the one-click data
+    // loss path where the user dismisses the banner and clicks Save.
+    // Per S13 review C2.
+    if (loadFailed) {
+      saveError =
+        "Cannot save: the agent file failed to load and the in-memory draft does not reflect the on-disk content. Cancel and reopen, or fix the file out-of-band.";
+      return;
+    }
     saveError = null;
 
     const validationError = validateNameOrError(draftName);
@@ -185,40 +314,52 @@
 
     saving = true;
     try {
-      if (mode.kind === "new") {
-        const result = await commands.createUserAgent(
-          draftName,
-          draftJson,
-          projectPath,
-        );
-        if (result.status === "ok") {
-          onSaved(`Created “${draftName}”`, null);
-        } else {
-          saveError = describeCommandError(result.error);
+      switch (mode.kind) {
+        case "new": {
+          const result = await commands.createUserAgent(
+            draftName,
+            draftJson,
+            projectPath,
+          );
+          if (result.status === "ok") {
+            onSaved(`Created “${draftName}”`, null);
+          } else {
+            saveError = result.error.message;
+          }
+          return;
         }
-        return;
-      }
-      // Edit mode. S16 modal not yet shipped: hardcode keep-linked
-      // (detach=false). When S16 lands, replace this with a
-      // SaveChoice-driven `detach` value; everything else here is
-      // already correct.
-      const detach = false;
-      const result = await commands.saveUserAgent(
-        originalName,
-        draftName,
-        draftJson,
-        detach,
-        projectPath,
-      );
-      if (result.status === "ok") {
-        // Post-A1: forward `orphan_left_behind` to the parent so the
-        // toast can render the rename-orphan warning. Discarding the
-        // outcome here would silently hide the partial-success state.
-        const orphan = result.data.orphan_left_behind;
-        const verb = originalName === draftName ? "Saved" : "Renamed to";
-        onSaved(`${verb} “${draftName}”`, orphan);
-      } else {
-        saveError = describeCommandError(result.error);
+        case "edit": {
+          // S16 modal not yet shipped: hardcode keep-linked
+          // (detach=false). When S16 lands, replace this with a
+          // SaveChoice-driven `detach` value; everything else here is
+          // already correct.
+          const detach = false;
+          const result = await commands.saveUserAgent(
+            originalName,
+            draftName,
+            draftJson,
+            detach,
+            projectPath,
+          );
+          if (result.status === "ok") {
+            // Post-A1: forward `orphan_left_behind` to the parent so
+            // the toast can render the rename-orphan warning.
+            // Discarding the outcome here would silently hide the
+            // partial-success state.
+            const orphan = result.data.orphan_left_behind;
+            const verb = originalName === draftName ? "Saved" : "Renamed to";
+            onSaved(`${verb} “${draftName}”`, orphan);
+          } else {
+            saveError = result.error.message;
+          }
+          return;
+        }
+        default: {
+          const _exhaustive: never = mode;
+          throw new Error(
+            `AgentEditor.handleSave: unhandled mode arm ${JSON.stringify(_exhaustive)}`,
+          );
+        }
       }
     } catch (e) {
       saveError = e instanceof Error ? e.message : String(e);
@@ -271,7 +412,7 @@
       <button
         type="button"
         onclick={handleSave}
-        disabled={saving || loading}
+        disabled={saving || loading || loadFailed}
         class="px-3 py-1.5 text-sm font-medium bg-kiro-accent-700 hover:bg-kiro-accent-600 disabled:opacity-50 disabled:cursor-not-allowed text-white rounded focus:outline-none focus:ring-2 focus:ring-kiro-accent-500"
       >
         {#if saving}
@@ -291,14 +432,28 @@
       class="mx-4 mt-3 px-4 py-2 rounded-md text-sm bg-kiro-error/10 border border-kiro-error/30 text-kiro-error flex items-start gap-3"
       role="alert"
     >
-      <p class="flex-1">{loadError}</p>
-      <button
-        type="button"
-        aria-label="Dismiss load error"
-        onclick={() => (loadError = null)}
-        class="opacity-70 hover:opacity-100 text-lg leading-none"
-        >×</button
-      >
+      <p class="flex-1">
+        {loadError}
+        {#if loadFailed}
+          <span class="block mt-1 text-[12px] opacity-80">
+            Save is disabled until the file loads successfully — the in-memory
+            draft does not reflect the on-disk content. Cancel and reopen, or
+            fix the file out-of-band.
+          </span>
+        {/if}
+      </p>
+      {#if !loadFailed}
+        <!-- Banner is only dismissable when it does NOT also mean
+             Save is gated — otherwise dismissing leaves the user with
+             a disabled Save and no visible explanation. -->
+        <button
+          type="button"
+          aria-label="Dismiss load error"
+          onclick={() => (loadError = null)}
+          class="opacity-70 hover:opacity-100 text-lg leading-none"
+          >×</button
+        >
+      {/if}
     </div>
   {/if}
   {#if saveError}

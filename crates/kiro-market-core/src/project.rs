@@ -9566,8 +9566,14 @@ mod tests {
         std::fs::create_dir_all(&agents).expect("mk agents");
 
         // Real file outside agents/ that the symlink would point at.
+        // The marker token is checked AFTER the variant assertion to
+        // pin that the symlink target's bytes never reach the caller
+        // (defense-in-depth: a future implementation that read the
+        // file before the symlink check would leak these bytes
+        // through the error message). Per S13 review S1.
         let real = dir.path().join("secret.json");
-        std::fs::write(&real, br#"{"name":"secret"}"#).expect("seed real");
+        let secret_bytes = br#"{"name":"secret","TOKEN":"BYTES_MUST_NEVER_LEAK"}"#;
+        std::fs::write(&real, secret_bytes).expect("seed real");
 
         // Symlink at <agents_dir>/foo.json -> ../secret.json.
         symlink(&real, agents.join("foo.json")).expect("mk symlink");
@@ -9581,6 +9587,51 @@ mod tests {
                 crate::error::Error::Agent(AgentError::NotInstalled { .. })
             ),
             "expected NotInstalled (the editor's UX shows 'agent missing'), got {err:?}",
+        );
+        // Byte-absence assertion: neither the secret content nor the
+        // marker token may appear anywhere in the error's Display or
+        // Debug rendering. A regression that read-before-check (or
+        // included the source file's contents in the error message)
+        // would surface here.
+        let display = format!("{err}");
+        let debug = format!("{err:?}");
+        assert!(
+            !display.contains("BYTES_MUST_NEVER_LEAK"),
+            "secret bytes leaked into Display: {display}",
+        );
+        assert!(
+            !debug.contains("BYTES_MUST_NEVER_LEAK"),
+            "secret bytes leaked into Debug: {debug}",
+        );
+    }
+
+    /// Non-UTF-8 file content surfaces as `io::Error::InvalidData` per
+    /// the doc-comment contract. The wrapping into `Error::Io` is the
+    /// only path between `String::from_utf8` rejection and the caller;
+    /// without this test, swapping the wrapping (e.g. to a generic
+    /// `io::ErrorKind::Other`) would silently change the wire-format
+    /// `error_type` from `io_error` to whatever else, with no test
+    /// failure to flag the drift. Per S13 review I4.
+    #[test]
+    fn read_user_agent_json_returns_io_error_for_non_utf8_content() {
+        let (_dir, project) = temp_project();
+        let agents = project.kiro_dir().join("agents");
+        std::fs::create_dir_all(&agents).expect("mk agents");
+        // Lone 0xFF + 0xFE bytes: invalid UTF-8 (no leading-byte
+        // pattern accommodates them as a continuation).
+        std::fs::write(agents.join("badenc.json"), [0xFFu8, 0xFE]).expect("seed");
+
+        let err = project
+            .read_user_agent_json("badenc")
+            .expect_err("invalid UTF-8 must error");
+        let io_err = match err {
+            crate::error::Error::Io(e) => e,
+            other => panic!("expected Error::Io, got {other:?}"),
+        };
+        assert_eq!(
+            io_err.kind(),
+            std::io::ErrorKind::InvalidData,
+            "non-UTF-8 must surface as InvalidData (pinned by the doc-comment contract)",
         );
     }
 
