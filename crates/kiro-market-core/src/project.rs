@@ -1187,6 +1187,65 @@ impl KiroProject {
         Ok(rows)
     }
 
+    /// Read the raw JSON of a user-authored agent for the editor's
+    /// edit-mode load. Returns the file's UTF-8 content as a `String`
+    /// suitable for passing back to [`Self::save_user_agent`] after the
+    /// user makes edits.
+    ///
+    /// Companion to [`Self::list_user_agents`] (which returns only
+    /// summary fields). Required because the editor's prompt / tools /
+    /// MCP / resources / hooks / advanced sections need the full
+    /// in-file shape — `UserAgentRow`'s counts can't reconstruct it.
+    ///
+    /// Symlinks at `<agents_dir>/<name>.json` are refused with the
+    /// same rationale as [`Self::try_project_user_agent_row`]: a link
+    /// to any host file the process can read would flow its bytes
+    /// into the editor's draft buffer, and on save those bytes would
+    /// land in `.kiro/agents/<name>.json` as a regular file. The list
+    /// endpoint already excludes symlinked agents, so a legitimate UI
+    /// flow never reaches this path with a symlinked target — the
+    /// check is defense-in-depth against a compromised renderer or a
+    /// caller that bypasses the list.
+    ///
+    /// # Errors
+    /// - [`AgentError::InvalidName`] — `name` fails validation.
+    /// - [`AgentError::NotInstalled`] — file missing on disk OR refused
+    ///   for safety (symlink). The two cases share a variant because
+    ///   the editor's UX for both is "the agent went missing; return
+    ///   to the list and refresh."
+    /// - I/O / UTF-8 errors during the read.
+    pub fn read_user_agent_json(&self, name: &str) -> crate::error::Result<String> {
+        let name = Self::validate_user_agent_name(name)?;
+        let path = self.agents_dir().join(format!("{}.json", name.as_str()));
+        let metadata = match fs::symlink_metadata(&path) {
+            Ok(m) => m,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Err(AgentError::NotInstalled {
+                    name: name.into_inner(),
+                }
+                .into());
+            }
+            Err(e) => return Err(e.into()),
+        };
+        if metadata.file_type().is_symlink() {
+            warn!(
+                path = %path.display(),
+                "refusing to read symlinked agent file in read_user_agent_json (defense-in-depth)",
+            );
+            return Err(AgentError::NotInstalled {
+                name: name.into_inner(),
+            }
+            .into());
+        }
+        let bytes = fs::read(&path)?;
+        // UTF-8 conversion failure is a real outcome (a hand-edited
+        // file with broken encoding) but extremely rare for legitimate
+        // agent JSON. Surface as `io::Error::InvalidData` so it threads
+        // through `Error::Io` rather than requiring a new variant.
+        String::from_utf8(bytes)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e).into())
+    }
+
     /// Project a single `.kiro/agents/<name>.json` file into a
     /// [`UserAgentRow`]. Returns `None` on any per-file failure
     /// (symlink, unreadable, malformed JSON) after logging a warning,
@@ -9423,6 +9482,156 @@ mod tests {
             std::fs::read(agents.join("foo.json")).expect("read post"),
             br#"{"name": "foo"}"#,
             "rejected save must not modify the existing file",
+        );
+    }
+
+    // -- read_user_agent_json --------------------------------------------
+
+    /// Happy path: pre-write a file, read it back via the new method,
+    /// assert byte equality. The fence the editor's edit-mode load
+    /// rests on — if this drifts (e.g. someone normalises whitespace
+    /// or re-serialises the JSON), the editor's saved bytes will
+    /// differ from what the user opened.
+    #[test]
+    fn read_user_agent_json_returns_file_bytes_verbatim() {
+        let (_dir, project) = temp_project();
+        let agents = project.kiro_dir().join("agents");
+        std::fs::create_dir_all(&agents).expect("mk agents");
+        // Deliberately includes whitespace + a trailing newline so the
+        // verbatim assertion is non-trivial.
+        let raw = "{\n  \"name\": \"alpha\",\n  \"tools\": []\n}\n";
+        std::fs::write(agents.join("alpha.json"), raw).expect("seed file");
+
+        let got = project
+            .read_user_agent_json("alpha")
+            .expect("read happy path");
+        assert_eq!(
+            got, raw,
+            "must return file bytes verbatim, no normalisation"
+        );
+    }
+
+    /// Missing file → `AgentError::NotInstalled`. Maps to the
+    /// `not_found` Tauri ErrorType so the editor can surface a
+    /// "agent went missing; refresh" branch distinct from a
+    /// validation failure.
+    #[test]
+    fn read_user_agent_json_returns_not_installed_for_missing_file() {
+        let (_dir, project) = temp_project();
+        let err = project
+            .read_user_agent_json("ghost")
+            .expect_err("missing file must error");
+        assert!(
+            matches!(
+                err,
+                crate::error::Error::Agent(AgentError::NotInstalled { .. })
+            ),
+            "expected NotInstalled, got {err:?}",
+        );
+    }
+
+    /// Invalid name (path separator) → `AgentError::InvalidName`. The
+    /// validator runs before any FS access — confirms the load path
+    /// can't be coerced into reading `<agents_dir>/../etc/passwd` via
+    /// a malicious name.
+    #[test]
+    fn read_user_agent_json_rejects_path_separator() {
+        let (_dir, project) = temp_project();
+        let err = project
+            .read_user_agent_json("foo/bar")
+            .expect_err("must reject path separator");
+        assert!(matches!(
+            err,
+            crate::error::Error::Agent(AgentError::InvalidName { .. })
+        ));
+    }
+
+    /// Symlink at the target path → refused as `NotInstalled`. Pinned
+    /// per the doc-comment's defense-in-depth rationale: even though
+    /// the list endpoint already excludes symlinked agents, a
+    /// compromised renderer or out-of-band caller must not be able to
+    /// read arbitrary host files via this command.
+    ///
+    /// Skipped on Windows where `std::os::unix::fs::symlink` is not
+    /// available; the parallel create-side test
+    /// (`create_user_agent_treats_symlink_at_target_as_collision`)
+    /// uses the same Unix-only gate.
+    #[cfg(unix)]
+    #[test]
+    fn read_user_agent_json_refuses_symlinked_target() {
+        use std::os::unix::fs::symlink;
+
+        let (dir, project) = temp_project();
+        let agents = project.kiro_dir().join("agents");
+        std::fs::create_dir_all(&agents).expect("mk agents");
+
+        // Real file outside agents/ that the symlink would point at.
+        // The marker token is checked AFTER the variant assertion to
+        // pin that the symlink target's bytes never reach the caller
+        // (defense-in-depth: a future implementation that read the
+        // file before the symlink check would leak these bytes
+        // through the error message). Per S13 review S1.
+        let real = dir.path().join("secret.json");
+        let secret_bytes = br#"{"name":"secret","TOKEN":"BYTES_MUST_NEVER_LEAK"}"#;
+        std::fs::write(&real, secret_bytes).expect("seed real");
+
+        // Symlink at <agents_dir>/foo.json -> ../secret.json.
+        symlink(&real, agents.join("foo.json")).expect("mk symlink");
+
+        let err = project
+            .read_user_agent_json("foo")
+            .expect_err("symlinked target must be refused");
+        assert!(
+            matches!(
+                err,
+                crate::error::Error::Agent(AgentError::NotInstalled { .. })
+            ),
+            "expected NotInstalled (the editor's UX shows 'agent missing'), got {err:?}",
+        );
+        // Byte-absence assertion: neither the secret content nor the
+        // marker token may appear anywhere in the error's Display or
+        // Debug rendering. A regression that read-before-check (or
+        // included the source file's contents in the error message)
+        // would surface here.
+        let display = format!("{err}");
+        let debug = format!("{err:?}");
+        assert!(
+            !display.contains("BYTES_MUST_NEVER_LEAK"),
+            "secret bytes leaked into Display: {display}",
+        );
+        assert!(
+            !debug.contains("BYTES_MUST_NEVER_LEAK"),
+            "secret bytes leaked into Debug: {debug}",
+        );
+    }
+
+    /// Non-UTF-8 file content surfaces as `io::Error::InvalidData` per
+    /// the doc-comment contract. The wrapping into `Error::Io` is the
+    /// only path between `String::from_utf8` rejection and the caller;
+    /// without this test, swapping the wrapping (e.g. to a generic
+    /// `io::ErrorKind::Other`) would silently change the wire-format
+    /// `error_type` from `io_error` to whatever else, with no test
+    /// failure to flag the drift. Per S13 review I4.
+    #[test]
+    fn read_user_agent_json_returns_io_error_for_non_utf8_content() {
+        let (_dir, project) = temp_project();
+        let agents = project.kiro_dir().join("agents");
+        std::fs::create_dir_all(&agents).expect("mk agents");
+        // Lone 0xFF + 0xFE bytes: invalid UTF-8 (no leading-byte
+        // pattern accommodates them as a continuation).
+        std::fs::write(agents.join("badenc.json"), [0xFFu8, 0xFE]).expect("seed");
+
+        let err = project
+            .read_user_agent_json("badenc")
+            .expect_err("invalid UTF-8 must error");
+        let io_err = match err {
+            crate::error::Error::Io(e) => e,
+            other => panic!("expected Error::Io, got {other:?}"),
+        };
+        assert_eq!(
+            io_err.kind(),
+            std::io::ErrorKind::InvalidData,
+            "non-UTF-8 must surface as InvalidData (pinned by the doc-comment contract)",
         );
     }
 

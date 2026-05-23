@@ -8,9 +8,10 @@
     filterAgentRows,
     formatLineageBadge,
     formatModelChip,
-    headerLabel,
     type AgentsTabMode,
   } from "$lib/agent-list-helpers";
+  import { formatSavedToast } from "$lib/save-params";
+  import AgentEditor from "./AgentEditor.svelte";
 
   let { projectPath }: { projectPath: string } = $props();
 
@@ -249,24 +250,21 @@
     {/if}
   </div>
 {:else}
-  <!-- Editor branch placeholder. Renders a back-link + a
-       "not yet available" notice so the navigation flow is
-       functional until the editor component lands. -->
-  <div class="flex flex-col h-full">
-    <div class="flex items-center gap-3 px-4 py-3 border-b border-kiro-muted">
-      <button
-        type="button"
-        onclick={() => (mode = { kind: "list" })}
-        class="text-sm text-kiro-text-secondary hover:text-kiro-text"
-      >
-        ‹ Agents
-      </button>
-      <span class="text-sm text-kiro-text font-medium">
-        {headerLabel(mode)}
-      </span>
-    </div>
-    <div class="flex-1 flex items-center justify-center text-kiro-subtle">
-      <p class="text-sm">Editor not yet available.</p>
-    </div>
-  </div>
+  <!-- Editor branch. Mode is `new` or `edit`; AgentEditor owns the
+       topbar, section rail, and panel content. On cancel/save it
+       hands control back via the callbacks below. -->
+  <AgentEditor
+    {mode}
+    {projectPath}
+    onCancel={() => (mode = { kind: "list" })}
+    onSaved={async (msg, orphanPath) => {
+      mode = { kind: "list" };
+      await refresh();
+      // A1 partial-success: when the rename succeeded but the
+      // post-rename unlink failed, the toast carries an orphan-path
+      // suffix so the user knows about the stale file on disk.
+      // formatting lives in save-params.ts to keep it vitest-covered.
+      showToast(formatSavedToast(msg, orphanPath));
+    }}
+  />
 {/if}

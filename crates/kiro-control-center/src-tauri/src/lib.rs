@@ -45,6 +45,7 @@ fn create_builder() -> Builder<tauri::Wry> {
         commands::agents_authoring::save_user_agent,
         commands::agents_authoring::delete_user_agent,
         commands::agents_authoring::duplicate_user_agent,
+        commands::agents_authoring::load_user_agent_json,
         commands::plugins::install_plugin,
         commands::plugins::list_installed_plugins,
         commands::plugins::remove_plugin,

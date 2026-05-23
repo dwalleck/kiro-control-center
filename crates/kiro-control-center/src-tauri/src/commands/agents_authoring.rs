@@ -25,6 +25,32 @@ pub async fn list_user_agents(project_path: String) -> Result<Vec<UserAgentRow>,
     Ok(rows)
 }
 
+/// Read the raw JSON content of a user-authored agent for the editor's
+/// edit-mode load. Returns the file's bytes as a UTF-8 string,
+/// suitable for round-tripping back through [`save_user_agent`] after
+/// the user makes edits.
+///
+/// Companion to [`list_user_agents`] (which only returns summary
+/// fields). The editor's prompt / tools / MCP / resources / hooks /
+/// advanced sections need the full in-file shape — `UserAgentRow`'s
+/// counts can't reconstruct it. Without this command edit mode would
+/// have to start from a synthetic empty draft, and saving would
+/// silently truncate the agent.
+#[tauri::command]
+#[specta::specta]
+pub async fn load_user_agent_json(
+    name: String,
+    project_path: String,
+) -> Result<String, CommandError> {
+    let project_root = validate_kiro_project_path(&project_path)?;
+    let project = KiroProject::new(project_root);
+    let json = project
+        .read_user_agent_json(&name)
+        .map_err(CommandError::from)?;
+    debug!(agent = %name, bytes = json.len(), "user agent JSON loaded");
+    Ok(json)
+}
+
 /// Atomically create a new user-authored agent at
 /// `.kiro/agents/<name>.json`. Rejects existing-file collisions before
 /// writing.
@@ -162,6 +188,34 @@ mod tests {
 
         let rows = list_user_agents(path).await.expect("list ok");
         assert!(rows.is_empty());
+    }
+
+    /// `load_user_agent_json` happy + missing path. Wrapper plumbing
+    /// only — full read semantics are pinned by the core
+    /// `read_user_agent_json_*` rstests in `project.rs`.
+    #[tokio::test]
+    async fn load_user_agent_json_returns_bytes_and_typed_not_found() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(dir.path().join(".kiro/agents")).expect("mk .kiro/agents");
+        std::fs::write(
+            dir.path().join(".kiro/agents/alpha.json"),
+            br#"{"name":"alpha"}"#,
+        )
+        .expect("seed");
+        let path = dir.path().to_string_lossy().to_string();
+
+        // Happy path: round-trip bytes verbatim.
+        let got = load_user_agent_json("alpha".to_string(), path.clone())
+            .await
+            .expect("load ok");
+        assert_eq!(got, r#"{"name":"alpha"}"#);
+
+        // Missing file: typed NotFound (so the editor can branch on
+        // `error_type === "not_found"`, not substring-match the message).
+        let err = load_user_agent_json("ghost".to_string(), path)
+            .await
+            .expect_err("missing must error");
+        assert_eq!(err.error_type, crate::error::ErrorType::NotFound);
     }
 
     /// `create_user_agent`'s wrapper must reject malformed JSON BEFORE
