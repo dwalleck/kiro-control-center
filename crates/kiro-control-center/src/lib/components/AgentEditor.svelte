@@ -20,6 +20,8 @@
   import { commands } from "$lib/bindings";
   import type { UserAgentRow } from "$lib/bindings";
   import type { AgentsTabMode } from "$lib/agent-list-helpers";
+  import { validateAgentNameForSave } from "$lib/agent-name";
+  import IdentityPanel from "./editor/IdentityPanel.svelte";
 
   // The editor only handles `new` and `edit` modes. The parent's
   // `{:else}` branch enforces that — `list` never reaches this
@@ -137,22 +139,13 @@
   // refresh. Per S13 review I3.
   let loadToken = 0;
 
-  // Frontend agent-name validation. **NOTE — this regex is a UX
-  // strictness layer, NOT parity with the backend.** The Rust
-  // `validate_name` (validation.rs:550) accepts a wider set than
-  // this regex — including uppercase, underscores, internal
-  // whitespace, and leading dots (e.g. "Terraform Agent",
-  // "my_plugin", ".hidden"). A user editing an existing
-  // marketplace-installed agent whose name doesn't match this
-  // strict regex cannot save without renaming. The deeper policy
-  // question (loosen frontend / split new-vs-edit semantics /
-  // document strictness as intentional) is tracked at **kiro-k9ok**
-  // and decided in S14 scope. The strict shape here matches the
-  // React design reference's `^[a-z0-9][a-z0-9-]*$/i` (without the
-  // `/i` flag — uppercase is a real divergence from the React
-  // reference too) and the kebab-case convention used by other
-  // Kiro plugin assets.
-  const AGENT_NAME_REGEX = /^[a-z0-9][a-z0-9-]*$/;
+  // Agent-name validation now lives in `$lib/agent-name`. The S13
+  // review's C1 finding flagged that the in-component regex comment
+  // lied about parity with the backend; the helper module owns the
+  // honest contract (it's a UX-strictness layer, NOT parity) and
+  // the split-policy escape hatch (per kiro-k9ok) that lets a user
+  // editing an existing agent with a permissive name save without
+  // renaming.
 
   let isNew = $derived(mode.kind === "new");
   let editingRow: UserAgentRow | null = $derived(
@@ -273,16 +266,34 @@
     }
   });
 
-  function trySetDraftName(value: string) {
-    draft = { ...draft, name: value };
+  function applyDraftPatch(patch: Record<string, string>) {
+    // Identity panel + future panels emit string-only patches. The
+    // editor folds them into `draft` here. Empty-string-to-null
+    // normalisation happens at save time, NOT here, so the user can
+    // clear-and-retype a field without losing focus through a
+    // derived re-render.
+    draft = { ...draft, ...patch };
   }
 
-  function validateNameOrError(name: string): string | null {
-    if (!name) return "Name is required.";
-    if (!AGENT_NAME_REGEX.test(name)) {
-      return "Name must be lowercase letters, digits, or hyphens, and start with a letter or digit.";
-    }
-    return null;
+  // Fields the Identity panel displays as text inputs. The draft is
+  // a `Record<string, unknown>` (it round-trips schema fields the
+  // panels haven't surfaced yet); these helpers extract the string
+  // representation, mapping null / missing / non-string to "" so
+  // the inputs render an empty string rather than literal "null".
+  function fieldOrEmpty(key: string): string {
+    const v = draft[key];
+    return typeof v === "string" ? v : "";
+  }
+
+  // Convert empty string back to null for save. This is the inverse
+  // of `fieldOrEmpty` — every optional Identity field that the user
+  // cleared should land in the saved JSON as `null`, not as `""`.
+  // The agent-spec.json schema treats null and absent as equivalent;
+  // an empty string would be a third state the schema doesn't model.
+  // Mirrors the React reference's `handleSave` cleanup at
+  // `Kiro Control Center Design System/.../AgentEditor.jsx` lines 41-46.
+  function nullIfEmpty(value: unknown): unknown {
+    return typeof value === "string" && value === "" ? null : value;
   }
 
   async function handleSave() {
@@ -299,7 +310,7 @@
     }
     saveError = null;
 
-    const validationError = validateNameOrError(draftName);
+    const validationError = validateAgentNameForSave(draftName, originalName);
     if (validationError !== null) {
       saveError = validationError;
       section = "identity";
@@ -309,7 +320,19 @@
     // Ensure the JSON's `name` field matches the filename stem (spec
     // D14). The backend enforces this too; doing it client-side
     // surfaces a clearer error before the IPC roundtrip.
-    const finalDraft = { ...draft, name: draftName };
+    //
+    // Normalise empty Identity-field strings to null on save (per the
+    // React reference). The agent-spec.json schema treats null and
+    // absent as equivalent for optional fields; passing "" would be
+    // a third state the schema doesn't model.
+    const finalDraft: Record<string, unknown> = {
+      ...draft,
+      name: draftName,
+      description: nullIfEmpty(draft.description),
+      model: nullIfEmpty(draft.model),
+      keyboardShortcut: nullIfEmpty(draft.keyboardShortcut),
+      welcomeMessage: nullIfEmpty(draft.welcomeMessage),
+    };
     const draftJson = JSON.stringify(finalDraft, null, 2);
 
     saving = true;
@@ -508,32 +531,19 @@
       {#if loading}
         <p class="text-sm text-kiro-subtle">Loading agent…</p>
       {:else if section === "identity"}
-        <!-- Identity placeholder (S14 fills this in). Exposes a
-             single `name` input so the save flow has a draft to send;
-             description / model / shortcut / welcome message land in S14. -->
-        <div class="max-w-xl flex flex-col gap-4">
-          <h2 class="text-base font-semibold text-kiro-text">Identity</h2>
-          <p class="text-xs text-kiro-subtle">
-            Full Identity panel arrives in slice S14. For now, only the agent
-            name is editable here — enough to wire create / rename through
-            the save path.
-          </p>
-          <label class="flex flex-col gap-1.5">
-            <span class="text-xs font-medium text-kiro-text-secondary">Name</span>
-            <input
-              type="text"
-              value={draftName}
-              oninput={(e) => trySetDraftName((e.currentTarget as HTMLInputElement).value)}
-              placeholder="code-reviewer"
-              class="px-3 py-1.5 text-sm font-mono bg-kiro-overlay border border-kiro-muted rounded text-kiro-text placeholder:text-kiro-subtle focus:outline-none focus:ring-2 focus:ring-kiro-accent-500"
-            />
-            <span class="text-[11px] text-kiro-subtle">
-              Lowercase letters, digits, and hyphens. Used as the filename in
-              <code class="font-mono">.kiro/agents/</code>.
-            </span>
-          </label>
+        <div class="flex flex-col gap-4">
+          <IdentityPanel
+            name={draftName}
+            {originalName}
+            description={fieldOrEmpty("description")}
+            model={fieldOrEmpty("model")}
+            keyboardShortcut={fieldOrEmpty("keyboardShortcut")}
+            welcomeMessage={fieldOrEmpty("welcomeMessage")}
+            {isNew}
+            onPatch={applyDraftPatch}
+          />
           {#if !isNew && editingRow?.lineage}
-            <div class="px-3 py-2 rounded text-xs bg-kiro-accent-900/20 border border-kiro-accent-800/40 text-kiro-accent-300">
+            <div class="max-w-xl px-3 py-2 rounded text-xs bg-kiro-accent-900/20 border border-kiro-accent-800/40 text-kiro-accent-300">
               This agent was installed from
               <strong>{editingRow.lineage.marketplace}</strong> /
               <strong>{editingRow.lineage.plugin}</strong>. Saving keeps the
