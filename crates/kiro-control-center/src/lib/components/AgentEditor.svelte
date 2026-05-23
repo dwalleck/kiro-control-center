@@ -21,8 +21,14 @@
   import type { UserAgentRow } from "$lib/bindings";
   import type { AgentsTabMode } from "$lib/agent-list-helpers";
   import { validateAgentNameForSave } from "$lib/agent-name";
+  import {
+    buildSaveParams,
+    shouldPromptForSaveChoice,
+    type SaveChoice,
+  } from "$lib/save-params";
   import IdentityPanel from "./editor/IdentityPanel.svelte";
   import PromptPanel from "./editor/PromptPanel.svelte";
+  import MarketplaceSavePromptModal from "./editor/MarketplaceSavePromptModal.svelte";
 
   // The editor only handles `new` and `edit` modes. The parent's
   // `{:else}` branch enforces that — `list` never reaches this
@@ -131,6 +137,17 @@
   let saving: boolean = $state(false);
   let saveError: string | null = $state(null);
 
+  // Save-time marketplace-prompt modal state (slice S16). The modal
+  // opens when the user clicks Save on a tracked agent and asks
+  // "keep linked or detach?". `pendingDraftJson` snapshots the
+  // serialised draft at the moment requestSave fires so the user's
+  // choice in the modal applies to that snapshot — not to any
+  // in-flight typing the user might do (the modal traps focus, so
+  // they shouldn't be typing, but the snapshot makes the
+  // requestSave -> performSaveEdit boundary deterministic).
+  let savePromptOpen: boolean = $state(false);
+  let pendingDraftJson: string | null = $state(null);
+
   // Token guard against last-write-wins between concurrent loads.
   // Each `$effect` invocation increments this; post-await writes
   // check that the token still matches the current invocation before
@@ -170,6 +187,12 @@
     saveError = null;
     loadFailed = false;
     saving = false;
+    // Defensive against future direct-mode-transition flows that
+    // could run the effect with a save-prompt mid-flight. Today the
+    // parent always unmounts the editor on cancel/save, so this is
+    // belt-and-braces — costs nothing.
+    savePromptOpen = false;
+    pendingDraftJson = null;
 
     // Increment the load token so any previous in-flight load's
     // post-await write becomes a no-op. Per S13 review I3.
@@ -297,7 +320,21 @@
     return typeof value === "string" && value === "" ? null : value;
   }
 
-  async function handleSave() {
+  // The save flow is split into three pieces (per S16):
+  //   - `requestSave()` — entry point, called from the Save button.
+  //     Validates the draft, snapshots the JSON, then either calls
+  //     the IPC directly (new mode, or edit mode without lineage)
+  //     OR opens the marketplace-prompt modal (edit mode with
+  //     lineage). Sets `saving = true` before either path so the
+  //     button disables correctly through the modal.
+  //   - `performSaveEdit(draftJson, detach)` — the IPC half for
+  //     edit mode. Called either inline by requestSave or by the
+  //     modal's onChoice handler.
+  //   - `handleSavePromptChoice` / `handleSavePromptCancel` — the
+  //     modal callbacks; close the modal and either continue the
+  //     save with the chosen detach value or roll back `saving`.
+
+  async function requestSave() {
     if (saving) return;
     // Refuse to save when the load left us with a synthetic-draft
     // stub. The dismiss button on the load-error banner clears the
@@ -349,9 +386,9 @@
     const draftJson = JSON.stringify(finalDraft, null, 2);
 
     saving = true;
-    try {
-      switch (mode.kind) {
-        case "new": {
+    switch (mode.kind) {
+      case "new": {
+        try {
           const result = await commands.createUserAgent(
             draftName,
             draftJson,
@@ -362,46 +399,85 @@
           } else {
             saveError = result.error.message;
           }
+        } catch (e) {
+          saveError = e instanceof Error ? e.message : String(e);
+        } finally {
+          saving = false;
+        }
+        return;
+      }
+      case "edit": {
+        if (shouldPromptForSaveChoice(mode.row)) {
+          // Snapshot the draftJson; the modal's onChoice handler
+          // picks it up. `saving` stays true so the Save button
+          // remains disabled until the modal resolves (either via
+          // a choice -> performSaveEdit, or via cancel ->
+          // handleSavePromptCancel which clears it).
+          pendingDraftJson = draftJson;
+          savePromptOpen = true;
           return;
         }
-        case "edit": {
-          // S16 modal not yet shipped: hardcode keep-linked
-          // (detach=false). When S16 lands, replace this with a
-          // SaveChoice-driven `detach` value; everything else here is
-          // already correct.
-          const detach = false;
-          const result = await commands.saveUserAgent(
-            originalName,
-            draftName,
-            draftJson,
-            detach,
-            projectPath,
-          );
-          if (result.status === "ok") {
-            // Post-A1: forward `orphan_left_behind` to the parent so
-            // the toast can render the rename-orphan warning.
-            // Discarding the outcome here would silently hide the
-            // partial-success state.
-            const orphan = result.data.orphan_left_behind;
-            const verb = originalName === draftName ? "Saved" : "Renamed to";
-            onSaved(`${verb} “${draftName}”`, orphan);
-          } else {
-            saveError = result.error.message;
-          }
-          return;
-        }
-        default: {
-          const _exhaustive: never = mode;
-          throw new Error(
-            `AgentEditor.handleSave: unhandled mode arm ${JSON.stringify(_exhaustive)}`,
-          );
-        }
+        // No lineage — save directly with detach=false (preserves
+        // the user-authored shape, which is the only legitimate
+        // value when there's no lineage to detach from).
+        await performSaveEdit(draftJson, false);
+        return;
+      }
+      default: {
+        const _exhaustive: never = mode;
+        throw new Error(
+          `AgentEditor.requestSave: unhandled mode arm ${JSON.stringify(_exhaustive)}`,
+        );
+      }
+    }
+  }
+
+  async function performSaveEdit(draftJson: string, detach: boolean) {
+    try {
+      const result = await commands.saveUserAgent(
+        originalName,
+        draftName,
+        draftJson,
+        detach,
+        projectPath,
+      );
+      if (result.status === "ok") {
+        // Post-A1: forward `orphan_left_behind` to the parent so
+        // the toast can render the rename-orphan warning.
+        // Discarding the outcome here would silently hide the
+        // partial-success state.
+        const orphan = result.data.orphan_left_behind;
+        const verb = originalName === draftName ? "Saved" : "Renamed to";
+        onSaved(`${verb} “${draftName}”`, orphan);
+      } else {
+        saveError = result.error.message;
       }
     } catch (e) {
       saveError = e instanceof Error ? e.message : String(e);
     } finally {
       saving = false;
     }
+  }
+
+  function handleSavePromptChoice(choice: SaveChoice) {
+    savePromptOpen = false;
+    if (pendingDraftJson === null) {
+      // Defensive: the modal can only open after pendingDraftJson
+      // is set in requestSave. If we reach this branch, something
+      // out-of-flow set savePromptOpen=true; recover by clearing
+      // saving so the Save button re-enables.
+      saving = false;
+      return;
+    }
+    const params = buildSaveParams(choice, originalName, pendingDraftJson);
+    pendingDraftJson = null;
+    void performSaveEdit(params.draftJson, params.detach);
+  }
+
+  function handleSavePromptCancel() {
+    savePromptOpen = false;
+    pendingDraftJson = null;
+    saving = false;
   }
 
   function selectSection(target: SectionId, enabled: boolean) {
@@ -447,7 +523,7 @@
       </button>
       <button
         type="button"
-        onclick={handleSave}
+        onclick={requestSave}
         disabled={saving || loading || loadFailed}
         class="px-3 py-1.5 text-sm font-medium bg-kiro-accent-700 hover:bg-kiro-accent-600 disabled:opacity-50 disabled:cursor-not-allowed text-white rounded focus:outline-none focus:ring-2 focus:ring-kiro-accent-500"
       >
@@ -559,8 +635,9 @@
             <div class="max-w-xl px-3 py-2 rounded text-xs bg-kiro-accent-900/20 border border-kiro-accent-800/40 text-kiro-accent-300">
               This agent was installed from
               <strong>{editingRow.lineage.marketplace}</strong> /
-              <strong>{editingRow.lineage.plugin}</strong>. Saving keeps the
-              marketplace link (slice S16 adds a keep-linked vs detach prompt).
+              <strong>{editingRow.lineage.plugin}</strong>. Saving will ask
+              whether to keep the marketplace link or detach into a
+              user-authored copy.
             </div>
           {/if}
         </div>
@@ -575,3 +652,19 @@
     </div>
   </div>
 </div>
+
+<!-- Save-time marketplace prompt. The modal is mounted unconditionally
+     so the `open` toggle drives mount/unmount of its content via the
+     {#if open} inside the component — keeps focus management and key
+     handlers tied to a single Svelte instance. -->
+{#if !isNew && editingRow?.lineage}
+  <MarketplaceSavePromptModal
+    open={savePromptOpen}
+    agentName={originalName}
+    marketplace={editingRow.lineage.marketplace}
+    plugin={editingRow.lineage.plugin}
+    version={editingRow.lineage.version}
+    onChoice={handleSavePromptChoice}
+    onCancel={handleSavePromptCancel}
+  />
+{/if}
