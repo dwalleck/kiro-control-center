@@ -151,7 +151,22 @@ pub struct InstalledNativeCompanionsMeta {
     /// by this plugin. Used for collision detection (cross-plugin path
     /// overlap) and for uninstall.
     pub files: Vec<PathBuf>,
-    pub source_hash: crate::hash::BlakeHash,
+    /// `Some(hash)` when this entry tracks real source-side companion
+    /// files (native-dialect plugin where `agents/prompts/*.md` etc. live
+    /// on the source side and are copied verbatim). Drift detection
+    /// recomputes the hash against the source layout and compares.
+    ///
+    /// `None` when the entry was synthesized by the translated install
+    /// path (Claude/Copilot agents whose prompt body is *extracted* from
+    /// the agent `.md` and written to `.kiro/agents/prompts/<name>.md`).
+    /// There is no source-side companion file to hash, so drift
+    /// detection MUST skip these entries — per-agent drift is already
+    /// captured by [`InstalledAgentMeta::source_hash`] against the
+    /// agent `.md` itself. The synthesized entry exists only for
+    /// cross-plugin force-mode ownership tracking on the destination
+    /// prompt path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_hash: Option<crate::hash::BlakeHash>,
     pub installed_hash: crate::hash::BlakeHash,
     /// Scan root (relative to `plugin_dir`) that this companion bundle
     /// was installed from. Required at install time. The
@@ -1116,6 +1131,77 @@ impl KiroProject {
         let json = serde_json::to_string_pretty(installed)?;
         crate::cache::atomic_write(&path, json.as_bytes())?;
         Ok(())
+    }
+
+    /// One-shot migration for `installed-agents.json` tracking files
+    /// written before `InstalledNativeCompanionsMeta::source_hash` became
+    /// `Option<BlakeHash>`.
+    ///
+    /// Pre-migration: the translated install path stored a `Some(hash)`
+    /// value computed against the destination prompt files (a recipe
+    /// the source side can't reproduce because translated agents have
+    /// no `agents/prompts/<name>.md` source file). Drift detection
+    /// then false-positived on every scan, surfacing as a
+    /// `"Run kiro-market update"` banner for plugins that were
+    /// genuinely up to date.
+    ///
+    /// Post-migration: synthesized entries (no sibling agent in the same
+    /// `(marketplace, plugin)` has [`AgentDialect::Native`]) get
+    /// `source_hash: None`. New installs already write the correct
+    /// shape via [`Self::synthesize_companion_entry`] and
+    /// [`install_native_companions_locked`].
+    ///
+    /// Returns `true` when changes were persisted, `false` when the
+    /// tracking file was already migrated (idempotent). Callers should
+    /// run this once at app startup or before the first drift scan.
+    ///
+    /// # Errors
+    ///
+    /// Returns errors from loading or writing the tracking file. Lock
+    /// acquisition uses the same advisory file lock that protects
+    /// every other agent-tracking mutation.
+    pub fn migrate_companion_source_hash(&self) -> crate::error::Result<bool> {
+        crate::file_lock::with_file_lock(
+            &self.agent_tracking_path(),
+            || -> crate::error::Result<bool> {
+                let mut installed = self.load_installed_agents()?;
+
+                // Pre-collect `(marketplace, plugin)` pairs that have at
+                // least one native-dialect agent. Necessary because we'd
+                // otherwise need a simultaneous borrow of
+                // `installed.agents` (read) and
+                // `installed.native_companions` (write), which the
+                // borrow checker correctly rejects.
+                let native_owners: std::collections::HashSet<(MarketplaceName, PluginName)> =
+                    installed
+                        .agents
+                        .values()
+                        .filter(|a| a.dialect == crate::agent::AgentDialect::Native)
+                        .map(|a| (a.marketplace.clone(), a.plugin.clone()))
+                        .collect();
+
+                let mut changed = false;
+                for meta in installed.native_companions.values_mut() {
+                    if meta.source_hash.is_none() {
+                        continue;
+                    }
+                    if native_owners.contains(&(meta.marketplace.clone(), meta.plugin.clone())) {
+                        continue;
+                    }
+                    meta.source_hash = None;
+                    changed = true;
+                }
+
+                if changed {
+                    self.write_agent_tracking(&installed)?;
+                    debug!(
+                        path = %self.agent_tracking_path().display(),
+                        "companion source_hash migration: rewrote synthesized translated entries to None"
+                    );
+                }
+                Ok(changed)
+            },
+        )
     }
 
     // -- user-authored agents -----------------------------------------------
@@ -3199,13 +3285,14 @@ impl KiroProject {
         // files. We track the union of installed prompt paths so the
         // native install path sees them as plugin-owned, not orphaned.
         //
-        // Hash semantics: source_hash == installed_hash because the
-        // translated path does not separately track original .md source
-        // files; both equal the hash over the prompt-bundle bytes.
-        //
-        // The HashMap key is still `String` (out of scope per Phase 1.5
-        // design); only the meta-value's `marketplace`/`plugin` fields
-        // adopt the newtypes.
+        // Hash semantics for translated agents: there is no source-side
+        // companion file (the prompt body is *extracted* from the
+        // agent `.md` at install time and written to the destination
+        // `prompts/<name>.md`). `source_hash` is therefore `None` —
+        // drift detection skips synthesized entries. `installed_hash`
+        // remains the hash over the destination prompt-bundle bytes so
+        // collision classification and force-transfer hash recomputes
+        // still work.
         let companion_entry = installed
             .native_companions
             .entry(input.plugin.as_str().to_owned())
@@ -3215,20 +3302,14 @@ impl KiroProject {
                 version: input.version.map(str::to_owned),
                 installed_at: chrono::Utc::now(),
                 files: Vec::new(),
-                source_hash: crate::hash::BlakeHash::placeholder(),
+                source_hash: None,
                 installed_hash: crate::hash::BlakeHash::placeholder(),
                 source_scan_root: input.source_scan_root.clone(),
             });
         // Refresh marketplace/version/timestamp + source_scan_root on
-        // every install. The post-insert refresh
-        // initially missed `source_scan_root`, so a manifest that
-        // changed its scan paths between installs would keep the stale
-        // root recorded forever — the install-time scan_root is what
-        // detection consults to locate the source side, so a stale
-        // value is a latent false-drift bug. Issue #99 currently masks
-        // this for translated companions (they don't yet read the
-        // field at detect time), but the moment that lands the
-        // staleness becomes a real bug.
+        // every install. The post-insert refresh initially missed
+        // `source_scan_root`, so a manifest that changed its scan paths
+        // between installs would keep the stale root recorded forever.
         companion_entry.marketplace = input.marketplace.clone();
         companion_entry.version = input.version.map(str::to_owned);
         companion_entry.installed_at = chrono::Utc::now();
@@ -3239,11 +3320,14 @@ impl KiroProject {
         {
             companion_entry.files.push(input.prompt_rel.to_path_buf());
         }
-        // Recompute hashes over the full prompt set for this plugin.
+        // Recompute installed_hash over the destination prompt set.
+        // source_hash stays None — re-affirmed below so a prior install
+        // (before this fix) that left a Some-value on disk gets cleared
+        // when the next translated install runs through this path.
         let companion_files_snapshot = companion_entry.files.clone();
         let companion_hash =
             crate::hash::hash_artifact(input.agents_root, &companion_files_snapshot)?;
-        companion_entry.source_hash = companion_hash.clone();
+        companion_entry.source_hash = None;
         companion_entry.installed_hash = companion_hash;
         Ok(())
     }
@@ -3728,7 +3812,11 @@ impl KiroProject {
                 version: input.version.map(String::from),
                 installed_at: chrono::Utc::now(),
                 files: input.rel_paths.to_vec(),
-                source_hash: input.source_hash.clone(),
+                // Native path: real source-side companion files exist
+                // (e.g. `agents/prompts/*.md` on the source side were
+                // copied verbatim). Wrap the source hash in `Some` so
+                // drift detection recomputes against the source layout.
+                source_hash: Some(input.source_hash.clone()),
                 installed_hash: installed_hash.clone(),
                 source_scan_root,
             },
@@ -3797,8 +3885,15 @@ impl KiroProject {
         // Same-plugin check first — idempotent or content-changed.
         // The HashMap key is still `String` (out of scope), so look up
         // by string view; equality below uses the same shape.
+        //
+        // Comparing `Option<BlakeHash>` to `&BlakeHash`: an existing
+        // entry with `source_hash: None` (translated-synthesized) is
+        // never idempotent for an incoming native install — `None !=
+        // Some(_)` falls through to `forced_overwrite` mode, which is
+        // the correct semantic (the native install replaces the
+        // synthesized ownership claim with a real drift-tracked one).
         if let Some(existing) = installed.native_companions.get(input.plugin.as_str()) {
-            if existing.source_hash == *input.source_hash {
+            if existing.source_hash.as_ref() == Some(input.source_hash) {
                 return Ok(CollisionDecision::Idempotent(Box::new(
                     InstalledNativeCompanionsOutcome {
                         plugin: input.plugin.to_string(),
@@ -4071,12 +4166,23 @@ impl KiroProject {
         // the entry, and we'd need to special-case "empty entries
         // don't need a hash recompute". Cleaner to recompute first,
         // then prune.
+        //
+        // `source_hash: None` entries (translated-synthesized) keep
+        // None. The hash_artifact call above hashes the destination
+        // `agents_dir`, which for native entries happens to match the
+        // source bytes (verbatim copy at install) — so refreshing the
+        // Some-arm with that hash preserves the existing equality
+        // contract. Synthesized entries have no source side to drift
+        // against; leaving `source_hash` as None keeps detection
+        // skipping them.
         for p in &modified {
             if let Some(meta) = installed.native_companions.get_mut(p)
                 && !meta.files.is_empty()
             {
                 let new_hash = crate::hash::hash_artifact(agents_dir, &meta.files)?;
-                new_hash.clone_into(&mut meta.source_hash);
+                if meta.source_hash.is_some() {
+                    meta.source_hash = Some(new_hash.clone());
+                }
                 meta.installed_hash = new_hash;
             }
         }
@@ -6131,8 +6237,11 @@ mod tests {
             a_entry.installed_hash, expected_a_hash,
             "installed_hash must be recomputed over surviving files"
         );
+        // Native install path writes Some(hash). The strip-transferred
+        // pass refreshes the Some-arm against the surviving file set.
         assert_eq!(
-            a_entry.source_hash, expected_a_hash,
+            a_entry.source_hash,
+            Some(expected_a_hash.clone()),
             "source_hash must equal installed_hash post-transfer (canonical truth = current bytes on disk)"
         );
         assert_ne!(
@@ -7608,7 +7717,7 @@ mod tests {
                 std::path::PathBuf::from("prompts/a.md"),
                 std::path::PathBuf::from("prompts/b.md"),
             ],
-            source_hash: crate::hash::BlakeHash::placeholder(),
+            source_hash: Some(crate::hash::BlakeHash::placeholder()),
             installed_hash: crate::hash::BlakeHash::placeholder(),
             source_scan_root: RelativePath::new("agents").expect("valid"),
         };
@@ -7976,8 +8085,20 @@ mod tests {
             "prompt file must be tracked under native_companions: {:?}",
             companion.files
         );
-        assert!(companion.source_hash.as_str().starts_with("blake3:"));
-        assert_eq!(companion.source_hash, companion.installed_hash);
+        // Synthesized for a translated agent: source_hash is None
+        // because there is no source-side companion file (the prompt
+        // body was extracted from the agent `.md`, not copied from a
+        // separate prompt file). installed_hash remains meaningful —
+        // it's the hash of the destination prompt bundle.
+        assert!(
+            companion.source_hash.is_none(),
+            "translated path must record source_hash: None, got {:?}",
+            companion.source_hash
+        );
+        assert!(
+            companion.installed_hash.as_str().starts_with("blake3:"),
+            "installed_hash should still be a real blake3 hash"
+        );
     }
 
     #[test]
@@ -8105,6 +8226,159 @@ mod tests {
             "second install must refresh the recorded source_scan_root \
              (regression: pre-fix it stuck at the first install's value)"
         );
+    }
+
+    /// Legacy migration: pre-Option-source_hash tracking files contain
+    /// `Some(hash)` on translated-synthesized companion entries. The
+    /// migration must demote them to `None` so the drift scan stops
+    /// trying to rehash a destination layout against the source side.
+    ///
+    /// Identifies translated-synthesized entries by the absence of any
+    /// native-dialect agent in the same `(marketplace, plugin)`.
+    #[test]
+    fn migrate_companion_source_hash_demotes_translated_synthesized_entries() {
+        let (_dir, project) = temp_project();
+
+        // Seed legacy tracking: one translated-only plugin (claude
+        // agent + companion entry carrying a Some-hash from the
+        // pre-fix install path).
+        let agent_meta = InstalledAgentMeta {
+            marketplace: mp("legacy-mp"),
+            plugin: pn("legacy-translated"),
+            version: Some("1.0".into()),
+            installed_at: Utc::now(),
+            dialect: AgentDialect::Claude,
+            source_path: RelativePath::new("agents/legacy.md").expect("valid"),
+            source_hash: crate::hash::BlakeHash::placeholder(),
+            installed_hash: crate::hash::BlakeHash::placeholder(),
+        };
+        let companion_meta = InstalledNativeCompanionsMeta {
+            marketplace: mp("legacy-mp"),
+            plugin: pn("legacy-translated"),
+            version: Some("1.0".into()),
+            installed_at: Utc::now(),
+            files: vec![PathBuf::from("prompts/legacy.md")],
+            // Pre-fix shape: Some(hash) populated by the old
+            // synthesize_companion_entry recipe.
+            source_hash: Some(crate::hash::BlakeHash::placeholder()),
+            installed_hash: crate::hash::BlakeHash::placeholder(),
+            source_scan_root: RelativePath::new("agents").expect("valid"),
+        };
+        let mut installed = InstalledAgents::default();
+        installed.agents.insert("legacy".to_owned(), agent_meta);
+        installed
+            .native_companions
+            .insert("legacy-translated".to_owned(), companion_meta);
+        project
+            .write_agent_tracking(&installed)
+            .expect("seed legacy tracking");
+
+        let changed = project
+            .migrate_companion_source_hash()
+            .expect("migration runs");
+        assert!(changed, "migration must report it persisted changes");
+
+        let after = project
+            .load_installed_agents()
+            .expect("load post-migration");
+        let entry = after
+            .native_companions
+            .get("legacy-translated")
+            .expect("entry survived");
+        assert!(
+            entry.source_hash.is_none(),
+            "translated-synthesized entry must be demoted to source_hash: None, got {:?}",
+            entry.source_hash
+        );
+        // installed_hash must NOT be touched by the migration.
+        assert!(
+            entry.installed_hash.as_str().starts_with("blake3:"),
+            "migration only touches source_hash; installed_hash stays"
+        );
+    }
+
+    /// Legacy migration must NOT demote native-dialect entries — those
+    /// genuinely have a source-side companion file to drift-check
+    /// against.
+    #[test]
+    fn migrate_companion_source_hash_preserves_native_entries() {
+        let (_dir, project) = temp_project();
+
+        let native_agent = InstalledAgentMeta {
+            marketplace: mp("native-mp"),
+            plugin: pn("native-plugin"),
+            version: Some("2.0".into()),
+            installed_at: Utc::now(),
+            dialect: AgentDialect::Native,
+            source_path: RelativePath::new("agents/n.json").expect("valid"),
+            source_hash: crate::hash::BlakeHash::placeholder(),
+            installed_hash: crate::hash::BlakeHash::placeholder(),
+        };
+        let native_companion = InstalledNativeCompanionsMeta {
+            marketplace: mp("native-mp"),
+            plugin: pn("native-plugin"),
+            version: Some("2.0".into()),
+            installed_at: Utc::now(),
+            files: vec![PathBuf::from("prompts/n.md")],
+            source_hash: Some(crate::hash::BlakeHash::placeholder()),
+            installed_hash: crate::hash::BlakeHash::placeholder(),
+            source_scan_root: RelativePath::new("agents").expect("valid"),
+        };
+        let mut installed = InstalledAgents::default();
+        installed.agents.insert("n".to_owned(), native_agent);
+        installed
+            .native_companions
+            .insert("native-plugin".to_owned(), native_companion);
+        project
+            .write_agent_tracking(&installed)
+            .expect("seed native tracking");
+
+        let changed = project
+            .migrate_companion_source_hash()
+            .expect("migration runs");
+        assert!(
+            !changed,
+            "migration must be a no-op when no translated-only plugins exist"
+        );
+
+        let after = project.load_installed_agents().expect("load");
+        let entry = after
+            .native_companions
+            .get("native-plugin")
+            .expect("entry survived");
+        assert!(
+            entry.source_hash.is_some(),
+            "native entry must keep its Some(_) source_hash"
+        );
+    }
+
+    /// Migration is idempotent: running it twice writes only once.
+    /// Closes the "every load rewrites" concern raised when choosing
+    /// between in-memory vs persistent migration.
+    #[test]
+    fn migrate_companion_source_hash_is_idempotent() {
+        let (_dir, project) = temp_project();
+
+        let companion_meta = InstalledNativeCompanionsMeta {
+            marketplace: mp("mp"),
+            plugin: pn("translated"),
+            version: None,
+            installed_at: Utc::now(),
+            files: vec![PathBuf::from("prompts/x.md")],
+            source_hash: Some(crate::hash::BlakeHash::placeholder()),
+            installed_hash: crate::hash::BlakeHash::placeholder(),
+            source_scan_root: RelativePath::new("agents").expect("valid"),
+        };
+        let mut installed = InstalledAgents::default();
+        installed
+            .native_companions
+            .insert("translated".to_owned(), companion_meta);
+        project.write_agent_tracking(&installed).expect("seed");
+
+        let first = project.migrate_companion_source_hash().unwrap();
+        let second = project.migrate_companion_source_hash().unwrap();
+        assert!(first, "first call demotes");
+        assert!(!second, "second call is a no-op");
     }
 
     // -----------------------------------------------------------------------
@@ -8644,7 +8918,8 @@ mod tests {
         assert_eq!(entry.marketplace, "marketplace-x");
         assert_eq!(entry.version.as_deref(), Some("0.1.0"));
         assert_eq!(entry.files.len(), 2);
-        assert_eq!(entry.source_hash, source_hash);
+        // Native install path: source_hash recorded as Some(_).
+        assert_eq!(entry.source_hash, Some(source_hash));
         assert_eq!(entry.installed_hash, outcome.installed_hash);
     }
 
