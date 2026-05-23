@@ -10,6 +10,7 @@
     formatModelChip,
     type AgentsTabMode,
   } from "$lib/agent-list-helpers";
+  import { formatSavedToast } from "$lib/save-params";
   import AgentEditor from "./AgentEditor.svelte";
 
   let { projectPath }: { projectPath: string } = $props();
@@ -259,14 +260,11 @@
     onSaved={async (msg, orphanPath) => {
       mode = { kind: "list" };
       await refresh();
-      if (orphanPath) {
-        // A1 partial-success warning. The save itself succeeded but
-        // the post-rename unlink failed; surface the orphan path so
-        // the user knows about the stale file on disk.
-        showToast(`${msg} (note: stale file remains at ${orphanPath})`);
-      } else {
-        showToast(msg);
-      }
+      // A1 partial-success: when the rename succeeded but the
+      // post-rename unlink failed, the toast carries an orphan-path
+      // suffix so the user knows about the stale file on disk.
+      // formatting lives in save-params.ts to keep it vitest-covered.
+      showToast(formatSavedToast(msg, orphanPath));
     }}
   />
 {/if}

@@ -1,28 +1,31 @@
 <script lang="ts">
-  // Workflows > Agents — editor shell. Renders the topbar, 7-entry
-  // section rail, and active panel slot. Owns the draft state, the
-  // load-on-mount flow for edit mode, and the save flow that consumes
-  // post-A1 `SaveOutcome` and forwards `orphan_left_behind` up to the
-  // parent for toast rendering.
+  // Workflows > Agents — editor for user-authored agents.
   //
-  // S13 ships the SHELL only. The Identity panel content (S14) and
-  // the System Prompt panel content (S15) are placeholders here —
-  // their slices replace those `{:else if section === ...}` arms with
-  // proper components. Tools / MCP / Resources / Hooks / Advanced
-  // sections (S in slices 2-6) are visibly disabled.
+  // Owns:
+  //   - the in-memory `draft` (a `name`-bearing open record so
+  //     panels can round-trip fields they don't yet surface)
+  //   - the load-on-mount flow for edit mode (with a `loadToken`
+  //     guard and a `loadFailed` flag separate from `loadError` so
+  //     a dismissed banner can't re-enable Save over a synthetic
+  //     stub)
+  //   - the save flow that consumes `SaveOutcome` and forwards
+  //     `orphan_left_behind` to the parent via `onSaved`
+  //   - the marketplace-prompt modal trigger (only mounts when
+  //     the editing row carries lineage)
   //
-  // The S16 modal that asks "keep linked or detach?" before saving a
-  // marketplace-tracked agent has not shipped yet. For S13, save in
-  // edit mode hardcodes `detach: false` (preserves lineage). The
-  // hardcode is replaced by a SaveChoice modal flow when S16 lands;
-  // the editor's contract with the IPC layer is unchanged.
+  // Identity (`IdentityPanel`) and System Prompt (`PromptPanel`)
+  // render in the active section slot. The other five sections
+  // (Tools, MCP, Resources, Hooks, Advanced) are visibly disabled
+  // until their slices land — see `SECTIONS` below.
 
   import { commands } from "$lib/bindings";
   import type { UserAgentRow } from "$lib/bindings";
   import type { AgentsTabMode } from "$lib/agent-list-helpers";
   import { validateAgentNameForSave } from "$lib/agent-name";
+  import { normalizePromptForSave } from "$lib/prompt-mode";
   import {
     buildSaveParams,
+    pickEditSavedVerb,
     shouldPromptForSaveChoice,
     type SaveChoice,
   } from "$lib/save-params";
@@ -137,14 +140,15 @@
   let saving: boolean = $state(false);
   let saveError: string | null = $state(null);
 
-  // Save-time marketplace-prompt modal state (slice S16). The modal
-  // opens when the user clicks Save on a tracked agent and asks
-  // "keep linked or detach?". `pendingDraftJson` snapshots the
-  // serialised draft at the moment requestSave fires so the user's
-  // choice in the modal applies to that snapshot — not to any
-  // in-flight typing the user might do (the modal traps focus, so
-  // they shouldn't be typing, but the snapshot makes the
-  // requestSave -> performSaveEdit boundary deterministic).
+  // Save-time marketplace-prompt modal state. The modal opens when
+  // the user clicks Save on a tracked agent and asks "keep linked
+  // or detach?". `pendingDraftJson` snapshots the serialised draft
+  // at the moment requestSave fires so the user's choice in the
+  // modal applies to that snapshot, making the requestSave ->
+  // performSaveEdit boundary deterministic regardless of any
+  // background interaction. (The modal sets initial focus to the
+  // safer Keep-linked button but does not implement a Tab-trap; the
+  // snapshot is what guarantees correctness, not focus management.)
   let savePromptOpen: boolean = $state(false);
   let pendingDraftJson: string | null = $state(null);
 
@@ -157,18 +161,43 @@
   // refresh. Per S13 review I3.
   let loadToken = 0;
 
-  // Agent-name validation now lives in `$lib/agent-name`. The S13
-  // review's C1 finding flagged that the in-component regex comment
-  // lied about parity with the backend; the helper module owns the
-  // honest contract (it's a UX-strictness layer, NOT parity) and
-  // the split-policy escape hatch (per kiro-k9ok) that lets a user
-  // editing an existing agent with a permissive name save without
-  // renaming.
+  // Mode discriminator derivations. Both go through `switch` with a
+  // `never`-typed default so a future `EditorMode` arm causes a
+  // compile error here rather than silently routing through the
+  // existing branches (the `_EDITOR_MODE_KINDS` tripwire catches
+  // type additions; these switches catch consumer-side drift).
+  function deriveIsNew(m: EditorMode): boolean {
+    switch (m.kind) {
+      case "new":
+        return true;
+      case "edit":
+        return false;
+      default: {
+        const _exhaustive: never = m;
+        throw new Error(
+          `AgentEditor.deriveIsNew: unhandled mode ${JSON.stringify(_exhaustive)}`,
+        );
+      }
+    }
+  }
 
-  let isNew = $derived(mode.kind === "new");
-  let editingRow: UserAgentRow | null = $derived(
-    mode.kind === "edit" ? mode.row : null,
-  );
+  function deriveEditingRow(m: EditorMode): UserAgentRow | null {
+    switch (m.kind) {
+      case "new":
+        return null;
+      case "edit":
+        return m.row;
+      default: {
+        const _exhaustive: never = m;
+        throw new Error(
+          `AgentEditor.deriveEditingRow: unhandled mode ${JSON.stringify(_exhaustive)}`,
+        );
+      }
+    }
+  }
+
+  let isNew = $derived(deriveIsNew(mode));
+  let editingRow: UserAgentRow | null = $derived(deriveEditingRow(mode));
   let draftName = $derived(draft.name);
   let titleLabel = $derived(
     isNew ? "New agent" : draftName || originalName || "Untitled agent",
@@ -362,18 +391,9 @@
     // Normalise empty Identity-field strings to null on save (per the
     // React reference). The agent-spec.json schema treats null and
     // absent as equivalent for optional fields; passing "" would be
-    // a third state the schema doesn't model.
-    //
-    // The prompt field has an extra normalisation rule: a bare
-    // `"file://"` (the post-mode-switch state with no path typed)
-    // is functionally empty — saving it would point the agent at a
-    // non-existent path. Treat it as null on save, same as an empty
-    // inline prompt.
-    const promptRaw = draft.prompt;
-    const promptNormalised =
-      typeof promptRaw === "string" && (promptRaw === "" || promptRaw === "file://")
-        ? null
-        : promptRaw;
+    // a third state the schema doesn't model. The prompt field's
+    // file-mode null-coercion lives in `normalizePromptForSave` so
+    // the whitespace-bypass case (`"file:// "`) has vitest coverage.
     const finalDraft: Record<string, unknown> = {
       ...draft,
       name: draftName,
@@ -381,7 +401,7 @@
       model: nullIfEmpty(draft.model),
       keyboardShortcut: nullIfEmpty(draft.keyboardShortcut),
       welcomeMessage: nullIfEmpty(draft.welcomeMessage),
-      prompt: promptNormalised,
+      prompt: normalizePromptForSave(draft.prompt),
     };
     const draftJson = JSON.stringify(finalDraft, null, 2);
 
@@ -447,7 +467,7 @@
         // Discarding the outcome here would silently hide the
         // partial-success state.
         const orphan = result.data.orphan_left_behind;
-        const verb = originalName === draftName ? "Saved" : "Renamed to";
+        const verb = pickEditSavedVerb(originalName, draftName);
         onSaved(`${verb} “${draftName}”`, orphan);
       } else {
         saveError = result.error.message;

@@ -4,6 +4,8 @@ import type { UserAgentRow } from "$lib/bindings";
 
 import {
   buildSaveParams,
+  formatSavedToast,
+  pickEditSavedVerb,
   shouldPromptForSaveChoice,
 } from "./save-params";
 
@@ -66,5 +68,58 @@ describe("shouldPromptForSaveChoice", () => {
         },
       }),
     ).toBe(true);
+  });
+});
+
+describe("pickEditSavedVerb", () => {
+  test("returns 'Saved' when name unchanged", () => {
+    expect(pickEditSavedVerb("agent", "agent")).toBe("Saved");
+  });
+
+  test("returns 'Renamed to' when name changed", () => {
+    expect(pickEditSavedVerb("old-name", "new-name")).toBe("Renamed to");
+  });
+
+  test("treats empty originalName as a rename (defensive)", () => {
+    // The editor only calls this in edit mode (originalName comes
+    // from row.name, which is never ""), but the function shouldn't
+    // depend on that invariant for correctness.
+    expect(pickEditSavedVerb("", "new-name")).toBe("Renamed to");
+  });
+});
+
+describe("formatSavedToast", () => {
+  test("returns message verbatim when orphanPath is null", () => {
+    expect(formatSavedToast("Saved foo", null)).toBe("Saved foo");
+  });
+
+  test("appends orphan-path suffix when orphanPath is provided", () => {
+    // Bug class this defeats: a future refactor that drops the
+    // orphan-path forwarding (the A1 plumbing in performSaveEdit)
+    // would result in a save that LOOKS clean but leaves a stale
+    // file the user has no signal about.
+    expect(formatSavedToast("Renamed to bar", ".kiro/agents/foo.json")).toBe(
+      "Renamed to bar (note: stale file remains at .kiro/agents/foo.json)",
+    );
+  });
+
+  test("preserves curly quotes in the message", () => {
+    // The editor composes messages with U+201C / U+201D smart quotes
+    // around the agent name (e.g. `Saved "foo"`). The helper must
+    // not normalise them — the e2e regex matchers depend on them
+    // staying through unchanged.
+    expect(formatSavedToast("Saved “foo”", null)).toBe(
+      "Saved “foo”",
+    );
+  });
+
+  test("empty string orphanPath still renders a (degenerate) suffix", () => {
+    // Pinned: only `null` is the "no orphan" signal. An empty
+    // string would be unusual coming from the backend but if it
+    // ever did, treat it as a present-but-empty path so the bug
+    // surfaces visibly rather than being silently absorbed.
+    expect(formatSavedToast("Saved x", "")).toBe(
+      "Saved x (note: stale file remains at )",
+    );
   });
 });

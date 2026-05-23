@@ -16,6 +16,23 @@
 
 export type PromptMode = "inline" | "file";
 
+// Compile-time exhaustiveness tripwire on PromptMode. Mirrors the
+// canonical pattern in AgentEditor.svelte's `_EDITOR_MODE_KINDS`.
+// If a future PromptMode arm lands without `_PROMPT_MODES` being
+// updated, the value-position `_assertPromptMode = true` fails to
+// compile — forcing the implementer to add explicit cases in the
+// switches below rather than silently routing through the existing
+// arms.
+const _PROMPT_MODES = ["inline", "file"] as const satisfies ReadonlyArray<
+  PromptMode
+>;
+type _AssertPromptModeExhaustive =
+  Exclude<PromptMode, (typeof _PROMPT_MODES)[number]> extends never
+    ? true
+    : never;
+const _assertPromptMode: _AssertPromptModeExhaustive = true;
+void _assertPromptMode;
+
 const FILE_PREFIX = "file://";
 
 /**
@@ -46,7 +63,18 @@ export function detectPromptMode(value: string | null): PromptMode {
  * remembered, mirroring the React design reference.
  */
 export function clearPromptOnModeSwitch(target: PromptMode): string {
-  return target === "file" ? FILE_PREFIX : "";
+  switch (target) {
+    case "file":
+      return FILE_PREFIX;
+    case "inline":
+      return "";
+    default: {
+      const _exhaustive: never = target;
+      throw new Error(
+        `clearPromptOnModeSwitch: unhandled PromptMode ${JSON.stringify(_exhaustive)}`,
+      );
+    }
+  }
 }
 
 /**
@@ -70,4 +98,34 @@ export function filePathFromPrompt(value: string): string {
  */
 export function buildFilePrompt(path: string): string {
   return FILE_PREFIX + path;
+}
+
+/**
+ * Normalize the draft's `prompt` field at save time.
+ *
+ * Returns `null` when the value is functionally empty so the saved
+ * agent JSON doesn't claim "my prompt is at <path that doesn't
+ * exist>" — the agent-spec.json schema treats null and absent as
+ * equivalent for optional fields. Three null-coerced cases:
+ *   - empty string
+ *   - bare `"file://"` (post-mode-switch state, no path typed)
+ *   - `"file://<whitespace>"` (path component is all-whitespace —
+ *     defeats the gap where typing a single space after switching
+ *     to file mode bypassed the bare-`"file://"` exact-match check)
+ *
+ * Non-string values pass through unchanged so the draft round-trips
+ * any field shape the panels haven't surfaced yet.
+ *
+ * The value is NOT trimmed — `"file:// foo"` is preserved verbatim
+ * because that may be the user's actual path. Only fully-empty path
+ * components are null-coerced.
+ */
+export function normalizePromptForSave(value: unknown): unknown {
+  if (typeof value !== "string") return value;
+  if (value === "") return null;
+  if (value.startsWith(FILE_PREFIX)) {
+    const path = value.slice(FILE_PREFIX.length);
+    if (path.trim() === "") return null;
+  }
+  return value;
 }

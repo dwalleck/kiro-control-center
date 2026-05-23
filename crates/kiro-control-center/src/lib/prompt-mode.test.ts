@@ -5,6 +5,7 @@ import {
   clearPromptOnModeSwitch,
   detectPromptMode,
   filePathFromPrompt,
+  normalizePromptForSave,
 } from "./prompt-mode";
 
 describe("detectPromptMode", () => {
@@ -83,5 +84,55 @@ describe("filePathFromPrompt / buildFilePrompt round-trip", () => {
     // Matches the post-mode-switch state from
     // clearPromptOnModeSwitch('file').
     expect(buildFilePrompt("")).toBe("file://");
+  });
+});
+
+describe("normalizePromptForSave", () => {
+  test("empty string becomes null", () => {
+    expect(normalizePromptForSave("")).toBeNull();
+  });
+
+  test("bare 'file://' becomes null", () => {
+    expect(normalizePromptForSave("file://")).toBeNull();
+  });
+
+  test("'file://' followed by single space becomes null", () => {
+    // Bug pinned: clicking File-mode and accidentally typing a
+    // space (or pasting whitespace) used to bypass the bare-
+    // `"file://"` exact-match check and save a prompt that pointed
+    // the agent at a non-existent path. The whitespace-trim guard
+    // catches this without modifying any legitimate path.
+    expect(normalizePromptForSave("file:// ")).toBeNull();
+  });
+
+  test("'file://' followed by tabs/newlines becomes null", () => {
+    expect(normalizePromptForSave("file://\t\n   ")).toBeNull();
+  });
+
+  test("'file://foo' is preserved verbatim", () => {
+    expect(normalizePromptForSave("file://foo")).toBe("file://foo");
+  });
+
+  test("'file:// foo' is preserved verbatim (path is not all-whitespace)", () => {
+    // Defensive: a legitimate path may start with a space — don't
+    // trim the user's input, only null-coerce when the path
+    // component is entirely whitespace.
+    expect(normalizePromptForSave("file:// foo")).toBe("file:// foo");
+  });
+
+  test("inline text is preserved verbatim", () => {
+    expect(normalizePromptForSave("inline text")).toBe("inline text");
+  });
+
+  test("non-string values pass through unchanged", () => {
+    // The draft is a Record<string, unknown> that round-trips fields
+    // the panels haven't surfaced yet. A non-string `prompt` (which
+    // would be schema-invalid but is parseable JSON) must not be
+    // coerced to null — preserve as-is so the source-of-truth file
+    // editor catches it.
+    expect(normalizePromptForSave(null)).toBeNull();
+    expect(normalizePromptForSave(undefined)).toBeUndefined();
+    expect(normalizePromptForSave(42)).toBe(42);
+    expect(normalizePromptForSave({ nested: true })).toEqual({ nested: true });
   });
 });
