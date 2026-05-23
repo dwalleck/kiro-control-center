@@ -1,0 +1,80 @@
+=== S13 contract oracle (Rust source, upstream of specta) ===
+
+# 1. SaveOutcome (kiro-market-core/src/user_agent.rs)
+
+pub struct SaveOutcome {
+    /// On a rename, the path of an old file whose unlink failed after
+    /// the new file was atomically written. `None` for the in-place
+    /// edit path, for renames where the old file was successfully
+    /// removed, and for renames where the old file was already absent
+    /// (`ErrorKind::NotFound`). The path is serialized as a string for
+    /// the FFI; the UI's only legitimate use is to display it back to
+    /// the user.
+    pub orphan_left_behind: Option<String>,
+
+# 2. UserAgentRow (user_agent.rs)
+
+pub struct UserAgentRow {
+    /// Agent identity. Always the filename stem of
+    /// `.kiro/agents/<name>.json` (canonical identity for CRUD ops).
+    /// The JSON file's `name` field is NOT used for this value â€”
+    /// `create_user_agent` and `save_user_agent` enforce that the
+    /// JSON `name` equals the filename stem at write time, so drift
+    /// between display and path cannot be introduced via the UI.
+    /// See spec D14 in `.agents-view/spec.md` for the rationale.
+    pub name: String,
+    /// Human-only label; not shown to the model.
+    pub description: Option<String>,
+    /// Model ID override; `None` means "use Kiro's default."
+    pub model: Option<String>,
+
+# 3. UserAgentLineage (user_agent.rs)
+
+pub struct UserAgentLineage {
+    pub marketplace: String,
+    pub plugin: String,
+    pub version: Option<String>,
+}
+
+/// Non-fatal outcome data returned by
+/// [`crate::project::KiroProject::save_user_agent`]. The save itself
+/// has already succeeded by the time the caller sees this value â€”
+
+# 4. ErrorType variants (kiro-control-center/src-tauri/src/error.rs)
+
+
+    NotFound,
+    AlreadyExists,
+    Validation,
+    GitError,
+    IoError,
+    ParseError,
+    Internal,
+    Unknown,
+
+# 5. The 5 #[tauri::command] signatures (commands/agents_authoring.rs)
+
+pub async fn list_user_agents(project_path: String) -> Result<Vec<UserAgentRow>, CommandError> {
+    let project_root = validate_kiro_project_path(&project_path)?;
+---
+pub async fn create_user_agent(
+    name: String,
+---
+pub async fn save_user_agent(
+    from_name: String,
+---
+pub async fn delete_user_agent(name: String, project_path: String) -> Result<(), CommandError> {
+    let project_root = validate_kiro_project_path(&project_path)?;
+---
+pub async fn duplicate_user_agent(
+    source_name: String,
+---
+
+# 6. AgentsTabMode consumer parity (AgentsTab.svelte uses kind values list/new/edit)
+
+L97: {#if mode.kind === "list"}
+L109: onclick={() => (mode = { kind: "new" })}
+L205: onclick={() => (mode = { kind: "edit", row })}
+L259: onclick={() => (mode = { kind: "list" })}
+
+

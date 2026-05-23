@@ -230,6 +230,20 @@ export const commands = {
 	 */
 	duplicateUserAgent: (sourceName: string, projectPath: string) => typedError<string, CommandError>(__TAURI_INVOKE("duplicate_user_agent", { sourceName, projectPath })),
 	/**
+	 *  Read the raw JSON content of a user-authored agent for the editor's
+	 *  edit-mode load. Returns the file's bytes as a UTF-8 string,
+	 *  suitable for round-tripping back through [`save_user_agent`] after
+	 *  the user makes edits.
+	 * 
+	 *  Companion to [`list_user_agents`] (which only returns summary
+	 *  fields). The editor's prompt / tools / MCP / resources / hooks /
+	 *  advanced sections need the full in-file shape — `UserAgentRow`'s
+	 *  counts can't reconstruct it. Without this command edit mode would
+	 *  have to start from a synthetic empty draft, and saving would
+	 *  silently truncate the agent.
+	 */
+	loadUserAgentJson: (name: string, projectPath: string) => typedError<string, CommandError>(__TAURI_INVOKE("load_user_agent_json", { name, projectPath })),
+	/**
 	 *  Install every skill, steering file, and agent declared by a plugin
 	 *  into the active project's `.kiro/` tree in one call.
 	 * 
