@@ -22,6 +22,7 @@
   import type { AgentsTabMode } from "$lib/agent-list-helpers";
   import { validateAgentNameForSave } from "$lib/agent-name";
   import IdentityPanel from "./editor/IdentityPanel.svelte";
+  import PromptPanel from "./editor/PromptPanel.svelte";
 
   // The editor only handles `new` and `edit` modes. The parent's
   // `{:else}` branch enforces that — `list` never reaches this
@@ -325,6 +326,17 @@
     // React reference). The agent-spec.json schema treats null and
     // absent as equivalent for optional fields; passing "" would be
     // a third state the schema doesn't model.
+    //
+    // The prompt field has an extra normalisation rule: a bare
+    // `"file://"` (the post-mode-switch state with no path typed)
+    // is functionally empty — saving it would point the agent at a
+    // non-existent path. Treat it as null on save, same as an empty
+    // inline prompt.
+    const promptRaw = draft.prompt;
+    const promptNormalised =
+      typeof promptRaw === "string" && (promptRaw === "" || promptRaw === "file://")
+        ? null
+        : promptRaw;
     const finalDraft: Record<string, unknown> = {
       ...draft,
       name: draftName,
@@ -332,6 +344,7 @@
       model: nullIfEmpty(draft.model),
       keyboardShortcut: nullIfEmpty(draft.keyboardShortcut),
       welcomeMessage: nullIfEmpty(draft.welcomeMessage),
+      prompt: promptNormalised,
     };
     const draftJson = JSON.stringify(finalDraft, null, 2);
 
@@ -552,15 +565,10 @@
           {/if}
         </div>
       {:else if section === "prompt"}
-        <!-- Prompt placeholder (S15 fills this in). -->
-        <div class="max-w-xl flex flex-col gap-3">
-          <h2 class="text-base font-semibold text-kiro-text">System Prompt</h2>
-          <p class="text-xs text-kiro-subtle">
-            Inline / file-mode prompt editor arrives in slice S15. The current
-            agent's <code class="font-mono">prompt</code> field round-trips
-            verbatim through save in the meantime.
-          </p>
-        </div>
+        <PromptPanel
+          prompt={fieldOrEmpty("prompt")}
+          onPatch={applyDraftPatch}
+        />
       {:else}
         <p class="text-sm text-kiro-subtle">Section not yet implemented.</p>
       {/if}
