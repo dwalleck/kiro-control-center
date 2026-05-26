@@ -1,79 +1,84 @@
 # Data Models
 
-## On-Disk State Files
+<!-- tags: types, models, json, data-structures -->
 
-### ~/.cache/kiro-market/known-marketplaces.json
+## Validation Newtypes (`validation.rs`)
 
-```json
-[
-  {
-    "name": "dotnet-agent-skills",
-    "source": "https://github.com/microsoft/dotnet-agent-skills.git"
-  }
-]
-```
+All newtypes are only constructible via validated constructors. They serialize/deserialize transparently as strings.
 
-### ~/.cache/kiro-market/registries/{marketplace}.json
+| Type | Rejects | Used for |
+|---|---|---|
+| `PluginName` | empty, traversal (`..`), NUL, backslash, forward slash | Plugin identifiers |
+| `MarketplaceName` | empty, traversal, NUL, backslash, forward slash | Marketplace identifiers |
+| `AgentName` | empty, traversal, NUL, path separators | Agent identifiers |
+| `RelativePath` | absolute paths, `..` components, backslashes, NUL, empty | Safe relative file paths |
 
-Plugin registry persisted after marketplace add/update:
+`validate_name()` additionally rejects: Windows reserved names (`CON`, `NUL`, etc.), trailing dots, leading/trailing spaces, other control characters.
 
-```json
-[
-  {
-    "name": "dotnet",
-    "description": "EF Core and .NET skills",
-    "path": "./dotnet",
-    "source": null
-  }
-]
-```
+---
 
-### .kiro/installed-skills.json
+## Tracking Files (`.kiro/`)
+
+### `installed-skills.json`
 
 ```json
 {
   "skills": {
-    "efcore": {
-      "marketplace": "dotnet-agent-skills",
-      "plugin": "dotnet",
-      "version": "abc1234",
-      "installed_at": "2025-01-15T10:30:00Z",
-      "source_hash": "blake3:abcdef...",
-      "installed_hash": "blake3:123456..."
+    "<skill-name>": {
+      "marketplace": "string",
+      "plugin": "string",
+      "skill_dir": "relative/path",
+      "scan_root": "relative/path",
+      "source_hash": "blake3:hex...",
+      "installed_hash": "blake3:hex...",
+      "installed_at": "2026-01-01T00:00:00Z",
+      "version": "string | null"
     }
   }
 }
 ```
 
-### .kiro/installed-agents.json
+### `installed-agents.json`
 
 ```json
 {
   "agents": {
-    "my-agent": {
-      "marketplace": "dotnet-agent-skills",
-      "plugin": "dotnet",
-      "dialect": "claude",
-      "installed_at": "2025-01-15T10:30:00Z",
-      "source_hash": "blake3:abcdef...",
-      "installed_hash": "blake3:123456...",
-      "native_companions": {}
+    "<agent-name>": {
+      "marketplace": "string",
+      "plugin": "string",
+      "dialect": "claude" | "copilot" | "native",
+      "source_path": "relative/path",
+      "source_hash": "blake3:hex...",
+      "installed_hash": "blake3:hex...",
+      "installed_at": "2026-01-01T00:00:00Z",
+      "version": "string | null",
+      "companion_files": ["relative/path", ...]
+    }
+  },
+  "native_companions": {
+    "<plugin@marketplace>": {
+      "files": ["relative/path", ...],
+      "source_scan_root": "relative/path",
+      "source_hash": "blake3:hex...",
+      "installed_hash": "blake3:hex..."
     }
   }
 }
 ```
 
-### .kiro/installed-steering.json
+### `installed-steering.json`
 
 ```json
 {
   "files": {
-    "review-process.md": {
-      "marketplace": "dotnet-agent-skills",
-      "plugin": "dotnet",
-      "installed_at": "2025-01-15T10:30:00Z",
-      "source_hash": "blake3:abcdef...",
-      "installed_hash": "blake3:123456..."
+    "relative/path/to/file.md": {
+      "marketplace": "string",
+      "plugin": "string",
+      "source_scan_root": "relative/path",
+      "source_hash": "blake3:hex...",
+      "installed_hash": "blake3:hex...",
+      "installed_at": "2026-01-01T00:00:00Z",
+      "version": "string | null"
     }
   }
 }
@@ -81,141 +86,213 @@ Plugin registry persisted after marketplace add/update:
 
 ---
 
-## Core Domain Types
+## Cache Files (`~/.cache/kiro-market/`)
 
-### MarketplaceSource (enum)
+### Known Marketplaces Registry
 
-Detected from user input string:
-
-```mermaid
-flowchart LR
-    Input["source string"] --> Detect["CacheDir::detect()"]
-    Detect --> GH["GitHubShorthand<br/>owner/repo"]
-    Detect --> URL["GitUrl<br/>https:// or git@"]
-    Detect --> HTTP["HttpUrl<br/>http://"]
-    Detect --> File["FileUrl<br/>file://"]
-    Detect --> Local["LocalPath<br/>./path or /abs"]
+```json
+{
+  "marketplaces": {
+    "<name>": {
+      "source": "github:owner/repo" | "https://..." | "local:/path",
+      "protocol": "https" | "ssh"
+    }
+  }
+}
 ```
 
-### AgentDefinition
+### Plugin Registry (`registries/<marketplace>.json`)
 
-Unified representation after parsing any dialect:
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `name` | `String` | Agent identifier |
-| `description` | `Option<String>` | Human-readable description |
-| `model` | `Option<String>` | LLM model preference |
-| `dialect` | `AgentDialect` | Source format (Claude, Copilot, Native) |
-| `body` | `String` | Prompt/system message content |
-| `source_tools` | `Vec<String>` | Original tool names from source |
-| `mcp_servers` | `Vec<McpServerConfig>` | MCP server declarations |
-
-### AgentDialect (enum)
-
-- `Claude` — parsed from `.md` with YAML frontmatter
-- `Copilot` — parsed from `.agent.md` with YAML frontmatter
-- `Native` — parsed from Kiro JSON format
-
-### McpServerConfig
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `name` | `String` | Server identifier |
-| `transport` | `Transport` | `Stdio { command, args, env }` or `Http { url }` |
-
-### SkillFrontmatter
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `name` | `String` | Skill identifier (validated) |
-| `description` | `Option<String>` | Human-readable description |
-| `invocable` | `Option<bool>` | Whether skill can be invoked directly |
-
-### PluginManifest (from plugin.json)
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `name` | `String` | Plugin identifier |
-| `description` | `Option<String>` | Description |
-| `skills` | `Vec<String>` | Skill scan paths |
-| `agents` | `Vec<String>` | Agent scan paths |
-| `steering` | `Vec<String>` | Steering file scan paths |
-| `format` | `Option<PluginFormat>` | `KiroCli` for native agents |
-
-### InstallMode (enum)
-
-- `Normal` — skip if already installed
-- `Force` — overwrite existing installations
-
-### InsecureHttpPolicy (enum)
-
-- `Reject` — refuse `http://` URLs (default)
-- `Allow` — permit insecure sources (requires explicit opt-in)
-
----
-
-## Error Hierarchy
-
-```mermaid
-classDiagram
-    class Error {
-        <<enum>>
-        Marketplace(MarketplaceError)
-        Plugin(PluginError)
-        Skill(SkillError)
-        Agent(AgentError)
-        Git(GitError)
-        Validation(ValidationError)
-        Io(io::Error)
-        Json(serde_json::Error)
+```json
+{
+  "plugins": [
+    {
+      "name": "string",
+      "path": "./relative/path",
+      "source": { "type": "github", "owner": "...", "repo": "..." } | null
     }
-
-    class MarketplaceError {
-        NotFound
-        AlreadyRegistered
-        InvalidManifest
-        NoPluginsFound
-        InsecureSource
-    }
-
-    class PluginError {
-        NotFound
-        InvalidManifest
-        ManifestNotFound
-        NoSkills
-        ManifestReadFailed
-        DirectoryMissing
-        RemoteSourceNotLocal
-    }
-
-    class GitError {
-        CloneFailed
-        PullFailed
-        OpenFailed
-        ShaMismatch
-        NotFound
-        CommandFailed
-    }
-
-    Error --> MarketplaceError
-    Error --> PluginError
-    Error --> GitError
+  ]
+}
 ```
 
 ---
 
-## Tauri Frontend Types
+## Plugin Manifest (`plugin.json`)
 
-The desktop app adds presentation-layer types:
+```json
+{
+  "name": "string",
+  "description": "string | null",
+  "version": "string | null",
+  "format": "translated" | "kiro-cli",
+  "skills": ["./path/to/skill/dir", ...],
+  "agents": ["./path/to/agent.md", ...],
+  "steering": ["./path/to/steering.md", ...]
+}
+```
 
-| Type | Purpose |
-|------|---------|
-| `MarketplaceInfo` | Marketplace with source type and plugin count |
-| `PluginInfo` | Plugin with skill count and source type |
-| `SourceType` | `github`, `git_url`, `local_path`, `git_subdir` |
-| `ProjectInfo` | Active project path and validation status |
-| `InstalledSkillInfo` | Installed skill with display metadata |
-| `Settings` | App-level settings (scan roots, active project) |
-| `DiscoveredProject` | Found project path from scan |
-| `CommandError` | Typed error with `ErrorType` discriminant |
+`format` defaults to `"translated"` when absent. `skills`/`agents`/`steering` default to empty (triggering default scan paths).
+
+---
+
+## Marketplace Manifest (`.claude-plugin/marketplace.json`)
+
+```json
+{
+  "plugins": [
+    {
+      "name": "string",
+      "path": "./relative/path",
+      "source": {
+        "type": "github" | "git_url" | "git_subdir",
+        ...
+      }
+    }
+  ]
+}
+```
+
+---
+
+## SKILL.md Frontmatter
+
+```yaml
+---
+name: skill-name
+description: "Human-readable description"
+invocable: true | false   # optional
+---
+```
+
+---
+
+## Agent Types (`agent/types.rs`)
+
+```rust
+pub struct AgentDefinition {
+    pub name: AgentName,
+    pub description: Option<String>,
+    pub model: Option<String>,
+    pub tools: Vec<MappedTool>,
+    pub mcp_servers: Vec<McpServerConfig>,
+    pub dialect: AgentDialect,
+    pub body: String,
+}
+
+pub enum AgentDialect { Claude, Copilot, Native }
+
+pub struct McpServerConfig {
+    pub name: String,
+    pub transport: McpTransport,  // Stdio { command, args, env } | Http { url }
+}
+```
+
+---
+
+## Kiro Agent JSON (installed at `.kiro/agents/<name>.json`)
+
+```json
+{
+  "name": "string",
+  "description": "string",
+  "model": "string | null",
+  "prompt": "file:///relative/path/to/prompt.md",
+  "tools": ["tool-name", ...],
+  "allowedTools": ["tool-name", ...],
+  "mcpServers": {
+    "<server-name>": {
+      "type": "stdio",
+      "command": "string",
+      "args": ["..."],
+      "env": {}
+    }
+  }
+}
+```
+
+---
+
+## BlakeHash (`hash.rs`)
+
+Validated hex string with `blake3:` prefix. Format: `blake3:<64-hex-chars>`. Normalized to lowercase. Constructed via `BlakeHash::new(s)` or `BlakeHash::from_blake3_digest(digest)`. A placeholder value exists for cases where hashing is deferred.
+
+---
+
+## Error Hierarchy (`error.rs`)
+
+```
+Error
+├── ValidationError (path traversal, invalid name, etc.)
+├── GitError
+│   ├── CloneFailed { url, gix_err, cli_err }
+│   ├── PullFailed { source }
+│   ├── OpenFailed { source }
+│   ├── CommandFailed { stderr }
+│   ├── NotFound
+│   └── ShaMismatch { expected, actual, reason: InvalidShaReason }
+├── PluginError
+│   ├── NotFound
+│   ├── ManifestReadFailed
+│   ├── InstallFailed
+│   ├── OrphanFileAtDestination
+│   ├── ContentChangedRequiresForce
+│   ├── PathOwnedByOtherPlugin
+│   └── NameClashWithOtherPlugin
+├── MarketplaceError
+│   ├── NotFound
+│   ├── AlreadyExists
+│   ├── RemoteSourceNotLocal
+│   └── ...
+├── AgentError
+├── SkillError
+└── (serde_json, io wrapping variants)
+```
+
+`remediation_hint()` returns an optional actionable string for CLI display (e.g., "use --force to overwrite").
+
+---
+
+## CommandError (Tauri, `src-tauri/src/error.rs`)
+
+```rust
+pub struct CommandError {
+    pub r#type: ErrorType,
+    pub message: String,
+}
+
+pub enum ErrorType {
+    Validation,
+    NotFound,
+    ParseError,
+    Internal,
+    Unknown,
+}
+```
+
+Serializes with snake_case discriminants. `From` impls for `Error`, `ValidationError`, `serde_json::Error`, `String`.
+
+---
+
+## Settings Types
+
+### App Settings (`commands/settings.rs`)
+
+```rust
+pub struct Settings {
+    pub scan_roots: Vec<String>,
+    pub active_project: Option<String>,
+}
+```
+
+### Kiro Setting Entry (`kiro_settings.rs`)
+
+```rust
+pub struct SettingEntry {
+    pub key: String,
+    pub category: SettingCategory,
+    pub label: String,
+    pub value_type: SettingType,   // Bool, String, Number, Array
+    pub current_value: Option<serde_json::Value>,
+    pub default_value: Option<serde_json::Value>,
+}
+```

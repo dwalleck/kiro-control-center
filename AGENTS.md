@@ -23,7 +23,7 @@
 crates/
 ├── kiro-market-core/src/       # Shared library — ALL business logic lives here
 │   ├── service.rs              # MarketplaceService: primary orchestrator (add/remove/update/install)
-│   ├── service/browse.rs       # Skill enumeration, plugin install context resolution
+│   ├── service/browse.rs       # Skill enumeration, plugin install context resolution, catalog assembly
 │   ├── cache.rs                # CacheDir: ~/.cache/kiro-market/ management, source detection
 │   ├── project.rs              # KiroProject: .kiro/ directory operations (install/remove skills+agents+steering)
 │   ├── git.rs                  # Dual-backend git (gix primary, CLI fallback)
@@ -42,14 +42,17 @@ crates/
 │   ├── cli.rs                  # Clap derive definitions
 │   ├── main.rs                 # Command dispatch
 │   └── commands/               # One module per subcommand
-└── kiro-control-center/        # Desktop app (Tauri 2 + Svelte 5)
-    ├── src-tauri/src/          # Rust backend
-    │   ├── lib.rs              # Tauri command registration (tauri-specta)
-    │   └── commands/           # Tauri IPC handlers (call into kiro-market-core)
-    └── src/                    # Svelte 5 frontend
-        ├── lib/bindings.ts     # Auto-generated TypeScript bindings (DO NOT EDIT)
-        ├── lib/stores/         # Svelte 5 $state module pattern
-        └── lib/components/     # UI components (BrowseTab, InstalledTab, etc.)
+├── kiro-control-center/        # Desktop app (Tauri 2 + Svelte 5)
+│   ├── src-tauri/src/          # Rust backend
+│   │   ├── lib.rs              # Tauri command registration (tauri-specta)
+│   │   └── commands/           # Tauri IPC handlers (call into kiro-market-core)
+│   └── src/                    # Svelte 5 frontend
+│       ├── lib/bindings.ts     # Auto-generated TypeScript bindings (DO NOT EDIT)
+│       ├── lib/stores/         # Svelte 5 $state module pattern
+│       └── lib/components/     # UI components (BrowseTab, InstalledTab, etc.)
+└── xtask/src/                  # Build/lint/hook automation
+    ├── main.rs                 # Hook dispatch (hook-block-cargo-lock, hook-post-edit)
+    └── plan_lint.rs            # Static analysis gates (no_panic, no_unwrap, ffi_enum_tag, etc.)
 ```
 
 **Key entry points:**
@@ -106,6 +109,10 @@ cargo test -p kiro-control-center --lib -- --ignored generate_types
 - **Self-cycle dev-dep**: `kiro-market-core` has itself as a dev-dependency with `features = ["test-support"]` to activate test utilities in integration tests (Cargo handles this without recursion).
 
 - **BLAKE3 hash tracking**: Both source and installed content hashes are stored. Idempotent reinstalls are skipped when hashes match; content changes require `--force`.
+
+- **chrono must not appear in Tauri IPC types**: `specta`'s chrono feature is disabled in `kiro-control-center`. The `bindings_export_plugin_catalog_view` test asserts no `DateTime` types appear in `bindings.ts`.
+
+- **plan-lint gates**: `cargo xtask plan-lint` enforces `no_panic`, `no_unwrap`, `non_exhaustive` (on public error enums in core), `no_frontend_deps` (core must not import tauri/tokio), and `ffi_enum_tag` (public enums with payload exposed via specta must have a serde tag).
 
 ---
 

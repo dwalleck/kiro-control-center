@@ -1,60 +1,53 @@
 # Review Notes
 
+<!-- tags: review, gaps, consistency -->
+
 ## Consistency Check
 
-All documentation files were cross-referenced for consistency. Findings:
+No cross-document contradictions found. The following terms are used consistently across all files:
 
-### ✅ Consistent
-
-- **Crate names and paths** — consistent across all files (kiro-market-core, kiro-market, kiro-control-center)
-- **Feature flags** — `cli`, `specta`, `test-support` documented identically in codebase_info.md and architecture.md
-- **Security invariants** — path validation, MCP opt-in, TLS enforcement documented consistently in architecture.md and data_models.md
-- **Dependency versions** — match Cargo.toml workspace definitions
-- **IPC command list** — matches actual `collect_commands!` registration in lib.rs (17 commands)
-- **CLI command structure** — matches clap derive definitions in cli.rs
-- **On-disk file formats** — JSON schemas in data_models.md match actual serde derives in source
-
-### ⚠️ Minor Notes
-
-1. **Workspace lint level**: AGENTS.md says `unsafe_code = "deny"` but Cargo.toml actually uses `unsafe_code = "forbid"` (stricter). The documentation should use "forbid" consistently.
-   - **Affected files**: Existing AGENTS.md (will be corrected in consolidation step)
-
----
+- Plugin reference format: `plugin@marketplace` (split on first `@`) — consistent in `interfaces.md`, `components.md`, `codebase_info.md`
+- Feature flag names (`cli`, `specta`, `test-support`) — consistent in `architecture.md`, `codebase_info.md`, `dependencies.md`
+- Default scan paths (`./skills/`, `./agents/`, `./steering/`) — consistent in `codebase_info.md` and `workflows.md`
+- BLAKE3 hash format (`blake3:<hex>`) — consistent in `data_models.md` and `dependencies.md`
+- `GixCliBackend` as the production `GitBackend` implementation — consistent in `interfaces.md` and `components.md`
 
 ## Completeness Check
 
-### Well-Documented Areas
-
-- ✅ Core service layer (MarketplaceService) — thoroughly covered
-- ✅ Agent parsing pipeline (all dialects) — complete
-- ✅ Installation workflows — detailed sequence diagrams
-- ✅ Error hierarchy — full type tree documented
-- ✅ Security model — all invariants captured
-- ✅ CI pipeline — all jobs listed
-- ✅ Dependencies — rationale provided for non-obvious choices
-
 ### Gaps Identified
 
-| Area | Gap | Severity | Recommendation |
-|------|-----|----------|----------------|
-| E2E tests | Playwright test structure not documented | Low | Add test patterns section to components.md if test coverage grows |
-| `.claude/` directory | Claude Code skills, commands, and agents in this repo not documented | Low | These are development aids, not part of the product. Document if they become part of the workflow |
-| `.kiro/` project agents | The 7 installed Kiro agents (code-reviewer, etc.) are not documented as project tooling | Low | These are operational tooling; mention in AGENTS.md Custom Instructions if relevant |
-| Hash change detection | The BLAKE3 source/installed hash comparison workflow could be more explicit | Low | Add a subsection to workflows.md explaining when hashes are compared |
-| Svelte 5 state patterns | The `$state` module pattern in `project.svelte.ts` is mentioned but not explained | Low | Add a brief pattern explanation to components.md frontend section |
-| Release workflow | `.github/workflows/release.yml` exists but release process not documented | Medium | Document release tagging and artifact generation |
-| `kiro-review.yml` workflow | Review automation workflow with `post-review-comments.py` not documented | Medium | Document the automated PR review pipeline |
+**1. Frontend state management detail**
+`components.md` lists the Svelte stores but does not describe the `$state` module pattern in depth. The Svelte 5 runes pattern (mutations via deep state proxy on a `const` object) is mentioned in `architecture.md` but not elaborated. Agents working on frontend state should consult the Svelte MCP server tools for authoritative Svelte 5 documentation.
 
-### Language Support Limitations
+**2. xtask plan-lint allowlist format**
+`architecture.md` mentions the allowlist mechanism for `plan-lint` gates but does not document the allowlist file format or location. This is an internal tool detail; consult `xtask/src/plan_lint.rs` directly if needed.
 
-- **Python scripts** (`.github/scripts/`): Analyzed structurally but not deeply. These are CI support scripts for posting review comments, not core product code.
-- **Svelte components**: Analyzed by file structure and naming. Deep component logic (reactive state, event handling) would require reading each `.svelte` file.
+**3. `.agents-view/` directory**
+The `.agents-view/` directory (containing `spec.md`, `design-slice-1.md`, probe scripts) is not documented. It appears to be a work-in-progress feature design area (plugin catalog view). It is not part of the shipped codebase and is excluded from documentation intentionally.
 
----
+**4. `Kiro Control Center Design System` directories**
+Two design handoff directories exist at the repo root (`Kiro Control Center Design System/` and `Kiro Control Center Design System -plugins/`). These contain Figma/design artifacts and are not part of the Rust/Svelte codebase. Excluded from documentation intentionally.
+
+**5. `.prove-it/` directory**
+Contains probe/oracle artifacts from the `prove-it-prototype` skill workflow. Not part of the shipped codebase. Excluded intentionally.
+
+**6. `docs/plans/` and `docs/reviews/`**
+Extensive design documents and review notes exist under `docs/`. These are historical artifacts. Not documented in the summary files; agents needing design rationale should read them directly.
+
+**7. Native companion files**
+The `native_companions` tracking structure in `installed-agents.json` is documented in `data_models.md` but the install workflow for native companions (multi-file Kiro-native plugins) is not traced in `workflows.md`. This is a complex sub-workflow; consult `project.rs::install_native_companions` and `service/mod.rs::install_native_companions_for_plugin` directly.
+
+**8. `resolve_local_path_restricted` in CacheDir**
+This security function (restricts path resolution to a set of allowed roots, rejects symlink escapes) is mentioned in `components.md` but not detailed in `interfaces.md` or `architecture.md`. It is used for local marketplace path validation.
+
+### Language Coverage Limitations
+
+- The `.github/scripts/post-review-comments.py` Python script is documented at the component level in `components.md` (implicitly, as a GitHub Actions script) but its internal structure is not covered. It handles PR review comment posting and is not part of the core application.
+- The probe scripts in `.agents-view/probe/` (Python + PowerShell) are not documented.
 
 ## Recommendations
 
-1. **Correct `unsafe_code` level** in AGENTS.md consolidation: use "forbid" (matches Cargo.toml)
-2. **Document release process** if the project reaches regular release cadence
-3. **Document the review automation pipeline** (`kiro-review.yml` + `post-review-comments.py`) as it's a significant piece of project infrastructure
-4. **Consider adding a testing.md** if test patterns become complex enough to warrant separate documentation
+1. If adding a new Tauri command, update `interfaces.md` and regenerate `bindings.ts`.
+2. If adding a new tracking field to any `.kiro/*.json` file, update `data_models.md`.
+3. If the native companion install workflow becomes a common change area, add a workflow trace to `workflows.md`.
+4. The `Custom Instructions` section in `AGENTS.md` is the right place for operational gotchas discovered during development — add them there rather than to these summary files.
