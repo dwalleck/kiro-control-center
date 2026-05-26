@@ -2892,6 +2892,11 @@ impl MarketplaceService {
         for meta in installed_agents.native_companions.values() {
             if meta.marketplace == plugin_info.marketplace && meta.plugin == plugin_info.plugin {
                 let Some(expected_hash) = meta.source_hash.as_ref() else {
+                    debug!(
+                        marketplace = %meta.marketplace,
+                        plugin = %meta.plugin,
+                        "skipping companion drift scan: source_hash = None (synthesized for translated agent)",
+                    );
                     continue;
                 };
                 let scan_root = plugin_dir.join(meta.source_scan_root.as_str());
@@ -7980,6 +7985,143 @@ mod tests {
              error because detection looked under hardcoded `./agents/`); \
              got: {:?}",
             result.failures
+        );
+    }
+
+    /// Negative control for the
+    /// `detect_plugin_updates_translated_synthesized_companion_no_false_drift`
+    /// regression test: confirms drift detection still FIRES on a
+    /// real `source_hash: Some(_)` native-companions entry when the
+    /// source bytes diverge from the recorded hash. A regression
+    /// that made the scan loop skip every entry — say, by inverting
+    /// the `let Some(expected_hash) = ...` into `let None = ...` —
+    /// would leave both the no-false-drift test AND the surviving
+    /// repro test passing while breaking the actual drift surface.
+    /// This test pins the positive case so that silent skip-the-world
+    /// regression cannot land green.
+    #[test]
+    fn detect_plugin_updates_native_companions_with_mutated_source_reports_drift() {
+        use crate::project::{
+            InstalledAgentMeta, InstalledAgents, InstalledNativeCompanionsMeta, KiroProject,
+        };
+        use crate::service::test_support::{
+            relative_path_entry, seed_marketplace_with_registry, temp_service,
+        };
+        use std::collections::HashMap;
+        use std::path::PathBuf;
+
+        let (dir, svc) = temp_service();
+        let entries = vec![relative_path_entry("p", "plugins/p")];
+        let mp_path = seed_marketplace_with_registry(dir.path(), &svc, "mp", &entries);
+        let plugin_dir = mp_path.join("plugins/p");
+
+        let companions_root = plugin_dir.join("companions");
+        let prompts_dir = companions_root.join("prompts");
+        fs::create_dir_all(&prompts_dir).expect("create prompts dir");
+        let prompt_path = prompts_dir.join("reviewer.md");
+        fs::write(&prompt_path, b"prompt body v1\n").expect("write companion v1");
+
+        // Matching plugin.json version pins the version-branch as a
+        // no-op so only the companion drift cascade can fire.
+        fs::write(
+            plugin_dir.join("plugin.json"),
+            br#"{"name":"p","version":"1.0","agents":["./companions/"]}"#,
+        )
+        .expect("write plugin.json");
+
+        let companion_rel = PathBuf::from("prompts/reviewer.md");
+        let source_hash_v1 =
+            crate::hash::hash_artifact(&companions_root, std::slice::from_ref(&companion_rel))
+                .expect("hash v1 source");
+
+        let project_tmp = tempfile::tempdir().expect("project tempdir");
+        let project = KiroProject::new(project_tmp.path().to_path_buf());
+        let kiro_dir = project_tmp.path().join(".kiro");
+        fs::create_dir_all(&kiro_dir).expect("create .kiro");
+
+        // Sibling non-drifting native agent so the plugin surfaces
+        // in the scan loop — leaves the companion cascade as the
+        // only thing the assertion depends on.
+        let agents_default_root = plugin_dir.join("agents");
+        fs::create_dir_all(&agents_default_root).expect("create agents/ dir");
+        fs::write(
+            agents_default_root.join("registrar.json"),
+            br#"{"name":"registrar"}"#,
+        )
+        .expect("write registrar.json");
+        let registrar_source_hash =
+            crate::hash::hash_artifact(&agents_default_root, &[PathBuf::from("registrar.json")])
+                .expect("hash registrar source");
+
+        let mut agents_map = HashMap::new();
+        agents_map.insert(
+            "registrar".to_string(),
+            InstalledAgentMeta {
+                marketplace: mp("mp"),
+                plugin: pn("p"),
+                version: Some("1.0".to_owned()),
+                installed_at: chrono::Utc::now(),
+                dialect: crate::agent::AgentDialect::Native,
+                source_path: crate::validation::RelativePath::new("agents/registrar.json")
+                    .expect("valid"),
+                source_hash: registrar_source_hash.clone(),
+                installed_hash: registrar_source_hash,
+            },
+        );
+
+        let mut companions = HashMap::new();
+        companions.insert(
+            "p".to_string(),
+            InstalledNativeCompanionsMeta {
+                marketplace: mp("mp"),
+                plugin: pn("p"),
+                version: Some("1.0".to_owned()),
+                installed_at: chrono::Utc::now(),
+                files: vec![companion_rel.clone()],
+                source_hash: Some(source_hash_v1.clone()),
+                installed_hash: source_hash_v1,
+                source_scan_root: crate::validation::RelativePath::new("companions")
+                    .expect("valid"),
+            },
+        );
+        let installed = InstalledAgents {
+            agents: agents_map,
+            native_companions: companions,
+        };
+        fs::write(
+            kiro_dir.join("installed-agents.json"),
+            serde_json::to_vec_pretty(&installed).expect("serialize"),
+        )
+        .expect("write installed-agents.json");
+
+        // Mutate the source bytes AFTER seeding so the recorded
+        // source_hash no longer matches.
+        fs::write(&prompt_path, b"prompt body v2 -- bytes drifted\n")
+            .expect("rewrite companion to drift");
+
+        let result = svc.detect_plugin_updates(&project).expect("detect");
+        assert!(
+            result.failures.is_empty(),
+            "drift on a Some(_) entry must surface as an update, \
+             not a failure; got failures: {:?}",
+            result.failures
+        );
+        assert_eq!(
+            result.updates.len(),
+            1,
+            "expected exactly one plugin to surface as drifted; got: {:?}",
+            result.updates
+        );
+        let update = &result.updates[0];
+        assert_eq!(update.plugin.as_str(), "p");
+        assert!(
+            matches!(
+                update.change_signal,
+                crate::service::UpdateChangeSignal::ContentChanged
+            ),
+            "mutated source bytes (without a version bump) must \
+             produce ContentChanged, not VersionBumped; got {:?}",
+            update.change_signal
         );
     }
 
