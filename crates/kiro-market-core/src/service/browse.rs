@@ -660,9 +660,14 @@ impl MarketplaceService {
     ///   `RelativePath` points to a missing directory.
     /// - [`Error::Plugin`] ([`PluginError::NotADirectory`]) if the path
     ///   exists but is a regular file (or other non-directory).
-    /// - [`Error::Plugin`] ([`PluginError::SymlinkRefused`]) if the path
-    ///   is a symlink — refused rather than followed as a security
-    ///   measure.
+    /// - [`Error::Plugin`] ([`PluginError::SymlinkRefused`]) if the
+    ///   resolved path canonicalizes outside the marketplace tree —
+    ///   e.g. a symlink or directory junction inside the marketplace
+    ///   redirects to a path that does not share the marketplace
+    ///   canonical prefix. The variant name predates the containment
+    ///   check; the refusal condition is now filesystem-level escape,
+    ///   not "is-a-symlink." A symlink whose target remains inside the
+    ///   marketplace tree is accepted.
     /// - [`Error::Plugin`] ([`PluginError::DirectoryUnreadable`]) if
     ///   stat'ing the path fails (permission denied, I/O error, etc.).
     /// - [`Error::Plugin`] ([`PluginError::RemoteSourceNotLocal`]) if
@@ -694,23 +699,35 @@ impl MarketplaceService {
                 // trusted (resolved == marketplace, contained) while
                 // still refusing a malicious `plugins/escape ->
                 // C:\Windows` link (canonical leaves marketplace).
+                //
+                // Trust-boundary note: marketplace contents are
+                // user-controlled (locally-linked) or
+                // cache-controlled (cloned remote), not adversarial
+                // *at the kernel level*. The TOCTOU window between
+                // `symlink_metadata`, `canonicalize`, and the final
+                // `fs::metadata` below is acceptable here — a
+                // local-user attacker who can swap inodes mid-call
+                // already has write access to `<cache>/marketplaces/`
+                // and need not exploit a race. Do NOT "optimize" by
+                // hoisting one of those syscalls; the containment
+                // invariant relies on canonicalize seeing the same
+                // path the stat saw.
                 let resolved = marketplace_path.join(rel);
                 // Disambiguate NotFound/other I/O up front so callers
                 // continue to see `DirectoryMissing` vs.
                 // `DirectoryUnreadable` rather than a generic
                 // canonicalize failure with the io kind buried.
-                match fs::symlink_metadata(&resolved) {
-                    Ok(_) => {}
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                        return Err(PluginError::DirectoryMissing { path: resolved }.into());
-                    }
-                    Err(e) => {
-                        return Err(PluginError::DirectoryUnreadable {
+                if let Err(e) = fs::symlink_metadata(&resolved) {
+                    return Err(match e.kind() {
+                        std::io::ErrorKind::NotFound => {
+                            PluginError::DirectoryMissing { path: resolved }.into()
+                        }
+                        _ => PluginError::DirectoryUnreadable {
                             path: resolved,
                             source: e,
                         }
-                        .into());
-                    }
+                        .into(),
+                    });
                 }
                 // Canonicalize both sides. The marketplace canonical
                 // follows the local-marketplace junction (if any) to
@@ -735,9 +752,10 @@ impl MarketplaceService {
                 }
                 // `symlink_metadata.is_dir()` returns false for a
                 // symlink-to-directory, so the directory check has to
-                // happen on the canonical path (which has no remaining
-                // links). `fs::metadata` follows nothing meaningful at
-                // this point — it's the truth about the final target.
+                // happen on the canonical path. `fs::metadata` follows
+                // symlinks; on a canonicalized path there are no
+                // symlinks left to follow, so it reports the final
+                // target's type directly.
                 let target = fs::metadata(&resolved_canonical).map_err(|e| {
                     PluginError::DirectoryUnreadable {
                         path: resolved.clone(),
@@ -747,6 +765,14 @@ impl MarketplaceService {
                 if !target.is_dir() {
                     return Err(PluginError::NotADirectory { path: resolved }.into());
                 }
+                // Return the non-canonical join, not `resolved_canonical`.
+                // The canonical form leaks the `\\?\` extended-path prefix
+                // on Windows, which downstream I/O surfaces (callers
+                // immediately `.join("plugin.json")`, format paths into
+                // user-facing errors, etc.) shouldn't see. Containment
+                // was proven on the canonical above; the return value
+                // carries no fewer trust guarantees than the input
+                // `marketplace_path` already had.
                 Ok(resolved)
             }
             PluginSource::Structured(s) => Err(PluginError::RemoteSourceNotLocal {
@@ -2287,16 +2313,22 @@ mod tests {
     // Symlink-refusal regression tests (plugin dir + plugin.json)
     // -----------------------------------------------------------------------
 
-    /// Regression guard: `resolve_local_plugin_dir` uses
-    /// `symlink_metadata` combined with an explicit `is_symlink()`
-    /// check rather than `Path::exists()`, so a symlink at the plugin
-    /// path is classified as [`PluginError::SymlinkRefused`] rather
-    /// than traversed. This test fails if the symlink arm is replaced
-    /// by `Path::exists()` (which would follow the link) or by a
-    /// weaker shape check (which would let the symlink fall through
-    /// to [`PluginError::NotADirectory`] and hide the security
-    /// semantic). Mirrors `resolve_plugin_dir_refuses_symlinked_relative_path`
-    /// for the cloning sibling in `service/mod.rs`.
+    /// Regression guard: a symlink at the plugin path whose target
+    /// leaves the marketplace tree must be refused with
+    /// [`PluginError::SymlinkRefused`], not silently traversed. The
+    /// refusal comes from the canonicalize-both + `starts_with`
+    /// containment check in `resolve_local_plugin_dir`: the resolved
+    /// canonical lands outside the marketplace canonical, so
+    /// containment fails. This test fails if containment is
+    /// downgraded to `Path::exists()` (which would follow the link)
+    /// or if the containment prefix is computed without canonicalizing
+    /// the marketplace root (which would let `..`-laden marketplace
+    /// paths slip through). Mirrors
+    /// `resolve_plugin_dir_refuses_symlinked_relative_path` for the
+    /// cloning sibling in `service/mod.rs`, which retains the older
+    /// `symlink_metadata` shape because its surface (cloned remote
+    /// source under the cache, never a junctioned root) doesn't need
+    /// containment.
     #[cfg(unix)]
     #[test]
     fn resolve_local_plugin_dir_refuses_symlinked_relative_path() {

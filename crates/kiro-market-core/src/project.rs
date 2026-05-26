@@ -8078,16 +8078,17 @@ mod tests {
         );
     }
 
-    /// A user upgrading from a pre-fix version has on-disk tracking
-    /// entries where translated-synthesized companions carry
-    /// `source_hash: Some(<placeholder>)`. The dropped one-shot
-    /// migration would have cleared those eagerly; the PR's
-    /// substitute is "on the next translated re-install, the
-    /// synthesize path re-affirms `source_hash = None` and the
-    /// stale value disappears." This test locks that substitute —
-    /// if anyone ever re-introduces a guard around the
-    /// `source_hash = None` write at `synthesize_companion_entry`,
-    /// the documented legacy-cleanup escape hatch silently breaks.
+    /// Locks the heal-on-reinstall invariant for translated-synthesized
+    /// companion entries: `synthesize_companion_entry` must
+    /// unconditionally write `source_hash = None`, including when the
+    /// existing on-disk entry already carries a stale `Some(_)`. This
+    /// is the only mechanism that clears legacy on-disk entries — no
+    /// eager migration runs — so the contract is "the next translated
+    /// re-install heals the data, regardless of what the prior value
+    /// was." A future guard wrapping the `source_hash = None` write
+    /// at `synthesize_companion_entry` (e.g. `if existing.source_hash
+    /// .is_none() { ... }`) silently breaks that path; this test
+    /// fails when that happens.
     #[test]
     fn install_agent_translated_reinstall_clears_legacy_some_source_hash() {
         let tmp = tempfile::tempdir().unwrap();
@@ -8128,6 +8129,12 @@ mod tests {
             "precondition: fresh install must write None"
         );
         companion.source_hash = Some(crate::hash::BlakeHash::placeholder());
+        // Also corrupt installed_hash so the post-second-install
+        // assertion below can verify the recompute path actually ran.
+        // Without this reset, the post-first-install real hash would
+        // already be non-placeholder and a regression that skipped
+        // only the installed_hash recompute would slip through.
+        companion.installed_hash = crate::hash::BlakeHash::placeholder();
         fs::write(
             &tracking_path,
             serde_json::to_vec_pretty(&installed).expect("serialize"),
@@ -8174,6 +8181,144 @@ mod tests {
                 .files
                 .contains(&std::path::PathBuf::from("prompts/beta.md")),
             "second install must append beta to companion files"
+        );
+        // installed_hash must be recomputed too — a regression that
+        // skipped only the installed_hash recompute (e.g. preserved
+        // the source_hash clear but removed the
+        // `installed_hash = companion_hash` line) would leave the
+        // injected placeholder in place.
+        assert_ne!(
+            companion_after.installed_hash,
+            crate::hash::BlakeHash::placeholder(),
+            "translated re-install must recompute installed_hash over \
+             the destination prompt set; got placeholder",
+        );
+    }
+
+    /// Pins the (Some, None) matrix cell that C1 doesn't cover: a
+    /// translated install that runs over an EXISTING native-companions
+    /// entry whose `source_hash` is `Some(_)`. C1's existing-Some
+    /// originates from a hand-mutated legacy state; this test's
+    /// existing-Some originates from a (simulated) prior native
+    /// install, including a non-empty `files` list and a non-default
+    /// `source_scan_root`. `synthesize_companion_entry` silently
+    /// clobbers `source_hash` to `None`, refreshes `source_scan_root`,
+    /// appends the new prompt path, and recomputes `installed_hash` —
+    /// dropping drift tracking for the prior native companions. This
+    /// is the current contract; pinning it forces any future change
+    /// that prefers refuse-rather-than-clobber semantics (e.g. erroring
+    /// when an existing `Some(_)` is encountered) to update both this
+    /// test and the production code together.
+    #[test]
+    fn install_agent_translated_clobbers_existing_native_some_source_hash() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = KiroProject::new(tmp.path().to_path_buf());
+        let plugin_name = sample_agent_meta().plugin.clone();
+        let marketplace_name = sample_agent_meta().marketplace.clone();
+
+        // Pre-create `.kiro/agents/native.md` so the merged-set
+        // `hash_artifact` call inside `synthesize_companion_entry`
+        // has bytes for the prior-native file when it recomputes
+        // `installed_hash` over the union of files.
+        let kiro_dir = project.kiro_dir();
+        fs::create_dir_all(&kiro_dir).expect("create .kiro");
+        let agents_dir = kiro_dir.join("agents");
+        fs::create_dir_all(&agents_dir).expect("create .kiro/agents");
+        let prior_native_rel = std::path::PathBuf::from("native.md");
+        fs::write(agents_dir.join(&prior_native_rel), b"prior native body")
+            .expect("write prior native file");
+
+        // Seed an installed-agents.json with the "real native install"
+        // shape: source_hash = Some, non-empty files, non-default
+        // source_scan_root ("companions" instead of "agents").
+        let seeded_some_hash = crate::hash::BlakeHash::placeholder();
+        let mut companions = std::collections::HashMap::new();
+        companions.insert(
+            plugin_name.as_str().to_owned(),
+            InstalledNativeCompanionsMeta {
+                marketplace: marketplace_name.clone(),
+                plugin: plugin_name.clone(),
+                version: Some("1.2.3".to_owned()),
+                installed_at: chrono::Utc::now(),
+                files: vec![prior_native_rel.clone()],
+                source_hash: Some(seeded_some_hash.clone()),
+                installed_hash: seeded_some_hash.clone(),
+                source_scan_root: crate::validation::RelativePath::new("companions")
+                    .expect("valid"),
+            },
+        );
+        let seeded = InstalledAgents {
+            agents: std::collections::HashMap::new(),
+            native_companions: companions,
+        };
+        fs::write(
+            kiro_dir.join("installed-agents.json"),
+            serde_json::to_vec_pretty(&seeded).expect("serialize"),
+        )
+        .expect("seed installed-agents.json");
+
+        // Run a translated install for the same plugin name.
+        let source_md = write_agent(tmp.path(), "alpha", "body");
+        let def = crate::agent::AgentDefinition {
+            name: agent_name("alpha"),
+            description: None,
+            prompt_body: "body".into(),
+            model: None,
+            source_tools: vec![],
+            mcp_servers: std::collections::BTreeMap::new(),
+            dialect: crate::agent::AgentDialect::Claude,
+        };
+        let meta = sample_agent_meta();
+        project
+            .install_agent(&def, &[], meta, Some(&source_md))
+            .expect("translated install over existing native succeeds");
+
+        let after = project.load_installed_agents().expect("reload");
+        let companion = after
+            .native_companions
+            .get(plugin_name.as_str())
+            .expect("companion entry persists");
+
+        // Load-bearing assertion: Some(_) → None. A future
+        // refuse-rather-than-clobber semantic would fail here and
+        // force a deliberate update.
+        assert!(
+            companion.source_hash.is_none(),
+            "translated install over an existing native Some(_) entry \
+             must clobber source_hash to None (current contract); \
+             got {:?}",
+            companion.source_hash
+        );
+        // Append, not replace.
+        assert!(
+            companion.files.contains(&prior_native_rel),
+            "prior native file must remain in files list after \
+             translated install; got: {:?}",
+            companion.files
+        );
+        assert!(
+            companion
+                .files
+                .contains(&std::path::PathBuf::from("prompts/alpha.md")),
+            "translated prompt file must be appended to files list; \
+             got: {:?}",
+            companion.files
+        );
+        // source_scan_root refreshes to the translated path
+        // (sample_agent_meta uses "agents/reviewer.md", so the
+        // computed companion_scan_root is "agents").
+        assert_eq!(
+            companion.source_scan_root.as_str(),
+            "agents",
+            "source_scan_root must refresh to the translated install's \
+             scan root, not preserve the prior native value"
+        );
+        // installed_hash recomputed over the merged set, not the
+        // seeded value.
+        assert_ne!(
+            companion.installed_hash, seeded_some_hash,
+            "installed_hash must be recomputed over the union of \
+             prior native files and the new prompt; got the seeded value",
         );
     }
 
@@ -9227,13 +9372,11 @@ mod tests {
         .expect("seed installed-agents.json");
 
         // Non-force: classifier must raise ContentChangedRequiresForce.
-        // The pre-Option code's equality (`existing.source_hash ==
-        // *input.source_hash`) trivially returned false here too —
-        // the regression risk is the new `.as_ref() == Some(_)`
-        // comparison being mis-typed (e.g. as `existing.source_hash
-        // == Some(input.source_hash.clone())` against a None left
-        // arm), which a careless future cleanup might silently
-        // simplify the wrong way.
+        // The regression risk is the `.as_ref() == Some(_)` comparison
+        // being mis-typed (e.g. as `existing.source_hash ==
+        // Some(input.source_hash.clone())` against a None left arm),
+        // which a careless future cleanup might silently simplify the
+        // wrong way and treat (None, Some(real)) as "no drift".
         let err = install_companions(
             &companion_bundle,
             "m",
@@ -9241,15 +9384,13 @@ mod tests {
             crate::service::InstallMode::New,
         )
         .expect_err("native install over synthesized entry must require --force");
-        match err {
-            AgentError::ContentChangedRequiresForce { name } => {
-                assert!(
-                    name.contains('p') && name.contains("companions"),
-                    "error must reference plugin and 'companions'; got: {name}"
-                );
-            }
-            other => panic!("expected ContentChangedRequiresForce, got {other:?}"),
-        }
+        let AgentError::ContentChangedRequiresForce { name } = &err else {
+            panic!("expected ContentChangedRequiresForce, got {err:?}");
+        };
+        assert!(
+            name.contains('p') && name.contains("companions"),
+            "error must reference plugin and 'companions'; got: {name}"
+        );
 
         // Force: succeeds, kind is ForceOverwrote, and the entry is
         // promoted from None to Some(real_hash). This is the
@@ -9402,25 +9543,9 @@ mod tests {
 
     // -- list_user_agents --------------------------------------------------
 
-    /// A project containing
-    /// - a user-authored agent file (no tracking entry)
-    /// - a marketplace-tracked agent file (tracking entry present)
-    /// - a JSON file with NO `name` field (would crash a strict parser)
-    /// - an orphan tracking entry (name in tracking, no file on disk)
-    ///
-    /// list_user_agents must produce exactly 3 rows (the orphan is
-    /// excluded), sorted by name, with lineage on the tracked one,
-    /// `name` falling back to filename stem on the no-name file, and
-    /// counts derived from JSON contents. Mirrors
-    /// `.agents-view/probe/fixture/` so the prove-it-prototype probe.py
-    /// can serve as the cross-cutting oracle.
-    #[test]
-    fn list_user_agents_matches_probe_fixture() {
-        use chrono::Utc;
-        let (_dir, project) = temp_project();
-        std::fs::create_dir_all(project.kiro_dir().join("agents")).expect("agents dir");
-
-        // (1) Marketplace-tracked agent + tracking entry.
+    /// Probe-fixture seed (1/4): marketplace-tracked agent file with
+    /// the full schema surface (mcpServers, resources, hooks, etc.).
+    fn seed_marketplace_tracked_agent(project: &KiroProject) {
         std::fs::write(
             project.kiro_dir().join("agents/marketplace-tracked.json"),
             serde_json::to_vec_pretty(&serde_json::json!({
@@ -9444,8 +9569,11 @@ mod tests {
             .expect("ser tracked agent"),
         )
         .expect("write tracked agent");
+    }
 
-        // (2) User-authored agent file (no tracking entry).
+    /// Probe-fixture seed (2/4): user-authored agent file with no
+    /// tracking entry.
+    fn seed_user_authored_agent(project: &KiroProject) {
         std::fs::write(
             project.kiro_dir().join("agents/user-authored.json"),
             serde_json::to_vec_pretty(&serde_json::json!({
@@ -9463,9 +9591,12 @@ mod tests {
             .expect("ser user-authored"),
         )
         .expect("write user-authored");
+    }
 
-        // (3) No-name file — name field absent. Would crash parse_native;
-        // serde_json::Value tolerates it. Falls back to filename stem.
+    /// Probe-fixture seed (3/4): file with no `name` field. Would
+    /// crash `parse_native`; `serde_json::Value` tolerates it.
+    /// `list_user_agents` falls back to the filename stem.
+    fn seed_no_name_agent(project: &KiroProject) {
         std::fs::write(
             project.kiro_dir().join("agents/no-name.json"),
             serde_json::to_vec_pretty(&serde_json::json!({
@@ -9479,9 +9610,12 @@ mod tests {
             .expect("ser no-name"),
         )
         .expect("write no-name");
+    }
 
-        // Tracking file: includes the tracked agent AND an orphan entry.
-        let now = Utc::now();
+    /// Probe-fixture seed (4/4): tracking file with one matching
+    /// entry (`marketplace-tracked`) and one orphan
+    /// (`orphan-tracking` — name in tracking but no file on disk).
+    fn seed_tracking_with_orphan(project: &KiroProject, now: chrono::DateTime<chrono::Utc>) {
         std::fs::write(
             project.kiro_dir().join(INSTALLED_AGENTS_FILE),
             serde_json::to_vec_pretty(&serde_json::json!({
@@ -9512,6 +9646,30 @@ mod tests {
             .expect("ser tracking"),
         )
         .expect("write tracking");
+    }
+
+    /// A project containing
+    /// - a user-authored agent file (no tracking entry)
+    /// - a marketplace-tracked agent file (tracking entry present)
+    /// - a JSON file with NO `name` field (would crash a strict parser)
+    /// - an orphan tracking entry (name in tracking, no file on disk)
+    ///
+    /// `list_user_agents` must produce exactly 3 rows (the orphan is
+    /// excluded), sorted by name, with lineage on the tracked one,
+    /// `name` falling back to filename stem on the no-name file, and
+    /// counts derived from JSON contents. Mirrors
+    /// `.agents-view/probe/fixture/` so the prove-it-prototype probe.py
+    /// can serve as the cross-cutting oracle.
+    #[test]
+    fn list_user_agents_matches_probe_fixture() {
+        use chrono::Utc;
+        let (_dir, project) = temp_project();
+        std::fs::create_dir_all(project.kiro_dir().join("agents")).expect("agents dir");
+
+        seed_marketplace_tracked_agent(&project);
+        seed_user_authored_agent(&project);
+        seed_no_name_agent(&project);
+        seed_tracking_with_orphan(&project, Utc::now());
 
         let rows = project.list_user_agents().expect("list_user_agents");
 
@@ -9573,7 +9731,7 @@ mod tests {
     // -- create_user_agent --------------------------------------------------
 
     /// Happy path: create writes the file atomically, and a
-    /// subsequent list_user_agents call sees it.
+    /// subsequent `list_user_agents` call sees it.
     #[test]
     fn create_user_agent_writes_atomically_and_lists() {
         let (_dir, project) = temp_project();
@@ -9593,13 +9751,13 @@ mod tests {
         assert_eq!(names, vec!["new-agent"]);
     }
 
-    /// Empty name is rejected by validate_name (no `.json` file
+    /// Empty name is rejected by `validate_name` (no `.json` file
     /// written).
     #[test]
     fn create_user_agent_rejects_empty_name() {
         let (_dir, project) = temp_project();
         let err = project
-            .create_user_agent("", br#"{}"#)
+            .create_user_agent("", br"{}")
             .expect_err("must reject");
         assert!(
             matches!(
@@ -9618,7 +9776,7 @@ mod tests {
     fn create_user_agent_rejects_path_separator() {
         let (_dir, project) = temp_project();
         let err = project
-            .create_user_agent("foo/bar", br#"{}"#)
+            .create_user_agent("foo/bar", br"{}")
             .expect_err("must reject path separator");
         assert!(matches!(
             err,
@@ -9766,7 +9924,7 @@ mod tests {
     }
 
     /// Missing file → `AgentError::NotInstalled`. Maps to the
-    /// `not_found` Tauri ErrorType so the editor can surface a
+    /// `not_found` Tauri `ErrorType` so the editor can surface a
     /// "agent went missing; refresh" branch distinct from a
     /// validation failure.
     #[test]
@@ -10265,7 +10423,7 @@ mod tests {
     }
 
     /// Marketplace-tracked source: duplicate is NEVER
-    /// inserted into InstalledAgents. The source's tracking entry is
+    /// inserted into `InstalledAgents`. The source's tracking entry is
     /// preserved; the new copy is user-authored.
     #[test]
     fn duplicate_user_agent_strips_marketplace_lineage() {
@@ -10531,7 +10689,9 @@ mod tests {
         std::fs::create_dir_all(&agents_dir).expect("agents dir");
         // Build a file one byte over the cap. Contents don't need to
         // be JSON — the size check fires before the read.
-        let oversized: Vec<u8> = vec![b'x'; (DUPLICATE_SOURCE_BYTE_CAP as usize) + 1];
+        let cap_usize = usize::try_from(DUPLICATE_SOURCE_BYTE_CAP)
+            .expect("DUPLICATE_SOURCE_BYTE_CAP (1 MiB) fits in usize on all supported targets");
+        let oversized: Vec<u8> = vec![b'x'; cap_usize + 1];
         std::fs::write(agents_dir.join("big.json"), &oversized).expect("write big");
 
         let err = project

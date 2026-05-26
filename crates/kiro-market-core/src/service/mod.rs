@@ -19,7 +19,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicU64;
 
 use serde::Serialize;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use crate::cache::{CacheDir, KnownMarketplace, MarketplaceSource};
 use crate::error::{Error, MarketplaceError, PluginError, error_full_chain};
@@ -2892,10 +2892,21 @@ impl MarketplaceService {
         for meta in installed_agents.native_companions.values() {
             if meta.marketplace == plugin_info.marketplace && meta.plugin == plugin_info.plugin {
                 let Some(expected_hash) = meta.source_hash.as_ref() else {
-                    debug!(
+                    // Tripwire (CLAUDE.md Rule 35): the `None` arm fires
+                    // for any entry without a recorded source hash —
+                    // either the translated-synthesized install path
+                    // (the documented case) or a legacy on-disk entry
+                    // from before the `Option<BlakeHash>` demotion that
+                    // the heal-on-reinstall escape hatch hasn't yet
+                    // cleared. `info!` rather than `debug!` so a future
+                    // regression that routes a native install through
+                    // this branch leaves an auditable line at default
+                    // production verbosity instead of a debug-only
+                    // signal nobody reads.
+                    info!(
                         marketplace = %meta.marketplace,
                         plugin = %meta.plugin,
-                        "skipping companion drift scan: source_hash = None (synthesized for translated agent)",
+                        "skipping companion drift scan: source_hash = None (translated-synthesized or pre-demotion legacy entry)",
                     );
                     continue;
                 };
@@ -7988,6 +7999,80 @@ mod tests {
         );
     }
 
+    /// Build an `InstalledAgents` fixture for the
+    /// `_with_mutated_source_reports_drift` test: one sibling
+    /// non-drifting native agent (so the plugin appears in the scan
+    /// loop), one `Some(_)`-tracked companion entry for plugin `p`,
+    /// and one foreign-marketplace companion entry that the
+    /// per-plugin filter must exclude.
+    fn drift_test_installed_agents(
+        registrar_source_hash: crate::hash::BlakeHash,
+        companion_rel: std::path::PathBuf,
+        companion_source_hash: crate::hash::BlakeHash,
+    ) -> crate::project::InstalledAgents {
+        use crate::project::{InstalledAgentMeta, InstalledAgents, InstalledNativeCompanionsMeta};
+        use std::collections::HashMap;
+        use std::path::PathBuf;
+
+        let mut agents_map = HashMap::new();
+        agents_map.insert(
+            "registrar".to_string(),
+            InstalledAgentMeta {
+                marketplace: mp("mp"),
+                plugin: pn("p"),
+                version: Some("1.0".to_owned()),
+                installed_at: chrono::Utc::now(),
+                dialect: crate::agent::AgentDialect::Native,
+                source_path: crate::validation::RelativePath::new("agents/registrar.json")
+                    .expect("valid"),
+                source_hash: registrar_source_hash.clone(),
+                installed_hash: registrar_source_hash,
+            },
+        );
+
+        let mut companions = HashMap::new();
+        companions.insert(
+            "p".to_string(),
+            InstalledNativeCompanionsMeta {
+                marketplace: mp("mp"),
+                plugin: pn("p"),
+                version: Some("1.0".to_owned()),
+                installed_at: chrono::Utc::now(),
+                files: vec![companion_rel],
+                source_hash: Some(companion_source_hash.clone()),
+                installed_hash: companion_source_hash.clone(),
+                source_scan_root: crate::validation::RelativePath::new("companions")
+                    .expect("valid"),
+            },
+        );
+        // Filter-pinning entry: a foreign marketplace+plugin whose
+        // files don't exist under p's plugin_dir. The scan filters
+        // by `meta.marketplace == plugin_info.marketplace &&
+        // meta.plugin == plugin_info.plugin` before hashing, so this
+        // entry is ignored. A regression that drops the filter would
+        // hash `<p's plugin_dir>/does-not-exist/foreign.md`, hit
+        // `NotFound`, and surface as a `failures` entry.
+        companions.insert(
+            "q".to_string(),
+            InstalledNativeCompanionsMeta {
+                marketplace: mp("other"),
+                plugin: pn("q"),
+                version: None,
+                installed_at: chrono::Utc::now(),
+                files: vec![PathBuf::from("foreign.md")],
+                source_hash: Some(companion_source_hash.clone()),
+                installed_hash: companion_source_hash,
+                source_scan_root: crate::validation::RelativePath::new("does-not-exist")
+                    .expect("valid"),
+            },
+        );
+
+        InstalledAgents {
+            agents: agents_map,
+            native_companions: companions,
+        }
+    }
+
     /// Negative control for the
     /// `detect_plugin_updates_translated_synthesized_companion_no_false_drift`
     /// regression test: confirms drift detection still FIRES on a
@@ -8001,13 +8086,10 @@ mod tests {
     /// regression cannot land green.
     #[test]
     fn detect_plugin_updates_native_companions_with_mutated_source_reports_drift() {
-        use crate::project::{
-            InstalledAgentMeta, InstalledAgents, InstalledNativeCompanionsMeta, KiroProject,
-        };
+        use crate::project::KiroProject;
         use crate::service::test_support::{
             relative_path_entry, seed_marketplace_with_registry, temp_service,
         };
-        use std::collections::HashMap;
         use std::path::PathBuf;
 
         let (dir, svc) = temp_service();
@@ -8053,41 +8135,8 @@ mod tests {
             crate::hash::hash_artifact(&agents_default_root, &[PathBuf::from("registrar.json")])
                 .expect("hash registrar source");
 
-        let mut agents_map = HashMap::new();
-        agents_map.insert(
-            "registrar".to_string(),
-            InstalledAgentMeta {
-                marketplace: mp("mp"),
-                plugin: pn("p"),
-                version: Some("1.0".to_owned()),
-                installed_at: chrono::Utc::now(),
-                dialect: crate::agent::AgentDialect::Native,
-                source_path: crate::validation::RelativePath::new("agents/registrar.json")
-                    .expect("valid"),
-                source_hash: registrar_source_hash.clone(),
-                installed_hash: registrar_source_hash,
-            },
-        );
-
-        let mut companions = HashMap::new();
-        companions.insert(
-            "p".to_string(),
-            InstalledNativeCompanionsMeta {
-                marketplace: mp("mp"),
-                plugin: pn("p"),
-                version: Some("1.0".to_owned()),
-                installed_at: chrono::Utc::now(),
-                files: vec![companion_rel.clone()],
-                source_hash: Some(source_hash_v1.clone()),
-                installed_hash: source_hash_v1,
-                source_scan_root: crate::validation::RelativePath::new("companions")
-                    .expect("valid"),
-            },
-        );
-        let installed = InstalledAgents {
-            agents: agents_map,
-            native_companions: companions,
-        };
+        let installed =
+            drift_test_installed_agents(registrar_source_hash, companion_rel, source_hash_v1);
         fs::write(
             kiro_dir.join("installed-agents.json"),
             serde_json::to_vec_pretty(&installed).expect("serialize"),
