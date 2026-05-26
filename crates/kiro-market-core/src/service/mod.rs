@@ -2531,25 +2531,6 @@ impl MarketplaceService {
         &self,
         project: &crate::project::KiroProject,
     ) -> Result<DetectUpdatesResult, Error> {
-        // One-shot legacy migration: pre-Option-source_hash tracking
-        // files have `Some(hash)` on translated-synthesized companion
-        // entries, which the drift scan below would (correctly per the
-        // type, incorrectly per intent) try to rehash against the
-        // source side and false-positive on every scan. Migrate to
-        // `None` so the scan skips synthesized entries.
-        //
-        // Idempotent: subsequent calls find no entries to demote and
-        // return without writing. Migration failures are logged and
-        // swallowed — a failed migration means the user keeps seeing
-        // the pre-fix banner, which is strictly no worse than the
-        // pre-migration behavior.
-        if let Err(e) = project.migrate_companion_source_hash() {
-            warn!(
-                error = %e,
-                "companion source_hash migration failed; drift scan may surface false-positive HashFailed for translated agents"
-            );
-        }
-
         let view = project.installed_plugins()?;
         // Hoist the three tracking-file loads above the per-plugin
         // loop. Previously,
@@ -8123,105 +8104,6 @@ mod tests {
              would emit HashFailed (NotFound on \
              plugin_dir/agents/prompts/svelte-file-editor.md). Got: {:?}",
             result.failures
-        );
-    }
-
-    /// End-to-end migration coverage at the service layer:
-    /// `detect_plugin_updates` calls `migrate_companion_source_hash`
-    /// before scanning, so a pre-fix tracking file (translated entry
-    /// with `Some(hash)` and `files` pointing at a non-existent source
-    /// path) produces no false `HashFailed` even on the FIRST detect
-    /// call after upgrade.
-    #[test]
-    fn detect_plugin_updates_migrates_legacy_translated_companion_before_scan() {
-        use crate::project::{
-            InstalledAgentMeta, InstalledAgents, InstalledNativeCompanionsMeta, KiroProject,
-        };
-        use crate::service::test_support::{
-            relative_path_entry, seed_marketplace_with_registry, temp_service,
-        };
-        use std::collections::HashMap;
-        use std::path::PathBuf;
-
-        let (dir, svc) = temp_service();
-        let entries = vec![relative_path_entry("p", "plugins/p")];
-        let mp_path = seed_marketplace_with_registry(dir.path(), &svc, "mp", &entries);
-        let plugin_dir = mp_path.join("plugins/p");
-
-        let agents_root = plugin_dir.join("agents");
-        fs::create_dir_all(&agents_root).expect("create agents/");
-        fs::write(agents_root.join("rev.md"), b"---\nname: rev\n---\nbody\n").expect("write agent");
-        fs::write(
-            plugin_dir.join("plugin.json"),
-            br#"{"name":"p","version":"1.0"}"#,
-        )
-        .expect("write plugin.json");
-
-        let agent_source_hash =
-            crate::hash::hash_artifact(&agents_root, &[PathBuf::from("rev.md")])
-                .expect("hash agent");
-
-        let project_tmp = tempfile::tempdir().expect("project tempdir");
-        let project = KiroProject::new(project_tmp.path().to_path_buf());
-        let kiro_dir = project_tmp.path().join(".kiro");
-        fs::create_dir_all(&kiro_dir).expect("create .kiro");
-
-        let mut agents_map = HashMap::new();
-        agents_map.insert(
-            "rev".to_string(),
-            InstalledAgentMeta {
-                marketplace: mp("mp"),
-                plugin: pn("p"),
-                version: Some("1.0".to_owned()),
-                installed_at: chrono::Utc::now(),
-                dialect: crate::agent::AgentDialect::Claude,
-                source_path: crate::validation::RelativePath::new("agents/rev.md").expect("valid"),
-                source_hash: agent_source_hash.clone(),
-                installed_hash: agent_source_hash,
-            },
-        );
-
-        // PRE-FIX shape: Some(hash) populated by old synthesize path.
-        let mut companions = HashMap::new();
-        companions.insert(
-            "p".to_string(),
-            InstalledNativeCompanionsMeta {
-                marketplace: mp("mp"),
-                plugin: pn("p"),
-                version: Some("1.0".to_owned()),
-                installed_at: chrono::Utc::now(),
-                files: vec![PathBuf::from("prompts/rev.md")],
-                source_hash: Some(crate::hash::BlakeHash::placeholder()),
-                installed_hash: crate::hash::BlakeHash::placeholder(),
-                source_scan_root: crate::validation::RelativePath::new("agents").expect("valid"),
-            },
-        );
-        let installed = InstalledAgents {
-            agents: agents_map,
-            native_companions: companions,
-        };
-        fs::write(
-            kiro_dir.join("installed-agents.json"),
-            serde_json::to_vec_pretty(&installed).expect("serialize"),
-        )
-        .expect("write installed-agents.json");
-
-        let result = svc.detect_plugin_updates(&project).expect("detect");
-        assert!(
-            result.failures.is_empty(),
-            "first detect post-upgrade must migrate the legacy entry \
-             in-place and avoid the false-positive HashFailed; got: {:?}",
-            result.failures
-        );
-
-        // Migration must have persisted: re-loading shows source_hash: None.
-        let after = project
-            .load_installed_agents()
-            .expect("load post-migration");
-        let entry = after.native_companions.get("p").expect("entry preserved");
-        assert!(
-            entry.source_hash.is_none(),
-            "migration during detect must demote translated entry to None"
         );
     }
 
