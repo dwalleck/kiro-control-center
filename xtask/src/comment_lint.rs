@@ -61,6 +61,30 @@ const SCANNED_ROOTS: &[&str] = &["crates", "xtask"];
 /// Directory basenames that are pruned at any depth during the walk.
 const PRUNED_DIRS: &[&str] = &["target", "node_modules", ".git"];
 
+/// Reviewer-agent names that, when they appear in a `//` comment, signal a
+/// "closes <agent> finding" / "per <agent> review" smell. The smell shape:
+/// the comment attributes the change to the reviewer process rather than
+/// describing the invariant the code enforces. CLAUDE.md's rule treats
+/// these the same as PR/issue references — they rot once the reviewer pass
+/// is forgotten and leave readers grepping transcripts that don't exist.
+///
+/// All entries are kebab-case multi-word (no English-word collisions).
+/// String-literal uses of these names (e.g. `pn("code-reviewer")` in test
+/// fixtures) are not flagged because the scanner is `//`-comment-scoped.
+const REVIEWER_AGENT_NAMES: &[&str] = &[
+    "code-reviewer",
+    "code-simplifier",
+    "comment-analyzer",
+    "pr-test-analyzer",
+    "silent-failure-hunter",
+    "type-design-analyzer",
+    "marketplace-security-reviewer",
+    "tauri-ipc-auditor",
+    "plugin-validator",
+    "skill-reviewer",
+    "gemini-code-assist",
+];
+
 /// Files (matched by basename) that the gate skips:
 ///
 /// - `bindings.ts` — regenerated from Rust via specta; manual cleanup there
@@ -93,6 +117,14 @@ struct AllowedSite {
 /// forcing coordinated updates.
 const LEGACY_BASELINE_REASON: &str =
     "Legacy baseline at gate introduction. Cleanup tracked in follow-up; do not extend.";
+
+/// String-literal reference to a domain plugin / agent name (e.g. a
+/// fixture `pn("code-reviewer")` whose surrounding comment quotes the
+/// name in prose). Not a reviewer-attribution smell — the gate's
+/// word-boundary check sees a bare token, but the comment treats it
+/// as a domain identifier.
+const FIXTURE_NAME_REASON: &str =
+    "Fixture plugin/agent name referenced in comment (not a reviewer attribution).";
 
 const ALLOWED_SITES: &[AllowedSite] = &[
     AllowedSite {
@@ -247,12 +279,93 @@ const ALLOWED_SITES: &[AllowedSite] = &[
     },
     AllowedSite {
         path: "crates/kiro-market-core/src/service/mod.rs",
-        line: 8769,
+        line: 8767,
         reason: LEGACY_BASELINE_REASON,
     },
     AllowedSite {
         path: "crates/kiro-market/src/commands/install.rs",
         line: 41,
+        reason: LEGACY_BASELINE_REASON,
+    },
+    // ── reviewer-agent legacy baseline (added with the reviewer-agent detector) ──
+    AllowedSite {
+        path: "crates/kiro-control-center/src/lib/components/AgentEditor.svelte",
+        line: 138,
+        reason: LEGACY_BASELINE_REASON,
+    },
+    AllowedSite {
+        path: "crates/kiro-market-core/src/agent/parse_native.rs",
+        line: 501,
+        reason: LEGACY_BASELINE_REASON,
+    },
+    AllowedSite {
+        path: "crates/kiro-market-core/src/kiro_settings.rs",
+        line: 1032,
+        reason: LEGACY_BASELINE_REASON,
+    },
+    AllowedSite {
+        path: "crates/kiro-market-core/src/project.rs",
+        line: 3761,
+        reason: LEGACY_BASELINE_REASON,
+    },
+    AllowedSite {
+        path: "crates/kiro-market-core/src/project.rs",
+        line: 4087,
+        reason: LEGACY_BASELINE_REASON,
+    },
+    AllowedSite {
+        path: "crates/kiro-market-core/src/project.rs",
+        line: 4497,
+        reason: LEGACY_BASELINE_REASON,
+    },
+    AllowedSite {
+        path: "crates/kiro-market-core/src/project.rs",
+        line: 4669,
+        reason: LEGACY_BASELINE_REASON,
+    },
+    AllowedSite {
+        path: "crates/kiro-market-core/src/project.rs",
+        line: 6185,
+        reason: LEGACY_BASELINE_REASON,
+    },
+    AllowedSite {
+        path: "crates/kiro-market-core/src/project.rs",
+        line: 6760,
+        reason: FIXTURE_NAME_REASON,
+    },
+    AllowedSite {
+        path: "crates/kiro-market-core/src/project.rs",
+        line: 6787,
+        reason: FIXTURE_NAME_REASON,
+    },
+    AllowedSite {
+        path: "crates/kiro-market-core/src/project.rs",
+        line: 8816,
+        reason: LEGACY_BASELINE_REASON,
+    },
+    AllowedSite {
+        path: "crates/kiro-market-core/src/project.rs",
+        line: 8828,
+        reason: LEGACY_BASELINE_REASON,
+    },
+    AllowedSite {
+        path: "crates/kiro-market-core/src/project.rs",
+        line: 8897,
+        reason: LEGACY_BASELINE_REASON,
+    },
+    AllowedSite {
+        path: "crates/kiro-market-core/src/project.rs",
+        line: 9127,
+        reason: LEGACY_BASELINE_REASON,
+    },
+    AllowedSite {
+        path: "crates/kiro-market-core/src/project.rs",
+        line: 9527,
+        reason: LEGACY_BASELINE_REASON,
+    },
+    AllowedSite {
+        path: "crates/kiro-market-core/src/service/browse.rs",
+        line: 1898,
         reason: LEGACY_BASELINE_REASON,
     },
 ];
@@ -509,7 +622,38 @@ fn scan_comment(path: &str, line_no: u32, comment: &str) -> Vec<Finding> {
             matched: m.to_string(),
         });
     }
+    if let Some(m) = find_reviewer_agent(comment) {
+        out.push(Finding {
+            path: path.to_string(),
+            line: line_no,
+            kind: "reviewer-agent",
+            matched: m.to_string(),
+        });
+    }
     out
+}
+
+/// Find a known reviewer-agent name in `text`. Word-boundary anchored on
+/// both sides so `kiro-code-reviewer-v2` (a legitimate plugin name) does
+/// NOT match `code-reviewer`. Returns the first match.
+fn find_reviewer_agent(text: &str) -> Option<&str> {
+    let bytes = text.as_bytes();
+    for name in REVIEWER_AGENT_NAMES {
+        let needle = name.as_bytes();
+        let mut i = 0;
+        while i + needle.len() <= bytes.len() {
+            if &bytes[i..i + needle.len()] == needle {
+                let left_ok = i == 0 || !is_id_continuation(bytes[i - 1]);
+                let right_idx = i + needle.len();
+                let right_ok = right_idx >= bytes.len() || !is_id_continuation(bytes[right_idx]);
+                if left_ok && right_ok {
+                    return Some(&text[i..right_idx]);
+                }
+            }
+            i += 1;
+        }
+    }
+    None
 }
 
 /// Find a `kiro-XXXX` rivets ID (exactly 4 lowercase alphanumeric chars).
@@ -669,6 +813,31 @@ mod tests {
     #[test]
     fn finds_issue_ref() {
         assert_eq!(find_issue_ref("see issue #66"), Some("issue #66"));
+    }
+
+    #[test]
+    fn finds_reviewer_agent_in_attribution_phrase() {
+        assert_eq!(
+            find_reviewer_agent("Closes silent-failure-hunter #1"),
+            Some("silent-failure-hunter"),
+        );
+        assert_eq!(
+            find_reviewer_agent("per code-reviewer feedback"),
+            Some("code-reviewer"),
+        );
+        assert_eq!(
+            find_reviewer_agent("flagged by marketplace-security-reviewer"),
+            Some("marketplace-security-reviewer"),
+        );
+    }
+
+    #[test]
+    fn does_not_match_reviewer_agent_inside_longer_kebab_name() {
+        // `kiro-code-reviewer-v2` is a legitimate plugin-name string literal
+        // used in tests. The word-boundary check on both sides must keep it
+        // from matching the embedded `code-reviewer`.
+        assert_eq!(find_reviewer_agent("kiro-code-reviewer-v2 plugin"), None);
+        assert_eq!(find_reviewer_agent("see code-reviewer-extra notes"), None);
     }
 
     #[test]

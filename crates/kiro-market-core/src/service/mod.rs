@@ -5464,12 +5464,10 @@ mod tests {
 
     #[test]
     fn steering_warning_display_sanitizes_terminal_control_bytes() {
-        // Closes marketplace-security-reviewer Minor finding: a malicious
-        // manifest with ANSI escape sequences in a `steering` scan path
-        // could inject terminal commands (clear screen, hide cursor)
-        // when the warning rendered to a user TTY. SteeringWarning's
-        // Display now wraps paths in SafeForTerminal, which escapes
-        // ASCII control bytes to `\x{NN}` form.
+        // A hostile manifest can embed ANSI escape sequences in a scan path
+        // and inject terminal commands (clear screen, hide cursor) when the
+        // warning renders to a TTY — SafeForTerminal escaping is the
+        // contract under test.
         let warning = crate::steering::SteeringWarning::ScanPathInvalid {
             path: std::path::PathBuf::from("..\x1b[2J\x1b[H/escape"),
             reason: "must not be an absolute path".into(),
