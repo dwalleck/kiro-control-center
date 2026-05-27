@@ -193,10 +193,15 @@ pub struct InstalledAgents {
 /// One entry per file under `.kiro/steering/`, keyed in
 /// [`InstalledSteering::files`] by the relative path under that
 /// directory (which is also the file's user-facing identity — there's
-/// no synthetic id). `source_hash` and `installed_hash` are the
-/// blake3-prefixed hashes computed against the source file's bytes
-/// and the installed bytes respectively; for steering they're
-/// always equal because there is no parse-and-translate step.
+/// no synthetic id). `source_hash` is the blake3-prefixed hash of
+/// the source file's original bytes (including YAML frontmatter if
+/// present). `installed_hash` is the hash of the installed bytes
+/// after YAML frontmatter stripping via
+/// [`crate::steering::strip_yaml_frontmatter`]. For files without
+/// frontmatter the two hashes are equal; for files with frontmatter
+/// they differ. Drift detection recomputes `source_hash` against the
+/// original source bytes the same way — source-to-source comparison
+/// remains internally consistent.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InstalledSteeringMeta {
     /// Marketplace the file was installed from. See
@@ -2495,7 +2500,8 @@ impl KiroProject {
                 path: source.to_path_buf(),
                 source: src,
             })?;
-        fs::write(&staged_file, &source_bytes).map_err(|src| {
+        let content = crate::steering::strip_yaml_frontmatter(&source_bytes);
+        fs::write(&staged_file, content).map_err(|src| {
             crate::steering::SteeringError::StagingWriteFailed {
                 path: staged_file.clone(),
                 source: src,
@@ -5541,6 +5547,59 @@ mod tests {
         assert_eq!(entry.plugin, "plugin-y");
         assert_eq!(entry.marketplace, "marketplace-x");
         assert_eq!(entry.version.as_deref(), Some("0.1.0"));
+    }
+
+    #[test]
+    fn install_steering_file_strips_yaml_frontmatter() {
+        // Locks the strip wiring in `stage_steering_file`: a future refactor
+        // that drops the `strip_yaml_frontmatter` call would diverge the
+        // dest bytes from `# Body\n` and trip this assertion.
+        let (_dir, project) = temp_project();
+
+        let scan_root = project.root.join("source-steering");
+        fs::create_dir_all(&scan_root).unwrap();
+        let src = scan_root.join("guide.md");
+        let raw: &[u8] = b"---\ndescription: Copilot guide\napplyTo: \"**/*.cs\"\n---\n\n# Body\n";
+        fs::write(&src, raw).unwrap();
+
+        let source_hash =
+            crate::hash::hash_artifact(&scan_root, &[PathBuf::from("guide.md")]).unwrap();
+
+        let discovered = crate::agent::DiscoveredNativeFile {
+            source: src.clone(),
+            scan_root: scan_root.clone(),
+        };
+
+        let mp_name = mp("marketplace-x");
+        let pn_name = pn("plugin-y");
+        let outcome = project
+            .install_steering_file(
+                &discovered,
+                &source_hash,
+                crate::steering::SteeringInstallContext {
+                    mode: crate::service::InstallMode::New,
+                    marketplace: &mp_name,
+                    plugin: &pn_name,
+                    version: Some("0.1.0"),
+                    plugin_dir: &project.root,
+                },
+            )
+            .expect("install_steering_file");
+
+        let dest = project.steering_dir().join("guide.md");
+        assert_eq!(
+            fs::read(&dest).unwrap(),
+            b"# Body\n",
+            "destination must contain stripped body, not raw frontmatter",
+        );
+        // `source_hash` hashes the raw source bytes; `installed_hash` hashes
+        // the staged stripped copy. They must differ when stripping happened.
+        assert_eq!(outcome.source_hash, source_hash);
+        assert_ne!(
+            outcome.source_hash.as_str(),
+            outcome.installed_hash.as_str(),
+            "installed_hash must differ from source_hash when frontmatter was stripped",
+        );
     }
 
     fn write_agent(tmp: &Path, name: &str, body: &str) -> PathBuf {
