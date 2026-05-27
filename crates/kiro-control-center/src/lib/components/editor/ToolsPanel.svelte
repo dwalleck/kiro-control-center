@@ -23,11 +23,13 @@
 
   import AllowedToolsList from "./AllowedToolsList.svelte";
   import {
+    type AddExternalReason,
     type AddExternalResult,
     addAllowed,
     addExternalTool,
     partitionTools,
     removeAllowed,
+    setAlias,
     toggleTool,
     type ToolsDraft,
   } from "$lib/tool-state";
@@ -93,13 +95,16 @@
     externalError = null;
   }
 
-  // Narrow union of failure reasons mirrored from AddExternalResult.
-  // Inlining keeps the switch's `_exhaustive: never` tripwire honest:
-  // a future reason added in tool-state.ts forces an update here
-  // (TS narrows the union, the default arm fails to compile).
-  type ExternalErrorReason = "empty" | "not-mcp" | "duplicate";
-
-  function formatExternalError(reason: ExternalErrorReason): string {
+  // `AddExternalReason` is imported from `$lib/tool-state` (its single
+  // source of truth) rather than re-declared here. Two compile-time
+  // safety nets fire when a fourth reason is added in tool-state.ts:
+  //   1. The call `formatExternalError(result.reason)` would pass a
+  //      widened union into the narrow parameter — fails at the call
+  //      site (line above).
+  //   2. The `default: _exhaustive: never` arm below is the local
+  //      backup: if the parameter type were ever loosened, the switch
+  //      itself would fail to compile.
+  function formatExternalError(reason: AddExternalReason): string {
     switch (reason) {
       case "empty":
         return "Enter an MCP tool name.";
@@ -114,13 +119,8 @@
     }
   }
 
-  function setAlias(name: string, value: string): void {
-    const trimmed = value.trim();
-    const { [name]: _existing, ...rest } = draft.toolAliases;
-    onChange({
-      ...draft,
-      toolAliases: trimmed === "" ? rest : { ...rest, [name]: trimmed },
-    });
+  function handleSetAlias(name: string, value: string): void {
+    onChange(setAlias(draft, name, value));
   }
 </script>
 
@@ -208,7 +208,7 @@
                       class="flex-1 rounded-sm border border-kiro-muted bg-kiro-base px-2 py-1 font-mono text-xs text-kiro-text focus:border-kiro-accent-500 focus:outline-none"
                       placeholder="(none)"
                       value={aliasVal}
-                      oninput={(e) => setAlias(t.name, e.currentTarget.value)}
+                      oninput={(e) => handleSetAlias(t.name, e.currentTarget.value)}
                     />
                   </label>
                 {/if}

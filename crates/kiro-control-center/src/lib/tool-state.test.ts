@@ -6,6 +6,7 @@ import {
   addExternalTool,
   partitionTools,
   removeAllowed,
+  setAlias,
   toggleTool,
   type ToolsDraft,
   toolsRailBadge,
@@ -140,6 +141,76 @@ describe("removeAllowed (C3)", () => {
   });
 });
 
+describe("setAlias", () => {
+  test("sets a fresh alias on a new tool name", () => {
+    const before: ToolsDraft = {
+      tools: ["fs_read"],
+      allowedTools: [],
+      toolAliases: {},
+    };
+    const after = setAlias(before, "fs_read", "read");
+    expect(after.toolAliases).toEqual({ fs_read: "read" });
+    expect(after.tools).toEqual(["fs_read"]);
+    expect(after.allowedTools).toEqual([]);
+  });
+
+  test("overwrites an existing alias for the same name", () => {
+    const before: ToolsDraft = {
+      tools: ["fs_read"],
+      allowedTools: [],
+      toolAliases: { fs_read: "old" },
+    };
+    const after = setAlias(before, "fs_read", "new");
+    expect(after.toolAliases).toEqual({ fs_read: "new" });
+  });
+
+  test("trims surrounding whitespace before storing", () => {
+    const after = setAlias(emptyDraft, "fs_read", "  read  ");
+    expect(after.toolAliases).toEqual({ fs_read: "read" });
+  });
+
+  test("empty string removes the alias key entirely", () => {
+    const before: ToolsDraft = {
+      tools: ["fs_read"],
+      allowedTools: [],
+      toolAliases: { fs_read: "read" },
+    };
+    const after = setAlias(before, "fs_read", "");
+    expect(after.toolAliases).toEqual({});
+  });
+
+  test("whitespace-only value removes the alias key entirely", () => {
+    const before: ToolsDraft = {
+      tools: ["fs_read"],
+      allowedTools: [],
+      toolAliases: { fs_read: "read" },
+    };
+    const after = setAlias(before, "fs_read", "   ");
+    expect(after.toolAliases).toEqual({});
+  });
+
+  test("never touches tools or allowedTools", () => {
+    const before: ToolsDraft = {
+      tools: ["fs_read", "grep"],
+      allowedTools: ["fs_read"],
+      toolAliases: {},
+    };
+    const after = setAlias(before, "grep", "g");
+    expect(after.tools).toEqual(["fs_read", "grep"]);
+    expect(after.allowedTools).toEqual(["fs_read"]);
+  });
+
+  test("removing a non-existent alias is a no-op on toolAliases", () => {
+    const before: ToolsDraft = {
+      tools: ["fs_read"],
+      allowedTools: [],
+      toolAliases: { fs_read: "read" },
+    };
+    const after = setAlias(before, "not-there", "");
+    expect(after.toolAliases).toEqual({ fs_read: "read" });
+  });
+});
+
 describe("partitionTools (C4)", () => {
   // Plan case 10.
   test("pure native: empty external group", () => {
@@ -189,6 +260,20 @@ describe("addExternalTool (C6) — mirrors React ExternalToolList", () => {
     // `@server` shape. Native names enable via the by-category
     // grid's checkbox.
     expect(addExternalTool(emptyDraft, "fs_read")).toEqual({
+      ok: false,
+      reason: "not-mcp",
+    });
+  });
+
+  test('bare "@" is rejected — the `@server` shape requires at least one trailing char', () => {
+    expect(addExternalTool(emptyDraft, "@")).toEqual({
+      ok: false,
+      reason: "not-mcp",
+    });
+  });
+
+  test('whitespace around "@" trims to bare "@" and is rejected', () => {
+    expect(addExternalTool(emptyDraft, "  @  ")).toEqual({
       ok: false,
       reason: "not-mcp",
     });

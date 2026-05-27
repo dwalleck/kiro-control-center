@@ -352,21 +352,74 @@
   // here is `unknown -> ToolsDraft` at the panel boundary — the
   // panel itself trusts the slice shape and reasons about it via
   // the pure reducers in `$lib/tool-state`.
+  //
+  // Sanitization is loud, not silent: any non-string entry dropped
+  // from `tools` / `allowedTools` / `toolAliases` is surfaced via
+  // console.warn so a malformed agent file leaves a debuggable trail
+  // instead of silently rewriting the user's data on next save.
   function toolsSlice(d: Draft): ToolsDraft {
-    const tools = Array.isArray(d.tools)
-      ? (d.tools as unknown[]).filter((t): t is string => typeof t === "string")
-      : [];
-    const allowed = Array.isArray(d.allowedTools)
-      ? (d.allowedTools as unknown[]).filter((t): t is string => typeof t === "string")
-      : [];
-    const aliasesRaw = d.toolAliases;
-    const aliases: Record<string, string> = {};
-    if (aliasesRaw && typeof aliasesRaw === "object") {
-      for (const [k, v] of Object.entries(aliasesRaw)) {
-        if (typeof v === "string") aliases[k] = v;
-      }
-    }
+    const tools = filterStringArray(d.tools, "tools");
+    const allowed = filterStringArray(d.allowedTools, "allowedTools");
+    const aliases = filterStringValues(d.toolAliases);
     return { tools, allowedTools: allowed, toolAliases: aliases };
+  }
+
+  // Dedup is load-bearing: the Tools components key `{#each}` blocks on
+  // the string value (e.g. `{#each externalTools as name (name)}`), and
+  // Svelte 5 throws at runtime on duplicate keys. Reducers can't
+  // introduce dupes (toggleTool/addExternalTool both gate on
+  // `.includes()`), so the only failure source is a hand-edited or
+  // upstream-buggy agent JSON. Dedup at this boundary keeps the panel
+  // crash-free; the warn keeps the data-loss visible.
+  function filterStringArray(raw: unknown, field: string): string[] {
+    if (!Array.isArray(raw)) return [];
+    const kept: string[] = [];
+    const seen = new Set<string>();
+    const dropped: unknown[] = [];
+    const duplicates: string[] = [];
+    for (const item of raw as unknown[]) {
+      if (typeof item !== "string") {
+        dropped.push(item);
+        continue;
+      }
+      if (seen.has(item)) {
+        duplicates.push(item);
+        continue;
+      }
+      seen.add(item);
+      kept.push(item);
+    }
+    if (dropped.length > 0) {
+      console.warn(
+        `AgentEditor: dropped ${dropped.length} non-string entr${dropped.length === 1 ? "y" : "ies"} from "${field}" — saving will not preserve these values:`,
+        dropped,
+      );
+    }
+    if (duplicates.length > 0) {
+      console.warn(
+        `AgentEditor: deduped ${duplicates.length} duplicate entr${duplicates.length === 1 ? "y" : "ies"} from "${field}" — saving will not preserve duplicates:`,
+        duplicates,
+      );
+    }
+    return kept;
+  }
+
+  function filterStringValues(raw: unknown): Record<string, string> {
+    const out: Record<string, string> = {};
+    if (!raw || typeof raw !== "object" || Array.isArray(raw)) return out;
+    const dropped: Record<string, unknown> = {};
+    for (const [k, v] of Object.entries(raw as Record<string, unknown>)) {
+      if (typeof v === "string") out[k] = v;
+      else dropped[k] = v;
+    }
+    const droppedCount = Object.keys(dropped).length;
+    if (droppedCount > 0) {
+      console.warn(
+        `AgentEditor: dropped ${droppedCount} non-string value${droppedCount === 1 ? "" : "s"} from "toolAliases" — saving will not preserve these values:`,
+        dropped,
+      );
+    }
+    return out;
   }
 
   let toolsDraft = $derived(toolsSlice(draft));

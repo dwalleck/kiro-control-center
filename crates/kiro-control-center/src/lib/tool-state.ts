@@ -25,7 +25,9 @@ export type ToolsDraft = {
 };
 
 /**
- * Toggle a tool's enabled status.
+ * Toggle a tool's enabled status. NOT idempotent — each call flips
+ * membership, so a second call with the same name disables what the
+ * first call enabled (and vice-versa).
  *
  * - **Enable** (`name ∉ tools`): append to `tools`. `allowedTools`
  *   and `toolAliases` unchanged.
@@ -33,9 +35,6 @@ export type ToolsDraft = {
  *   This is the cascade invariant from the spec's "Things to watch
  *   out for" item 8 — without the alias and allowed-list cleanup,
  *   re-enabling the tool later surfaces stale state.
- *
- * Idempotent on the enable path: calling twice with the same name
- * leaves `tools` unchanged (no duplicates).
  */
 export function toggleTool(draft: ToolsDraft, name: string): ToolsDraft {
   if (draft.tools.includes(name)) {
@@ -82,6 +81,25 @@ export function removeAllowed(draft: ToolsDraft, name: string): ToolsDraft {
 }
 
 /**
+ * Set or clear the rename alias for `name`. The trimmed-empty case
+ * removes the key entirely (an empty alias is the same state as no
+ * alias — distinguishing them would create a third state the schema
+ * doesn't model). Never touches `tools` or `allowedTools`.
+ */
+export function setAlias(
+  draft: ToolsDraft,
+  name: string,
+  value: string,
+): ToolsDraft {
+  const trimmed = value.trim();
+  const { [name]: _existing, ...rest } = draft.toolAliases;
+  return {
+    ...draft,
+    toolAliases: trimmed === "" ? rest : { ...rest, [name]: trimmed },
+  };
+}
+
+/**
  * Split `tools` into native and external (MCP) groups. An entry routes
  * to `external` iff `name.startsWith("@")`; otherwise `native`. Source
  * order is preserved within each group.
@@ -103,19 +121,49 @@ export function partitionTools(
 }
 
 /**
- * Outcome of an `+Add external tool` request from the External (MCP)
- * sub-region. Discriminated union so the panel can route the failure
- * reason to a user-facing message rather than silently no-op'ing.
+ * Failure reasons for the `+Add external tool` request from the
+ * External (MCP) sub-region. Single source of truth for the failure
+ * union — consumers import `AddExternalReason` and switch on it with
+ * a `_exhaustive: never` default arm.
  *
- * Reasons (per the React reference `ExternalToolList`, AgentEditor.jsx:461):
+ * Reasons (per the React reference `ExternalToolList`):
  * - `empty` — input was whitespace-only.
  * - `not-mcp` — input doesn't start with `@`; external MCP entries
  *   require the `@server/tool` or `@server` shape.
  * - `duplicate` — input already exists in `tools[]`.
  */
+export type AddExternalReason = "empty" | "not-mcp" | "duplicate";
+
+/**
+ * Outcome of an `+Add external tool` request. Discriminated union so
+ * the panel can route the failure reason to a user-facing message
+ * rather than silently no-op'ing.
+ */
 export type AddExternalResult =
   | { ok: true; draft: ToolsDraft }
-  | { ok: false; reason: "empty" | "not-mcp" | "duplicate" };
+  | { ok: false; reason: AddExternalReason };
+
+// Compile-time exhaustiveness tripwire for `AddExternalReason`.
+// Bidirectional guard mirroring `_PLUGIN_ACTION_VALUES` in
+// `stores/plugin-updates.ts`:
+//   - `satisfies readonly AddExternalReason[]` fails if an element of
+//     the array is not a valid reason.
+//   - `Exclude<AddExternalReason, …>` fails if `AddExternalReason`
+//     gains a new arm not listed in `_ADD_EXTERNAL_REASON_VALUES`.
+// The value-position `const _assert: … = true` forces type-check
+// evaluation; an unused type alias resolving to `never` is valid TS,
+// so the const is what makes the tripwire fire.
+const _ADD_EXTERNAL_REASON_VALUES = [
+  "empty",
+  "not-mcp",
+  "duplicate",
+] as const satisfies readonly AddExternalReason[];
+type _AssertAddExternalReasonExhaustive =
+  Exclude<AddExternalReason, (typeof _ADD_EXTERNAL_REASON_VALUES)[number]> extends never
+    ? true
+    : never;
+const _assertAddExternalReasonExhaustive: _AssertAddExternalReasonExhaustive = true;
+void _assertAddExternalReasonExhaustive;
 
 /**
  * Validate and apply an `+Add` request from the External (MCP)
@@ -134,7 +182,12 @@ export function addExternalTool(
 ): AddExternalResult {
   const trimmed = raw.trim();
   if (!trimmed) return { ok: false, reason: "empty" };
-  if (!trimmed.startsWith("@")) return { ok: false, reason: "not-mcp" };
+  // Bare `@` fails the @server/@server/tool shape requirement — there
+  // must be at least one character after the prefix. Folds under
+  // `not-mcp` so the user gets the shape-of-a-valid-name error message.
+  if (!trimmed.startsWith("@") || trimmed === "@") {
+    return { ok: false, reason: "not-mcp" };
+  }
   if (draft.tools.includes(trimmed)) return { ok: false, reason: "duplicate" };
   return {
     ok: true,
