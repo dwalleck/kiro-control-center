@@ -660,9 +660,14 @@ impl MarketplaceService {
     ///   `RelativePath` points to a missing directory.
     /// - [`Error::Plugin`] ([`PluginError::NotADirectory`]) if the path
     ///   exists but is a regular file (or other non-directory).
-    /// - [`Error::Plugin`] ([`PluginError::SymlinkRefused`]) if the path
-    ///   is a symlink — refused rather than followed as a security
-    ///   measure.
+    /// - [`Error::Plugin`] ([`PluginError::SymlinkRefused`]) if the
+    ///   resolved path canonicalizes outside the marketplace tree —
+    ///   e.g. a symlink or directory junction inside the marketplace
+    ///   redirects to a path that does not share the marketplace
+    ///   canonical prefix. The variant name predates the containment
+    ///   check; the refusal condition is now filesystem-level escape,
+    ///   not "is-a-symlink." A symlink whose target remains inside the
+    ///   marketplace tree is accepted.
     /// - [`Error::Plugin`] ([`PluginError::DirectoryUnreadable`]) if
     ///   stat'ing the path fails (permission denied, I/O error, etc.).
     /// - [`Error::Plugin`] ([`PluginError::RemoteSourceNotLocal`]) if
@@ -674,35 +679,101 @@ impl MarketplaceService {
     ) -> Result<PathBuf, Error> {
         match &entry.source {
             PluginSource::RelativePath(rel) => {
-                // `rel` is a validated `RelativePath` — no traversal
-                // check needed. `symlink_metadata` refuses to follow
-                // symlinks, matching the hardening in
-                // `resolve_plugin_dir`. Metadata outcomes split into
-                // five arms: is_dir success, symlink → SymlinkRefused
-                // (security refusal), non-directory → NotADirectory
-                // (shape mismatch), NotFound → DirectoryMissing, and
-                // other I/O → DirectoryUnreadable carrying the
-                // underlying io::Error via #[source]. Splitting
-                // NotFound from the catch-all ensures a permissions
-                // problem surfaces as "could not access" with
-                // ErrorKind preserved, not as a misleading "does not
-                // exist."
+                // `rel` is a validated `RelativePath` — textual traversal
+                // (`..`, absolute, NUL) is impossible. The remaining
+                // attack vector is a filesystem-level escape: a symlink
+                // or Windows directory junction somewhere along the
+                // resolved path that redirects outside the marketplace
+                // tree. We refuse that by canonicalizing both the
+                // resolved plugin path and the marketplace root, then
+                // requiring the resolved canonical to remain inside
+                // the marketplace canonical (a "containment" check).
+                //
+                // This replaces an earlier bare `is_symlink()` check
+                // that mis-refused legitimate setups: on Windows a
+                // local-linked marketplace is itself a junction at
+                // `<cache>/marketplaces/<name>`, so a plugin with
+                // `source: "."` would stat the junction directly and
+                // trip the symlink branch. Containment treats the
+                // user's deliberately-linked marketplace root as
+                // trusted (resolved == marketplace, contained) while
+                // still refusing a malicious `plugins/escape ->
+                // C:\Windows` link (canonical leaves marketplace).
+                //
+                // Trust-boundary note: marketplace contents are
+                // user-controlled (locally-linked) or
+                // cache-controlled (cloned remote), not adversarial
+                // *at the kernel level*. The TOCTOU window between
+                // `symlink_metadata`, `canonicalize`, and the final
+                // `fs::metadata` below is acceptable here — a
+                // local-user attacker who can swap inodes mid-call
+                // already has write access to `<cache>/marketplaces/`
+                // and need not exploit a race. Do NOT "optimize" by
+                // hoisting one of those syscalls; the containment
+                // invariant relies on canonicalize seeing the same
+                // path the stat saw.
                 let resolved = marketplace_path.join(rel);
-                match fs::symlink_metadata(&resolved) {
-                    Ok(m) if m.file_type().is_symlink() => {
-                        Err(PluginError::SymlinkRefused { path: resolved }.into())
-                    }
-                    Ok(m) if m.is_dir() => Ok(resolved),
-                    Ok(_) => Err(PluginError::NotADirectory { path: resolved }.into()),
-                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                        Err(PluginError::DirectoryMissing { path: resolved }.into())
-                    }
-                    Err(e) => Err(PluginError::DirectoryUnreadable {
-                        path: resolved,
+                // Disambiguate NotFound/other I/O up front so callers
+                // continue to see `DirectoryMissing` vs.
+                // `DirectoryUnreadable` rather than a generic
+                // canonicalize failure with the io kind buried.
+                if let Err(e) = fs::symlink_metadata(&resolved) {
+                    return Err(match e.kind() {
+                        std::io::ErrorKind::NotFound => {
+                            PluginError::DirectoryMissing { path: resolved }.into()
+                        }
+                        _ => PluginError::DirectoryUnreadable {
+                            path: resolved,
+                            source: e,
+                        }
+                        .into(),
+                    });
+                }
+                // Canonicalize both sides. The marketplace canonical
+                // follows the local-marketplace junction (if any) to
+                // the user's real on-disk path, so a `source: "."`
+                // plugin canonicalizes to the same target and passes
+                // containment. A malicious link inside the tree
+                // resolves to a path that doesn't share the prefix
+                // and falls through to `SymlinkRefused`.
+                let resolved_canonical =
+                    fs::canonicalize(&resolved).map_err(|e| PluginError::DirectoryUnreadable {
+                        path: resolved.clone(),
+                        source: e,
+                    })?;
+                let marketplace_canonical = fs::canonicalize(marketplace_path).map_err(|e| {
+                    PluginError::DirectoryUnreadable {
+                        path: marketplace_path.to_path_buf(),
                         source: e,
                     }
-                    .into()),
+                })?;
+                if !resolved_canonical.starts_with(&marketplace_canonical) {
+                    return Err(PluginError::SymlinkRefused { path: resolved }.into());
                 }
+                // `symlink_metadata.is_dir()` returns false for a
+                // symlink-to-directory, so the directory check has to
+                // happen on the canonical path. `fs::metadata` follows
+                // symlinks; on a canonicalized path there are no
+                // symlinks left to follow, so it reports the final
+                // target's type directly.
+                let target = fs::metadata(&resolved_canonical).map_err(|e| {
+                    PluginError::DirectoryUnreadable {
+                        path: resolved.clone(),
+                        source: e,
+                    }
+                })?;
+                if !target.is_dir() {
+                    return Err(PluginError::NotADirectory { path: resolved }.into());
+                }
+                // Return the non-canonical join, not `resolved_canonical`.
+                // The canonical form leaks the `\\?\` extended-path prefix
+                // on Windows, which downstream I/O surfaces (callers
+                // immediately `.join("plugin.json")`, format paths into
+                // user-facing errors, etc.) shouldn't see. Containment
+                // was proven on the canonical above; the return value
+                // carries no fewer trust guarantees than the input
+                // `marketplace_path` already had.
+                Ok(resolved)
             }
             PluginSource::Structured(s) => Err(PluginError::RemoteSourceNotLocal {
                 plugin: entry.name.clone(),
@@ -2242,16 +2313,22 @@ mod tests {
     // Symlink-refusal regression tests (plugin dir + plugin.json)
     // -----------------------------------------------------------------------
 
-    /// Regression guard: `resolve_local_plugin_dir` uses
-    /// `symlink_metadata` combined with an explicit `is_symlink()`
-    /// check rather than `Path::exists()`, so a symlink at the plugin
-    /// path is classified as [`PluginError::SymlinkRefused`] rather
-    /// than traversed. This test fails if the symlink arm is replaced
-    /// by `Path::exists()` (which would follow the link) or by a
-    /// weaker shape check (which would let the symlink fall through
-    /// to [`PluginError::NotADirectory`] and hide the security
-    /// semantic). Mirrors `resolve_plugin_dir_refuses_symlinked_relative_path`
-    /// for the cloning sibling in `service/mod.rs`.
+    /// Regression guard: a symlink at the plugin path whose target
+    /// leaves the marketplace tree must be refused with
+    /// [`PluginError::SymlinkRefused`], not silently traversed. The
+    /// refusal comes from the canonicalize-both + `starts_with`
+    /// containment check in `resolve_local_plugin_dir`: the resolved
+    /// canonical lands outside the marketplace canonical, so
+    /// containment fails. This test fails if containment is
+    /// downgraded to `Path::exists()` (which would follow the link)
+    /// or if the containment prefix is computed without canonicalizing
+    /// the marketplace root (which would let `..`-laden marketplace
+    /// paths slip through). Mirrors
+    /// `resolve_plugin_dir_refuses_symlinked_relative_path` for the
+    /// cloning sibling in `service/mod.rs`, which retains the older
+    /// `symlink_metadata` shape because its surface (cloned remote
+    /// source under the cache, never a junctioned root) doesn't need
+    /// containment.
     #[cfg(unix)]
     #[test]
     fn resolve_local_plugin_dir_refuses_symlinked_relative_path() {
@@ -2274,6 +2351,90 @@ mod tests {
         assert!(
             matches!(err, Error::Plugin(PluginError::SymlinkRefused { .. })),
             "expected SymlinkRefused for symlink, got: {err:?}"
+        );
+    }
+
+    /// Regression guard (Windows): a local-linked marketplace is a
+    /// directory junction at `<cache>/marketplaces/<name>`. A plugin
+    /// with `source: "."` must still resolve — the junction at the
+    /// marketplace root is the user's deliberately linked tree, not
+    /// an untrusted reparse point that needs refusing.
+    ///
+    /// User-reported bug: `kiro-market install gilfoyle/gilfoyle`
+    /// failed with `refusing to follow symlinked plugin path:
+    /// <cache>\marketplaces\gilfoyle\.\` because the older check used
+    /// a bare `is_symlink()` on the stat'd path, which on Windows
+    /// (junction at marketplace root + `rel = "."`) reported true.
+    /// Canonicalize-then-`starts_with` containment is the replacement.
+    /// Without this regression test, a future revert to a per-entry
+    /// reparse-point check would re-break local marketplaces on
+    /// Windows and the Unix CI would happily pass.
+    #[cfg(windows)]
+    #[test]
+    fn resolve_local_plugin_dir_accepts_junctioned_marketplace_root() {
+        let (dir, svc) = temp_service();
+        // The user's real on-disk marketplace tree.
+        let target = dir.path().join("real-marketplace");
+        fs::create_dir_all(&target).expect("create target marketplace");
+        // junction::create requires absolute source paths.
+        let abs_target = fs::canonicalize(&target).expect("canon target");
+
+        // The cache slot the local-link mechanism produces: a directory
+        // junction at `<cache>/marketplaces/<name>` pointing at the
+        // user's real tree.
+        let marketplace_path = dir.path().join("cache-marketplace");
+        if junction::create(&abs_target, &marketplace_path).is_err() {
+            // Some sandboxed runners lack junction support on NTFS.
+            // Skip rather than spuriously fail — the codepath under
+            // test isn't reachable without a junction.
+            return;
+        }
+
+        let entry = relative_path_entry("gilfoyle", ".");
+        let resolved = svc
+            .resolve_local_plugin_dir(&entry, &marketplace_path)
+            .expect("junctioned marketplace root + source `.` must resolve");
+        // The returned path is the original (non-canonical) join, so
+        // downstream I/O continues to see the same surface the caller
+        // passed in (avoids leaking the `\\?\` extended-path prefix).
+        assert_eq!(resolved, marketplace_path.join("."));
+    }
+
+    /// Windows mirror of
+    /// `resolve_local_plugin_dir_refuses_symlinked_relative_path`:
+    /// a directory junction inside the marketplace tree that escapes
+    /// to a path outside the marketplace root must still be refused
+    /// with [`PluginError::SymlinkRefused`]. The Unix-only test
+    /// covers symlinks; without this case the security behavior had
+    /// no Windows coverage and a regression that replaced the
+    /// containment check with something laxer would slip through CI.
+    /// This is the case the original (broken) `is_symlink()` check
+    /// was attempting to catch — containment subsumes it.
+    #[cfg(windows)]
+    #[test]
+    fn resolve_local_plugin_dir_refuses_junctioned_relative_path() {
+        let (dir, svc) = temp_service();
+        let marketplace_path = dir.path().join("marketplace");
+        fs::create_dir_all(&marketplace_path).expect("create marketplace root");
+
+        let outside = dir.path().join("outside-marketplace");
+        fs::create_dir_all(&outside).expect("create outside target");
+        let abs_outside = fs::canonicalize(&outside).expect("canon outside");
+
+        let link_path = marketplace_path.join("plugins").join("escape");
+        fs::create_dir_all(link_path.parent().expect("plugins dir parent"))
+            .expect("create plugins dir");
+        if junction::create(&abs_outside, &link_path).is_err() {
+            return;
+        }
+
+        let entry = relative_path_entry("escape", "plugins/escape");
+        let err = svc
+            .resolve_local_plugin_dir(&entry, &marketplace_path)
+            .expect_err("junctioned plugin directory pointing outside must be refused");
+        assert!(
+            matches!(err, Error::Plugin(PluginError::SymlinkRefused { .. })),
+            "expected SymlinkRefused for escape junction, got: {err:?}"
         );
     }
 

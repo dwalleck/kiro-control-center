@@ -1,110 +1,133 @@
 # Architecture
 
-## Design Philosophy
+<!-- tags: architecture, patterns, design -->
 
-**Shared core, thin frontends.** All business logic lives in `kiro-market-core`. The CLI (`kiro-market`) and desktop app (`kiro-control-center`) are presentation-only wrappers that delegate to the core library. This ensures behavior parity between interfaces and keeps the test surface concentrated.
+## Core Pattern: Shared-Core / Thin Frontends
 
-## System Layers
+All business logic lives in `kiro-market-core`. The CLI and desktop app are presentation-only wrappers. No business logic belongs in the frontend crates.
 
 ```mermaid
 graph TB
-    subgraph Frontends
-        CLI["kiro-market (CLI)"]
-        Desktop["kcc (Tauri Desktop)"]
-    end
+    CLI["kiro-market (CLI binary)"]
+    Desktop["kiro-control-center (Tauri desktop)"]
+    Core["kiro-market-core (shared library)"]
+    FS["File System / Git"]
 
-    subgraph Core["kiro-market-core"]
-        Service["MarketplaceService<br/>orchestrator"]
-        Project["KiroProject<br/>disk operations"]
-        Cache["CacheDir<br/>marketplace storage"]
-        Git["Git Backend<br/>gix + CLI"]
-        Agent["Agent Module<br/>parse/emit/discover"]
-    end
-
-    subgraph Storage["On-Disk State"]
-        CacheFS["~/.cache/kiro-market/"]
-        ProjectFS[".kiro/ directory"]
-    end
-
-    CLI --> Service
-    Desktop -->|"IPC (tauri-specta)"| Service
-    Service --> Project
-    Service --> Cache
-    Service --> Git
-    Service --> Agent
-    Cache --> CacheFS
-    Project --> ProjectFS
+    CLI -->|"feature: cli"| Core
+    Desktop -->|"feature: specta"| Core
+    Core --> FS
 ```
 
-## Key Architectural Decisions
+## Service Layer
 
-### 1. Generic Git Backend
+`MarketplaceService` in `service/mod.rs` is the primary orchestrator. It is generic over `GitBackend`, enabling test injection of mock backends.
 
-`MarketplaceService` is generic over a `GitBackend` trait. Production uses `GixCliBackend` (tries gix first, falls back to git CLI). Tests inject mock backends for deterministic behavior without network access.
+```mermaid
+classDiagram
+    class MarketplaceService~G~ {
+        +add(source, options) MarketplaceAddResult
+        +remove(name) Result
+        +update(name) UpdateResult
+        +list() Vec~PluginBasicInfo~
+        +install_plugin(ctx) InstallPluginResult
+        +detect_plugin_updates(project) DetectUpdatesResult
+        +list_plugin_catalog(marketplace, project) PluginCatalogView
+    }
+    class GitBackend {
+        <<trait>>
+        +clone_repo(url, dest, opts) Result
+        +pull_repo(path) Result
+        +verify_sha(path, expected) Result
+    }
+    MarketplaceService --> GitBackend
+    MarketplaceService --> CacheDir
+    MarketplaceService --> KiroProject
+```
 
-### 2. File-Based State (No Database)
+## IPC Binding Generation
 
-All persistence is JSON on disk:
-- `~/.cache/kiro-market/` — marketplace clones, plugin registries
-- `.kiro/installed-skills.json` — installed skill tracking
-- `.kiro/installed-agents.json` — installed agent tracking
-- `.kiro/settings.json` — project-level Kiro settings
+`tauri-specta` generates `src/lib/bindings.ts` from Rust types. Never edit this file manually. Regenerate after changing any Tauri command:
 
-Concurrent access is serialized via `fs4` file locks.
+```
+cargo test -p kiro-control-center --lib -- --ignored generate_types
+```
 
-### 3. RAII Cleanup Guards
+In debug builds, `run()` in `lib.rs` auto-exports bindings on startup. The `bindings_export_plugin_catalog_view` test asserts required types are present in the committed file.
 
-`DirCleanupGuard` auto-removes staging directories on failure (Drop). Call `.defuse()` on success to keep the directory. This prevents orphaned temp dirs from interrupted operations.
+## File-Based State
 
-### 4. Typed IPC via tauri-specta
+All persistence is JSON on disk. No database. Concurrent access serialized via `fs4` file locks (one `.lock` file per tracking file).
 
-Tauri commands are defined in Rust with `specta::Type` derives. The `generate_types` test produces `bindings.ts` with full TypeScript types for all commands and their return types. The frontend never uses untyped `invoke()`.
+| Path | Purpose |
+|---|---|
+| `~/.cache/kiro-market/` | Marketplace clones, plugin registries |
+| `.kiro/installed-skills.json` | Installed skill tracking |
+| `.kiro/installed-agents.json` | Installed agent tracking |
+| `.kiro/installed-steering.json` | Installed steering file tracking |
+| `.kiro/settings.json` | Project-level Kiro settings |
 
-### 5. Dual Git Backend Strategy
+## RAII Staging Pattern
+
+Installs use a staging directory. `DirCleanupGuard` removes it on drop (failure path). Call `.defuse()` on success.
 
 ```mermaid
 flowchart LR
-    Clone["clone_repo()"] --> Gix["Try gix"]
-    Gix -->|success| Done["Return OK"]
-    Gix -->|failure| CLI["Try git CLI"]
-    CLI -->|success| Done
-    CLI -->|failure| Combined["Combine both errors"]
+    A[Create staging dir] --> B[DirCleanupGuard::new]
+    B --> C{Install succeeds?}
+    C -->|Yes| D[guard.defuse — keep dir]
+    C -->|No| E[guard drops — dir removed]
 ```
 
-`gix` provides pure-Rust git without subprocess overhead. The CLI fallback handles edge cases (auth helpers, unusual SSH configs). Both errors are combined for diagnostics.
+## Feature Flags
 
-### 6. Platform Abstraction
+| Flag | Activating crate | Effect |
+|---|---|---|
+| `cli` | `kiro-market` | Enables `clap` derives on core types |
+| `specta` | `kiro-control-center` | Enables `specta::Type` derives for TS binding generation |
+| `test-support` | dev-deps (self-cycle) | Exposes `service::test_support` with mock backends |
 
-Local marketplaces use OS-native linking:
-- **Unix**: symlinks
-- **Windows**: NTFS junctions (preferred), recursive copy (fallback)
+The self-cycle dev-dep (`kiro-market-core` depends on itself with `features = ["test-support"]`) lets integration tests in `tests/` access test utilities without `cfg(test)`.
 
-`MarketplaceStorage` enum tracks which method was used so the UI can warn about copy-mode limitations.
-
-## Security Architecture
+## Platform Abstraction
 
 ```mermaid
 flowchart TD
-    Input["User Input"] --> Validate["validate_name()<br/>validate_relative_path()"]
-    Validate -->|pass| Process["Process Request"]
-    Validate -->|fail| Reject["Return ValidationError"]
-    
-    Process --> PathCheck["RelativePath newtype<br/>enforces at construction"]
-    Process --> MCPCheck["MCP opt-in gate<br/>--accept-mcp required"]
-    Process --> TLSCheck["TLS enforcement<br/>reject http:// by default"]
-    Process --> LinkCheck["Symlink rejection<br/>in copy_dir_recursive"]
+    A[Link local marketplace] --> B{Unix?}
+    B -->|Yes| C[symlink]
+    B -->|No| D{NTFS junction?}
+    D -->|Success| E[junction]
+    D -->|Fail| F[recursive copy]
 ```
 
-**Invariants:**
-1. All user-supplied names pass `validate_name()` (rejects traversal, reserved names, control chars)
-2. All paths use `RelativePath` newtype (rejects absolute paths, `..`, backslash)
-3. MCP agents require explicit `--accept-mcp` opt-in
-4. `http://` sources rejected unless `--allow-insecure-http` passed
-5. `copy_dir_recursive` skips symlinks and hardlinks in source trees
-6. Workspace-level `unsafe_code = "forbid"`
+`MarketplaceStorage` enum tracks which method was used. `copy_dir_recursive` skips symlinks and hardlinks in source trees.
 
-## Error Handling Strategy
+## Security Model
 
-Errors are organized into domain-specific enums (`MarketplaceError`, `PluginError`, `SkillError`, `AgentError`, `GitError`) unified by a top-level `Error` enum with `From` conversions. Each variant carries enough context for actionable error messages (paths, names, source chains).
+Path safety is enforced at type construction, not at call sites:
 
-The Tauri layer wraps core errors into `CommandError` with an `ErrorType` discriminant for frontend-friendly categorization.
+- `validate_name()` — rejects traversal, NUL bytes, Windows reserved names, control chars
+- `validate_relative_path()` — rejects absolute paths, `..` components, backslashes
+- `RelativePath` newtype — only constructible via `validate_relative_path()`
+- MCP agents require explicit `--accept-mcp` opt-in
+- `http://` sources rejected unless `--allow-insecure-http` is passed
+- `unsafe_code = "forbid"` at workspace level
+
+## TLS Activation Pattern
+
+`kiro-market-core` takes `curl = { workspace = true }` as a direct dependency solely to activate the `ssl` feature on `curl-sys` (pulled transitively by `gix-transport`). Without this activator, HTTPS clones silently fall back to plaintext on static-libcurl builds. The `assert-curl-tls` CI job verifies this invariant.
+
+## xtask Hooks
+
+| Hook | Trigger | Action |
+|---|---|---|
+| `hook-block-cargo-lock` | PreToolUse Write/Edit | Blocks direct Cargo.lock edits; use `cargo update -p <crate>` instead. Override: `KIRO_ALLOW_LOCKFILE_EDIT=1` |
+| `hook-post-edit` | PostToolUse Write/Edit | Runs `rustfmt` then `clippy` on the edited file's package |
+
+## plan-lint Gates
+
+`cargo xtask plan-lint` enforces:
+- `no_panic` — no `panic!`, `todo!`, `unimplemented!` in production code
+- `no_unwrap` — no `.unwrap()` or `.expect()` in production code
+- `non_exhaustive` — public error enums in `kiro-market-core` must have `#[non_exhaustive]`
+- `no_frontend_deps` — `kiro-market-core` must not import `tauri` or `tokio`
+- `ffi_enum_tag` — public enums with payload exposed via `specta` must have a serde tag

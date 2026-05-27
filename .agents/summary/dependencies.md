@@ -1,104 +1,131 @@
 # Dependencies
 
-## Rust Dependencies (Workspace)
+<!-- tags: dependencies, external, crates, npm -->
 
-### Core Functionality
-
-| Crate | Version | Purpose | Used By |
-|-------|---------|---------|---------|
-| `gix` | 0.81 | Pure-Rust git operations (clone, pull, checkout) | kiro-market-core |
-| `curl` | 0.4 | **TLS shim only** — activates `ssl` feature on `curl-sys` for gix-transport. Not used for HTTP requests. | kiro-market-core |
-| `fs4` | 0.13 | Cross-process file locking for concurrent access serialization | kiro-market-core |
-| `blake3` | 1.5 | Content hashing for change detection (source/installed hash comparison) | kiro-market-core |
-| `junction` | 1 | Windows NTFS junction creation for local marketplace linking | kiro-market-core (Windows only) |
-| `tempfile` | 3 | Staging directories with OS-cleanup-on-Drop semantics | kiro-market-core |
+## Rust Workspace Dependencies
 
 ### Serialization
 
-| Crate | Version | Purpose | Used By |
-|-------|---------|---------|---------|
-| `serde` | 1 | Serialization framework (derive) | All crates |
-| `serde_json` | 1 | JSON parsing/writing for all on-disk state | All crates |
-| `serde_yaml_ng` | 0.10 | YAML frontmatter parsing in SKILL.md and agent files | kiro-market-core |
+| Crate | Version | Purpose |
+|---|---|---|
+| `serde` | 1 | Derive `Serialize`/`Deserialize` on all data types |
+| `serde_json` | 1 | JSON read/write for tracking files, plugin manifests, Tauri IPC |
+| `serde_yaml_ng` | 0.10 | YAML frontmatter parsing in `SKILL.md` and agent files |
+| `toml` | 0.8 | Cargo manifest parsing in xtask (`parse_package_name`) |
 
 ### CLI
 
-| Crate | Version | Purpose | Used By |
-|-------|---------|---------|---------|
-| `clap` | 4 | Command-line argument parsing (derive API) | kiro-market |
-| `colored` | 3 | Terminal color output | kiro-market |
+| Crate | Version | Purpose |
+|---|---|---|
+| `clap` | 4 | CLI argument parsing (derive mode). Optional in core via `cli` feature. |
 
-### Desktop App
+### Git
 
-| Crate | Version | Purpose | Used By |
-|-------|---------|---------|---------|
-| `tauri` | 2 | Desktop app framework (webview + IPC) | kiro-control-center |
-| `tauri-specta` | 2.0.0-rc.24 | Auto-generate TypeScript bindings from Rust types | kiro-control-center |
-| `specta` | 2.0.0-rc.24 | Type reflection for TypeScript generation | kiro-control-center |
-| `tauri-plugin-dialog` | 2 | Native file/folder dialog | kiro-control-center |
-| `tauri-plugin-opener` | 2 | Open URLs/files with system default | kiro-control-center |
+| Crate | Version | Purpose | Notes |
+|---|---|---|---|
+| `gix` | 0.81 | Primary git backend: clone, pull, SHA verification | `blocking-network-client` + `blocking-http-transport-curl` features |
+| `curl` | 0.4 | **TLS activator only** — not used for HTTP requests | Activates `ssl` feature on `curl-sys` (transitive via `gix-transport`). Without this, HTTPS clones silently fall back to plaintext on static-libcurl builds. The `assert-curl-tls` CI job guards this invariant. |
 
-### Infrastructure
+### Console
 
-| Crate | Version | Purpose | Used By |
-|-------|---------|---------|---------|
-| `thiserror` | 2 | Derive `Error` trait for domain error types | kiro-market-core |
-| `anyhow` | 1 | Ergonomic error handling in CLI/binary contexts | kiro-market |
-| `tracing` | 0.1 | Structured logging | All crates |
-| `tracing-subscriber` | 0.3 | Log output formatting with env-filter | kiro-market, kiro-control-center |
-| `dirs` | 6 | Platform-standard directory paths (cache, config) | All crates |
-| `chrono` | 0.4 | Timestamps for install tracking | All crates |
-| `hex` | 0.4 | Hex encoding for hash display | kiro-market-core |
+| Crate | Version | Purpose |
+|---|---|---|
+| `colored` | 3 | ANSI color output in CLI. Respects `NO_COLOR` env var. |
+
+### Error Handling
+
+| Crate | Version | Purpose |
+|---|---|---|
+| `thiserror` | 2 | Derive `Error` on structured error enums |
+| `anyhow` | 1 | Used in CLI binary for top-level error propagation |
+
+### Logging
+
+| Crate | Version | Purpose |
+|---|---|---|
+| `tracing` | 0.1 | Structured logging macros throughout core and CLI |
+| `tracing-subscriber` | 0.3 | Subscriber setup in CLI main (env-filter feature) |
+
+### File System
+
+| Crate | Version | Purpose |
+|---|---|---|
+| `dirs` | 6 | Resolves `~/.cache/` and home directory paths |
+| `fs4` | 0.13 | Cross-process file locking for tracking files |
+| `tempfile` | 3 | `TempDir` for staging directories during install |
+| `junction` | 1 | Windows NTFS junction creation for local marketplace linking. Windows-only target dep. |
+
+### Hashing
+
+| Crate | Version | Purpose |
+|---|---|---|
+| `blake3` | 1.5 | Content hashing for change detection. Hashes stored as `blake3:<hex>` strings. |
+| `hex` | 0.4 | Hex encoding/decoding for `BlakeHash` |
+
+### Date/Time
+
+| Crate | Version | Purpose |
+|---|---|---|
+| `chrono` | 0.4 | `installed_at` timestamps in tracking files. `serde` feature for JSON serialization. **Not** used in Tauri IPC types (specta's chrono feature is off). |
+
+### Tauri (kiro-control-center only)
+
+| Crate | Version | Purpose |
+|---|---|---|
+| `tauri` | 2 | Desktop app framework |
+| `tauri-specta` | (workspace) | Generates TypeScript bindings from Rust command types |
+| `specta` | 2.0.0-rc.24 | Type reflection for TS binding generation. Optional via `specta` feature. |
+| `tauri_plugin_opener` | 2 | Opens files/URLs from the desktop app |
+| `tauri_plugin_dialog` | 2.7.0 | Native file/folder picker dialogs |
 
 ### Testing
 
-| Crate | Version | Purpose | Used By |
-|-------|---------|---------|---------|
-| `rstest` | 0.26 | Parameterized test fixtures | All crates (dev) |
-| `tempfile` | 3 | Temporary directories for test isolation | All crates (dev) |
-| `tokio` | 1 | Async runtime for Tauri command tests | kiro-control-center (dev) |
+| Crate | Version | Purpose |
+|---|---|---|
+| `rstest` | 0.26 | Parameterized test fixtures |
+| `tempfile` | 3 | Temporary directories in tests |
 
 ---
 
-## Frontend Dependencies (npm)
+## npm Dependencies (kiro-control-center frontend)
 
 ### Runtime
 
 | Package | Version | Purpose |
-|---------|---------|---------|
-| `@tauri-apps/api` | ^2 | Tauri IPC from JavaScript |
-| `@tauri-apps/plugin-dialog` | ^2.7.0 | Native dialog bindings |
-| `@tauri-apps/plugin-opener` | ^2 | URL/file opener bindings |
-| `tailwindcss` | ^4.2.2 | Utility-first CSS framework |
-| `@tailwindcss/postcss` | ^4.2.2 | PostCSS integration for Tailwind |
-| `postcss` | ^8.5.8 | CSS processing pipeline |
+|---|---|---|
+| `@tauri-apps/api` | ^2 | Tauri IPC `invoke()` and event APIs |
+| `@tauri-apps/plugin-dialog` | ^2.7.0 | Native dialog plugin JS bindings |
+| `@tauri-apps/plugin-opener` | ^2 | Opener plugin JS bindings |
+| `tailwindcss` | ^4.2.2 | Utility CSS framework |
+| `@tailwindcss/postcss` | ^4.2.2 | PostCSS integration for Tailwind 4 |
+| `postcss` | ^8.5.8 | CSS processing |
 
-### Development
+### Dev
 
 | Package | Version | Purpose |
-|---------|---------|---------|
+|---|---|---|
 | `svelte` | ^5.0.0 | UI framework (runes mode) |
-| `@sveltejs/kit` | ^2.9.0 | SvelteKit framework |
-| `@sveltejs/adapter-static` | ^3.0.6 | Static site generation for Tauri |
-| `@sveltejs/vite-plugin-svelte` | ^5.0.0 | Vite integration |
-| `@tauri-apps/cli` | ^2 | Tauri build tooling |
-| `vite` | ^6.0.3 | Build tool and dev server |
-| `typescript` | ~5.6.2 | Type checking |
-| `svelte-check` | ^4.0.0 | Svelte type checking |
-| `@playwright/test` | ^1.59.1 | E2E testing |
+| `@sveltejs/kit` | ^2.9.0 | SvelteKit app framework |
+| `@sveltejs/adapter-static` | ^3.0.6 | Static adapter (Tauri uses static output) |
+| `@sveltejs/vite-plugin-svelte` | ^5.0.0 | Vite plugin for Svelte |
+| `vite` | ^6.0.3 | Build tool and dev server (port 1420) |
+| `typescript` | ~5.6.2 | TypeScript compiler |
+| `svelte-check` | ^4.0.0 | Svelte type checking (`npm run check`) |
+| `vitest` | ^2.1.0 | Unit test runner for TypeScript/Svelte |
+| `@playwright/test` | ^1.59.1 | End-to-end tests (`tests/e2e/`) |
+| `@tauri-apps/cli` | ^2 | `npx tauri` commands |
+| `@types/node` | ^25.5.2 | Node.js type definitions |
 
 ---
 
-## Dependency Notes
+## Non-Obvious Dependency Notes
 
-### Why `curl` exists but isn't used for HTTP
+- **`curl` is a shim**: The `curl = { workspace = true }` entry in `kiro-market-core` exists solely to activate `ssl` on `curl-sys`. It is not used for any HTTP requests. Removing it breaks TLS on static-libcurl builds silently.
 
-The `curl` crate dependency exists solely to activate the `ssl` feature on `curl-sys`, which is pulled transitively by `gix-transport`. Without this feature activation, static-libcurl builds (Windows minimal, vendored CI) would build `curl-sys` without a TLS backend, causing HTTPS clones to silently fail or fall back to plaintext. The CI job `assert-curl-tls` verifies this feature is active.
+- **`specta` is optional**: Only activated when building the Tauri crate (`specta` feature). The core library compiles without it for CLI use.
 
-### Why `tempfile` appears in both deps and dev-deps
+- **`tempfile` is a runtime dep in core**: Used for `TempDir` staging directories during install, not just in tests.
 
-Production code uses `tempfile::TempDir` for staging directories (OS-cleanup-on-Drop replaces hand-rolled unique-name generation). Dev-deps use it for test isolation. The workspace entry covers both uses.
+- **`junction` is Windows-only**: Declared under `[target.'cfg(windows)'.dependencies]` in `kiro-market-core`.
 
-### External Services
-
-This project has **no runtime external service dependencies** beyond git repositories. All state is local JSON files. No databases, no cloud APIs, no authentication services.
+- **`chrono` must not appear in Tauri IPC types**: `specta`'s chrono feature is disabled in `kiro-control-center`. The `bindings_export_plugin_catalog_view` test asserts no `DateTime` types appear in `bindings.ts`.

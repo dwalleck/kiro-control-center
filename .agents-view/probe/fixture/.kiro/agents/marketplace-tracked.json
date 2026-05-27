@@ -1,0 +1,29 @@
+{
+  "$schema": "../agent-schema.json",
+  "name": "marketplace-tracked",
+  "description": "Installed via marketplace, tracking entry present",
+  "model": "claude-opus-4-7",
+  "prompt": "file://prompts/marketplace-tracked.md",
+  "tools": ["fs_read", "grep", "code"],
+  "allowedTools": ["fs_read", "grep", "code"],
+  "mcpServers": {
+    "kiro-docs": {
+      "type": "stdio",
+      "command": "kiro-docs-mcp",
+      "args": []
+    }
+  },
+  "resources": [
+    "file://AGENTS.md",
+    {
+      "type": "knowledgeBase",
+      "source": "file://docs/",
+      "name": "kiro-docs",
+      "indexType": "best"
+    }
+  ],
+  "hooks": {
+    "SessionStart": [{"command": "echo hello"}]
+  },
+  "keyboardShortcut": "ctrl+shift+m"
+}

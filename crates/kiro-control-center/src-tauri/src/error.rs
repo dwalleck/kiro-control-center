@@ -1,5 +1,5 @@
 use kiro_market_core::error::{
-    error_full_chain, Error as CoreError, MarketplaceError, PluginError, SkillError,
+    error_full_chain, AgentError, Error as CoreError, MarketplaceError, PluginError, SkillError,
     ValidationError,
 };
 use serde::Serialize;
@@ -79,6 +79,49 @@ impl From<CoreError> for CommandError {
             CoreError::Plugin(PluginError::RemoteSourceNotLocal { .. }) => ErrorType::Validation,
             CoreError::Plugin(_) => {
                 warn!("unmapped Plugin error variant, defaulting to Unknown");
+                ErrorType::Unknown
+            }
+            // Per-variant Agent mapping. claude[bot]'s PR #120 review
+            // surfaced that AgentError variants (including the new
+            // user-authoring ones — NameCollision, InvalidName,
+            // DuplicateSourceNotFound, etc.) were falling into the
+            // catch-all `_ => Unknown` arm below. CLAUDE.md's classifier
+            // discipline ("Classifier functions over error enums
+            // enumerate every variant explicitly") makes the explicit
+            // listing mandatory; the residual `Agent(_) => Unknown` arm
+            // covers future #[non_exhaustive] additions but logs so a
+            // new variant doesn't silently dustbin.
+            CoreError::Agent(AgentError::AlreadyInstalled { .. }) => ErrorType::AlreadyExists,
+            CoreError::Agent(AgentError::NotInstalled { .. }) => ErrorType::NotFound,
+            CoreError::Agent(AgentError::ParseFailed { .. }) => ErrorType::ParseError,
+            CoreError::Agent(AgentError::NativeManifestParseFailed { .. }) => ErrorType::ParseError,
+            CoreError::Agent(AgentError::NativeManifestMissingName { .. }) => ErrorType::Validation,
+            CoreError::Agent(AgentError::NativeManifestInvalidName { .. }) => ErrorType::Validation,
+            CoreError::Agent(AgentError::ManifestReadFailed { .. }) => ErrorType::IoError,
+            CoreError::Agent(AgentError::NameClashWithOtherPlugin { .. }) => {
+                ErrorType::AlreadyExists
+            }
+            CoreError::Agent(AgentError::PathOwnedByOtherPlugin { .. }) => ErrorType::AlreadyExists,
+            CoreError::Agent(AgentError::OrphanFileAtDestination { .. }) => ErrorType::Validation,
+            CoreError::Agent(AgentError::ContentChangedRequiresForce { .. }) => {
+                ErrorType::Validation
+            }
+            CoreError::Agent(AgentError::MultipleScanRootsNotSupported { .. }) => {
+                ErrorType::Validation
+            }
+            CoreError::Agent(AgentError::SourceHardlinked { .. }) => ErrorType::Validation,
+            CoreError::Agent(AgentError::InstallFailed { .. }) => ErrorType::IoError,
+            CoreError::Agent(AgentError::InvalidName { .. }) => ErrorType::Validation,
+            CoreError::Agent(AgentError::NameCollision { .. }) => ErrorType::AlreadyExists,
+            CoreError::Agent(AgentError::DuplicateSourceNotFound { .. }) => ErrorType::NotFound,
+            CoreError::Agent(AgentError::DuplicateSourceSymlinked { .. }) => ErrorType::Validation,
+            CoreError::Agent(AgentError::DuplicateSourceNotAFile { .. }) => ErrorType::Validation,
+            CoreError::Agent(AgentError::DuplicateSourceTooLarge { .. }) => ErrorType::Validation,
+            CoreError::Agent(AgentError::DuplicateNameSpaceExhausted { .. }) => {
+                ErrorType::Validation
+            }
+            CoreError::Agent(_) => {
+                warn!("unmapped Agent error variant, defaulting to Unknown");
                 ErrorType::Unknown
             }
             _ => {
@@ -271,6 +314,99 @@ mod tests {
                 git_ref: None,
                 sha: None,
             },
+        }),
+        ErrorType::Validation
+    )]
+    // -- Agent variants (Finding C from PR #120 claude[bot] review) --------
+    // Pin per-variant classification so the From<CoreError> impl above
+    // doesn't silently regress to the catch-all `Unknown` arm for any
+    // of the user-authoring failure modes.
+    #[case::agent_already_installed(
+        CoreError::Agent(AgentError::AlreadyInstalled { name: "a".into() }),
+        ErrorType::AlreadyExists
+    )]
+    #[case::agent_not_installed(
+        CoreError::Agent(AgentError::NotInstalled { name: "a".into() }),
+        ErrorType::NotFound
+    )]
+    #[case::agent_native_manifest_missing_name(
+        CoreError::Agent(AgentError::NativeManifestMissingName {
+            path: PathBuf::from("/tmp/agents/x.json")
+        }),
+        ErrorType::Validation
+    )]
+    #[case::agent_native_manifest_invalid_name(
+        CoreError::Agent(AgentError::NativeManifestInvalidName {
+            path: PathBuf::from("/tmp/agents/x.json"),
+            reason: "uppercase not allowed".into(),
+        }),
+        ErrorType::Validation
+    )]
+    #[case::agent_native_manifest_parse_failed(
+        CoreError::Agent(AgentError::NativeManifestParseFailed {
+            path: PathBuf::from("/tmp/agents/x.json"),
+            reason: "bad json".into(),
+        }),
+        ErrorType::ParseError
+    )]
+    #[case::agent_manifest_read_failed(
+        CoreError::Agent(AgentError::ManifestReadFailed {
+            path: PathBuf::from("/tmp/agents/x.json"),
+            source: std::io::Error::from(std::io::ErrorKind::PermissionDenied),
+        }),
+        ErrorType::IoError
+    )]
+    #[case::agent_name_clash_with_other_plugin(
+        CoreError::Agent(AgentError::NameClashWithOtherPlugin {
+            name: "a".into(),
+            owner: "other-plugin".into(),
+        }),
+        ErrorType::AlreadyExists
+    )]
+    #[case::agent_orphan_file_at_destination(
+        CoreError::Agent(AgentError::OrphanFileAtDestination {
+            path: PathBuf::from("/tmp/agents/x.json")
+        }),
+        ErrorType::Validation
+    )]
+    #[case::agent_content_changed_requires_force(
+        CoreError::Agent(AgentError::ContentChangedRequiresForce { name: "a".into() }),
+        ErrorType::Validation
+    )]
+    // User-authoring variants (the ones the bot's finding specifically
+    // flagged as currently collapsing to Unknown):
+    #[case::agent_invalid_name(
+        CoreError::Agent(AgentError::InvalidName { reason: "leading hyphen".into() }),
+        ErrorType::Validation
+    )]
+    #[case::agent_name_collision(
+        CoreError::Agent(AgentError::NameCollision { name: "a".into() }),
+        ErrorType::AlreadyExists
+    )]
+    #[case::agent_duplicate_source_not_found(
+        CoreError::Agent(AgentError::DuplicateSourceNotFound { name: "ghost".into() }),
+        ErrorType::NotFound
+    )]
+    #[case::agent_duplicate_source_symlinked(
+        CoreError::Agent(AgentError::DuplicateSourceSymlinked { name: "linky".into() }),
+        ErrorType::Validation
+    )]
+    #[case::agent_duplicate_source_not_a_file(
+        CoreError::Agent(AgentError::DuplicateSourceNotAFile { name: "weird".into() }),
+        ErrorType::Validation
+    )]
+    #[case::agent_duplicate_source_too_large(
+        CoreError::Agent(AgentError::DuplicateSourceTooLarge {
+            name: "huge".into(),
+            size: 2_000_000,
+            cap: 1_048_576,
+        }),
+        ErrorType::Validation
+    )]
+    #[case::agent_duplicate_name_space_exhausted(
+        CoreError::Agent(AgentError::DuplicateNameSpaceExhausted {
+            source_name: "foo".into(),
+            cap: 10_000,
         }),
         ErrorType::Validation
     )]

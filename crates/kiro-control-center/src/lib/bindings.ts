@@ -188,6 +188,62 @@ export const commands = {
 	 */
 	removeAgent: (name: string, projectPath: string) => typedError<null, CommandError>(__TAURI_INVOKE("remove_agent", { name, projectPath })),
 	/**
+	 *  List every JSON-parseable agent in `.kiro/agents/` for the given
+	 *  project. Auto-creates the directory if absent.
+	 */
+	listUserAgents: (projectPath: string) => typedError<UserAgentRow[], CommandError>(__TAURI_INVOKE("list_user_agents", { projectPath })),
+	/**
+	 *  Atomically create a new user-authored agent at
+	 *  `.kiro/agents/<name>.json`. Rejects existing-file collisions before
+	 *  writing.
+	 * 
+	 *  `draft_json` is the agent JSON as a UTF-8 string; the wrapper
+	 *  passes its bytes directly to the core write path. No re-serialization.
+	 */
+	createUserAgent: (name: string, draftJson: string, projectPath: string) => typedError<null, CommandError>(__TAURI_INVOKE("create_user_agent", { name, draftJson, projectPath })),
+	/**
+	 *  Save an edited user-authored agent. Handles three orthogonal
+	 *  shapes — in-place edit, rename, and optional detach from
+	 *  marketplace tracking — under a single file lock.
+	 * 
+	 *  `from_name` is the filename stem of the agent being edited.
+	 *  `draft_name` is the post-edit name (may equal `from_name` for
+	 *  in-place; differ for rename). `detach=true` drops the
+	 *  `InstalledAgents` entry for `from_name` if present.
+	 */
+	saveUserAgent: (fromName: string, draftName: string, draftJson: string, detach: boolean, projectPath: string) => typedError<SaveOutcome, CommandError>(__TAURI_INVOKE("save_user_agent", { fromName, draftName, draftJson, detach, projectPath })),
+	/**
+	 *  Delete a user-visible agent. Tracking-aware: agents with marketplace
+	 *  lineage take the full `remove_agent` path (file lock + tracking
+	 *  update + rollback on unlink failure); user-authored agents take a
+	 *  direct `fs::remove_file` that is idempotent on `NotFound`.
+	 */
+	deleteUserAgent: (name: string, projectPath: string) => typedError<null, CommandError>(__TAURI_INVOKE("delete_user_agent", { name, projectPath })),
+	/**
+	 *  Duplicate a user-visible agent. Walks `<source>-copy`,
+	 *  `<source>-copy-2`, ... finding the smallest unused name. The
+	 *  duplicate is always user-authored even if the source has
+	 *  marketplace lineage.
+	 * 
+	 *  Returns the new agent's name as a string so the UI can navigate
+	 *  to the duplicate or refresh the list.
+	 */
+	duplicateUserAgent: (sourceName: string, projectPath: string) => typedError<string, CommandError>(__TAURI_INVOKE("duplicate_user_agent", { sourceName, projectPath })),
+	/**
+	 *  Read the raw JSON content of a user-authored agent for the editor's
+	 *  edit-mode load. Returns the file's bytes as a UTF-8 string,
+	 *  suitable for round-tripping back through [`save_user_agent`] after
+	 *  the user makes edits.
+	 * 
+	 *  Companion to [`list_user_agents`] (which only returns summary
+	 *  fields). The editor's prompt / tools / MCP / resources / hooks /
+	 *  advanced sections need the full in-file shape — `UserAgentRow`'s
+	 *  counts can't reconstruct it. Without this command edit mode would
+	 *  have to start from a synthetic empty draft, and saving would
+	 *  silently truncate the agent.
+	 */
+	loadUserAgentJson: (name: string, projectPath: string) => typedError<string, CommandError>(__TAURI_INVOKE("load_user_agent_json", { name, projectPath })),
+	/**
 	 *  Install every skill, steering file, and agent declared by a plugin
 	 *  into the active project's `.kiro/` tree in one call.
 	 * 
@@ -1443,6 +1499,33 @@ export type RemoveSteeringResult = {
 };
 
 /**
+ *  Non-fatal outcome data returned by
+ *  [`crate::project::KiroProject::save_user_agent`]. The save itself
+ *  has already succeeded by the time the caller sees this value —
+ *  the fields describe partial-success conditions the UI may want to
+ *  surface as a warning.
+ * 
+ *  Currently the only such condition is a rename whose new-file write
+ *  succeeded but whose old-file unlink failed (the new file is in
+ *  place; the old one is an orphan on disk). Without this channel the
+ *  rename appears fully successful but the list endpoint silently
+ *  shows both files until the user notices and deletes the orphan
+ *  manually.
+ */
+export type SaveOutcome = {
+	/**
+	 *  On a rename, the path of an old file whose unlink failed after
+	 *  the new file was atomically written. `None` for the in-place
+	 *  edit path, for renames where the old file was successfully
+	 *  removed, and for renames where the old file was already absent
+	 *  (`ErrorKind::NotFound`). The path is serialized as a string for
+	 *  the FFI; the UI's only legitimate use is to display it back to
+	 *  the user.
+	 */
+	orphan_left_behind: string | null,
+};
+
+/**
  *  Top-level category for a Kiro CLI setting.
  * 
  *  Categories are a **UI grouping** used by the settings UI to organize
@@ -1875,6 +1958,50 @@ export type UpdateResult = {
 	updated: string[],
 	failed: FailedUpdate[],
 	skipped: string[],
+};
+
+/**
+ *  Marketplace lineage projected from
+ *  [`crate::project::InstalledAgentMeta`] for display.
+ */
+export type UserAgentLineage = {
+	marketplace: string,
+	plugin: string,
+	version: string | null,
+};
+
+/**
+ *  One row of the Agents list-page payload. Serialized as the response
+ *  of the `list_user_agents` Tauri command.
+ */
+export type UserAgentRow = {
+	/**
+	 *  Agent identity. Always the filename stem of
+	 *  `.kiro/agents/<name>.json` (canonical identity for CRUD ops).
+	 *  The JSON file's `name` field is NOT used for this value —
+	 *  `create_user_agent` and `save_user_agent` enforce that the
+	 *  JSON `name` equals the filename stem at write time, so drift
+	 *  between display and path cannot be introduced via the UI.
+	 *  See spec D14 in `.agents-view/spec.md` for the rationale.
+	 */
+	name: string,
+	// Human-only label; not shown to the model.
+	description: string | null,
+	// Model ID override; `None` means "use Kiro's default."
+	model: string | null,
+	// Number of entries in the JSON's `tools` array.
+	tools_count: number,
+	// Number of entries in the JSON's `mcpServers` object.
+	mcp_count: number,
+	// Number of entries in the JSON's `resources` array.
+	resources_count: number,
+	// Sum of array lengths across the JSON's `hooks` object values.
+	hooks_count: number,
+	/**
+	 *  Marketplace lineage badge data. `Some` iff the agent's name is
+	 *  a key in `installed-agents.json#/agents`.
+	 */
+	lineage: UserAgentLineage | null,
 };
 
 /* Tauri Specta runtime */
