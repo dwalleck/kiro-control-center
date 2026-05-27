@@ -85,6 +85,21 @@ const REVIEWER_AGENT_NAMES: &[&str] = &[
     "gemini-code-assist",
 ];
 
+/// Process-reference keywords / phrases. Same smell class as PR/issue/
+/// reviewer-agent references: the comment attributes the code to a
+/// process artifact (plan amendment, slice number from the budgeted-plan)
+/// rather than describing the invariant the code enforces.
+///
+/// Cases:
+/// - `amendment` — bare word, case-insensitive. References plan
+///   amendments like "Per A1 amendment", "amendment A2". A real English
+///   word, but every observed use in this codebase is a process
+///   reference; legitimate prose uses are rare enough that allowlist
+///   bookkeeping is cheaper than under-detecting.
+/// - `per A<digits>` — shorthand attribution like "Per A1: …" naming
+///   a plan amendment by its identifier.
+const PROCESS_REF_KEYWORDS: &[&str] = &["amendment"];
+
 /// Files (matched by basename) that the gate skips:
 ///
 /// - `bindings.ts` — regenerated from Rust via specta; manual cleanup there
@@ -368,6 +383,27 @@ const ALLOWED_SITES: &[AllowedSite] = &[
         line: 1898,
         reason: LEGACY_BASELINE_REASON,
     },
+    // ── process-ref legacy baseline (added with the process-ref detector) ──
+    AllowedSite {
+        path: "crates/kiro-control-center/src/lib/components/editor/MarketplaceSavePromptModal.svelte",
+        line: 19,
+        reason: LEGACY_BASELINE_REASON,
+    },
+    AllowedSite {
+        path: "crates/kiro-control-center/tests/e2e/agents.spec.ts",
+        line: 303,
+        reason: LEGACY_BASELINE_REASON,
+    },
+    AllowedSite {
+        path: "crates/kiro-market-core/src/service/mod.rs",
+        line: 7062,
+        reason: LEGACY_BASELINE_REASON,
+    },
+    AllowedSite {
+        path: "crates/kiro-market-core/src/steering/types.rs",
+        line: 235,
+        reason: LEGACY_BASELINE_REASON,
+    },
 ];
 
 pub fn run(args: impl Iterator<Item = String>) -> Result<usize> {
@@ -630,7 +666,89 @@ fn scan_comment(path: &str, line_no: u32, comment: &str) -> Vec<Finding> {
             matched: m.to_string(),
         });
     }
+    if let Some(m) = find_process_ref(comment) {
+        out.push(Finding {
+            path: path.to_string(),
+            line: line_no,
+            kind: "process-ref",
+            matched: m.to_string(),
+        });
+    }
     out
+}
+
+/// Find a process-reference phrase: bare `amendment` (case-insensitive)
+/// or `per A<digits>` shorthand. Both attribute code to a planning
+/// artifact rather than describing the invariant the code enforces —
+/// the comment's reader has to consult the plan doc to understand
+/// what changed, and the plan doc rots once the slice ships.
+fn find_process_ref(text: &str) -> Option<&str> {
+    if let Some(m) = find_keyword(text, PROCESS_REF_KEYWORDS) {
+        return Some(m);
+    }
+    find_per_amendment_shorthand(text)
+}
+
+/// Generic case-insensitive whole-word match against a list of keywords.
+/// Returns the substring of `text` that matched (preserving original
+/// case for the reviewer's eyes).
+fn find_keyword<'a>(text: &'a str, keywords: &[&str]) -> Option<&'a str> {
+    let lower = text.to_ascii_lowercase();
+    let lb = lower.as_bytes();
+    for kw in keywords {
+        let kb = kw.as_bytes();
+        let mut i = 0;
+        while i + kb.len() <= lb.len() {
+            if &lb[i..i + kb.len()] == kb {
+                let left_ok = i == 0 || !lb[i - 1].is_ascii_alphanumeric();
+                let right_idx = i + kb.len();
+                let right_ok = right_idx >= lb.len() || !lb[right_idx].is_ascii_alphanumeric();
+                if left_ok && right_ok {
+                    return Some(&text[i..right_idx]);
+                }
+            }
+            i += 1;
+        }
+    }
+    None
+}
+
+/// Match `per A<digits>` (case-insensitive). The `A` is uppercase in
+/// the canonical slice convention (`A1`, `A2`), but contributors type
+/// it in various cases — flag all forms.
+fn find_per_amendment_shorthand(text: &str) -> Option<&str> {
+    let lower = text.to_ascii_lowercase();
+    let lb = lower.as_bytes();
+    let needle = b"per ";
+    let mut i = 0;
+    while i + needle.len() < lb.len() {
+        if &lb[i..i + needle.len()] == needle {
+            let left_ok = i == 0 || !lb[i - 1].is_ascii_alphanumeric();
+            let mut j = i + needle.len();
+            // Skip extra spaces after "per".
+            while j < lb.len() && lb[j] == b' ' {
+                j += 1;
+            }
+            if left_ok && j < lb.len() && lb[j] == b'a' {
+                let mut k = j + 1;
+                let digits_start = k;
+                while k < lb.len() && lb[k].is_ascii_digit() {
+                    k += 1;
+                }
+                if k > digits_start {
+                    // At least one digit consumed. Right-boundary
+                    // check so `per A123x` does not match (the `x`
+                    // would change the semantic).
+                    let right_ok = k >= lb.len() || !lb[k].is_ascii_alphanumeric();
+                    if right_ok {
+                        return Some(&text[i..k]);
+                    }
+                }
+            }
+        }
+        i += 1;
+    }
+    None
 }
 
 /// Find a known reviewer-agent name in `text`. Word-boundary anchored on
@@ -838,6 +956,37 @@ mod tests {
         // from matching the embedded `code-reviewer`.
         assert_eq!(find_reviewer_agent("kiro-code-reviewer-v2 plugin"), None);
         assert_eq!(find_reviewer_agent("see code-reviewer-extra notes"), None);
+    }
+
+    #[test]
+    fn finds_bare_amendment_word_case_insensitive() {
+        assert_eq!(find_process_ref("Per A1 amendment"), Some("amendment"));
+        assert_eq!(find_process_ref("Per the AMENDMENT"), Some("AMENDMENT"));
+        assert_eq!(find_process_ref("see plan amendment"), Some("amendment"));
+    }
+
+    #[test]
+    fn does_not_match_amendment_inside_word() {
+        // The inner letters of a longer alphanumeric token must not match.
+        assert_eq!(find_process_ref("amendments9 trailing alphanumeric"), None);
+        assert_eq!(find_process_ref("preamendment leading alphanumeric"), None);
+    }
+
+    #[test]
+    fn finds_per_a_digits_shorthand() {
+        assert_eq!(find_process_ref("Per A1: foo"), Some("Per A1"));
+        assert_eq!(find_process_ref("per a2 — note"), Some("per a2"));
+        assert_eq!(find_process_ref("(per A14)"), Some("per A14"));
+    }
+
+    #[test]
+    fn does_not_match_per_a_when_not_amendment_shape() {
+        // No digits after the A → not the amendment shorthand.
+        assert_eq!(find_process_ref("per Apple"), None);
+        // Trailing alphanumeric on the digit run → ambiguous, refuse.
+        assert_eq!(find_process_ref("per A1x"), None);
+        // The "per" must be word-boundaried.
+        assert_eq!(find_process_ref("superA1"), None);
     }
 
     #[test]

@@ -8,16 +8,16 @@
   //   1. Remove an existing allowed entry → `onRemove(name)`.
   //   2. Add a new entry, either by picking from the candidate list
   //      (enabled-not-allowed, then catalog-not-enabled-not-allowed)
-  //      or by typing free text. Both paths route through `onAdd(name)`
-  //      — the parent maps that to `addAllowed(draft, name)` per the
-  //      A1 plan amendment (slice-2 plan-slice-2.md): a single
-  //      reducer per the React reference's `addAllowed`, no
-  //      side-effects on `tools[]`.
+  //      or by typing free text. Both paths route through `onAdd(name)`;
+  //      the parent maps it to a single `addAllowed` reducer that only
+  //      mutates `allowedTools[]`. Visibility (`tools[]`) is a
+  //      separate concern — the External (MCP) form and the
+  //      by-category grid checkbox are the only paths that touch it.
   //
   // The "NOT VISIBLE" yellow chip on a picker row surfaces when a
   // candidate is in `allowed[]` already but NOT in `enabled[]` — the
   // independence between visibility and auto-allow that the design
-  // intentionally surfaces (claim C3).
+  // intentionally surfaces.
 
   import type { Tool } from "$lib/tools-catalog";
 

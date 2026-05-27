@@ -411,9 +411,10 @@ test.describe("Agents view — Tools section round-trip (slice S7)", () => {
   // Falsifier shape: a regression where ToolsPanel mutates `draft.tools`
   // but AgentEditor's save handler omits the field from the serialized
   // payload fails the assertion that the saved JSON contains the
-  // toggled name. A regression where addExternalTool accidentally
-  // appends to `allowedTools[]` (the A1 amendment removed that
-  // side-effect) fails the `allowedTools = []` assertion.
+  // toggled name. A regression where addExternalTool side-effects
+  // `allowedTools[]` fails the `allowedTools = []` assertion —
+  // visibility (`tools[]`) and auto-allow (`allowedTools[]`) are
+  // orthogonal fields per the agent spec.
   test("create agent, toggle native + add MCP, save, assert JSON shape", async ({
     page,
   }) => {
@@ -470,10 +471,10 @@ test.describe("Agents view — Tools section round-trip (slice S7)", () => {
       const agentPath = path.join(activePath, ".kiro/agents/tools-test.json");
       const saved = JSON.parse(fs.readFileSync(agentPath, "utf8"));
       expect(saved.tools).toEqual(expect.arrayContaining(["fs_read", "@svc/foo"]));
-      // Per A1 amendment: addExternalTool does NOT side-effect
-      // allowedTools[]. addAllowed was never invoked in this test
-      // (we didn't open the auto-allow picker), so allowedTools is
-      // empty.
+      // addExternalTool only touches `tools[]` — visibility and
+      // auto-allow are orthogonal fields per the agent spec. The
+      // auto-allow picker was never opened in this test, so the
+      // allowed list must be empty.
       expect(saved.allowedTools).toEqual([]);
       // No alias UI exercised — toolAliases stays empty.
       expect(saved.toolAliases ?? {}).toEqual({});
