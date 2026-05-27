@@ -1771,7 +1771,18 @@ impl MarketplaceService {
                 };
 
             match project.install_steering_file(f, &source_hash, ctx) {
-                Ok(outcome) => result.installed.push(outcome),
+                Ok((outcome, strip_warning)) => {
+                    result.installed.push(outcome);
+                    // Route the StripOutcome anomaly (non-UTF-8,
+                    // unclosed-fence) into the user-visible warnings
+                    // stream. The install itself proceeded — the
+                    // bytes landed on disk — but the user almost
+                    // certainly wants to know their source file is
+                    // malformed. CLAUDE.md Rule 35 / kiro-uphh.
+                    if let Some(w) = strip_warning {
+                        result.warnings.push(w);
+                    }
+                }
                 Err(error) => result.failed.push(crate::steering::FailedSteeringFile {
                     source: f.source.clone(),
                     error,
@@ -5187,6 +5198,151 @@ mod tests {
             crate::steering::SteeringWarning::ScanPathInvalid { path, .. }
                 if path == std::path::Path::new("../escape/")
         ));
+    }
+
+    /// Falsifier for kiro-uphh acceptance criterion (d): a steering
+    /// source whose bytes aren't valid UTF-8 must surface as a typed
+    /// `SteeringWarning::SourceNotUtf8` reaching `result.warnings`,
+    /// AND the install must still proceed (lenient policy — bytes
+    /// land on disk verbatim so the user can recover their data).
+    /// A regression that dropped the strip-anomaly routing in
+    /// `install_steering_file` (e.g. discarded the `Option<Warning>`
+    /// at the loop in service/mod.rs) would silently install the
+    /// malformed file with no user-visible signal, exactly the
+    /// pre-PR shape this issue closes.
+    #[test]
+    fn install_plugin_steering_surfaces_source_not_utf8_warning() {
+        let plugin_tmp = tempfile::tempdir().expect("plugin tempdir");
+        let steering = plugin_tmp.path().join("steering");
+        std::fs::create_dir_all(&steering).expect("create steering dir");
+        // UTF-16 LE BOM + a few UTF-16 code units. Discovery accepts
+        // any `.md` file by extension, so this lands at the strip
+        // boundary. The byte sequence is *not* valid UTF-8
+        // (\xff\xfe is the invalid leading byte).
+        let utf16_bom_content: &[u8] = b"\xff\xfe# \x00B\x00o\x00d\x00y\x00\n\x00";
+        let source_path = steering.join("binary.md");
+        std::fs::write(&source_path, utf16_bom_content).unwrap();
+
+        let (_dir, _svc) = crate::service::test_support::temp_service();
+        let project_tmp = tempfile::tempdir().expect("project tempdir");
+        let project = crate::project::KiroProject::new(project_tmp.path().to_path_buf());
+
+        let scan_paths = vec!["./steering/".to_string()];
+        let mp_name = crate::service::test_support::mp("m");
+        let pn_name = crate::service::test_support::pn("p");
+        let ctx = crate::steering::SteeringInstallContext {
+            mode: InstallMode::New,
+            marketplace: &mp_name,
+            plugin: &pn_name,
+            version: None,
+            plugin_dir: plugin_tmp.path(),
+        };
+
+        let result = MarketplaceService::install_plugin_steering(
+            &project,
+            plugin_tmp.path(),
+            &scan_paths,
+            &InstallFilter::All,
+            ctx,
+        );
+
+        // Install proceeded (lenient policy).
+        assert_eq!(
+            result.installed.len(),
+            1,
+            "non-UTF-8 source must still install: {:?}",
+            result.installed
+        );
+        assert!(
+            result.failed.is_empty(),
+            "non-UTF-8 source is not a hard failure; got: {:?}",
+            result.failed
+        );
+
+        // The typed warning surfaced — the user-visible signal that
+        // closes the silent-install gap from PR #119 review.
+        assert_eq!(
+            result.warnings.len(),
+            1,
+            "expected exactly one SourceNotUtf8 warning, got: {:?}",
+            result.warnings
+        );
+        assert!(
+            matches!(
+                &result.warnings[0],
+                crate::steering::SteeringWarning::SourceNotUtf8 { path }
+                    if path == &source_path
+            ),
+            "wrong warning variant or path: {:?}",
+            result.warnings[0]
+        );
+
+        // Bytes landed verbatim — the lenient install contract means
+        // the user can recover their file from `.kiro/steering/` even
+        // though it's malformed.
+        let dest = project.steering_dir().join("binary.md");
+        assert_eq!(
+            std::fs::read(&dest).expect("dest read"),
+            utf16_bom_content,
+            "non-UTF-8 source must land on disk verbatim"
+        );
+    }
+
+    /// Falsifier for the unclosed-fence routing arm: a `---` opener
+    /// with no matching closer surfaces as
+    /// `SteeringWarning::UnclosedFrontmatter`. Symmetric to the
+    /// non-UTF-8 case above so a regression that handled one anomaly
+    /// arm but not the other would be caught here.
+    #[test]
+    fn install_plugin_steering_surfaces_unclosed_frontmatter_warning() {
+        let plugin_tmp = tempfile::tempdir().expect("plugin tempdir");
+        let steering = plugin_tmp.path().join("steering");
+        std::fs::create_dir_all(&steering).expect("create steering dir");
+        // Opener `---\n` with no matching closer.
+        let unclosed: &[u8] = b"---\ndescription: forgot the closer\nBody content";
+        let source_path = steering.join("unfinished.md");
+        std::fs::write(&source_path, unclosed).unwrap();
+
+        let (_dir, _svc) = crate::service::test_support::temp_service();
+        let project_tmp = tempfile::tempdir().expect("project tempdir");
+        let project = crate::project::KiroProject::new(project_tmp.path().to_path_buf());
+
+        let scan_paths = vec!["./steering/".to_string()];
+        let mp_name = crate::service::test_support::mp("m");
+        let pn_name = crate::service::test_support::pn("p");
+        let ctx = crate::steering::SteeringInstallContext {
+            mode: InstallMode::New,
+            marketplace: &mp_name,
+            plugin: &pn_name,
+            version: None,
+            plugin_dir: plugin_tmp.path(),
+        };
+
+        let result = MarketplaceService::install_plugin_steering(
+            &project,
+            plugin_tmp.path(),
+            &scan_paths,
+            &InstallFilter::All,
+            ctx,
+        );
+
+        assert_eq!(result.installed.len(), 1, "install proceeds");
+        assert!(result.failed.is_empty());
+        assert_eq!(
+            result.warnings.len(),
+            1,
+            "unclosed fence must surface exactly one warning: {:?}",
+            result.warnings
+        );
+        assert!(
+            matches!(
+                &result.warnings[0],
+                crate::steering::SteeringWarning::UnclosedFrontmatter { path }
+                    if path == &source_path
+            ),
+            "wrong warning variant or path: {:?}",
+            result.warnings[0]
+        );
     }
 
     #[test]

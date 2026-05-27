@@ -1883,7 +1883,27 @@ export type SteeringWarning =
  *  declare `./steering/` without authoring any files. This variant
  *  fires only for system-level failures the user can act on.
  */
-{ kind: "scan_dir_unreadable"; path: string; reason: string };
+{ kind: "scan_dir_unreadable"; path: string; reason: string } | 
+/**
+ *  The steering source file's bytes were not valid UTF-8.
+ *  [`crate::steering::strip_yaml_frontmatter`] cannot operate on
+ *  non-textual input, so the install proceeds with the original
+ *  bytes and this warning surfaces — the user almost certainly
+ *  wants to know their steering file is binary / wrong-encoded
+ *  (UTF-16, mid-conversion, accidental binary leak) before the
+ *  content lands in `.kiro/steering/`. Dedicated variant rather
+ *  than a `reason: String` so callers can branch on the semantic
+ *  (e.g. fail-loud presets).
+ */
+{ kind: "source_not_utf8"; path: string } | 
+/**
+ *  The steering source file opens with a `---` YAML frontmatter
+ *  fence but has no matching closing `---` line. The install
+ *  proceeds with the bytes verbatim (the unclosed opener is
+ *  treated as body content), but the user almost certainly has an
+ *  authoring slip worth surfacing before the file ships.
+ */
+{ kind: "unclosed_frontmatter"; path: string };
 
 /**
  *  Provider-specific structured source descriptor, internally tagged on `"source"`.

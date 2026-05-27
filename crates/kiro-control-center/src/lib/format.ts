@@ -126,6 +126,10 @@ export function formatSteeringWarning(w: SteeringWarning): string {
       return `invalid scan path '${w.path}': ${w.reason}`;
     case "scan_dir_unreadable":
       return `could not read steering dir '${w.path}': ${w.reason}`;
+    case "source_not_utf8":
+      return `steering source '${w.path}' is not valid UTF-8; installed bytes verbatim`;
+    case "unclosed_frontmatter":
+      return `steering source '${w.path}' has an unclosed YAML frontmatter fence; installed bytes verbatim`;
     default: {
       const _exhaustive: never = w;
       throw new Error(
