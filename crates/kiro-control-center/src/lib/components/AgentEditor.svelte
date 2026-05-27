@@ -31,7 +31,9 @@
   } from "$lib/save-params";
   import IdentityPanel from "./editor/IdentityPanel.svelte";
   import PromptPanel from "./editor/PromptPanel.svelte";
+  import ToolsPanel from "./editor/ToolsPanel.svelte";
   import MarketplaceSavePromptModal from "./editor/MarketplaceSavePromptModal.svelte";
+  import { type ToolsDraft, toolsRailBadge } from "$lib/tool-state";
 
   // The editor only handles `new` and `edit` modes. The parent's
   // `{:else}` branch enforces that — `list` never reaches this
@@ -110,7 +112,7 @@
   }> = [
     { id: "identity", label: "Identity", enabled: true, note: "" },
     { id: "prompt", label: "System Prompt", enabled: true, note: "" },
-    { id: "tools", label: "Tools", enabled: false, note: "Slice 2" },
+    { id: "tools", label: "Tools", enabled: true, note: "" },
     { id: "mcp", label: "MCP Servers", enabled: false, note: "Slice 3" },
     { id: "resources", label: "Resources", enabled: false, note: "Slice 4" },
     { id: "hooks", label: "Hooks", enabled: false, note: "Slice 5" },
@@ -319,12 +321,17 @@
     }
   });
 
-  function applyDraftPatch(patch: Record<string, string>) {
-    // Identity panel + future panels emit string-only patches. The
-    // editor folds them into `draft` here. Empty-string-to-null
-    // normalisation happens at save time, NOT here, so the user can
-    // clear-and-retype a field without losing focus through a
-    // derived re-render.
+  function applyDraftPatch(patch: Record<string, unknown>) {
+    // Panel-emitted patches fold into `draft` here. Identity / Prompt
+    // patches are string-only; the Tools panel (slice S6 onward) emits
+    // array + object patches (`tools`, `allowedTools`, `toolAliases`).
+    // The shape stays loose because the draft is an open record per
+    // slice-1's design — panels in unimplemented slices round-trip
+    // any field they don't surface.
+    //
+    // Empty-string-to-null normalisation happens at save time, NOT
+    // here, so the user can clear-and-retype a field without losing
+    // focus through a derived re-render.
     draft = { ...draft, ...patch };
   }
 
@@ -336,6 +343,41 @@
   function fieldOrEmpty(key: string): string {
     const v = draft[key];
     return typeof v === "string" ? v : "";
+  }
+
+  // Tools section's slice of the open-record draft. Defaults to
+  // empty arrays / empty object when the corresponding draft fields
+  // are missing or wrong-typed (a fresh agent has no tool fields;
+  // a malformed loaded JSON could have anything). The narrowing
+  // here is `unknown -> ToolsDraft` at the panel boundary — the
+  // panel itself trusts the slice shape and reasons about it via
+  // the pure reducers in `$lib/tool-state`.
+  function toolsSlice(d: Draft): ToolsDraft {
+    const tools = Array.isArray(d.tools)
+      ? (d.tools as unknown[]).filter((t): t is string => typeof t === "string")
+      : [];
+    const allowed = Array.isArray(d.allowedTools)
+      ? (d.allowedTools as unknown[]).filter((t): t is string => typeof t === "string")
+      : [];
+    const aliasesRaw = d.toolAliases;
+    const aliases: Record<string, string> = {};
+    if (aliasesRaw && typeof aliasesRaw === "object") {
+      for (const [k, v] of Object.entries(aliasesRaw)) {
+        if (typeof v === "string") aliases[k] = v;
+      }
+    }
+    return { tools, allowedTools: allowed, toolAliases: aliases };
+  }
+
+  let toolsDraft = $derived(toolsSlice(draft));
+  let toolsBadge = $derived(toolsRailBadge(toolsDraft));
+
+  function handleToolsChange(next: ToolsDraft): void {
+    applyDraftPatch({
+      tools: next.tools,
+      allowedTools: next.allowedTools,
+      toolAliases: next.toolAliases,
+    });
   }
 
   // Convert empty string back to null for save. This is the inverse
@@ -628,6 +670,12 @@
               <span class="truncate">{s.label}</span>
               {#if !s.enabled}
                 <span class="text-[10px] uppercase tracking-wider text-kiro-subtle/70">{s.note}</span>
+              {:else if s.id === "tools" && toolsBadge !== null}
+                <span
+                  class="rounded-sm bg-kiro-overlay px-1.5 py-0.5 font-mono text-[10px] text-kiro-subtle"
+                >
+                  {toolsBadge}
+                </span>
               {/if}
             </button>
           </li>
@@ -666,6 +714,8 @@
           prompt={fieldOrEmpty("prompt")}
           onPatch={applyDraftPatch}
         />
+      {:else if section === "tools"}
+        <ToolsPanel draft={toolsDraft} onChange={handleToolsChange} />
       {:else}
         <p class="text-sm text-kiro-subtle">Section not yet implemented.</p>
       {/if}
