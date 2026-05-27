@@ -290,7 +290,7 @@ const ALLOWED_SITES: &[AllowedSite] = &[
     // ── reviewer-agent legacy baseline (added with the reviewer-agent detector) ──
     AllowedSite {
         path: "crates/kiro-control-center/src/lib/components/AgentEditor.svelte",
-        line: 138,
+        line: 140,
         reason: LEGACY_BASELINE_REASON,
     },
     AllowedSite {
