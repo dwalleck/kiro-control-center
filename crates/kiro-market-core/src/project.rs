@@ -151,7 +151,22 @@ pub struct InstalledNativeCompanionsMeta {
     /// by this plugin. Used for collision detection (cross-plugin path
     /// overlap) and for uninstall.
     pub files: Vec<PathBuf>,
-    pub source_hash: crate::hash::BlakeHash,
+    /// `Some(hash)` when this entry tracks real source-side companion
+    /// files (native-dialect plugin where `agents/prompts/*.md` etc. live
+    /// on the source side and are copied verbatim). Drift detection
+    /// recomputes the hash against the source layout and compares.
+    ///
+    /// `None` when the entry was synthesized by the translated install
+    /// path (Claude/Copilot agents whose prompt body is *extracted* from
+    /// the agent `.md` and written to `.kiro/agents/prompts/<name>.md`).
+    /// There is no source-side companion file to hash, so drift
+    /// detection MUST skip these entries — per-agent drift is already
+    /// captured by [`InstalledAgentMeta::source_hash`] against the
+    /// agent `.md` itself. The synthesized entry exists only for
+    /// cross-plugin force-mode ownership tracking on the destination
+    /// prompt path.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source_hash: Option<crate::hash::BlakeHash>,
     pub installed_hash: crate::hash::BlakeHash,
     /// Scan root (relative to `plugin_dir`) that this companion bundle
     /// was installed from. Required at install time. The
@@ -711,10 +726,10 @@ struct CompanionInput<'a> {
     /// agent .md was discovered; used to populate
     /// [`InstalledNativeCompanionsMeta::source_scan_root`]. For the
     /// translated-agents companion synthesis path the prompts are
-    /// extracted (not separately stored in the source tree), so this
-    /// value is the agent's source-side scan root by convention —
-    /// closing C-1 (the install/detect hash recipe asymmetry for
-    /// translated companions) is tracked at issue #99.
+    /// extracted (not separately stored in the source tree), so the
+    /// recorded `source_hash` on the synthesized entry is `None` and
+    /// drift detection skips it — see
+    /// [`InstalledNativeCompanionsMeta::source_hash`].
     source_scan_root: &'a RelativePath,
 }
 
@@ -2945,8 +2960,11 @@ impl KiroProject {
                 // Source-side scan root for the synthesized companion
                 // entry: prompt is extracted from agent .md, so use
                 // the agent's source_path.parent() (typically
-                // "agents") by convention. C-1 (issue #99) tracks
-                // install/detect hash recipe alignment.
+                // "agents") by convention. The synthesized entry
+                // records `source_hash: None`, so drift detection
+                // skips it and the scan_root is informational —
+                // load-bearing only for the companion `installed_hash`
+                // recompute path in `synthesize_companion_entry`.
                 let companion_scan_root = meta
                     .source_path
                     .as_str()
@@ -3199,13 +3217,14 @@ impl KiroProject {
         // files. We track the union of installed prompt paths so the
         // native install path sees them as plugin-owned, not orphaned.
         //
-        // Hash semantics: source_hash == installed_hash because the
-        // translated path does not separately track original .md source
-        // files; both equal the hash over the prompt-bundle bytes.
-        //
-        // The HashMap key is still `String` (out of scope per Phase 1.5
-        // design); only the meta-value's `marketplace`/`plugin` fields
-        // adopt the newtypes.
+        // Hash semantics for translated agents: there is no source-side
+        // companion file (the prompt body is *extracted* from the
+        // agent `.md` at install time and written to the destination
+        // `prompts/<name>.md`). `source_hash` is therefore `None` —
+        // drift detection skips synthesized entries. `installed_hash`
+        // remains the hash over the destination prompt-bundle bytes so
+        // collision classification and force-transfer hash recomputes
+        // still work.
         let companion_entry = installed
             .native_companions
             .entry(input.plugin.as_str().to_owned())
@@ -3215,20 +3234,14 @@ impl KiroProject {
                 version: input.version.map(str::to_owned),
                 installed_at: chrono::Utc::now(),
                 files: Vec::new(),
-                source_hash: crate::hash::BlakeHash::placeholder(),
+                source_hash: None,
                 installed_hash: crate::hash::BlakeHash::placeholder(),
                 source_scan_root: input.source_scan_root.clone(),
             });
         // Refresh marketplace/version/timestamp + source_scan_root on
-        // every install. The post-insert refresh
-        // initially missed `source_scan_root`, so a manifest that
-        // changed its scan paths between installs would keep the stale
-        // root recorded forever — the install-time scan_root is what
-        // detection consults to locate the source side, so a stale
-        // value is a latent false-drift bug. Issue #99 currently masks
-        // this for translated companions (they don't yet read the
-        // field at detect time), but the moment that lands the
-        // staleness becomes a real bug.
+        // every install. The post-insert refresh initially missed
+        // `source_scan_root`, so a manifest that changed its scan paths
+        // between installs would keep the stale root recorded forever.
         companion_entry.marketplace = input.marketplace.clone();
         companion_entry.version = input.version.map(str::to_owned);
         companion_entry.installed_at = chrono::Utc::now();
@@ -3239,11 +3252,14 @@ impl KiroProject {
         {
             companion_entry.files.push(input.prompt_rel.to_path_buf());
         }
-        // Recompute hashes over the full prompt set for this plugin.
+        // Recompute installed_hash over the destination prompt set.
+        // source_hash stays None — re-affirmed below so a prior install
+        // (before this fix) that left a Some-value on disk gets cleared
+        // when the next translated install runs through this path.
         let companion_files_snapshot = companion_entry.files.clone();
         let companion_hash =
             crate::hash::hash_artifact(input.agents_root, &companion_files_snapshot)?;
-        companion_entry.source_hash = companion_hash.clone();
+        companion_entry.source_hash = None;
         companion_entry.installed_hash = companion_hash;
         Ok(())
     }
@@ -3728,7 +3744,11 @@ impl KiroProject {
                 version: input.version.map(String::from),
                 installed_at: chrono::Utc::now(),
                 files: input.rel_paths.to_vec(),
-                source_hash: input.source_hash.clone(),
+                // Native path: real source-side companion files exist
+                // (e.g. `agents/prompts/*.md` on the source side were
+                // copied verbatim). Wrap the source hash in `Some` so
+                // drift detection recomputes against the source layout.
+                source_hash: Some(input.source_hash.clone()),
                 installed_hash: installed_hash.clone(),
                 source_scan_root,
             },
@@ -3797,8 +3817,15 @@ impl KiroProject {
         // Same-plugin check first — idempotent or content-changed.
         // The HashMap key is still `String` (out of scope), so look up
         // by string view; equality below uses the same shape.
+        //
+        // Comparing `Option<BlakeHash>` to `&BlakeHash`: an existing
+        // entry with `source_hash: None` (translated-synthesized) is
+        // never idempotent for an incoming native install — `None !=
+        // Some(_)` falls through to `forced_overwrite` mode, which is
+        // the correct semantic (the native install replaces the
+        // synthesized ownership claim with a real drift-tracked one).
         if let Some(existing) = installed.native_companions.get(input.plugin.as_str()) {
-            if existing.source_hash == *input.source_hash {
+            if existing.source_hash.as_ref() == Some(input.source_hash) {
                 return Ok(CollisionDecision::Idempotent(Box::new(
                     InstalledNativeCompanionsOutcome {
                         plugin: input.plugin.to_string(),
@@ -4071,12 +4098,23 @@ impl KiroProject {
         // the entry, and we'd need to special-case "empty entries
         // don't need a hash recompute". Cleaner to recompute first,
         // then prune.
+        //
+        // `source_hash: None` entries (translated-synthesized) keep
+        // None. The hash_artifact call above hashes the destination
+        // `agents_dir`, which for native entries happens to match the
+        // source bytes (verbatim copy at install) — so refreshing the
+        // Some-arm with that hash preserves the existing equality
+        // contract. Synthesized entries have no source side to drift
+        // against; leaving `source_hash` as None keeps detection
+        // skipping them.
         for p in &modified {
             if let Some(meta) = installed.native_companions.get_mut(p)
                 && !meta.files.is_empty()
             {
                 let new_hash = crate::hash::hash_artifact(agents_dir, &meta.files)?;
-                new_hash.clone_into(&mut meta.source_hash);
+                if meta.source_hash.is_some() {
+                    meta.source_hash = Some(new_hash.clone());
+                }
                 meta.installed_hash = new_hash;
             }
         }
@@ -6131,8 +6169,11 @@ mod tests {
             a_entry.installed_hash, expected_a_hash,
             "installed_hash must be recomputed over surviving files"
         );
+        // Native install path writes Some(hash). The strip-transferred
+        // pass refreshes the Some-arm against the surviving file set.
         assert_eq!(
-            a_entry.source_hash, expected_a_hash,
+            a_entry.source_hash,
+            Some(expected_a_hash.clone()),
             "source_hash must equal installed_hash post-transfer (canonical truth = current bytes on disk)"
         );
         assert_ne!(
@@ -7608,7 +7649,7 @@ mod tests {
                 std::path::PathBuf::from("prompts/a.md"),
                 std::path::PathBuf::from("prompts/b.md"),
             ],
-            source_hash: crate::hash::BlakeHash::placeholder(),
+            source_hash: Some(crate::hash::BlakeHash::placeholder()),
             installed_hash: crate::hash::BlakeHash::placeholder(),
             source_scan_root: RelativePath::new("agents").expect("valid"),
         };
@@ -7976,8 +8017,20 @@ mod tests {
             "prompt file must be tracked under native_companions: {:?}",
             companion.files
         );
-        assert!(companion.source_hash.as_str().starts_with("blake3:"));
-        assert_eq!(companion.source_hash, companion.installed_hash);
+        // Synthesized for a translated agent: source_hash is None
+        // because there is no source-side companion file (the prompt
+        // body was extracted from the agent `.md`, not copied from a
+        // separate prompt file). installed_hash remains meaningful —
+        // it's the hash of the destination prompt bundle.
+        assert!(
+            companion.source_hash.is_none(),
+            "translated path must record source_hash: None, got {:?}",
+            companion.source_hash
+        );
+        assert!(
+            companion.installed_hash.as_str().starts_with("blake3:"),
+            "installed_hash should still be a real blake3 hash"
+        );
     }
 
     #[test]
@@ -8025,17 +8078,261 @@ mod tests {
         );
     }
 
+    /// Locks the heal-on-reinstall invariant for translated-synthesized
+    /// companion entries: `synthesize_companion_entry` must
+    /// unconditionally write `source_hash = None`, including when the
+    /// existing on-disk entry already carries a stale `Some(_)`. This
+    /// is the only mechanism that clears legacy on-disk entries — no
+    /// eager migration runs — so the contract is "the next translated
+    /// re-install heals the data, regardless of what the prior value
+    /// was." A future guard wrapping the `source_hash = None` write
+    /// at `synthesize_companion_entry` (e.g. `if existing.source_hash
+    /// .is_none() { ... }`) silently breaks that path; this test
+    /// fails when that happens.
+    #[test]
+    fn install_agent_translated_reinstall_clears_legacy_some_source_hash() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = KiroProject::new(tmp.path().to_path_buf());
+        let plugin_name = sample_agent_meta().plugin.clone();
+
+        // First install: synthesizes a companion entry with
+        // `source_hash: None` (the fix's correct shape).
+        let source_md_a = write_agent(tmp.path(), "alpha", "body");
+        let def_a = crate::agent::AgentDefinition {
+            name: agent_name("alpha"),
+            description: None,
+            prompt_body: "body".into(),
+            model: None,
+            source_tools: vec![],
+            mcp_servers: std::collections::BTreeMap::new(),
+            dialect: crate::agent::AgentDialect::Claude,
+        };
+        let mut meta_a = sample_agent_meta();
+        meta_a.source_hash = crate::hash::BlakeHash::placeholder();
+        meta_a.installed_hash = crate::hash::BlakeHash::placeholder();
+        project
+            .install_agent(&def_a, &[], meta_a, Some(&source_md_a))
+            .expect("first install succeeds");
+
+        // Simulate legacy on-disk state: mutate the persisted entry
+        // to carry `source_hash: Some(<stale placeholder>)` — the
+        // exact pre-fix shape that produced the false-drift banner.
+        let kiro_dir = project.kiro_dir();
+        let tracking_path = kiro_dir.join("installed-agents.json");
+        let mut installed = project.load_installed_agents().expect("load");
+        let companion = installed
+            .native_companions
+            .get_mut(plugin_name.as_str())
+            .expect("companion entry exists after first install");
+        assert!(
+            companion.source_hash.is_none(),
+            "precondition: fresh install must write None"
+        );
+        companion.source_hash = Some(crate::hash::BlakeHash::placeholder());
+        // Also corrupt installed_hash so the post-second-install
+        // assertion below can verify the recompute path actually ran.
+        // Without this reset, the post-first-install real hash would
+        // already be non-placeholder and a regression that skipped
+        // only the installed_hash recompute would slip through.
+        companion.installed_hash = crate::hash::BlakeHash::placeholder();
+        fs::write(
+            &tracking_path,
+            serde_json::to_vec_pretty(&installed).expect("serialize"),
+        )
+        .expect("write legacy state");
+
+        // Second install (different agent name, same plugin): drives
+        // through `synthesize_companion_entry` again. The post-insert
+        // re-affirm at `project.rs:source_hash = None` must clear the
+        // injected legacy value.
+        let source_md_b = write_agent(tmp.path(), "beta", "body");
+        let def_b = crate::agent::AgentDefinition {
+            name: agent_name("beta"),
+            description: None,
+            prompt_body: "body".into(),
+            model: None,
+            source_tools: vec![],
+            mcp_servers: std::collections::BTreeMap::new(),
+            dialect: crate::agent::AgentDialect::Claude,
+        };
+        let mut meta_b = sample_agent_meta();
+        meta_b.source_hash = crate::hash::BlakeHash::placeholder();
+        meta_b.installed_hash = crate::hash::BlakeHash::placeholder();
+        project
+            .install_agent(&def_b, &[], meta_b, Some(&source_md_b))
+            .expect("second install succeeds");
+
+        let installed_after = project.load_installed_agents().expect("reload");
+        let companion_after = installed_after
+            .native_companions
+            .get(plugin_name.as_str())
+            .expect("companion entry persists");
+        assert!(
+            companion_after.source_hash.is_none(),
+            "translated re-install must re-affirm source_hash = None, \
+             clearing the injected legacy value; got {:?}",
+            companion_after.source_hash
+        );
+        // Sanity: the second prompt file was appended, confirming
+        // we actually drove through the synthesize path (and didn't
+        // short-circuit early before the source_hash write).
+        assert!(
+            companion_after
+                .files
+                .contains(&std::path::PathBuf::from("prompts/beta.md")),
+            "second install must append beta to companion files"
+        );
+        // installed_hash must be recomputed too — a regression that
+        // skipped only the installed_hash recompute (e.g. preserved
+        // the source_hash clear but removed the
+        // `installed_hash = companion_hash` line) would leave the
+        // injected placeholder in place.
+        assert_ne!(
+            companion_after.installed_hash,
+            crate::hash::BlakeHash::placeholder(),
+            "translated re-install must recompute installed_hash over \
+             the destination prompt set; got placeholder",
+        );
+    }
+
+    /// Pins the (Some, None) matrix cell that C1 doesn't cover: a
+    /// translated install that runs over an EXISTING native-companions
+    /// entry whose `source_hash` is `Some(_)`. C1's existing-Some
+    /// originates from a hand-mutated legacy state; this test's
+    /// existing-Some originates from a (simulated) prior native
+    /// install, including a non-empty `files` list and a non-default
+    /// `source_scan_root`. `synthesize_companion_entry` silently
+    /// clobbers `source_hash` to `None`, refreshes `source_scan_root`,
+    /// appends the new prompt path, and recomputes `installed_hash` —
+    /// dropping drift tracking for the prior native companions. This
+    /// is the current contract; pinning it forces any future change
+    /// that prefers refuse-rather-than-clobber semantics (e.g. erroring
+    /// when an existing `Some(_)` is encountered) to update both this
+    /// test and the production code together.
+    #[test]
+    fn install_agent_translated_clobbers_existing_native_some_source_hash() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = KiroProject::new(tmp.path().to_path_buf());
+        let plugin_name = sample_agent_meta().plugin.clone();
+        let marketplace_name = sample_agent_meta().marketplace.clone();
+
+        // Pre-create `.kiro/agents/native.md` so the merged-set
+        // `hash_artifact` call inside `synthesize_companion_entry`
+        // has bytes for the prior-native file when it recomputes
+        // `installed_hash` over the union of files.
+        let kiro_dir = project.kiro_dir();
+        fs::create_dir_all(&kiro_dir).expect("create .kiro");
+        let agents_dir = kiro_dir.join("agents");
+        fs::create_dir_all(&agents_dir).expect("create .kiro/agents");
+        let prior_native_rel = std::path::PathBuf::from("native.md");
+        fs::write(agents_dir.join(&prior_native_rel), b"prior native body")
+            .expect("write prior native file");
+
+        // Seed an installed-agents.json with the "real native install"
+        // shape: source_hash = Some, non-empty files, non-default
+        // source_scan_root ("companions" instead of "agents").
+        let seeded_some_hash = crate::hash::BlakeHash::placeholder();
+        let mut companions = std::collections::HashMap::new();
+        companions.insert(
+            plugin_name.as_str().to_owned(),
+            InstalledNativeCompanionsMeta {
+                marketplace: marketplace_name.clone(),
+                plugin: plugin_name.clone(),
+                version: Some("1.2.3".to_owned()),
+                installed_at: chrono::Utc::now(),
+                files: vec![prior_native_rel.clone()],
+                source_hash: Some(seeded_some_hash.clone()),
+                installed_hash: seeded_some_hash.clone(),
+                source_scan_root: crate::validation::RelativePath::new("companions")
+                    .expect("valid"),
+            },
+        );
+        let seeded = InstalledAgents {
+            agents: std::collections::HashMap::new(),
+            native_companions: companions,
+        };
+        fs::write(
+            kiro_dir.join("installed-agents.json"),
+            serde_json::to_vec_pretty(&seeded).expect("serialize"),
+        )
+        .expect("seed installed-agents.json");
+
+        // Run a translated install for the same plugin name.
+        let source_md = write_agent(tmp.path(), "alpha", "body");
+        let def = crate::agent::AgentDefinition {
+            name: agent_name("alpha"),
+            description: None,
+            prompt_body: "body".into(),
+            model: None,
+            source_tools: vec![],
+            mcp_servers: std::collections::BTreeMap::new(),
+            dialect: crate::agent::AgentDialect::Claude,
+        };
+        let meta = sample_agent_meta();
+        project
+            .install_agent(&def, &[], meta, Some(&source_md))
+            .expect("translated install over existing native succeeds");
+
+        let after = project.load_installed_agents().expect("reload");
+        let companion = after
+            .native_companions
+            .get(plugin_name.as_str())
+            .expect("companion entry persists");
+
+        // Load-bearing assertion: Some(_) → None. A future
+        // refuse-rather-than-clobber semantic would fail here and
+        // force a deliberate update.
+        assert!(
+            companion.source_hash.is_none(),
+            "translated install over an existing native Some(_) entry \
+             must clobber source_hash to None (current contract); \
+             got {:?}",
+            companion.source_hash
+        );
+        // Append, not replace.
+        assert!(
+            companion.files.contains(&prior_native_rel),
+            "prior native file must remain in files list after \
+             translated install; got: {:?}",
+            companion.files
+        );
+        assert!(
+            companion
+                .files
+                .contains(&std::path::PathBuf::from("prompts/alpha.md")),
+            "translated prompt file must be appended to files list; \
+             got: {:?}",
+            companion.files
+        );
+        // source_scan_root refreshes to the translated path
+        // (sample_agent_meta uses "agents/reviewer.md", so the
+        // computed companion_scan_root is "agents").
+        assert_eq!(
+            companion.source_scan_root.as_str(),
+            "agents",
+            "source_scan_root must refresh to the translated install's \
+             scan root, not preserve the prior native value"
+        );
+        // installed_hash recomputed over the merged set, not the
+        // seeded value.
+        assert_ne!(
+            companion.installed_hash, seeded_some_hash,
+            "installed_hash must be recomputed over the union of \
+             prior native files and the new prompt; got the seeded value",
+        );
+    }
+
     /// When a plugin's manifest changes its
     /// translated-agent source path between installs, the recorded
     /// `source_scan_root` on the existing `native_companions` entry
-    /// must refresh to the latest install's scan root — otherwise
-    /// drift detection (once issue #99 lands and starts consulting
-    /// the field) would look up the source under the stale root and
-    /// emit false drift on every scan. Previously the `or_insert_with`
-    /// initializer set the value once and the post-insert refresh
-    /// updated `marketplace`/`version`/`installed_at`/`files` but
-    /// skipped `source_scan_root`, so the very first install's value
-    /// stuck forever.
+    /// must refresh to the latest install's scan root — otherwise a
+    /// later refactor that adds a source-side companion file (i.e.
+    /// flips this entry's `source_hash` to `Some(_)`) would consult
+    /// the stale root and emit false drift on every scan. Previously
+    /// the `or_insert_with` initializer set the value once and the
+    /// post-insert refresh updated `marketplace`/`version`/
+    /// `installed_at`/`files` but skipped `source_scan_root`, so the
+    /// very first install's value stuck forever.
     #[test]
     fn install_agent_translated_refreshes_source_scan_root_on_subsequent_install() {
         let tmp = tempfile::tempdir().unwrap();
@@ -8644,7 +8941,8 @@ mod tests {
         assert_eq!(entry.marketplace, "marketplace-x");
         assert_eq!(entry.version.as_deref(), Some("0.1.0"));
         assert_eq!(entry.files.len(), 2);
-        assert_eq!(entry.source_hash, source_hash);
+        // Native install path: source_hash recorded as Some(_).
+        assert_eq!(entry.source_hash, Some(source_hash));
         assert_eq!(entry.installed_hash, outcome.installed_hash);
     }
 
@@ -9029,6 +9327,103 @@ mod tests {
         assert_eq!(fs::read(&dest_a).expect("read"), b"prompt v2");
     }
 
+    /// Classifier fallthrough for the cross-shape collision:
+    /// existing entry has `source_hash: None` (translated-synthesized)
+    /// and an incoming native install arrives with `Some(_)`. The
+    /// `None.as_ref() == Some(_)` comparison must NOT match
+    /// idempotent — non-force mode raises
+    /// `ContentChangedRequiresForce`, force mode succeeds and
+    /// promotes the entry to `Some(real_hash)`. A future refactor
+    /// that mis-reads the option comparison and returns Idempotent
+    /// here would silently skip a real native install over a
+    /// synthesized ownership claim.
+    #[rstest]
+    fn install_native_companions_over_translated_synthesized_entry_requires_force(
+        companion_bundle: CompanionBundle,
+    ) {
+        // Seed a synthesized companion entry on disk: `source_hash:
+        // None`, same plugin name as the incoming install. Mirrors
+        // the state a user has after installing a Claude-format
+        // plugin's translated agent.
+        let kiro_dir = companion_bundle.project.kiro_dir();
+        fs::create_dir_all(&kiro_dir).expect("create .kiro");
+        let mut companions = std::collections::HashMap::new();
+        companions.insert(
+            "p".to_owned(),
+            InstalledNativeCompanionsMeta {
+                marketplace: mp("m"),
+                plugin: pn("p"),
+                version: None,
+                installed_at: chrono::Utc::now(),
+                files: vec![std::path::PathBuf::from("prompts/a.md")],
+                source_hash: None,
+                installed_hash: crate::hash::BlakeHash::placeholder(),
+                source_scan_root: RelativePath::new("agents").expect("valid"),
+            },
+        );
+        let seeded = InstalledAgents {
+            agents: std::collections::HashMap::new(),
+            native_companions: companions,
+        };
+        fs::write(
+            kiro_dir.join("installed-agents.json"),
+            serde_json::to_vec_pretty(&seeded).expect("serialize"),
+        )
+        .expect("seed installed-agents.json");
+
+        // Non-force: classifier must raise ContentChangedRequiresForce.
+        // The regression risk is the `.as_ref() == Some(_)` comparison
+        // being mis-typed (e.g. as `existing.source_hash ==
+        // Some(input.source_hash.clone())` against a None left arm),
+        // which a careless future cleanup might silently simplify the
+        // wrong way and treat (None, Some(real)) as "no drift".
+        let err = install_companions(
+            &companion_bundle,
+            "m",
+            "p",
+            crate::service::InstallMode::New,
+        )
+        .expect_err("native install over synthesized entry must require --force");
+        let AgentError::ContentChangedRequiresForce { name } = &err else {
+            panic!("expected ContentChangedRequiresForce, got {err:?}");
+        };
+        assert!(
+            name.contains('p') && name.contains("companions"),
+            "error must reference plugin and 'companions'; got: {name}"
+        );
+
+        // Force: succeeds, kind is ForceOverwrote, and the entry is
+        // promoted from None to Some(real_hash). This is the
+        // load-bearing post-condition: the native install must
+        // replace the synthesized ownership claim with a real
+        // drift-tracked one (otherwise the comment at
+        // `classify_companion_collision` is a lie).
+        let outcome = install_companions(
+            &companion_bundle,
+            "m",
+            "p",
+            crate::service::InstallMode::Force,
+        )
+        .expect("force install over synthesized entry");
+        assert_eq!(outcome.kind, InstallOutcomeKind::ForceOverwrote);
+
+        let entry = companion_bundle
+            .project
+            .load_installed_agents()
+            .expect("load")
+            .native_companions
+            .get("p")
+            .expect("entry persists")
+            .clone();
+        assert_eq!(
+            entry.source_hash,
+            Some(companion_bundle.source_hash.clone()),
+            "force install must promote source_hash from None to Some(real_hash); \
+             got {:?}",
+            entry.source_hash
+        );
+    }
+
     #[rstest]
     fn install_native_companions_orphan_at_destination_fails_loudly(
         companion_bundle: CompanionBundle,
@@ -9148,25 +9543,9 @@ mod tests {
 
     // -- list_user_agents --------------------------------------------------
 
-    /// A project containing
-    /// - a user-authored agent file (no tracking entry)
-    /// - a marketplace-tracked agent file (tracking entry present)
-    /// - a JSON file with NO `name` field (would crash a strict parser)
-    /// - an orphan tracking entry (name in tracking, no file on disk)
-    ///
-    /// list_user_agents must produce exactly 3 rows (the orphan is
-    /// excluded), sorted by name, with lineage on the tracked one,
-    /// `name` falling back to filename stem on the no-name file, and
-    /// counts derived from JSON contents. Mirrors
-    /// `.agents-view/probe/fixture/` so the prove-it-prototype probe.py
-    /// can serve as the cross-cutting oracle.
-    #[test]
-    fn list_user_agents_matches_probe_fixture() {
-        use chrono::Utc;
-        let (_dir, project) = temp_project();
-        std::fs::create_dir_all(project.kiro_dir().join("agents")).expect("agents dir");
-
-        // (1) Marketplace-tracked agent + tracking entry.
+    /// Probe-fixture seed (1/4): marketplace-tracked agent file with
+    /// the full schema surface (mcpServers, resources, hooks, etc.).
+    fn seed_marketplace_tracked_agent(project: &KiroProject) {
         std::fs::write(
             project.kiro_dir().join("agents/marketplace-tracked.json"),
             serde_json::to_vec_pretty(&serde_json::json!({
@@ -9190,8 +9569,11 @@ mod tests {
             .expect("ser tracked agent"),
         )
         .expect("write tracked agent");
+    }
 
-        // (2) User-authored agent file (no tracking entry).
+    /// Probe-fixture seed (2/4): user-authored agent file with no
+    /// tracking entry.
+    fn seed_user_authored_agent(project: &KiroProject) {
         std::fs::write(
             project.kiro_dir().join("agents/user-authored.json"),
             serde_json::to_vec_pretty(&serde_json::json!({
@@ -9209,9 +9591,12 @@ mod tests {
             .expect("ser user-authored"),
         )
         .expect("write user-authored");
+    }
 
-        // (3) No-name file — name field absent. Would crash parse_native;
-        // serde_json::Value tolerates it. Falls back to filename stem.
+    /// Probe-fixture seed (3/4): file with no `name` field. Would
+    /// crash `parse_native`; `serde_json::Value` tolerates it.
+    /// `list_user_agents` falls back to the filename stem.
+    fn seed_no_name_agent(project: &KiroProject) {
         std::fs::write(
             project.kiro_dir().join("agents/no-name.json"),
             serde_json::to_vec_pretty(&serde_json::json!({
@@ -9225,9 +9610,12 @@ mod tests {
             .expect("ser no-name"),
         )
         .expect("write no-name");
+    }
 
-        // Tracking file: includes the tracked agent AND an orphan entry.
-        let now = Utc::now();
+    /// Probe-fixture seed (4/4): tracking file with one matching
+    /// entry (`marketplace-tracked`) and one orphan
+    /// (`orphan-tracking` — name in tracking but no file on disk).
+    fn seed_tracking_with_orphan(project: &KiroProject, now: chrono::DateTime<chrono::Utc>) {
         std::fs::write(
             project.kiro_dir().join(INSTALLED_AGENTS_FILE),
             serde_json::to_vec_pretty(&serde_json::json!({
@@ -9258,6 +9646,30 @@ mod tests {
             .expect("ser tracking"),
         )
         .expect("write tracking");
+    }
+
+    /// A project containing
+    /// - a user-authored agent file (no tracking entry)
+    /// - a marketplace-tracked agent file (tracking entry present)
+    /// - a JSON file with NO `name` field (would crash a strict parser)
+    /// - an orphan tracking entry (name in tracking, no file on disk)
+    ///
+    /// `list_user_agents` must produce exactly 3 rows (the orphan is
+    /// excluded), sorted by name, with lineage on the tracked one,
+    /// `name` falling back to filename stem on the no-name file, and
+    /// counts derived from JSON contents. Mirrors
+    /// `.agents-view/probe/fixture/` so the prove-it-prototype probe.py
+    /// can serve as the cross-cutting oracle.
+    #[test]
+    fn list_user_agents_matches_probe_fixture() {
+        use chrono::Utc;
+        let (_dir, project) = temp_project();
+        std::fs::create_dir_all(project.kiro_dir().join("agents")).expect("agents dir");
+
+        seed_marketplace_tracked_agent(&project);
+        seed_user_authored_agent(&project);
+        seed_no_name_agent(&project);
+        seed_tracking_with_orphan(&project, Utc::now());
 
         let rows = project.list_user_agents().expect("list_user_agents");
 
@@ -9319,7 +9731,7 @@ mod tests {
     // -- create_user_agent --------------------------------------------------
 
     /// Happy path: create writes the file atomically, and a
-    /// subsequent list_user_agents call sees it.
+    /// subsequent `list_user_agents` call sees it.
     #[test]
     fn create_user_agent_writes_atomically_and_lists() {
         let (_dir, project) = temp_project();
@@ -9339,13 +9751,13 @@ mod tests {
         assert_eq!(names, vec!["new-agent"]);
     }
 
-    /// Empty name is rejected by validate_name (no `.json` file
+    /// Empty name is rejected by `validate_name` (no `.json` file
     /// written).
     #[test]
     fn create_user_agent_rejects_empty_name() {
         let (_dir, project) = temp_project();
         let err = project
-            .create_user_agent("", br#"{}"#)
+            .create_user_agent("", br"{}")
             .expect_err("must reject");
         assert!(
             matches!(
@@ -9364,7 +9776,7 @@ mod tests {
     fn create_user_agent_rejects_path_separator() {
         let (_dir, project) = temp_project();
         let err = project
-            .create_user_agent("foo/bar", br#"{}"#)
+            .create_user_agent("foo/bar", br"{}")
             .expect_err("must reject path separator");
         assert!(matches!(
             err,
@@ -9512,7 +9924,7 @@ mod tests {
     }
 
     /// Missing file → `AgentError::NotInstalled`. Maps to the
-    /// `not_found` Tauri ErrorType so the editor can surface a
+    /// `not_found` Tauri `ErrorType` so the editor can surface a
     /// "agent went missing; refresh" branch distinct from a
     /// validation failure.
     #[test]
@@ -10011,7 +10423,7 @@ mod tests {
     }
 
     /// Marketplace-tracked source: duplicate is NEVER
-    /// inserted into InstalledAgents. The source's tracking entry is
+    /// inserted into `InstalledAgents`. The source's tracking entry is
     /// preserved; the new copy is user-authored.
     #[test]
     fn duplicate_user_agent_strips_marketplace_lineage() {
@@ -10277,7 +10689,9 @@ mod tests {
         std::fs::create_dir_all(&agents_dir).expect("agents dir");
         // Build a file one byte over the cap. Contents don't need to
         // be JSON — the size check fires before the read.
-        let oversized: Vec<u8> = vec![b'x'; (DUPLICATE_SOURCE_BYTE_CAP as usize) + 1];
+        let cap_usize = usize::try_from(DUPLICATE_SOURCE_BYTE_CAP)
+            .expect("DUPLICATE_SOURCE_BYTE_CAP (1 MiB) fits in usize on all supported targets");
+        let oversized: Vec<u8> = vec![b'x'; cap_usize + 1];
         std::fs::write(agents_dir.join("big.json"), &oversized).expect("write big");
 
         let err = project

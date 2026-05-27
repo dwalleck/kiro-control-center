@@ -9,7 +9,7 @@
 //! continues to agree with them as the implementation evolves.
 //!
 //! If this test fails, S3's design claim C1 (list output specification)
-//! and C2 (untyped JSON, never parse_native) have drifted. Stop and
+//! and C2 (untyped JSON, never `parse_native`) have drifted. Stop and
 //! surface — don't paper over.
 
 use std::path::PathBuf;
