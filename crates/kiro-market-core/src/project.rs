@@ -2507,7 +2507,7 @@ impl KiroProject {
             })?;
         let outcome = crate::steering::strip_yaml_frontmatter(&source_bytes);
         let warning = outcome.anomaly_warning(source);
-        let content = outcome.bytes_to_install(&source_bytes);
+        let content = outcome.bytes_to_install();
         fs::write(&staged_file, content).map_err(|src| {
             crate::steering::SteeringError::StagingWriteFailed {
                 path: staged_file.clone(),
@@ -2736,9 +2736,7 @@ impl KiroProject {
             // so it couldn't accidentally substitute `dest` for the missing
             // source path.
             CollisionDecision::Idempotent(echo) => {
-                // Idempotent path doesn't go through `stage_steering_file`,
-                // so there's no strip outcome to surface — the file on
-                // disk is byte-identical to a prior install.
+                // Idempotent path skips staging — no strip outcome exists.
                 return Ok((
                     crate::steering::InstalledSteeringOutcome {
                         source: source.source.clone(),
@@ -5281,12 +5279,7 @@ mod tests {
         };
         let mp_name = mp("m");
         let pn_name = pn(plugin);
-        // Test helper discards the strip-anomaly warning — every
-        // call site here uses well-formed markdown so no warning
-        // ever fires. The dedicated falsifier tests
-        // (`install_plugin_steering_surfaces_*`) drive
-        // `install_steering_file` directly when they need to
-        // assert on the warning.
+        // Helper discards the warning; well-formed markdown never triggers one.
         f.project
             .install_steering_file(
                 &discovered,

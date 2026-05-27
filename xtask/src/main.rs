@@ -14,6 +14,7 @@ use std::process::{Command, ExitCode};
 
 use anyhow::{Context, Result, bail};
 
+mod comment_lint;
 mod plan_lint;
 
 /// Exit codes documented by `cargo xtask plan-lint --help`:
@@ -32,7 +33,7 @@ fn main() -> ExitCode {
 fn dispatch() -> Result<u8> {
     let mut args = env::args().skip(1);
     let cmd = args.next().context(
-        "missing subcommand (expected: hook-post-edit | hook-stop-frontend-check | hook-block-cargo-lock | plan-lint)",
+        "missing subcommand (expected: hook-post-edit | hook-stop-frontend-check | hook-block-cargo-lock | plan-lint | comment-lint)",
     )?;
     match cmd.as_str() {
         "hook-post-edit" => {
@@ -49,6 +50,10 @@ fn dispatch() -> Result<u8> {
         }
         "plan-lint" => {
             let findings = plan_lint::run(args)?;
+            Ok(u8::from(findings > 0))
+        }
+        "comment-lint" => {
+            let findings = comment_lint::run(args)?;
             Ok(u8::from(findings > 0))
         }
         other => bail!("unknown xtask subcommand: {other}"),

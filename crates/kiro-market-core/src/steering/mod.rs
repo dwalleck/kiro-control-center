@@ -19,99 +19,72 @@ use std::path::Path;
 
 use tracing::warn;
 
-/// Outcome of [`strip_yaml_frontmatter`]. Discriminates between the
-/// four cases the caller actually cares about:
-///
-/// - [`StripOutcome::Stripped`] — a well-formed frontmatter block was
-///   removed; `body` is the post-frontmatter byte slice borrowed from
-///   the input.
-/// - [`StripOutcome::NoFrontmatter`] — input did not begin with a
-///   `---` opener; install the bytes verbatim.
-/// - [`StripOutcome::NonUtf8`] — input was not valid UTF-8; install
-///   the bytes verbatim. Anomalous: the caller should surface a
-///   [`SteeringWarning::SourceNotUtf8`] so the user notices their
-///   steering file isn't actually text.
-/// - [`StripOutcome::UnclosedFence`] — input had an opening `---`
-///   fence with no matching closer; install the bytes verbatim.
-///   Anomalous: the caller should surface a
-///   [`SteeringWarning::UnclosedFrontmatter`] — almost certainly an
-///   authoring slip.
-///
-/// The lifetime parameter binds [`StripOutcome::Stripped::body`] to
-/// the input slice so the caller reads the result without copying.
+/// Discriminated outcome of [`strip_yaml_frontmatter`]. Echo variants
+/// carry the original input slice so [`Self::bytes_to_install`] returns
+/// the canonical bytes by construction — callers cannot pass the wrong
+/// slice back.
 #[derive(Debug)]
+#[must_use = "dropping a StripOutcome silently discards any anomaly warning; call \
+              .anomaly_warning() and route the result into InstallSteeringResult.warnings"]
 #[non_exhaustive]
-pub enum StripOutcome<'a> {
-    Stripped { body: &'a [u8] },
-    NoFrontmatter,
-    NonUtf8,
-    UnclosedFence,
+pub(crate) enum StripOutcome<'a> {
+    /// Well-formed frontmatter was removed. `body` is a strict suffix
+    /// of the input, borrowed without copying.
+    Stripped {
+        body: &'a [u8],
+    },
+    NoFrontmatter {
+        input: &'a [u8],
+    },
+    NonUtf8 {
+        input: &'a [u8],
+    },
+    UnclosedFence {
+        input: &'a [u8],
+    },
 }
 
 impl<'a> StripOutcome<'a> {
-    /// Bytes the caller should install. For [`StripOutcome::Stripped`]
-    /// the post-frontmatter body; for every other variant the original
-    /// input slice. Encodes the lenient install policy: even malformed
-    /// sources land on disk, paired with a typed warning to surface
-    /// the issue.
-    #[must_use]
-    pub fn bytes_to_install(&self, original: &'a [u8]) -> &'a [u8] {
+    pub(crate) fn bytes_to_install(&self) -> &'a [u8] {
         match self {
-            Self::Stripped { body } => body,
-            Self::NoFrontmatter | Self::NonUtf8 | Self::UnclosedFence => original,
+            Self::Stripped { body, .. } => body,
+            Self::NoFrontmatter { input }
+            | Self::NonUtf8 { input }
+            | Self::UnclosedFence { input } => input,
         }
     }
 
-    /// Map an anomalous outcome to a typed [`SteeringWarning`].
-    /// Returns `None` for the non-anomalous variants ([`Stripped`],
-    /// [`NoFrontmatter`]). Exhaustive over all variants — adding a
-    /// new [`StripOutcome`] arm forces a compile-time decision here.
-    ///
-    /// [`Stripped`]: StripOutcome::Stripped
-    /// [`NoFrontmatter`]: StripOutcome::NoFrontmatter
-    #[must_use]
-    pub fn anomaly_warning(&self, source_path: &Path) -> Option<SteeringWarning> {
+    pub(crate) fn anomaly_warning(&self, source_path: &Path) -> Option<SteeringWarning> {
         match self {
-            Self::NonUtf8 => Some(SteeringWarning::SourceNotUtf8 {
+            Self::NonUtf8 { .. } => Some(SteeringWarning::SourceNotUtf8 {
                 path: source_path.to_path_buf(),
             }),
-            Self::UnclosedFence => Some(SteeringWarning::UnclosedFrontmatter {
+            Self::UnclosedFence { .. } => Some(SteeringWarning::UnclosedFrontmatter {
                 path: source_path.to_path_buf(),
             }),
-            Self::Stripped { .. } | Self::NoFrontmatter => None,
+            Self::Stripped { .. } | Self::NoFrontmatter { .. } => None,
         }
     }
 }
 
-/// Strip YAML frontmatter from markdown content if a well-formed `---`
-/// fence pair is present at the start.
+/// Strip YAML frontmatter when a well-formed `---` fence pair leads the input.
 ///
 /// A fence is `---` *alone on a line* — leading dashes that are part of
 /// a longer token (`----` thematic break, `--- trailing text`) are not
-/// treated as fences, so the body of a non-frontmatter file with `---`
-/// horizontal rules is never accidentally truncated.
+/// treated as fences, so a non-frontmatter file with `---` horizontal
+/// rules is never accidentally truncated. Copilot `instructions/`
+/// sources carry frontmatter Kiro doesn't interpret; stripping it
+/// keeps misleading metadata out of `.kiro/steering/`.
 ///
-/// Steering files sourced from Copilot `instructions/` directories carry
-/// frontmatter (`description`, `applyTo`) that Kiro doesn't interpret.
-/// Stripping it avoids installing misleading metadata into
-/// `.kiro/steering/`.
-///
-/// The return value is a [`StripOutcome`] discriminating between
-/// stripped, no-frontmatter, non-UTF-8, and unclosed-opener cases.
-/// The anomalous variants ([`StripOutcome::NonUtf8`] and
-/// [`StripOutcome::UnclosedFence`]) also log at `tracing::warn!` with
-/// a `len` field for operators who watch the structured stream.
-/// Callers route the anomalies into [`SteeringWarning`]s via
-/// [`StripOutcome::anomaly_warning`] so they reach
-/// `InstallSteeringResult.warnings` and surface in the UI/CLI.
-#[must_use]
-pub fn strip_yaml_frontmatter(content: &[u8]) -> StripOutcome<'_> {
+/// Anomalous outcomes ([`StripOutcome::NonUtf8`], [`StripOutcome::UnclosedFence`])
+/// also log at `tracing::warn!` with a `len` field for operators.
+pub(crate) fn strip_yaml_frontmatter(content: &[u8]) -> StripOutcome<'_> {
     let Ok(s) = std::str::from_utf8(content) else {
         warn!(
             len = content.len(),
             "steering source is not valid UTF-8; frontmatter stripping skipped"
         );
-        return StripOutcome::NonUtf8;
+        return StripOutcome::NonUtf8 { input: content };
     };
     // Strip only ASCII whitespace and an optional UTF-8 BOM — not arbitrary
     // Unicode whitespace (which would eat NBSP, ideographic space, etc.).
@@ -122,7 +95,7 @@ pub fn strip_yaml_frontmatter(content: &[u8]) -> StripOutcome<'_> {
         .strip_prefix("---\n")
         .or_else(|| trimmed.strip_prefix("---\r\n"))
     else {
-        return StripOutcome::NoFrontmatter;
+        return StripOutcome::NoFrontmatter { input: content };
     };
     // The closer must be a line whose content (after stripping trailing
     // CR/space/tab) is exactly `---`. Iterating line-by-line avoids the
@@ -152,49 +125,52 @@ pub fn strip_yaml_frontmatter(content: &[u8]) -> StripOutcome<'_> {
         len = content.len(),
         "steering source has an opening `---` fence with no matching closer; returning bytes unchanged"
     );
-    StripOutcome::UnclosedFence
+    StripOutcome::UnclosedFence { input: content }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    /// Helper: assert the outcome is `Stripped` with the given body
-    /// bytes. Routes through `bytes_to_install` so the lenient install
-    /// invariant (`bytes_to_install` returns the body slice on
-    /// `Stripped`) also gets pinned by every byte-content test.
     #[track_caller]
     fn assert_stripped(input: &[u8], expected_body: &[u8]) {
         let outcome = strip_yaml_frontmatter(input);
         match &outcome {
-            StripOutcome::Stripped { body } => {
+            StripOutcome::Stripped { body, .. } => {
                 assert_eq!(*body, expected_body, "stripped body bytes differ");
             }
             other => panic!("expected Stripped, got {other:?}"),
         }
         assert_eq!(
-            outcome.bytes_to_install(input),
+            outcome.bytes_to_install(),
             expected_body,
             "bytes_to_install must match the body on Stripped",
         );
     }
 
-    /// Helper: assert the outcome is one of the echo variants with the
-    /// expected discriminant, and that `bytes_to_install` returns the
-    /// original input slice (the lenient install policy).
+    #[derive(Debug, Clone, Copy, PartialEq)]
+    enum EchoKind {
+        NoFrontmatter,
+        NonUtf8,
+        UnclosedFence,
+    }
+
     #[track_caller]
-    fn assert_echoes(input: &[u8], expected: &StripOutcome<'_>) {
+    fn assert_echoes(input: &[u8], expected: EchoKind) {
         let outcome = strip_yaml_frontmatter(input);
-        // Match by discriminant — for echo variants there's no payload
-        // to compare, but we want exact-variant equality.
-        let got_kind = std::mem::discriminant(&outcome);
-        let want_kind = std::mem::discriminant(expected);
+        let got = match outcome {
+            StripOutcome::NoFrontmatter { .. } => Some(EchoKind::NoFrontmatter),
+            StripOutcome::NonUtf8 { .. } => Some(EchoKind::NonUtf8),
+            StripOutcome::UnclosedFence { .. } => Some(EchoKind::UnclosedFence),
+            StripOutcome::Stripped { .. } => None,
+        };
         assert_eq!(
-            got_kind, want_kind,
-            "expected {expected:?}, got {outcome:?}",
+            got,
+            Some(expected),
+            "expected echo {expected:?}, got {outcome:?}"
         );
         assert_eq!(
-            outcome.bytes_to_install(input),
+            outcome.bytes_to_install(),
             input,
             "bytes_to_install must echo the original on non-Stripped variants",
         );
@@ -209,14 +185,14 @@ mod tests {
     #[test]
     fn returns_unchanged_without_frontmatter() {
         let input = b"# Just a heading\nSome content\n";
-        assert_echoes(input, &StripOutcome::NoFrontmatter);
+        assert_echoes(input, EchoKind::NoFrontmatter);
     }
 
     #[tracing_test::traced_test]
     #[test]
     fn returns_unchanged_with_unclosed_frontmatter() {
         let input = b"---\nname: broken\nno closing fence\n";
-        assert_echoes(input, &StripOutcome::UnclosedFence);
+        assert_echoes(input, EchoKind::UnclosedFence);
         // CLAUDE.md Rule 35: the warn arm is contract, not decoration.
         // A regression that removed the `warn!` call would otherwise
         // pass — the function returns the input bytes either way.
@@ -261,7 +237,7 @@ mod tests {
         // `trim_end_matches(...) == "---"` to a `starts_with("---")`
         // shape (the pre-rewrite shape), this test fails.
         let input = b"----\n# Title\n----\n\nBody\n";
-        assert_echoes(input, &StripOutcome::NoFrontmatter);
+        assert_echoes(input, EchoKind::NoFrontmatter);
     }
 
     #[test]
@@ -279,7 +255,7 @@ mod tests {
         // — falls through to `UnclosedFence` because the opener was
         // valid but no closer line was found.
         let input = b"---\nkey: v\n--- not a fence\nBody\n";
-        assert_echoes(input, &StripOutcome::UnclosedFence);
+        assert_echoes(input, EchoKind::UnclosedFence);
     }
 
     #[test]
@@ -311,7 +287,7 @@ mod tests {
     #[test]
     fn handles_empty_input() {
         // Empty input has no opener — falls through to NoFrontmatter.
-        assert_echoes(b"", &StripOutcome::NoFrontmatter);
+        assert_echoes(b"", EchoKind::NoFrontmatter);
     }
 
     #[test]
@@ -326,7 +302,7 @@ mod tests {
         // YAML's closing fence must be at column 0; an indented `---` is
         // body content, not a fence. The file is therefore unclosed.
         let input = b"---\nkey: v\n  ---\nBody\n";
-        assert_echoes(input, &StripOutcome::UnclosedFence);
+        assert_echoes(input, EchoKind::UnclosedFence);
     }
 
     #[tracing_test::traced_test]
@@ -337,7 +313,7 @@ mod tests {
         // captured-log assertion locks the warn contract — see the
         // companion test `returns_unchanged_with_unclosed_frontmatter`.
         let input: &[u8] = b"\xff\xfe---\nkey\n---\nBody\n";
-        assert_echoes(input, &StripOutcome::NonUtf8);
+        assert_echoes(input, EchoKind::NonUtf8);
         assert!(logs_contain("not valid UTF-8"));
     }
 
@@ -345,25 +321,21 @@ mod tests {
     fn anomaly_warning_routes_to_typed_steering_warning() {
         use std::path::PathBuf;
 
-        // The Stripped and NoFrontmatter cases produce no warning.
         let stripped = StripOutcome::Stripped { body: b"" };
         assert!(stripped.anomaly_warning(Path::new("x.md")).is_none());
         assert!(
-            StripOutcome::NoFrontmatter
+            StripOutcome::NoFrontmatter { input: b"" }
                 .anomaly_warning(Path::new("x.md"))
                 .is_none()
         );
 
-        // The anomalous cases produce typed SteeringWarnings carrying
-        // the source path. A regression that maps NonUtf8 to the
-        // UnclosedFrontmatter variant (or vice versa) would flip the
-        // user-facing message and this test catches it.
-        let utf8 = StripOutcome::NonUtf8.anomaly_warning(Path::new("bin.md"));
+        let utf8 = StripOutcome::NonUtf8 { input: b"" }.anomaly_warning(Path::new("bin.md"));
         assert!(matches!(
             utf8,
             Some(SteeringWarning::SourceNotUtf8 { ref path }) if path == &PathBuf::from("bin.md")
         ));
-        let unclosed = StripOutcome::UnclosedFence.anomaly_warning(Path::new("oops.md"));
+        let unclosed =
+            StripOutcome::UnclosedFence { input: b"" }.anomaly_warning(Path::new("oops.md"));
         assert!(matches!(
             unclosed,
             Some(SteeringWarning::UnclosedFrontmatter { ref path }) if path == &PathBuf::from("oops.md")

@@ -12,6 +12,7 @@ import type {
   SkippedItem,
   SkippedSkill,
 } from "$lib/bindings";
+import type { SteeringWarning } from "$lib/bindings";
 import {
   formatFailedAgent,
   formatFailedSkill,
@@ -20,6 +21,7 @@ import {
   formatRemovePluginResult,
   formatSkippedItemsForPlugin,
   formatSkippedSkillsForPlugin,
+  formatSteeringWarning,
 } from "./format";
 
 // Field names + structure tracked from bindings.ts. Line numbers
@@ -504,5 +506,55 @@ describe("formatSkippedItemsForPlugin", () => {
   it("assertNever path: throws for unknown kind", () => {
     const bad = { kind: "future_variant" } as unknown as SkippedItem;
     expect(() => formatSkippedItemsForPlugin([bad])).toThrow();
+  });
+});
+
+describe("formatSteeringWarning", () => {
+  it("scan_path_invalid: renders path and reason", () => {
+    const w: SteeringWarning = {
+      kind: "scan_path_invalid",
+      path: "/bad",
+      reason: "not absolute",
+    };
+    expect(formatSteeringWarning(w)).toBe("invalid scan path '/bad': not absolute");
+  });
+
+  it("scan_dir_unreadable: renders path and reason", () => {
+    const w: SteeringWarning = {
+      kind: "scan_dir_unreadable",
+      path: "/tmp/plugins/x/steering",
+      reason: "permission denied",
+    };
+    expect(formatSteeringWarning(w)).toBe(
+      "could not read steering dir '/tmp/plugins/x/steering': permission denied",
+    );
+  });
+
+  it("source_not_utf8: names the path AND states bytes installed verbatim", () => {
+    // The "installed bytes verbatim" tail is the user-actionable signal —
+    // tells them the file is on disk and recoverable. Drift here drops a
+    // key piece of the lenient-install contract.
+    const w: SteeringWarning = {
+      kind: "source_not_utf8",
+      path: "/tmp/plugins/x/steering/binary.md",
+    };
+    expect(formatSteeringWarning(w)).toBe(
+      "steering source '/tmp/plugins/x/steering/binary.md' is not valid UTF-8; installed bytes verbatim",
+    );
+  });
+
+  it("unclosed_frontmatter: names the path AND states bytes installed verbatim", () => {
+    const w: SteeringWarning = {
+      kind: "unclosed_frontmatter",
+      path: "/tmp/plugins/x/steering/unfinished.md",
+    };
+    expect(formatSteeringWarning(w)).toBe(
+      "steering source '/tmp/plugins/x/steering/unfinished.md' has an unclosed YAML frontmatter fence; installed bytes verbatim",
+    );
+  });
+
+  it("assertNever path: throws for unknown kind", () => {
+    const bad = { kind: "future_variant" } as unknown as SteeringWarning;
+    expect(() => formatSteeringWarning(bad)).toThrow();
   });
 });
