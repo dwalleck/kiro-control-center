@@ -159,9 +159,11 @@ pub fn map_copilot_tools(source: &[String]) -> (Vec<MappedTool>, Vec<UnmappedToo
             }
         } else if let Some(kiro_names) = map_copilot_bare_tool(tool) {
             for &kiro in kiro_names {
-                let entry = MappedTool::Native(kiro.to_string());
-                if !mapped.contains(&entry) {
-                    mapped.push(entry);
+                let already_present = mapped
+                    .iter()
+                    .any(|m| matches!(m, MappedTool::Native(s) if s == kiro));
+                if !already_present {
+                    mapped.push(MappedTool::Native(kiro.to_string()));
                 }
             }
         } else {
