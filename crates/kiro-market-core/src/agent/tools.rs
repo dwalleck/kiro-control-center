@@ -92,6 +92,14 @@ pub fn map_claude_tools(source: &[String]) -> (Vec<MappedTool>, Vec<UnmappedTool
 /// listed exactly as they appear in the Copilot docs so a future audit
 /// against the upstream table is straightforward.
 ///
+/// Multiple source aliases legitimately share a Kiro target (`Edit` and
+/// `Write` both → `["write"]`; `shell`/`bash`/`powershell` → `["shell"]`)
+/// — `map_copilot_tools` dedupes after lookup so the canonical table can
+/// stay readable rather than collapsing rows to satisfy uniqueness on the
+/// output side. The alias-uniqueness `#[test]` below locks that the same
+/// alias never appears in two groups (which would silently shadow under
+/// the first-match `find` semantics).
+///
 /// Internal Copilot concepts with no reliable Kiro equivalent
 /// (`codebase`, `findTestFiles`, `usages`, `problems`, `testFailure`,
 /// `runCommands`, `runTasks`, `editFiles`, …) are intentionally absent
@@ -167,6 +175,12 @@ pub fn map_copilot_tools(source: &[String]) -> (Vec<MappedTool>, Vec<UnmappedToo
                 }
             }
         } else {
+            // `unmapped` is intentionally NOT deduped (unlike `mapped`):
+            // a user shipping `["codebase", "codebase"]` sees both
+            // occurrences in the install output, so the rendered warning
+            // reflects what was in the manifest. Dedup-and-count is a
+            // plausible future shape but would lose the per-occurrence
+            // surface today.
             unmapped.push(UnmappedTool {
                 source: tool.clone(),
                 reason: UnmappedReason::BareCopilotName,
@@ -411,5 +425,33 @@ mod tests {
                 MappedTool::Native("glob".into()),
             ]
         );
+    }
+
+    #[test]
+    fn copilot_bare_tool_groups_alias_uniqueness_and_lowercase() {
+        // Lock two table-hygiene invariants the rustdoc relies on but
+        // doesn't enforce:
+        //   1. No alias appears in more than one group — otherwise the
+        //      first-match `find` in `map_copilot_bare_tool` would
+        //      silently shadow the second occurrence, making the table
+        //      sensitive to ordering and easy to break in review.
+        //   2. All aliases are already lowercase — the lookup uses
+        //      `eq_ignore_ascii_case` so this is data discipline, not
+        //      correctness; the lowercased shape lets `grep` find an
+        //      alias deterministically.
+        let mut seen = std::collections::HashSet::new();
+        for (aliases, _) in COPILOT_BARE_TOOL_GROUPS {
+            for alias in *aliases {
+                assert_eq!(
+                    *alias,
+                    alias.to_ascii_lowercase(),
+                    "alias {alias:?} must be already lowercase"
+                );
+                assert!(
+                    seen.insert(*alias),
+                    "alias {alias:?} appears in two groups — first-wins shadowing"
+                );
+            }
+        }
     }
 }

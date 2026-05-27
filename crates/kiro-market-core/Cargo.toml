@@ -49,6 +49,14 @@ junction = { workspace = true }
 [dev-dependencies]
 rstest = { workspace = true }
 tempfile = { workspace = true }
+# Tracing-log capture for unit tests. Used to assert that
+# `strip_yaml_frontmatter`'s `tracing::warn!` arms (non-UTF-8 input,
+# unclosed opener) actually fire — without capture, a regression that
+# removed either `warn!` call would pass the entire suite (the function
+# returns `&[u8]` unchanged in both arms, so byte-equality assertions
+# can't tell the difference). New direct dep rather than workspace.deps
+# because no other crate needs log capture today.
+tracing-test = "0.2"
 # Self-cycle dev-dep activates the `test-support` feature for unit AND
 # integration tests in this crate. Cargo handles the self-reference for
 # dev-deps (no transitive recursion). Without this, integration tests in

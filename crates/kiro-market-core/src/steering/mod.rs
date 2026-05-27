@@ -32,8 +32,12 @@ use tracing::warn;
 /// `.kiro/steering/`.
 ///
 /// Non-UTF-8 input and openers without a matching closer are returned
-/// unchanged but are logged at `tracing::warn!` so operators notice
-/// likely-malformed authoring rather than seeing a silent no-op install.
+/// unchanged but are logged at `tracing::warn!` with a `len` field
+/// carrying the input byte count, so operators can grep logs by that
+/// structured field rather than relying on message-text matches.
+/// The current call site can't distinguish a stripped return from an
+/// echoed-unchanged return at the type level — see `kiro-uphh` for the
+/// follow-up that surfaces these as typed `SteeringWarning` variants.
 #[must_use]
 pub fn strip_yaml_frontmatter(content: &[u8]) -> &[u8] {
     let Ok(s) = std::str::from_utf8(content) else {
@@ -99,10 +103,15 @@ mod tests {
         assert_eq!(strip_yaml_frontmatter(input), input);
     }
 
+    #[tracing_test::traced_test]
     #[test]
     fn returns_unchanged_with_unclosed_frontmatter() {
         let input = b"---\nname: broken\nno closing fence\n";
         assert_eq!(strip_yaml_frontmatter(input), input);
+        // CLAUDE.md Rule 35: the warn arm is contract, not decoration.
+        // A regression that removed the `warn!` call would otherwise
+        // pass — the function returns the input bytes either way.
+        assert!(logs_contain("no matching closer"));
     }
 
     #[test]
@@ -138,7 +147,10 @@ mod tests {
     #[test]
     fn does_not_strip_four_dash_thematic_break() {
         // A line of `----` is a markdown thematic break, not a YAML opener.
-        // The whole document must be returned unchanged.
+        // The whole document must be returned unchanged. Locks the
+        // refusal class: if closer-matching downgrades from exact
+        // `trim_end_matches(...) == "---"` to a `starts_with("---")`
+        // shape (the pre-rewrite shape), this test fails.
         let input = b"----\n# Title\n----\n\nBody\n";
         assert_eq!(strip_yaml_frontmatter(input), input);
     }
@@ -163,6 +175,23 @@ mod tests {
     fn handles_frontmatter_only_file_with_no_body() {
         let input = b"---\nkey: v\n---\n";
         assert_eq!(strip_yaml_frontmatter(input), b"");
+    }
+
+    #[test]
+    fn handles_adjacent_open_and_close_fences_with_body() {
+        // Empty frontmatter (opener and closer on adjacent lines).
+        // The pre-rewrite bug class was `find("\n---")` requiring a
+        // preceding newline, which missed this shape entirely.
+        // Pinned so the line-by-line scan can't silently regress to
+        // that pattern.
+        let input = b"---\n---\nBody\n";
+        assert_eq!(strip_yaml_frontmatter(input), b"Body\n");
+    }
+
+    #[test]
+    fn handles_adjacent_open_and_close_fences_with_body_crlf() {
+        let input = b"---\r\n---\r\nBody\r\n";
+        assert_eq!(strip_yaml_frontmatter(input), b"Body\r\n");
     }
 
     #[test]
@@ -194,11 +223,15 @@ mod tests {
         assert_eq!(strip_yaml_frontmatter(input), input);
     }
 
+    #[tracing_test::traced_test]
     #[test]
     fn non_utf8_input_returns_unchanged() {
         // Non-UTF-8 bytes are a likely-bug signal; the function returns
-        // input unchanged and (separately) logs at warn level.
+        // input unchanged and (separately) logs at warn level. The
+        // captured-log assertion locks the warn contract — see the
+        // companion test `returns_unchanged_with_unclosed_frontmatter`.
         let input: &[u8] = b"\xff\xfe---\nkey\n---\nBody\n";
         assert_eq!(strip_yaml_frontmatter(input), input);
+        assert!(logs_contain("not valid UTF-8"));
     }
 }
