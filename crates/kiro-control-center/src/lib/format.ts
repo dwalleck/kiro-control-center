@@ -126,6 +126,10 @@ export function formatSteeringWarning(w: SteeringWarning): string {
       return `invalid scan path '${w.path}': ${w.reason}`;
     case "scan_dir_unreadable":
       return `could not read steering dir '${w.path}': ${w.reason}`;
+    case "source_not_utf8":
+      return `steering source '${w.path}' is not valid UTF-8; installed bytes verbatim`;
+    case "unclosed_frontmatter":
+      return `steering source '${w.path}' has an unclosed YAML frontmatter fence; installed bytes verbatim`;
     default: {
       const _exhaustive: never = w;
       throw new Error(
@@ -134,6 +138,11 @@ export function formatSteeringWarning(w: SteeringWarning): string {
     }
   }
 }
+
+// Value-position exhaustiveness assert; see _FAILED_AGENT_KINDS above.
+const _STEERING_WARNING_KINDS = ["scan_path_invalid", "scan_dir_unreadable", "source_not_utf8", "unclosed_frontmatter"] as const satisfies readonly SteeringWarning["kind"][];
+type _AssertSteeringWarningExhaustive = Exclude<SteeringWarning["kind"], (typeof _STEERING_WARNING_KINDS)[number]> extends never ? true : never;
+const _assertSteeringWarningExhaustive: _AssertSteeringWarningExhaustive = true;
 
 // Render an `InstallWarning` (from agent installs) as a one-line
 // label. The `mcp_servers_require_opt_in` variant is the

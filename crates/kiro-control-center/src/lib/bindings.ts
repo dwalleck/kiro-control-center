@@ -1883,7 +1883,17 @@ export type SteeringWarning =
  *  declare `./steering/` without authoring any files. This variant
  *  fires only for system-level failures the user can act on.
  */
-{ kind: "scan_dir_unreadable"; path: string; reason: string };
+{ kind: "scan_dir_unreadable"; path: string; reason: string } | 
+/**
+ *  Source bytes were not valid UTF-8; bytes installed verbatim.
+ *  `path` is the absolute path to the source file on disk.
+ */
+{ kind: "source_not_utf8"; path: string } | 
+/**
+ *  Opening `---` fence with no matching closer; bytes installed verbatim.
+ *  `path` is the absolute path to the source file on disk.
+ */
+{ kind: "unclosed_frontmatter"; path: string };
 
 /**
  *  Provider-specific structured source descriptor, internally tagged on `"source"`.

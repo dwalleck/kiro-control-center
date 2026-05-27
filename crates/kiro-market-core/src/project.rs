@@ -2443,7 +2443,12 @@ impl KiroProject {
         &self,
         source: &Path,
         rel_path: &Path,
-    ) -> crate::error::Result<(tempfile::TempDir, PathBuf, crate::hash::BlakeHash)> {
+    ) -> crate::error::Result<(
+        tempfile::TempDir,
+        PathBuf,
+        crate::hash::BlakeHash,
+        Option<crate::steering::SteeringWarning>,
+    )> {
         let kiro_dir = self.kiro_dir();
         fs::create_dir_all(&kiro_dir).map_err(|src| {
             crate::steering::SteeringError::DestinationDirFailed {
@@ -2500,7 +2505,9 @@ impl KiroProject {
                 path: source.to_path_buf(),
                 source: src,
             })?;
-        let content = crate::steering::strip_yaml_frontmatter(&source_bytes);
+        let outcome = crate::steering::strip_yaml_frontmatter(&source_bytes);
+        let warning = outcome.anomaly_warning(source);
+        let content = outcome.bytes_to_install();
         fs::write(&staged_file, content).map_err(|src| {
             crate::steering::SteeringError::StagingWriteFailed {
                 path: staged_file.clone(),
@@ -2517,7 +2524,7 @@ impl KiroProject {
             source: src,
         })?;
 
-        Ok((staging, staged_file, installed_hash))
+        Ok((staging, staged_file, installed_hash, warning))
     }
 
     /// Decide what `install_steering_file` should do given the existing
@@ -2643,7 +2650,13 @@ impl KiroProject {
         source: &crate::agent::DiscoveredNativeFile,
         source_hash: &crate::hash::BlakeHash,
         ctx: crate::steering::SteeringInstallContext<'_>,
-    ) -> Result<crate::steering::InstalledSteeringOutcome, crate::steering::SteeringError> {
+    ) -> Result<
+        (
+            crate::steering::InstalledSteeringOutcome,
+            Option<crate::steering::SteeringWarning>,
+        ),
+        crate::steering::SteeringError,
+    > {
         let rel_path = match source.source.strip_prefix(&source.scan_root) {
             Ok(p) => p.to_path_buf(),
             Err(_) => {
@@ -2659,10 +2672,12 @@ impl KiroProject {
         let dest = self.steering_dir().join(&rel_path);
         let tracking_path = self.steering_tracking_path();
 
-        let result: crate::error::Result<crate::steering::InstalledSteeringOutcome> =
-            crate::file_lock::with_file_lock(&tracking_path, || {
-                self.install_steering_file_locked(source, &rel_path, &dest, source_hash, ctx)
-            });
+        let result: crate::error::Result<(
+            crate::steering::InstalledSteeringOutcome,
+            Option<crate::steering::SteeringWarning>,
+        )> = crate::file_lock::with_file_lock(&tracking_path, || {
+            self.install_steering_file_locked(source, &rel_path, &dest, source_hash, ctx)
+        });
 
         result.map_err(|e| match e {
             crate::error::Error::Steering(steering_err) => steering_err,
@@ -2690,7 +2705,10 @@ impl KiroProject {
         dest: &Path,
         source_hash: &crate::hash::BlakeHash,
         ctx: crate::steering::SteeringInstallContext<'_>,
-    ) -> crate::error::Result<crate::steering::InstalledSteeringOutcome> {
+    ) -> crate::error::Result<(
+        crate::steering::InstalledSteeringOutcome,
+        Option<crate::steering::SteeringWarning>,
+    )> {
         let tracking_path = self.steering_tracking_path();
         let mut installed = self.load_installed_steering().map_err(|e| match e {
             // A malformed installed-steering.json is a distinct condition
@@ -2718,13 +2736,17 @@ impl KiroProject {
             // so it couldn't accidentally substitute `dest` for the missing
             // source path.
             CollisionDecision::Idempotent(echo) => {
-                return Ok(crate::steering::InstalledSteeringOutcome {
-                    source: source.source.clone(),
-                    destination: dest.to_path_buf(),
-                    kind: InstallOutcomeKind::Idempotent,
-                    source_hash: source_hash.to_owned(),
-                    installed_hash: echo.prior_installed_hash,
-                });
+                // Idempotent path skips staging — no strip outcome exists.
+                return Ok((
+                    crate::steering::InstalledSteeringOutcome {
+                        source: source.source.clone(),
+                        destination: dest.to_path_buf(),
+                        kind: InstallOutcomeKind::Idempotent,
+                        source_hash: source_hash.to_owned(),
+                        installed_hash: echo.prior_installed_hash,
+                    },
+                    None,
+                ));
             }
             CollisionDecision::Proceed { forced_overwrite } => forced_overwrite,
         };
@@ -2743,7 +2765,7 @@ impl KiroProject {
         // `_staging` is held as a RAII guard so its TempDir Drop sweeps
         // the staging directory at end-of-scope, including on early
         // returns from the rest of this function.
-        let (_staging, staged_file, installed_hash) =
+        let (_staging, staged_file, installed_hash, strip_warning) =
             self.stage_steering_file(&source.source, rel_path)?;
 
         let backups = Self::promote_staged_steering(&staged_file, dest, forced_overwrite)?;
@@ -2803,17 +2825,20 @@ impl KiroProject {
             "steering file installed"
         );
 
-        Ok(crate::steering::InstalledSteeringOutcome {
-            source: source.source.clone(),
-            destination: dest.to_path_buf(),
-            kind: if forced_overwrite {
-                InstallOutcomeKind::ForceOverwrote
-            } else {
-                InstallOutcomeKind::Installed
+        Ok((
+            crate::steering::InstalledSteeringOutcome {
+                source: source.source.clone(),
+                destination: dest.to_path_buf(),
+                kind: if forced_overwrite {
+                    InstallOutcomeKind::ForceOverwrote
+                } else {
+                    InstallOutcomeKind::Installed
+                },
+                source_hash: source_hash.to_owned(),
+                installed_hash,
             },
-            source_hash: source_hash.to_owned(),
-            installed_hash,
-        })
+            strip_warning,
+        ))
     }
 
     /// Install a parsed agent into the Kiro project.
@@ -5254,17 +5279,20 @@ mod tests {
         };
         let mp_name = mp("m");
         let pn_name = pn(plugin);
-        f.project.install_steering_file(
-            &discovered,
-            &f.source_hash,
-            crate::steering::SteeringInstallContext {
-                mode,
-                marketplace: &mp_name,
-                plugin: &pn_name,
-                version: None,
-                plugin_dir: f.scratch.path(),
-            },
-        )
+        // Helper discards the warning; well-formed markdown never triggers one.
+        f.project
+            .install_steering_file(
+                &discovered,
+                &f.source_hash,
+                crate::steering::SteeringInstallContext {
+                    mode,
+                    marketplace: &mp_name,
+                    plugin: &pn_name,
+                    version: None,
+                    plugin_dir: f.scratch.path(),
+                },
+            )
+            .map(|(outcome, _warning)| outcome)
     }
 
     #[fixture]
@@ -5387,7 +5415,7 @@ mod tests {
         }
 
         // Force mode transfers ownership.
-        let outcome = steering_file
+        let (outcome, _strip_warning) = steering_file
             .project
             .install_steering_file(
                 &discovered_b,
@@ -5516,7 +5544,7 @@ mod tests {
 
         let mp_name = mp("marketplace-x");
         let pn_name = pn("plugin-y");
-        let outcome = project
+        let (outcome, _strip_warning) = project
             .install_steering_file(
                 &discovered,
                 &source_hash,
@@ -5572,7 +5600,7 @@ mod tests {
 
         let mp_name = mp("marketplace-x");
         let pn_name = pn("plugin-y");
-        let outcome = project
+        let (outcome, strip_warning) = project
             .install_steering_file(
                 &discovered,
                 &source_hash,
@@ -5585,6 +5613,15 @@ mod tests {
                 },
             )
             .expect("install_steering_file");
+
+        // Well-formed frontmatter: no anomaly warning should fire.
+        // A regression where StripOutcome::Stripped started routing
+        // through `anomaly_warning` would fail here loudly.
+        assert!(
+            strip_warning.is_none(),
+            "well-formed frontmatter must not produce an anomaly warning; \
+             got: {strip_warning:?}"
+        );
 
         let dest = project.steering_dir().join("guide.md");
         assert_eq!(

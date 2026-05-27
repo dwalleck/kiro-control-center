@@ -259,6 +259,12 @@ pub enum SteeringWarning {
     /// declare `./steering/` without authoring any files. This variant
     /// fires only for system-level failures the user can act on.
     ScanDirUnreadable { path: PathBuf, reason: String },
+    /// Source bytes were not valid UTF-8; bytes installed verbatim.
+    /// `path` is the absolute path to the source file on disk.
+    SourceNotUtf8 { path: PathBuf },
+    /// Opening `---` fence with no matching closer; bytes installed verbatim.
+    /// `path` is the absolute path to the source file on disk.
+    UnclosedFrontmatter { path: PathBuf },
 }
 
 /// Wrapper for safe terminal rendering of paths from untrusted manifests.
@@ -297,6 +303,17 @@ impl std::fmt::Display for SteeringWarning {
                 "could not read steering scan directory {}: {}",
                 SafeForTerminal(path),
                 reason
+            ),
+            Self::SourceNotUtf8 { path } => write!(
+                f,
+                "steering source {} is not valid UTF-8; installed bytes verbatim",
+                SafeForTerminal(path)
+            ),
+            Self::UnclosedFrontmatter { path } => write!(
+                f,
+                "steering source {} has an opening `---` fence with no matching closer; \
+                 installed bytes verbatim",
+                SafeForTerminal(path)
             ),
         }
     }
@@ -363,6 +380,24 @@ mod tests {
             "kind": "scan_dir_unreadable",
             "path": "/tmp/plugins/x/steering",
             "reason": "permission denied",
+        }),
+    )]
+    #[case::source_not_utf8(
+        SteeringWarning::SourceNotUtf8 {
+            path: PathBuf::from("/tmp/plugins/x/steering/binary.md"),
+        },
+        serde_json::json!({
+            "kind": "source_not_utf8",
+            "path": "/tmp/plugins/x/steering/binary.md",
+        }),
+    )]
+    #[case::unclosed_frontmatter(
+        SteeringWarning::UnclosedFrontmatter {
+            path: PathBuf::from("/tmp/plugins/x/steering/unfinished.md"),
+        },
+        serde_json::json!({
+            "kind": "unclosed_frontmatter",
+            "path": "/tmp/plugins/x/steering/unfinished.md",
         }),
     )]
     fn steering_warning_variants_json_shape(
