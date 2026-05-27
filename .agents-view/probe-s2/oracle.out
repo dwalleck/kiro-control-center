@@ -1,0 +1,92 @@
+{
+  "categories": [
+    "Cloud",
+    "Code",
+    "Filesystem",
+    "Meta",
+    "Orchestration",
+    "Planning",
+    "Reasoning",
+    "Shell",
+    "Web"
+  ],
+  "category_count": 9,
+  "tool_count": 15,
+  "tools": [
+    {
+      "category": "Code",
+      "name": "code",
+      "summary": "AST-based symbol search and rewrite"
+    },
+    {
+      "category": "Shell",
+      "name": "execute_bash",
+      "summary": "Run shell commands"
+    },
+    {
+      "category": "Filesystem",
+      "name": "fs_read",
+      "summary": "Read files, directories, and images"
+    },
+    {
+      "category": "Filesystem",
+      "name": "fs_write",
+      "summary": "Create, edit, insert into files"
+    },
+    {
+      "category": "Code",
+      "name": "glob",
+      "summary": "Find paths by glob pattern"
+    },
+    {
+      "category": "Code",
+      "name": "grep",
+      "summary": "Regex search across files"
+    },
+    {
+      "category": "Meta",
+      "name": "introspect",
+      "summary": "Inspect Kiro features and commands"
+    },
+    {
+      "category": "Meta",
+      "name": "report_issue",
+      "summary": "File a GitHub issue with context"
+    },
+    {
+      "category": "Meta",
+      "name": "session",
+      "summary": "Adjust temporary session settings"
+    },
+    {
+      "category": "Reasoning",
+      "name": "thinking",
+      "summary": "Internal step-by-step reasoning"
+    },
+    {
+      "category": "Planning",
+      "name": "todo_list",
+      "summary": "Track multi-step task plans"
+    },
+    {
+      "category": "Cloud",
+      "name": "use_aws",
+      "summary": "Invoke AWS CLI operations"
+    },
+    {
+      "category": "Orchestration",
+      "name": "use_subagent",
+      "summary": "Delegate to specialized subagents"
+    },
+    {
+      "category": "Web",
+      "name": "web_fetch",
+      "summary": "Fetch and extract URL content"
+    },
+    {
+      "category": "Web",
+      "name": "web_search",
+      "summary": "Search the web for current information"
+    }
+  ]
+}
