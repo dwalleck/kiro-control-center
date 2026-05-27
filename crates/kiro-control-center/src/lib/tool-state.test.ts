@@ -1,9 +1,9 @@
 import { describe, expect, test } from "vitest";
 
 import {
-  type AddCustomResult,
+  type AddExternalResult,
   addAllowed,
-  addCustomTool,
+  addExternalTool,
   partitionTools,
   removeAllowed,
   toggleTool,
@@ -178,69 +178,66 @@ describe("partitionTools (C4)", () => {
   });
 });
 
-describe("addCustomTool (C6)", () => {
-  // Plan case 14.
+describe("addExternalTool (C6) — mirrors React ExternalToolList", () => {
   test("whitespace-only input returns ok:false, reason:empty", () => {
-    const r = addCustomTool(emptyDraft, "   ");
-    expect(r).toEqual<AddCustomResult>({ ok: false, reason: "empty" });
+    const r = addExternalTool(emptyDraft, "   ");
+    expect(r).toEqual<AddExternalResult>({ ok: false, reason: "empty" });
   });
 
-  // Plan case 15.
   test("non-`@`-prefixed input returns ok:false, reason:not-mcp", () => {
-    // The +Add custom flow is for MCP-style entries only. A native
-    // name like "fs_read" must route through the by-category grid's
-    // checkbox, not this affordance.
-    expect(addCustomTool(emptyDraft, "fs_read")).toEqual({
+    // The External (MCP) sub-region requires `@server/tool` or
+    // `@server` shape. Native names enable via the by-category
+    // grid's checkbox.
+    expect(addExternalTool(emptyDraft, "fs_read")).toEqual({
       ok: false,
       reason: "not-mcp",
     });
   });
 
-  // Plan case 16.
-  test("well-formed new entry appends to BOTH tools and allowedTools", () => {
-    const r = addCustomTool(emptyDraft, "@svc/foo");
+  test("well-formed new entry appends to tools only (NOT allowedTools)", () => {
+    // Per the React reference, addExternalTool only touches tools[].
+    // Auto-allow is the user's separate decision via AllowedToolsList.
+    const r = addExternalTool(emptyDraft, "@svc/foo");
     expect(r.ok).toBe(true);
     if (r.ok) {
       expect(r.draft.tools).toEqual(["@svc/foo"]);
-      expect(r.draft.allowedTools).toEqual(["@svc/foo"]);
+      expect(r.draft.allowedTools).toEqual([]);
       expect(r.draft.toolAliases).toEqual({});
     }
   });
 
-  // Plan case 17.
   test("duplicate returns ok:false, reason:duplicate", () => {
     const before: ToolsDraft = {
       tools: ["@svc/foo"],
       allowedTools: [],
       toolAliases: {},
     };
-    expect(addCustomTool(before, "@svc/foo")).toEqual({
+    expect(addExternalTool(before, "@svc/foo")).toEqual({
       ok: false,
       reason: "duplicate",
     });
   });
 
-  // Plan case 18.
   test("trimmed input — surrounding whitespace stripped before validation", () => {
-    const r = addCustomTool(emptyDraft, "  @svc/foo  ");
+    const r = addExternalTool(emptyDraft, "  @svc/foo  ");
     expect(r.ok).toBe(true);
     if (r.ok) expect(r.draft.tools).toEqual(["@svc/foo"]);
   });
 
-  // Allowed-dedupe edge: tool absent but already-allowed (e.g. user
-  // yellow-chipped the name into allowedTools earlier). The customAdd
-  // appends to tools but must NOT duplicate the allowedTools entry.
-  test("allowedTools dedupe: pre-existing yellow-chip name not duplicated", () => {
+  test("does not modify allowedTools even when name already allowed", () => {
+    // Yellow-chip state: name in allowedTools, not in tools. Adding
+    // via addExternalTool puts the name in tools[] but allowedTools[]
+    // is untouched (no append, no dedupe — orthogonal field).
     const before: ToolsDraft = {
       tools: [],
       allowedTools: ["@svc/foo"], // yellow-chip state
       toolAliases: {},
     };
-    const r = addCustomTool(before, "@svc/foo");
+    const r = addExternalTool(before, "@svc/foo");
     expect(r.ok).toBe(true);
     if (r.ok) {
       expect(r.draft.tools).toEqual(["@svc/foo"]);
-      expect(r.draft.allowedTools).toEqual(["@svc/foo"]); // not duplicated
+      expect(r.draft.allowedTools).toEqual(["@svc/foo"]); // unchanged
     }
   });
 });

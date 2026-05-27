@@ -425,3 +425,47 @@ treated: append an "Amendment YYYY-MM-DD" block to this plan, run any
 new falsifier, and proceed.
 
 ## Plan ready for `checkpointed-build`
+
+---
+
+## Amendments
+
+### A1 (2026-05-26, during S2 implementation) — `addCustomTool` → `addExternalTool`, semantics corrected
+
+The original plan defined `addCustomTool(draft, raw)` as the AllowedToolsList's
+`+Add custom` reducer, with two behaviors that diverged from the React reference:
+
+1. **Stricter validation than the reference.** Plan required `@`-prefix on
+   the `+Add custom` input. React's `AllowedToolsList` (AgentEditor.jsx:336)
+   accepts any string — the picker's free-add path just appends the trimmed
+   value to `allowedTools` with no shape check.
+2. **Side-effected `tools[]`.** Plan said the reducer appends to BOTH
+   `tools[]` AND `allowedTools[]`. React's `addAllowed` (AgentEditor.jsx:245)
+   only touches `allowedTools`.
+
+The correct decomposition, per the React reference:
+
+| Source sub-region | Reducer (this module) | Target field | Validation |
+|---|---|---|---|
+| AllowedToolsList picker (candidate select OR free-text) | `addAllowed` | `allowedTools` only | dedupe + non-empty |
+| ExternalToolList form input | `addExternalTool` (new name) | `tools` only | `@`-prefix + dedupe |
+
+Visibility (`tools[]`) and auto-allow (`allowedTools[]`) are orthogonal
+fields in the agent spec. Conflating them in one reducer would have
+collapsed a deliberate design separation.
+
+**Impact:**
+- Renamed `addCustomTool` → `addExternalTool` and `AddCustomResult` → `AddExternalResult`.
+- Removed the `allowedTools[]` side effect.
+- Test case 16 changed from "appends to BOTH" to "appends to tools only";
+  the yellow-chip dedupe edge case now asserts `allowedTools` is
+  **unchanged** rather than dedup-appended.
+- S4 (AllowedToolsList) routes its `+Add custom` through `onAdd` →
+  `addAllowed` (no separate `onAddCustom` callback).
+- S5 (ToolsPanel) gains an inline ExternalToolList form that routes
+  through `addExternalTool` for the External (MCP) sub-region's `+Add`.
+
+Caught by re-reading the React reference before implementing S4. Without
+the correction, S4 would have shipped a `+Add custom` flow that silently
+mutated `tools[]` in addition to `allowedTools[]`, surprising users who
+expected the two fields to be independent.

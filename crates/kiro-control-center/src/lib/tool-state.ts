@@ -103,45 +103,42 @@ export function partitionTools(
 }
 
 /**
- * Outcome of a `+Add custom` request. Discriminated union so the panel
- * can route the failure reason to a user-facing message rather than
- * silently no-op'ing.
+ * Outcome of an `+Add external tool` request from the External (MCP)
+ * sub-region. Discriminated union so the panel can route the failure
+ * reason to a user-facing message rather than silently no-op'ing.
  *
- * Reasons map to design § 5 of the design bundle:
+ * Reasons (per the React reference `ExternalToolList`, AgentEditor.jsx:461):
  * - `empty` — input was whitespace-only.
- * - `not-mcp` — input doesn't start with `@`; the +Add custom flow is
- *   for MCP-style entries only (native tools enable via the by-category
- *   grid's checkbox).
+ * - `not-mcp` — input doesn't start with `@`; external MCP entries
+ *   require the `@server/tool` or `@server` shape.
  * - `duplicate` — input already exists in `tools[]`.
  */
-export type AddCustomResult =
+export type AddExternalResult =
   | { ok: true; draft: ToolsDraft }
   | { ok: false; reason: "empty" | "not-mcp" | "duplicate" };
 
 /**
- * Validate and apply a `+Add custom` MCP entry. On success, the entry
- * is appended to BOTH `tools[]` and `allowedTools[]` (the design intent:
- * "make this MCP tool visible AND auto-allowed in one action"); the
- * `allowedTools` append is dedupe-aware in case the user previously
- * yellow-chipped the same name into the allowed list.
+ * Validate and apply an `+Add` request from the External (MCP)
+ * sub-region. On success appends to `tools[]` only — `allowedTools[]`
+ * and `toolAliases{}` are unchanged.
+ *
+ * Visibility (`tools[]`) and auto-allow (`allowedTools[]`) are
+ * orthogonal concepts in the agent spec. The user adds an MCP tool
+ * to `tools[]` here; if they also want it auto-allowed, the
+ * AllowedToolsList sub-region's `+Add custom` is the separate path.
+ * Mirrors the React reference at `ExternalToolList` (AgentEditor.jsx:461).
  */
-export function addCustomTool(
+export function addExternalTool(
   draft: ToolsDraft,
   raw: string,
-): AddCustomResult {
+): AddExternalResult {
   const trimmed = raw.trim();
   if (!trimmed) return { ok: false, reason: "empty" };
   if (!trimmed.startsWith("@")) return { ok: false, reason: "not-mcp" };
   if (draft.tools.includes(trimmed)) return { ok: false, reason: "duplicate" };
   return {
     ok: true,
-    draft: {
-      ...draft,
-      tools: [...draft.tools, trimmed],
-      allowedTools: draft.allowedTools.includes(trimmed)
-        ? draft.allowedTools
-        : [...draft.allowedTools, trimmed],
-    },
+    draft: { ...draft, tools: [...draft.tools, trimmed] },
   };
 }
 
