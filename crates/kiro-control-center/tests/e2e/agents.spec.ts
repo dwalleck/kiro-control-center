@@ -401,3 +401,85 @@ test.describe("Agents view — IPC validation rejects malformed input (A2)", () 
     }
   });
 });
+
+test.describe("Agents view — Tools section round-trip (slice S7)", () => {
+  // Exercises slice S5+S6's Tools panel through the save pipeline:
+  // toggle a native tool (via the by-category grid checkbox), add an
+  // external MCP entry (via the External form), save, and verify the
+  // three tool fields round-trip through serde_json::Value untouched.
+  //
+  // Falsifier shape: a regression where ToolsPanel mutates `draft.tools`
+  // but AgentEditor's save handler omits the field from the serialized
+  // payload fails the assertion that the saved JSON contains the
+  // toggled name. A regression where addExternalTool side-effects
+  // `allowedTools[]` fails the `allowedTools = []` assertion —
+  // visibility (`tools[]`) and auto-allow (`allowedTools[]`) are
+  // orthogonal fields per the agent spec.
+  test("create agent, toggle native + add MCP, save, assert JSON shape", async ({
+    page,
+  }) => {
+    const { tmpdir, activePath } = await setupFreshProject(page);
+    try {
+      await page.getByRole("button", { name: "Agents", exact: true }).click();
+      await page.getByRole("button", { name: /Create Agent/ }).click();
+      await page.getByPlaceholder("code-reviewer").fill("tools-test");
+      await page.getByRole("button", { name: "Create Agent", exact: true }).click();
+      await expect(page.getByText(/Created.+tools-test/)).toBeVisible({
+        timeout: 10_000,
+      });
+
+      // Re-open in edit mode to reach the Tools section.
+      await page.getByRole("button", { name: "Edit", exact: true }).click();
+      await expect(page.getByPlaceholder("code-reviewer")).toHaveValue(
+        "tools-test",
+        { timeout: 10_000 },
+      );
+
+      // Navigate to Tools section.
+      await page.getByRole("button", { name: "Tools", exact: true }).click();
+      // The "Available tools" subhead is the marker that ToolsPanel
+      // rendered, separating us from a stale Identity / Prompt view.
+      await expect(page.getByText("Available tools")).toBeVisible();
+
+      // Toggle a native tool ON. The by-category grid renders each tool
+      // as a button with the tool name + its summary. Clicking the
+      // button toggles the checkbox.
+      await page
+        .getByRole("button", { name: /^fs_read.*Read files/ })
+        .click();
+
+      // Add an external (MCP) tool via the External form. The form
+      // surfaces an input + Add button at the bottom of the section.
+      await page
+        .getByPlaceholder(/@terraform-mcp\/plan/)
+        .fill("@svc/foo");
+      await page.getByRole("button", { name: "Add", exact: true }).click();
+
+      // Both visible in the External list.
+      await expect(page.getByText("@svc/foo", { exact: true })).toBeVisible();
+
+      // Save.
+      await page
+        .getByRole("button", { name: "Save Changes", exact: true })
+        .click();
+      await expect(page.getByText(/Saved.+tools-test/)).toBeVisible({
+        timeout: 10_000,
+      });
+
+      // Filesystem assertions — the round-trip through serde_json::Value
+      // must preserve the three tool fields as the panel emitted them.
+      const agentPath = path.join(activePath, ".kiro/agents/tools-test.json");
+      const saved = JSON.parse(fs.readFileSync(agentPath, "utf8"));
+      expect(saved.tools).toEqual(expect.arrayContaining(["fs_read", "@svc/foo"]));
+      // addExternalTool only touches `tools[]` — visibility and
+      // auto-allow are orthogonal fields per the agent spec. The
+      // auto-allow picker was never opened in this test, so the
+      // allowed list must be empty.
+      expect(saved.allowedTools).toEqual([]);
+      // No alias UI exercised — toolAliases stays empty.
+      expect(saved.toolAliases ?? {}).toEqual({});
+    } finally {
+      cleanup(tmpdir);
+    }
+  });
+});
