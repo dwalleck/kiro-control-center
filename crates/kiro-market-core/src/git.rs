@@ -516,7 +516,7 @@ impl GitBackend for GixCliBackend {
         })?;
 
         let output =
-            self.run_git(&["pull", "--ff-only"], path)
+            self.run_git(&["pull", "--ff-only", "--no-tags"], path)
                 .map_err(|e| GitError::PullFailed {
                     path: path.to_path_buf(),
                     source: Box::new(e),

@@ -51,13 +51,56 @@ pub fn discover_agents_in_dirs(plugin_dir: &Path, scan_paths: &[String]) -> Vec<
             );
             continue;
         }
-        let dir = plugin_dir.join(rel.trim_start_matches("./"));
-        let entries = match fs::read_dir(&dir) {
-            Ok(entries) => entries,
+        let resolved = plugin_dir.join(rel.trim_start_matches("./"));
+
+        // Check if the scan path points directly to a file (plugin.json
+        // may list individual agent files, e.g.
+        // `./agents/code-testing-generator.agent.md`).
+        let metadata = match fs::symlink_metadata(&resolved) {
+            Ok(m) => m,
             Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
             Err(e) => {
                 warn!(
-                    path = %dir.display(),
+                    path = %resolved.display(),
+                    error = %e,
+                    "failed to stat agent scan path; skipping"
+                );
+                continue;
+            }
+        };
+
+        if crate::platform::is_reparse_or_symlink(&metadata) {
+            debug!(
+                path = %resolved.display(),
+                "skipping symlink or reparse point in agent scan path"
+            );
+            continue;
+        }
+
+        if metadata.file_type().is_file() {
+            if let Some(name) = resolved.file_name().and_then(|n| n.to_str()) {
+                if EXCLUDED_FILENAMES
+                    .iter()
+                    .any(|excluded| excluded.eq_ignore_ascii_case(name))
+                {
+                    continue;
+                }
+                if Path::new(name)
+                    .extension()
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("md"))
+                {
+                    out.push(resolved);
+                }
+            }
+            continue;
+        }
+
+        // Directory path: scan for .md files as before.
+        let entries = match fs::read_dir(&resolved) {
+            Ok(entries) => entries,
+            Err(e) => {
+                warn!(
+                    path = %resolved.display(),
                     error = %e,
                     "failed to read agent scan directory; skipping"
                 );
@@ -69,7 +112,7 @@ pub fn discover_agents_in_dirs(plugin_dir: &Path, scan_paths: &[String]) -> Vec<
                 Ok(e) => e,
                 Err(e) => {
                     warn!(
-                        dir = %dir.display(),
+                        dir = %resolved.display(),
                         error = %e,
                         "failed to read directory entry; skipping"
                     );
@@ -80,7 +123,7 @@ pub fn discover_agents_in_dirs(plugin_dir: &Path, scan_paths: &[String]) -> Vec<
             // Use symlink_metadata (does NOT follow symlinks) so a malicious
             // plugin cannot smuggle in an agent path that reads arbitrary
             // files via parse_agent_file. Matches project::copy_dir_recursive.
-            let metadata = match fs::symlink_metadata(&path) {
+            let entry_meta = match fs::symlink_metadata(&path) {
                 Ok(m) => m,
                 Err(e) => {
                     warn!(
@@ -91,14 +134,14 @@ pub fn discover_agents_in_dirs(plugin_dir: &Path, scan_paths: &[String]) -> Vec<
                     continue;
                 }
             };
-            if crate::platform::is_reparse_or_symlink(&metadata) {
+            if crate::platform::is_reparse_or_symlink(&entry_meta) {
                 debug!(
                     path = %path.display(),
                     "skipping symlink or reparse point in agent scan directory"
                 );
                 continue;
             }
-            if !metadata.file_type().is_file() {
+            if !entry_meta.file_type().is_file() {
                 continue;
             }
             let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
@@ -159,13 +202,65 @@ pub fn discover_native_kiro_agents_in_dirs(
             );
             continue;
         }
-        let dir = plugin_dir.join(rel.trim_start_matches("./"));
-        let entries = match fs::read_dir(&dir) {
-            Ok(entries) => entries,
+        let resolved = plugin_dir.join(rel.trim_start_matches("./"));
+
+        let metadata = match fs::symlink_metadata(&resolved) {
+            Ok(m) => m,
             Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
             Err(e) => {
                 warn!(
-                    path = %dir.display(),
+                    path = %resolved.display(),
+                    error = %e,
+                    "failed to stat native agent scan path; skipping"
+                );
+                continue;
+            }
+        };
+
+        if crate::platform::is_reparse_or_symlink(&metadata) {
+            debug!(
+                path = %resolved.display(),
+                "skipping symlink or reparse point in native agent scan path"
+            );
+            continue;
+        }
+
+        if metadata.file_type().is_file() {
+            if let Some(name) = resolved.file_name().and_then(|n| n.to_str()) {
+                let stem = Path::new(name)
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or(name);
+                if EXCLUDED_STEMS
+                    .iter()
+                    .any(|excluded| excluded.eq_ignore_ascii_case(stem))
+                {
+                    continue;
+                }
+                if Path::new(name)
+                    .extension()
+                    .is_some_and(|ext| ext.eq_ignore_ascii_case("json"))
+                {
+                    // For a file path, derive scan_root from the parent directory.
+                    let scan_root = resolved
+                        .parent()
+                        .unwrap_or(&resolved)
+                        .to_path_buf();
+                    out.push(DiscoveredNativeFile {
+                        source: resolved,
+                        scan_root,
+                    });
+                }
+            }
+            continue;
+        }
+
+        // Directory path: scan for .json files as before.
+        let entries = match fs::read_dir(&resolved) {
+            Ok(entries) => entries,
+            Err(e) => {
+                warn!(
+                    path = %resolved.display(),
                     error = %e,
                     "failed to read native agent scan directory; skipping"
                 );
@@ -177,7 +272,7 @@ pub fn discover_native_kiro_agents_in_dirs(
                 Ok(e) => e,
                 Err(e) => {
                     warn!(
-                        dir = %dir.display(),
+                        dir = %resolved.display(),
                         error = %e,
                         "failed to read directory entry; skipping"
                     );
@@ -185,7 +280,7 @@ pub fn discover_native_kiro_agents_in_dirs(
                 }
             };
             let path = entry.path();
-            let metadata = match fs::symlink_metadata(&path) {
+            let entry_meta = match fs::symlink_metadata(&path) {
                 Ok(m) => m,
                 Err(e) => {
                     warn!(
@@ -196,14 +291,14 @@ pub fn discover_native_kiro_agents_in_dirs(
                     continue;
                 }
             };
-            if crate::platform::is_reparse_or_symlink(&metadata) {
+            if crate::platform::is_reparse_or_symlink(&entry_meta) {
                 debug!(
                     path = %path.display(),
                     "skipping symlink or reparse point in native agent scan directory"
                 );
                 continue;
             }
-            if !metadata.file_type().is_file() {
+            if !entry_meta.file_type().is_file() {
                 continue;
             }
             let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
@@ -227,7 +322,7 @@ pub fn discover_native_kiro_agents_in_dirs(
             {
                 out.push(DiscoveredNativeFile {
                     source: path,
-                    scan_root: dir.clone(),
+                    scan_root: resolved.clone(),
                 });
             }
         }
@@ -760,6 +855,123 @@ mod tests {
         fs::write(agents.join("only.json"), b"{}").unwrap();
 
         let found = discover_native_companion_files(tmp.path(), &["./agents/".to_string()]);
+        assert!(found.is_empty());
+    }
+
+    // -------------------------------------------------------------------
+    // File-path scan entries (plugin.json lists individual files)
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn discover_handles_individual_file_paths() {
+        let tmp = tempdir().unwrap();
+        let agents = tmp.path().join("agents");
+        fs::create_dir_all(&agents).unwrap();
+        fs::write(agents.join("a.agent.md"), "---\nname: a\n---\n").unwrap();
+        fs::write(agents.join("b.agent.md"), "---\nname: b\n---\n").unwrap();
+        fs::write(agents.join("c.agent.md"), "---\nname: c\n---\n").unwrap();
+
+        // Only list two of three files explicitly.
+        let found = discover_agents_in_dirs(
+            tmp.path(),
+            &[
+                "./agents/a.agent.md".to_string(),
+                "./agents/b.agent.md".to_string(),
+            ],
+        );
+        let names: Vec<_> = found
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
+            .collect();
+        assert_eq!(names.len(), 2);
+        assert!(names.contains(&"a.agent.md".to_string()));
+        assert!(names.contains(&"b.agent.md".to_string()));
+    }
+
+    #[test]
+    fn discover_file_path_excludes_readme() {
+        let tmp = tempdir().unwrap();
+        let agents = tmp.path().join("agents");
+        fs::create_dir_all(&agents).unwrap();
+        fs::write(agents.join("README.md"), "# readme").unwrap();
+
+        let found = discover_agents_in_dirs(
+            tmp.path(),
+            &["./agents/README.md".to_string()],
+        );
+        assert!(found.is_empty());
+    }
+
+    #[test]
+    fn discover_file_path_skips_non_md_extension() {
+        let tmp = tempdir().unwrap();
+        let agents = tmp.path().join("agents");
+        fs::create_dir_all(&agents).unwrap();
+        fs::write(agents.join("notes.txt"), "notes").unwrap();
+
+        let found = discover_agents_in_dirs(
+            tmp.path(),
+            &["./agents/notes.txt".to_string()],
+        );
+        assert!(found.is_empty());
+    }
+
+    #[test]
+    fn discover_file_path_mixed_with_directory_path() {
+        let tmp = tempdir().unwrap();
+        let agents = tmp.path().join("agents");
+        fs::create_dir_all(&agents).unwrap();
+        fs::write(agents.join("a.md"), "---\nname: a\n---\n").unwrap();
+        fs::write(agents.join("b.md"), "---\nname: b\n---\n").unwrap();
+
+        // Mix: one file path + one directory path
+        let found = discover_agents_in_dirs(
+            tmp.path(),
+            &[
+                "./agents/a.md".to_string(),
+                "./agents/".to_string(),
+            ],
+        );
+        let names: Vec<_> = found
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
+            .collect();
+        // a.md appears from the file path, and both a.md and b.md from the dir scan
+        assert!(names.contains(&"a.md".to_string()));
+        assert!(names.contains(&"b.md".to_string()));
+    }
+
+    #[test]
+    fn native_discovery_handles_individual_file_paths() {
+        let tmp = tempdir().unwrap();
+        let agents = tmp.path().join("agents");
+        fs::create_dir_all(&agents).unwrap();
+        fs::write(agents.join("a.json"), b"{}").unwrap();
+        fs::write(agents.join("b.json"), b"{}").unwrap();
+
+        let found = discover_native_kiro_agents_in_dirs(
+            tmp.path(),
+            &["./agents/a.json".to_string()],
+        );
+        assert_eq!(found.len(), 1);
+        assert_eq!(
+            found[0].source.file_name().unwrap().to_string_lossy(),
+            "a.json"
+        );
+        assert_eq!(found[0].scan_root, agents);
+    }
+
+    #[test]
+    fn native_discovery_file_path_excludes_readme_json() {
+        let tmp = tempdir().unwrap();
+        let agents = tmp.path().join("agents");
+        fs::create_dir_all(&agents).unwrap();
+        fs::write(agents.join("README.json"), b"{}").unwrap();
+
+        let found = discover_native_kiro_agents_in_dirs(
+            tmp.path(),
+            &["./agents/README.json".to_string()],
+        );
         assert!(found.is_empty());
     }
 }
