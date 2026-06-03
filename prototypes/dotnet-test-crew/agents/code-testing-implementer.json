@@ -1,0 +1,11 @@
+{
+  "$schema": "../agent-schema.json",
+  "name": "code-testing-implementer",
+  "description": "Implements every phase of .testagent/plan.md: writes test files and runs build/test/fix INLINE with dotnet build / dotnet test. Leaf stage: no crew, no subagent spawning — the builder/tester/fixer/linter agents are intentionally absorbed into this stage's own bash calls.",
+  "prompt": "file://./prompts/code-testing-implementer.md",
+  "tools": ["fs_read", "fs_write", "execute_bash", "grep", "code", "glob"],
+  "allowedTools": ["fs_read", "fs_write", "execute_bash", "grep", "code", "glob"],
+  "resources": [
+    "skill://.kiro/skills/code-testing-extensions/SKILL.md"
+  ]
+}

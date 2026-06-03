@@ -1,0 +1,31 @@
+{
+  "$schema": "../agent-schema.json",
+  "name": "code-testing-generator",
+  "description": "Orchestrates .NET test generation via a Research->Plan->Implement crew pipeline, then runs final full-solution validation and decides whether to iterate. The ONLY agent in this set permitted to run a crew; the three stage agents are leaves.",
+  "prompt": "file://./prompts/code-testing-generator.md",
+  "tools": ["fs_read", "fs_write", "execute_bash", "grep", "code", "glob", "subagent"],
+  "allowedTools": ["fs_read", "fs_write", "execute_bash", "grep", "code", "glob", "subagent"],
+  "resources": [
+    "file://CLAUDE.md",
+    "file://AGENTS.md",
+    "file://.editorconfig",
+    "skill://.kiro/skills/code-testing-extensions/SKILL.md",
+    "skill://.kiro/skills/code-testing-agent/SKILL.md"
+  ],
+  "toolsSettings": {
+    "subagent": {
+      "availableAgents": [
+        "code-testing-researcher",
+        "code-testing-planner",
+        "code-testing-implementer",
+        "code-testing-validator"
+      ],
+      "trustedAgents": [
+        "code-testing-researcher",
+        "code-testing-planner",
+        "code-testing-implementer",
+        "code-testing-validator"
+      ]
+    }
+  }
+}

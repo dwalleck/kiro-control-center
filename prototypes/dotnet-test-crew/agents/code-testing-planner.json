@@ -1,0 +1,11 @@
+{
+  "$schema": "../agent-schema.json",
+  "name": "code-testing-planner",
+  "description": "Reads .testagent/research.md and writes a phased .testagent/plan.md. Leaf stage: no crew, no subagent spawning.",
+  "prompt": "file://./prompts/code-testing-planner.md",
+  "tools": ["fs_read", "fs_write", "grep", "glob", "code"],
+  "allowedTools": ["fs_read", "fs_write", "grep", "glob", "code"],
+  "resources": [
+    "skill://.kiro/skills/code-testing-extensions/SKILL.md"
+  ]
+}

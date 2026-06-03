@@ -1,0 +1,11 @@
+{
+  "$schema": "../agent-schema.json",
+  "name": "code-testing-researcher",
+  "description": "Analyzes a .NET codebase and writes .testagent/research.md. Leaf stage: no crew, no subagent spawning. Does its own searching with grep/glob.",
+  "prompt": "file://./prompts/code-testing-researcher.md",
+  "tools": ["fs_read", "fs_write", "execute_bash", "grep", "code", "glob"],
+  "allowedTools": ["fs_read", "fs_write", "execute_bash", "grep", "code", "glob"],
+  "resources": [
+    "skill://.kiro/skills/code-testing-extensions/SKILL.md"
+  ]
+}

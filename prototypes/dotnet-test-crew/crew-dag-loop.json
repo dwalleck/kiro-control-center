@@ -1,0 +1,35 @@
+{
+  "_comment": "NATIVE-LOOP variant (5 stages) via the v2 `agent_crew` tool. Identical RPI core to crew-dag.json, but final validation + coverage-iteration are expressed IN the crew: a `validate` stage runs the full-solution build/test/coverage check and, if gaps remain, fires `loop_to` back to `implement` by calling the built-in `summary` tool with resultType='changes_needed' and the token COVERAGE_GAP in its result. On loop re-entry the engine passes the validator's feedback to `implement` as context (the one edge that injects predecessor output — forward depends_on edges do NOT, they rely on .testagent/*.md disk handoff). Loop bounds enforced by Kiro: trigger >= 4 chars, max_iterations 1..=10, no self-loops, no mutual loops, planned upfront. With this variant the orchestrator just submits the crew and reports; it does NOT run its own Step 5 validation or Step 4 manual loop.",
+  "task": "<<the user's test-generation request, verbatim>>",
+  "mode": "blocking",
+  "stages": [
+    {
+      "name": "research",
+      "role": "code-testing-researcher",
+      "prompt_template": "Research the codebase for this test-generation task: {task}\n\nIdentify project structure, language(s), the test framework, build/test commands, the source files in scope, existing tests, and a per-file estimated coverage level. Build a leaf-first dependency graph. Read the dotnet extension guidance first (see your prompt). Write the complete findings to .testagent/research.md following the output contract in your prompt. Do NOT write any test code."
+    },
+    {
+      "name": "plan",
+      "role": "code-testing-planner",
+      "depends_on": ["research"],
+      "prompt_template": "Create a phased test implementation plan for: {task}\n\nRead .testagent/research.md. Choose broad vs targeted strategy from the estimated-coverage data, order phases leaf-first, and assign every in-scope source file to a phase with concrete test cases. Write the plan to .testagent/plan.md following the output contract in your prompt. Do NOT write any test code."
+    },
+    {
+      "name": "implement",
+      "role": "code-testing-implementer",
+      "depends_on": ["plan"],
+      "prompt_template": "Implement the test plan for: {task}\n\nFIRST RUN: read .testagent/plan.md and .testagent/research.md and implement EVERY phase in order. LOOP RE-ENTRY (when the validator triggered COVERAGE_GAP): the validator's feedback is provided to you as context — read it plus .testagent/status.md and implement ONLY the still-missing tests/files it names; do NOT redo phases already marked SUCCESS. In both cases: read source files in full, write tests append-only (never edit production code), build and run ONLY the affected test project inline with `dotnet build` / `dotnet test`, fix failing assertions against real behavior (build retry 3x, test retry 5x), never [Ignore]/[Skip]. Append a per-phase/per-gap result block to .testagent/status.md."
+    },
+    {
+      "name": "validate",
+      "role": "code-testing-validator",
+      "depends_on": ["implement"],
+      "prompt_template": "Validate the full test suite for: {task}\n\nRun a full-solution non-incremental build (all target frameworks) and a fresh full-solution test run. Audit new tests for implementation-specificity (a test that still passes with the function body emptied is weak). Compare in-scope source files (.testagent/research.md) against tests created (.testagent/status.md) for coverage gaps. DECISION via the built-in `summary` tool: if any build failure, test failure, weak test, or non-trivial uncovered source file remains, call summary with resultType='changes_needed' and put the token COVERAGE_GAP in the result followed by a concrete list of the specific files/behaviors/failing-tests still needing work. Otherwise call summary with resultType='terminal' and a final report. Do NOT write tests yourself.",
+      "loop_to": {
+        "target": "implement",
+        "trigger": "COVERAGE_GAP",
+        "max_iterations": 3
+      }
+    }
+  ]
+}

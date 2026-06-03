@@ -1,0 +1,24 @@
+{
+  "_comment": "The literal payload code-testing-generator emits for ONE pass via the v2 `agent_crew` tool (granted as `subagent` in the agent config; wire/tool name is `agent_crew`). Flat by construction: research -> plan -> implement, linear. The implement stage loops ALL phases itself and runs build/test/fix inline, which collapses the per-phase fan-out AND the builder/tester/fixer nesting into a single leaf stage. Forward depends_on handoff is via .testagent/*.md on a shared cwd, NOT via prompt_template (only {task} is substituted). Coverage-iteration can be expressed natively with a `loop_to` block on a validate stage (target=implement, trigger='COVERAGE_GAP', max_iterations 1..=10) instead of an orchestrator-driven re-issue — see README. Self-loops and mutual loops are rejected; loops are planned upfront.",
+  "task": "<<the user's test-generation request, verbatim — e.g. 'Generate unit tests for src/InvoiceService.cs'>>",
+  "mode": "blocking",
+  "stages": [
+    {
+      "name": "research",
+      "role": "code-testing-researcher",
+      "prompt_template": "Research the codebase for this test-generation task: {task}\n\nIdentify project structure, language(s), the test framework, build/test commands, the source files in scope, existing tests, and a per-file estimated coverage level. Build a leaf-first dependency graph. Read the dotnet extension guidance first (see your prompt). Write the complete findings to .testagent/research.md following the output contract in your prompt. Do NOT write any test code."
+    },
+    {
+      "name": "plan",
+      "role": "code-testing-planner",
+      "depends_on": ["research"],
+      "prompt_template": "Create a phased test implementation plan for: {task}\n\nRead .testagent/research.md. Choose broad vs targeted strategy from the estimated-coverage data, order phases leaf-first, and assign every in-scope source file to a phase with concrete test cases. Write the plan to .testagent/plan.md following the output contract in your prompt. Do NOT write any test code."
+    },
+    {
+      "name": "implement",
+      "role": "code-testing-implementer",
+      "depends_on": ["plan"],
+      "prompt_template": "Implement EVERY phase of the test plan in order for: {task}\n\nRead .testagent/plan.md and .testagent/research.md. For each phase, in sequence: read the source files in full, write the test files (append-only to existing test files; never edit production code), then build and run ONLY the affected test project inline with `dotnet build` / `dotnet test` (no full-solution build here), fixing failing assertions against real production behavior — retry build up to 3x and tests up to 5x. Never [Ignore]/[Skip]/[Inconclusive] a test. Append a per-phase result block to .testagent/status.md."
+    }
+  ]
+}

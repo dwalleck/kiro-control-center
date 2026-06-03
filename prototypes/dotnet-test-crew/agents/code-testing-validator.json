@@ -1,0 +1,11 @@
+{
+  "$schema": "../agent-schema.json",
+  "name": "code-testing-validator",
+  "description": "Runs full-solution build/test + coverage-gap + weak-test audit, then routes the crew: fires loop_to back to implement (via summary resultType=changes_needed + COVERAGE_GAP) when gaps remain, or reports terminal when clean. Leaf stage: no subagent grant; uses the built-in summary tool to drive the loop. Does not write tests.",
+  "prompt": "file://./prompts/code-testing-validator.md",
+  "tools": ["fs_read", "fs_write", "execute_bash", "grep", "code", "glob"],
+  "allowedTools": ["fs_read", "fs_write", "execute_bash", "grep", "code", "glob"],
+  "resources": [
+    "skill://.kiro/skills/code-testing-extensions/SKILL.md"
+  ]
+}
