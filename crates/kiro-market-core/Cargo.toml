@@ -46,6 +46,12 @@ tempfile = { workspace = true }
 [target.'cfg(windows)'.dependencies]
 junction = { workspace = true }
 
+# `O_NOFOLLOW` for the race-free agent-file read in `read_user_agent_json`
+# (single-syscall open that refuses a symlinked final component, closing
+# the symlink-swap TOCTOU window a separate stat-then-read would leave).
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
 [dev-dependencies]
 rstest = { workspace = true }
 tempfile = { workspace = true }

@@ -112,6 +112,7 @@ impl From<CoreError> for CommandError {
             CoreError::Agent(AgentError::SourceHardlinked { .. }) => ErrorType::Validation,
             CoreError::Agent(AgentError::InstallFailed { .. }) => ErrorType::IoError,
             CoreError::Agent(AgentError::InvalidName { .. }) => ErrorType::Validation,
+            CoreError::Agent(AgentError::AgentFileTooLarge { .. }) => ErrorType::Validation,
             CoreError::Agent(AgentError::NameCollision { .. }) => ErrorType::AlreadyExists,
             CoreError::Agent(AgentError::DuplicateSourceNotFound { .. }) => ErrorType::NotFound,
             CoreError::Agent(AgentError::DuplicateSourceSymlinked { .. }) => ErrorType::Validation,
@@ -377,6 +378,13 @@ mod tests {
     // flagged as currently collapsing to Unknown):
     #[case::agent_invalid_name(
         CoreError::Agent(AgentError::InvalidName { reason: "leading hyphen".into() }),
+        ErrorType::Validation
+    )]
+    #[case::agent_file_too_large(
+        CoreError::Agent(AgentError::AgentFileTooLarge {
+            name: "huge".into(),
+            limit_bytes: 1_048_576,
+        }),
         ErrorType::Validation
     )]
     #[case::agent_name_collision(

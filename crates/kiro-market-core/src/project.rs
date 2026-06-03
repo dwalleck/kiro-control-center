@@ -609,6 +609,60 @@ const INSTALLED_STEERING_FILE: &str = "installed-steering.json";
 /// orders of magnitude beyond any plausible hand-authored shape.
 const DUPLICATE_SOURCE_BYTE_CAP: u64 = 1024 * 1024;
 
+/// Upper bound on bytes [`KiroProject::read_user_agent_json`] will pull
+/// into memory for the editor's edit-mode load. Bounds the read against a
+/// multi-GB file mistakenly placed at `.kiro/agents/<name>.json`. 1 MiB
+/// matches the draft-write cap enforced at the IPC boundary
+/// (`DRAFT_JSON_BYTE_CAP` in the Tauri crate), so the authoring round-trip
+/// is lossless: a file materially larger than the write cap did not come
+/// from the authoring path. Kept equal to that constant by intent — see
+/// the cross-reference in `commands::mod`.
+const USER_AGENT_READ_BYTE_CAP: u64 = 1024 * 1024;
+
+/// Open `path` for reading without following a final-component symlink:
+/// `O_NOFOLLOW` on Unix, `FILE_FLAG_OPEN_REPARSE_POINT` on Windows. The
+/// single-syscall open closes the symlink-swap TOCTOU window a separate
+/// `symlink_metadata`-then-`read` leaves — there is no instant between a
+/// check and the read for a writer of `.kiro/agents/` to swap a regular
+/// file for a link to a sensitive host file. On Unix a symlinked target
+/// makes the open fail with `ELOOP`; on Windows the reparse point is
+/// opened rather than its target, and the caller refuses it after
+/// inspecting the handle's metadata.
+#[cfg(unix)]
+fn open_agent_file_nofollow(path: &Path) -> std::io::Result<fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
+}
+
+#[cfg(windows)]
+fn open_agent_file_nofollow(path: &Path) -> std::io::Result<fs::File> {
+    use std::os::windows::fs::OpenOptionsExt;
+    // Open the reparse point itself instead of its target so a symlink or
+    // junction is not followed; the caller refuses it via the handle's
+    // metadata.
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+}
+
+/// True if `e` is the open error a symlinked final component produces
+/// under `O_NOFOLLOW` (`ELOOP`). Windows surfaces a symlink via the open
+/// handle's metadata instead, so this is always false there.
+#[cfg(unix)]
+fn is_nofollow_symlink_error(e: &std::io::Error) -> bool {
+    e.raw_os_error() == Some(libc::ELOOP)
+}
+
+#[cfg(not(unix))]
+fn is_nofollow_symlink_error(_e: &std::io::Error) -> bool {
+    false
+}
+
 /// Recursively copy a directory tree from `src` to `dest`.
 ///
 /// Creates `dest` and all intermediate directories. Files are copied
@@ -1233,13 +1287,35 @@ impl KiroProject {
     ///   for safety (symlink). The two cases share a variant because
     ///   the editor's UX for both is "the agent went missing; return
     ///   to the list and refresh."
+    /// - [`AgentError::AgentFileTooLarge`] — file exceeds
+    ///   [`USER_AGENT_READ_BYTE_CAP`]; refused without loading it into
+    ///   memory.
     /// - I/O / UTF-8 errors during the read.
     pub fn read_user_agent_json(&self, name: &str) -> crate::error::Result<String> {
+        use std::io::Read;
+
         let name = Self::validate_user_agent_name(name)?;
         let path = self.agents_dir().join(format!("{}.json", name.as_str()));
-        let metadata = match fs::symlink_metadata(&path) {
-            Ok(m) => m,
+
+        // Single-syscall no-follow open. A separate `symlink_metadata`
+        // then `read` would leave a TOCTOU window an attacker with write
+        // access to `.kiro/agents/` could exploit by swapping a regular
+        // file for a symlink to a sensitive host file between the two
+        // syscalls; opening with `O_NOFOLLOW` refuses the symlinked
+        // target atomically.
+        let file = match open_agent_file_nofollow(&path) {
+            Ok(f) => f,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Err(AgentError::NotInstalled {
+                    name: name.into_inner(),
+                }
+                .into());
+            }
+            Err(e) if is_nofollow_symlink_error(&e) => {
+                warn!(
+                    path = %path.display(),
+                    "refusing symlinked agent file in read_user_agent_json: O_NOFOLLOW open refused it (defense-in-depth)",
+                );
                 return Err(AgentError::NotInstalled {
                     name: name.into_inner(),
                 }
@@ -1247,17 +1323,39 @@ impl KiroProject {
             }
             Err(e) => return Err(e.into()),
         };
-        if metadata.file_type().is_symlink() {
+
+        // Windows opens the reparse point rather than failing the open, so
+        // refuse a symlink/junction here via the open handle's metadata. On
+        // Unix `O_NOFOLLOW` already guaranteed a non-symlink, so this is a
+        // harmless second line of defense.
+        let metadata = file.metadata()?;
+        if crate::platform::is_reparse_or_symlink(&metadata) {
             warn!(
                 path = %path.display(),
-                "refusing to read symlinked agent file in read_user_agent_json (defense-in-depth)",
+                "refusing symlinked agent file in read_user_agent_json: open-handle metadata is a reparse point (defense-in-depth)",
             );
             return Err(AgentError::NotInstalled {
                 name: name.into_inner(),
             }
             .into());
         }
-        let bytes = fs::read(&path)?;
+
+        // Bounded read: pull at most `CAP + 1` bytes so a multi-GB file
+        // cannot OOM the backend on a single load. Reading one byte past
+        // the cap lets us distinguish "over the cap" from a file of
+        // exactly `CAP` bytes, which still reads in full (lossless
+        // round-trip with the draft-write cap).
+        let mut bytes = Vec::new();
+        file.take(USER_AGENT_READ_BYTE_CAP + 1)
+            .read_to_end(&mut bytes)?;
+        if bytes.len() as u64 > USER_AGENT_READ_BYTE_CAP {
+            return Err(AgentError::AgentFileTooLarge {
+                name: name.into_inner(),
+                limit_bytes: USER_AGENT_READ_BYTE_CAP,
+            }
+            .into());
+        }
+
         // UTF-8 conversion failure is a real outcome (a hand-edited
         // file with broken encoding) but extremely rare for legitimate
         // agent JSON. Surface as `io::Error::InvalidData` so it threads
@@ -10017,6 +10115,73 @@ mod tests {
             got, raw,
             "must return file bytes verbatim, no normalisation"
         );
+    }
+
+    /// A file larger than `USER_AGENT_READ_BYTE_CAP` is refused with
+    /// `AgentFileTooLarge` rather than read into memory. Without the cap a
+    /// multi-GB file at `.kiro/agents/<name>.json` would OOM the backend on
+    /// a single editor load — the load-side mirror of the IPC draft-write
+    /// cap.
+    #[test]
+    fn read_user_agent_json_refuses_oversized_file() {
+        let (_dir, project) = temp_project();
+        let agents = project.kiro_dir().join("agents");
+        std::fs::create_dir_all(&agents).expect("mk agents");
+        let cap = usize::try_from(USER_AGENT_READ_BYTE_CAP)
+            .expect("1 MiB cap fits in usize on all supported targets");
+        // One byte over the cap.
+        let oversized = "x".repeat(cap + 1);
+        std::fs::write(agents.join("big.json"), &oversized).expect("seed oversized");
+
+        let err = project
+            .read_user_agent_json("big")
+            .expect_err("oversized file must be refused");
+        assert!(
+            matches!(
+                err,
+                crate::error::Error::Agent(AgentError::AgentFileTooLarge {
+                    ref name,
+                    limit_bytes,
+                }) if name == "big" && limit_bytes == USER_AGENT_READ_BYTE_CAP
+            ),
+            "expected AgentFileTooLarge {{ name: big, limit_bytes: {USER_AGENT_READ_BYTE_CAP} }}, got {err:?}",
+        );
+    }
+
+    /// A file of exactly `USER_AGENT_READ_BYTE_CAP` bytes still reads
+    /// successfully — the cap is inclusive so a draft written at exactly
+    /// the write cap round-trips. Guards against an off-by-one that would
+    /// make max-size agents unloadable.
+    #[test]
+    fn read_user_agent_json_reads_file_at_cap_boundary() {
+        let (_dir, project) = temp_project();
+        let agents = project.kiro_dir().join("agents");
+        std::fs::create_dir_all(&agents).expect("mk agents");
+        let cap = usize::try_from(USER_AGENT_READ_BYTE_CAP)
+            .expect("1 MiB cap fits in usize on all supported targets");
+        let at_cap = "y".repeat(cap);
+        std::fs::write(agents.join("max.json"), &at_cap).expect("seed at-cap");
+
+        let got = project
+            .read_user_agent_json("max")
+            .expect("file at exactly the cap must read successfully");
+        assert_eq!(got.len(), cap, "must return all cap bytes verbatim");
+    }
+
+    /// An empty (0-byte) file reads successfully as an empty string — not
+    /// mistaken for missing or errored. Exercises `read_to_end` returning
+    /// zero bytes under the cap.
+    #[test]
+    fn read_user_agent_json_reads_empty_file() {
+        let (_dir, project) = temp_project();
+        let agents = project.kiro_dir().join("agents");
+        std::fs::create_dir_all(&agents).expect("mk agents");
+        std::fs::write(agents.join("empty.json"), b"").expect("seed empty");
+
+        let got = project
+            .read_user_agent_json("empty")
+            .expect("empty file must read successfully");
+        assert_eq!(got, "", "empty file reads as empty string");
     }
 
     /// Missing file → `AgentError::NotInstalled`. Maps to the
