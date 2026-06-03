@@ -515,12 +515,12 @@ impl GitBackend for GixCliBackend {
             source: Box::new(e),
         })?;
 
-        let output =
-            self.run_git(&["pull", "--ff-only", "--no-tags"], path)
-                .map_err(|e| GitError::PullFailed {
-                    path: path.to_path_buf(),
-                    source: Box::new(e),
-                })?;
+        let output = self
+            .run_git(&["pull", "--ff-only", "--no-tags"], path)
+            .map_err(|e| GitError::PullFailed {
+                path: path.to_path_buf(),
+                source: Box::new(e),
+            })?;
 
         if !output.status.success() {
             let detail = git_error_detail(&output);

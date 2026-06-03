@@ -14,6 +14,66 @@ const EXCLUDED_FILENAMES: &[&str] = &["README.md", "CONTRIBUTING.md", "CHANGELOG
 /// native agent discovery (where files are `.json`, not `.md`).
 const EXCLUDED_STEMS: &[&str] = &["README", "CONTRIBUTING", "CHANGELOG"];
 
+/// Push `path` into `out` if its filename qualifies as a markdown agent:
+/// not an excluded doc file (README/CONTRIBUTING/CHANGELOG, case-insensitive)
+/// and carrying a case-insensitive `.md` extension.
+///
+/// The caller owns the symlink/reparse refusal and the `is_file` check;
+/// this helper only inspects the basename. Shared by both the file-path
+/// and directory-scan branches so the two stay in lockstep.
+fn push_if_md_agent(path: PathBuf, out: &mut Vec<PathBuf>) {
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+        return;
+    };
+    if EXCLUDED_FILENAMES
+        .iter()
+        .any(|excluded| excluded.eq_ignore_ascii_case(name))
+    {
+        return;
+    }
+    if Path::new(name)
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("md"))
+    {
+        out.push(path);
+    }
+}
+
+/// Push a [`DiscoveredNativeFile`] for `path` if its filename qualifies as
+/// a native Kiro agent: not an excluded doc stem and carrying a
+/// case-insensitive `.json` extension. `scan_root` is recorded so the
+/// install layer can compute destination-relative paths.
+///
+/// The caller owns the symlink/reparse refusal and the `is_file` check;
+/// this helper only inspects the basename. Shared by both the file-path
+/// and directory-scan branches.
+fn push_if_native_json(path: PathBuf, scan_root: PathBuf, out: &mut Vec<DiscoveredNativeFile>) {
+    let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+        return;
+    };
+    // README/CONTRIBUTING/CHANGELOG with .json extension are excluded
+    // case-insensitively by stem to mirror the .md exclusion.
+    let stem = Path::new(name)
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or(name);
+    if EXCLUDED_STEMS
+        .iter()
+        .any(|excluded| excluded.eq_ignore_ascii_case(stem))
+    {
+        return;
+    }
+    if Path::new(name)
+        .extension()
+        .is_some_and(|ext| ext.eq_ignore_ascii_case("json"))
+    {
+        out.push(DiscoveredNativeFile {
+            source: path,
+            scan_root,
+        });
+    }
+}
+
 /// Find agent markdown files inside `plugin_dir` according to `scan_paths`.
 ///
 /// `scan_paths` are relative to `plugin_dir`. Each entry is first validated
@@ -78,20 +138,7 @@ pub fn discover_agents_in_dirs(plugin_dir: &Path, scan_paths: &[String]) -> Vec<
         }
 
         if metadata.file_type().is_file() {
-            if let Some(name) = resolved.file_name().and_then(|n| n.to_str()) {
-                if EXCLUDED_FILENAMES
-                    .iter()
-                    .any(|excluded| excluded.eq_ignore_ascii_case(name))
-                {
-                    continue;
-                }
-                if Path::new(name)
-                    .extension()
-                    .is_some_and(|ext| ext.eq_ignore_ascii_case("md"))
-                {
-                    out.push(resolved);
-                }
-            }
+            push_if_md_agent(resolved, &mut out);
             continue;
         }
 
@@ -144,21 +191,7 @@ pub fn discover_agents_in_dirs(plugin_dir: &Path, scan_paths: &[String]) -> Vec<
             if !entry_meta.file_type().is_file() {
                 continue;
             }
-            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
-                continue;
-            };
-            if EXCLUDED_FILENAMES
-                .iter()
-                .any(|excluded| excluded.eq_ignore_ascii_case(name))
-            {
-                continue;
-            }
-            if Path::new(name)
-                .extension()
-                .is_some_and(|ext| ext.eq_ignore_ascii_case("md"))
-            {
-                out.push(path);
-            }
+            push_if_md_agent(path, &mut out);
         }
     }
     out
@@ -226,32 +259,9 @@ pub fn discover_native_kiro_agents_in_dirs(
         }
 
         if metadata.file_type().is_file() {
-            if let Some(name) = resolved.file_name().and_then(|n| n.to_str()) {
-                let stem = Path::new(name)
-                    .file_stem()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or(name);
-                if EXCLUDED_STEMS
-                    .iter()
-                    .any(|excluded| excluded.eq_ignore_ascii_case(stem))
-                {
-                    continue;
-                }
-                if Path::new(name)
-                    .extension()
-                    .is_some_and(|ext| ext.eq_ignore_ascii_case("json"))
-                {
-                    // For a file path, derive scan_root from the parent directory.
-                    let scan_root = resolved
-                        .parent()
-                        .unwrap_or(&resolved)
-                        .to_path_buf();
-                    out.push(DiscoveredNativeFile {
-                        source: resolved,
-                        scan_root,
-                    });
-                }
-            }
+            // For a file path, derive scan_root from the parent directory.
+            let scan_root = resolved.parent().unwrap_or(&resolved).to_path_buf();
+            push_if_native_json(resolved, scan_root, &mut out);
             continue;
         }
 
@@ -301,30 +311,7 @@ pub fn discover_native_kiro_agents_in_dirs(
             if !entry_meta.file_type().is_file() {
                 continue;
             }
-            let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
-                continue;
-            };
-            // README/CONTRIBUTING/CHANGELOG with .json extension are excluded
-            // case-insensitively by stem to mirror the .md exclusion.
-            let stem = Path::new(name)
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or(name);
-            if EXCLUDED_STEMS
-                .iter()
-                .any(|excluded| excluded.eq_ignore_ascii_case(stem))
-            {
-                continue;
-            }
-            if Path::new(name)
-                .extension()
-                .is_some_and(|ext| ext.eq_ignore_ascii_case("json"))
-            {
-                out.push(DiscoveredNativeFile {
-                    source: path,
-                    scan_root: resolved.clone(),
-                });
-            }
+            push_if_native_json(path, resolved.clone(), &mut out);
         }
     }
     out
@@ -895,10 +882,7 @@ mod tests {
         fs::create_dir_all(&agents).unwrap();
         fs::write(agents.join("README.md"), "# readme").unwrap();
 
-        let found = discover_agents_in_dirs(
-            tmp.path(),
-            &["./agents/README.md".to_string()],
-        );
+        let found = discover_agents_in_dirs(tmp.path(), &["./agents/README.md".to_string()]);
         assert!(found.is_empty());
     }
 
@@ -909,10 +893,7 @@ mod tests {
         fs::create_dir_all(&agents).unwrap();
         fs::write(agents.join("notes.txt"), "notes").unwrap();
 
-        let found = discover_agents_in_dirs(
-            tmp.path(),
-            &["./agents/notes.txt".to_string()],
-        );
+        let found = discover_agents_in_dirs(tmp.path(), &["./agents/notes.txt".to_string()]);
         assert!(found.is_empty());
     }
 
@@ -927,10 +908,7 @@ mod tests {
         // Mix: one file path + one directory path
         let found = discover_agents_in_dirs(
             tmp.path(),
-            &[
-                "./agents/a.md".to_string(),
-                "./agents/".to_string(),
-            ],
+            &["./agents/a.md".to_string(), "./agents/".to_string()],
         );
         let names: Vec<_> = found
             .iter()
@@ -949,10 +927,8 @@ mod tests {
         fs::write(agents.join("a.json"), b"{}").unwrap();
         fs::write(agents.join("b.json"), b"{}").unwrap();
 
-        let found = discover_native_kiro_agents_in_dirs(
-            tmp.path(),
-            &["./agents/a.json".to_string()],
-        );
+        let found =
+            discover_native_kiro_agents_in_dirs(tmp.path(), &["./agents/a.json".to_string()]);
         assert_eq!(found.len(), 1);
         assert_eq!(
             found[0].source.file_name().unwrap().to_string_lossy(),
@@ -968,10 +944,8 @@ mod tests {
         fs::create_dir_all(&agents).unwrap();
         fs::write(agents.join("README.json"), b"{}").unwrap();
 
-        let found = discover_native_kiro_agents_in_dirs(
-            tmp.path(),
-            &["./agents/README.json".to_string()],
-        );
+        let found =
+            discover_native_kiro_agents_in_dirs(tmp.path(), &["./agents/README.json".to_string()]);
         assert!(found.is_empty());
     }
 }
