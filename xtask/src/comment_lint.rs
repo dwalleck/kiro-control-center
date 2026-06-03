@@ -264,7 +264,7 @@ const ALLOWED_SITES: &[AllowedSite] = &[
     },
     AllowedSite {
         path: "crates/kiro-market-core/src/project.rs",
-        line: 10891,
+        line: 10859,
         reason: LEGACY_BASELINE_REASON,
     },
     AllowedSite {

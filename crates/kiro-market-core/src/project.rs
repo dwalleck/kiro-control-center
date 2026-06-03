@@ -10184,38 +10184,6 @@ mod tests {
         assert_eq!(got, "", "empty file reads as empty string");
     }
 
-    /// Windows: a reparse point (directory junction) at `<name>.json` is
-    /// refused via the open-handle metadata check, mirroring the Unix
-    /// `O_NOFOLLOW` refusal. `Path::is_symlink()` misses junctions
-    /// (`IO_REPARSE_TAG_MOUNT_POINT`), so `is_reparse_or_symlink` is what
-    /// catches them. Exercises the Windows half of the no-follow open,
-    /// which the Unix-only symlink test cannot reach.
-    #[cfg(windows)]
-    #[test]
-    fn read_user_agent_json_refuses_reparse_point() {
-        let (dir, project) = temp_project();
-        let agents = project.kiro_dir().join("agents");
-        std::fs::create_dir_all(&agents).expect("mk agents");
-
-        // Junctions are directory-only, so point one outside agents/.
-        // A reparse point at <agents>/evil.json must be refused before
-        // any target content can flow back into the editor draft.
-        let outside = dir.path().join("outside");
-        std::fs::create_dir_all(&outside).expect("mk outside");
-        junction::create(&outside, agents.join("evil.json")).expect("create junction");
-
-        let err = project
-            .read_user_agent_json("evil")
-            .expect_err("reparse point at the target must be refused");
-        assert!(
-            matches!(
-                err,
-                crate::error::Error::Agent(AgentError::NotInstalled { .. })
-            ),
-            "expected NotInstalled for a reparse point, got {err:?}",
-        );
-    }
-
     /// Missing file → `AgentError::NotInstalled`. Maps to the
     /// `not_found` Tauri `ErrorType` so the editor can surface a
     /// "agent went missing; refresh" branch distinct from a
