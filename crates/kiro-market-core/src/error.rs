@@ -443,6 +443,12 @@ pub enum AgentError {
     /// The cap matches the draft-write cap so the authoring round-trip
     /// stays lossless: anything materially larger than the write cap did
     /// not originate from the authoring path.
+    ///
+    /// Unlike the sibling [`AgentError::DuplicateSourceTooLarge`], this
+    /// carries only `limit_bytes`, not the file's actual size: the bounded
+    /// `take(cap + 1)` read stops before the true size is known, so there
+    /// is no honest size to report (and fabricating one would assert a
+    /// byte count the read never measured).
     #[error("agent `{name}` exceeds the {limit_bytes}-byte read cap")]
     AgentFileTooLarge { name: String, limit_bytes: u64 },
 

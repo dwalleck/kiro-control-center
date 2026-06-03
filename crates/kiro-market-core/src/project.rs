@@ -1287,6 +1287,9 @@ impl KiroProject {
     ///   for safety (symlink). The two cases share a variant because
     ///   the editor's UX for both is "the agent went missing; return
     ///   to the list and refresh."
+    /// - [`AgentError::AgentFileTooLarge`] — file exceeds
+    ///   [`USER_AGENT_READ_BYTE_CAP`]; refused without loading it into
+    ///   memory.
     /// - I/O / UTF-8 errors during the read.
     pub fn read_user_agent_json(&self, name: &str) -> crate::error::Result<String> {
         use std::io::Read;
@@ -1311,7 +1314,7 @@ impl KiroProject {
             Err(e) if is_nofollow_symlink_error(&e) => {
                 warn!(
                     path = %path.display(),
-                    "refusing to read symlinked agent file in read_user_agent_json (defense-in-depth)",
+                    "refusing symlinked agent file in read_user_agent_json: O_NOFOLLOW open refused it (defense-in-depth)",
                 );
                 return Err(AgentError::NotInstalled {
                     name: name.into_inner(),
@@ -1329,7 +1332,7 @@ impl KiroProject {
         if crate::platform::is_reparse_or_symlink(&metadata) {
             warn!(
                 path = %path.display(),
-                "refusing to read symlinked agent file in read_user_agent_json (defense-in-depth)",
+                "refusing symlinked agent file in read_user_agent_json: open-handle metadata is a reparse point (defense-in-depth)",
             );
             return Err(AgentError::NotInstalled {
                 name: name.into_inner(),
@@ -10163,6 +10166,54 @@ mod tests {
             .read_user_agent_json("max")
             .expect("file at exactly the cap must read successfully");
         assert_eq!(got.len(), cap, "must return all cap bytes verbatim");
+    }
+
+    /// An empty (0-byte) file reads successfully as an empty string — not
+    /// mistaken for missing or errored. Exercises `read_to_end` returning
+    /// zero bytes under the cap.
+    #[test]
+    fn read_user_agent_json_reads_empty_file() {
+        let (_dir, project) = temp_project();
+        let agents = project.kiro_dir().join("agents");
+        std::fs::create_dir_all(&agents).expect("mk agents");
+        std::fs::write(agents.join("empty.json"), b"").expect("seed empty");
+
+        let got = project
+            .read_user_agent_json("empty")
+            .expect("empty file must read successfully");
+        assert_eq!(got, "", "empty file reads as empty string");
+    }
+
+    /// Windows: a reparse point (directory junction) at `<name>.json` is
+    /// refused via the open-handle metadata check, mirroring the Unix
+    /// `O_NOFOLLOW` refusal. `Path::is_symlink()` misses junctions
+    /// (`IO_REPARSE_TAG_MOUNT_POINT`), so `is_reparse_or_symlink` is what
+    /// catches them. Exercises the Windows half of the no-follow open,
+    /// which the Unix-only symlink test cannot reach.
+    #[cfg(windows)]
+    #[test]
+    fn read_user_agent_json_refuses_reparse_point() {
+        let (dir, project) = temp_project();
+        let agents = project.kiro_dir().join("agents");
+        std::fs::create_dir_all(&agents).expect("mk agents");
+
+        // Junctions are directory-only, so point one outside agents/.
+        // A reparse point at <agents>/evil.json must be refused before
+        // any target content can flow back into the editor draft.
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(&outside).expect("mk outside");
+        junction::create(&outside, agents.join("evil.json")).expect("create junction");
+
+        let err = project
+            .read_user_agent_json("evil")
+            .expect_err("reparse point at the target must be refused");
+        assert!(
+            matches!(
+                err,
+                crate::error::Error::Agent(AgentError::NotInstalled { .. })
+            ),
+            "expected NotInstalled for a reparse point, got {err:?}",
+        );
     }
 
     /// Missing file → `AgentError::NotInstalled`. Maps to the

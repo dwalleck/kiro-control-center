@@ -380,6 +380,13 @@ mod tests {
         CoreError::Agent(AgentError::InvalidName { reason: "leading hyphen".into() }),
         ErrorType::Validation
     )]
+    #[case::agent_file_too_large(
+        CoreError::Agent(AgentError::AgentFileTooLarge {
+            name: "huge".into(),
+            limit_bytes: 1_048_576,
+        }),
+        ErrorType::Validation
+    )]
     #[case::agent_name_collision(
         CoreError::Agent(AgentError::NameCollision { name: "a".into() }),
         ErrorType::AlreadyExists

@@ -121,6 +121,13 @@ pub(in crate::commands) fn validate_kiro_project_path(
 /// (typical files are under 10 KiB) while bounding the memory
 /// footprint a renderer can ask the backend to allocate via a single
 /// `create_user_agent` / `save_user_agent` call.
+///
+/// Kept equal to `kiro_market_core`'s `USER_AGENT_READ_BYTE_CAP` (the
+/// read-side bound in `read_user_agent_json`) by intent: the read cap
+/// must be >= this write cap or a draft saved at exactly the write cap
+/// would be rejected on reload, breaking the authoring round-trip. The
+/// two are separate constants (distinct crates, `usize` vs `u64`) equal
+/// by value, not by definition — change them together.
 pub(in crate::commands) const DRAFT_JSON_BYTE_CAP: usize = 1024 * 1024;
 
 /// Fail-fast IPC-boundary guard for the `draft_json` payload accepted

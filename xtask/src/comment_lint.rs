@@ -244,27 +244,27 @@ const ALLOWED_SITES: &[AllowedSite] = &[
     },
     AllowedSite {
         path: "crates/kiro-market-core/src/project.rs",
-        line: 1416,
+        line: 1419,
         reason: LEGACY_BASELINE_REASON,
     },
     AllowedSite {
         path: "crates/kiro-market-core/src/project.rs",
-        line: 1579,
+        line: 1582,
         reason: LEGACY_BASELINE_REASON,
     },
     AllowedSite {
         path: "crates/kiro-market-core/src/project.rs",
-        line: 1860,
+        line: 1863,
         reason: LEGACY_BASELINE_REASON,
     },
     AllowedSite {
         path: "crates/kiro-market-core/src/project.rs",
-        line: 10013,
+        line: 10016,
         reason: LEGACY_BASELINE_REASON,
     },
     AllowedSite {
         path: "crates/kiro-market-core/src/project.rs",
-        line: 10840,
+        line: 10891,
         reason: LEGACY_BASELINE_REASON,
     },
     AllowedSite {
@@ -320,62 +320,62 @@ const ALLOWED_SITES: &[AllowedSite] = &[
     },
     AllowedSite {
         path: "crates/kiro-market-core/src/project.rs",
-        line: 3856,
+        line: 3859,
         reason: LEGACY_BASELINE_REASON,
     },
     AllowedSite {
         path: "crates/kiro-market-core/src/project.rs",
-        line: 4182,
+        line: 4185,
         reason: LEGACY_BASELINE_REASON,
     },
     AllowedSite {
         path: "crates/kiro-market-core/src/project.rs",
-        line: 4592,
+        line: 4595,
         reason: LEGACY_BASELINE_REASON,
     },
     AllowedSite {
         path: "crates/kiro-market-core/src/project.rs",
-        line: 4764,
+        line: 4767,
         reason: LEGACY_BASELINE_REASON,
     },
     AllowedSite {
         path: "crates/kiro-market-core/src/project.rs",
-        line: 6280,
+        line: 6283,
         reason: LEGACY_BASELINE_REASON,
     },
     AllowedSite {
         path: "crates/kiro-market-core/src/project.rs",
-        line: 6855,
+        line: 6858,
         reason: FIXTURE_NAME_REASON,
     },
     AllowedSite {
         path: "crates/kiro-market-core/src/project.rs",
-        line: 6882,
+        line: 6885,
         reason: FIXTURE_NAME_REASON,
     },
     AllowedSite {
         path: "crates/kiro-market-core/src/project.rs",
-        line: 8911,
+        line: 8914,
         reason: LEGACY_BASELINE_REASON,
     },
     AllowedSite {
         path: "crates/kiro-market-core/src/project.rs",
-        line: 8923,
+        line: 8926,
         reason: LEGACY_BASELINE_REASON,
     },
     AllowedSite {
         path: "crates/kiro-market-core/src/project.rs",
-        line: 8992,
+        line: 8995,
         reason: LEGACY_BASELINE_REASON,
     },
     AllowedSite {
         path: "crates/kiro-market-core/src/project.rs",
-        line: 9222,
+        line: 9225,
         reason: LEGACY_BASELINE_REASON,
     },
     AllowedSite {
         path: "crates/kiro-market-core/src/project.rs",
-        line: 9622,
+        line: 9625,
         reason: LEGACY_BASELINE_REASON,
     },
     AllowedSite {
