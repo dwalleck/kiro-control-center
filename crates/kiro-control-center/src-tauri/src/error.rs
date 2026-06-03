@@ -112,6 +112,7 @@ impl From<CoreError> for CommandError {
             CoreError::Agent(AgentError::SourceHardlinked { .. }) => ErrorType::Validation,
             CoreError::Agent(AgentError::InstallFailed { .. }) => ErrorType::IoError,
             CoreError::Agent(AgentError::InvalidName { .. }) => ErrorType::Validation,
+            CoreError::Agent(AgentError::AgentFileTooLarge { .. }) => ErrorType::Validation,
             CoreError::Agent(AgentError::NameCollision { .. }) => ErrorType::AlreadyExists,
             CoreError::Agent(AgentError::DuplicateSourceNotFound { .. }) => ErrorType::NotFound,
             CoreError::Agent(AgentError::DuplicateSourceSymlinked { .. }) => ErrorType::Validation,

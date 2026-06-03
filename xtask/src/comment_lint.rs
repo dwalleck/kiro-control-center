@@ -194,7 +194,7 @@ const ALLOWED_SITES: &[AllowedSite] = &[
     },
     AllowedSite {
         path: "crates/kiro-control-center/src-tauri/src/error.rs",
-        line: 320,
+        line: 321,
         reason: LEGACY_BASELINE_REASON,
     },
     AllowedSite {
@@ -244,27 +244,27 @@ const ALLOWED_SITES: &[AllowedSite] = &[
     },
     AllowedSite {
         path: "crates/kiro-market-core/src/project.rs",
-        line: 1321,
+        line: 1416,
         reason: LEGACY_BASELINE_REASON,
     },
     AllowedSite {
         path: "crates/kiro-market-core/src/project.rs",
-        line: 1484,
+        line: 1579,
         reason: LEGACY_BASELINE_REASON,
     },
     AllowedSite {
         path: "crates/kiro-market-core/src/project.rs",
-        line: 1765,
+        line: 1860,
         reason: LEGACY_BASELINE_REASON,
     },
     AllowedSite {
         path: "crates/kiro-market-core/src/project.rs",
-        line: 9918,
+        line: 10013,
         reason: LEGACY_BASELINE_REASON,
     },
     AllowedSite {
         path: "crates/kiro-market-core/src/project.rs",
-        line: 10694,
+        line: 10840,
         reason: LEGACY_BASELINE_REASON,
     },
     AllowedSite {
@@ -274,27 +274,27 @@ const ALLOWED_SITES: &[AllowedSite] = &[
     },
     AllowedSite {
         path: "crates/kiro-market-core/src/service/mod.rs",
-        line: 3689,
+        line: 3690,
         reason: LEGACY_BASELINE_REASON,
     },
     AllowedSite {
         path: "crates/kiro-market-core/src/service/mod.rs",
-        line: 4717,
+        line: 4718,
         reason: LEGACY_BASELINE_REASON,
     },
     AllowedSite {
         path: "crates/kiro-market-core/src/service/mod.rs",
-        line: 5050,
+        line: 5051,
         reason: LEGACY_BASELINE_REASON,
     },
     AllowedSite {
         path: "crates/kiro-market-core/src/service/mod.rs",
-        line: 5100,
+        line: 5101,
         reason: LEGACY_BASELINE_REASON,
     },
     AllowedSite {
         path: "crates/kiro-market-core/src/service/mod.rs",
-        line: 8767,
+        line: 8768,
         reason: LEGACY_BASELINE_REASON,
     },
     AllowedSite {
@@ -320,62 +320,62 @@ const ALLOWED_SITES: &[AllowedSite] = &[
     },
     AllowedSite {
         path: "crates/kiro-market-core/src/project.rs",
-        line: 3761,
+        line: 3856,
         reason: LEGACY_BASELINE_REASON,
     },
     AllowedSite {
         path: "crates/kiro-market-core/src/project.rs",
-        line: 4087,
+        line: 4182,
         reason: LEGACY_BASELINE_REASON,
     },
     AllowedSite {
         path: "crates/kiro-market-core/src/project.rs",
-        line: 4497,
+        line: 4592,
         reason: LEGACY_BASELINE_REASON,
     },
     AllowedSite {
         path: "crates/kiro-market-core/src/project.rs",
-        line: 4669,
+        line: 4764,
         reason: LEGACY_BASELINE_REASON,
     },
     AllowedSite {
         path: "crates/kiro-market-core/src/project.rs",
-        line: 6185,
+        line: 6280,
         reason: LEGACY_BASELINE_REASON,
     },
     AllowedSite {
         path: "crates/kiro-market-core/src/project.rs",
-        line: 6760,
+        line: 6855,
         reason: FIXTURE_NAME_REASON,
     },
     AllowedSite {
         path: "crates/kiro-market-core/src/project.rs",
-        line: 6787,
+        line: 6882,
         reason: FIXTURE_NAME_REASON,
     },
     AllowedSite {
         path: "crates/kiro-market-core/src/project.rs",
-        line: 8816,
+        line: 8911,
         reason: LEGACY_BASELINE_REASON,
     },
     AllowedSite {
         path: "crates/kiro-market-core/src/project.rs",
-        line: 8828,
+        line: 8923,
         reason: LEGACY_BASELINE_REASON,
     },
     AllowedSite {
         path: "crates/kiro-market-core/src/project.rs",
-        line: 8897,
+        line: 8992,
         reason: LEGACY_BASELINE_REASON,
     },
     AllowedSite {
         path: "crates/kiro-market-core/src/project.rs",
-        line: 9127,
+        line: 9222,
         reason: LEGACY_BASELINE_REASON,
     },
     AllowedSite {
         path: "crates/kiro-market-core/src/project.rs",
-        line: 9527,
+        line: 9622,
         reason: LEGACY_BASELINE_REASON,
     },
     AllowedSite {
@@ -396,7 +396,7 @@ const ALLOWED_SITES: &[AllowedSite] = &[
     },
     AllowedSite {
         path: "crates/kiro-market-core/src/service/mod.rs",
-        line: 7062,
+        line: 7063,
         reason: LEGACY_BASELINE_REASON,
     },
     AllowedSite {

@@ -3337,6 +3337,7 @@ dependencies = [
  "hex",
  "junction",
  "kiro-market-core",
+ "libc",
  "rstest",
  "serde",
  "serde_json",

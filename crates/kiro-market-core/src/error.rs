@@ -436,6 +436,16 @@ pub enum AgentError {
     #[error("agent name is invalid: {reason}")]
     InvalidName { reason: String },
 
+    /// The user-authored agent file at `<name>.json` exceeds the byte cap
+    /// the editor's edit-mode load will pull into memory. The read path
+    /// bounds the bytes read at the cap so a multi-GB file mistakenly
+    /// placed in `.kiro/agents/` cannot OOM the backend on a single load.
+    /// The cap matches the draft-write cap so the authoring round-trip
+    /// stays lossless: anything materially larger than the write cap did
+    /// not originate from the authoring path.
+    #[error("agent `{name}` exceeds the {limit_bytes}-byte read cap")]
+    AgentFileTooLarge { name: String, limit_bytes: u64 },
+
     /// A file already exists at the target `<name>.json` path on create
     /// or rename. The target file is not modified. The user must pick a
     /// different name or delete the existing agent first.

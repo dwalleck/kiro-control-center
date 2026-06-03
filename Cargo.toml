@@ -71,6 +71,7 @@ hex = "0.4"
 
 # Platform
 junction = "1"
+libc = "0.2"
 
 # File locking
 fs4 = "0.13"

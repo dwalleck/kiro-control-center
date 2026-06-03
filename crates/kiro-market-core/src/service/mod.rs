@@ -791,6 +791,7 @@ fn companion_conflicts_from_error(err: &crate::error::AgentError) -> Vec<std::pa
         // the marketplace install pipeline, so they cannot produce
         // companion-file conflicts.
         | AgentError::InvalidName { .. }
+        | AgentError::AgentFileTooLarge { .. }
         | AgentError::NameCollision { .. }
         | AgentError::DuplicateSourceNotFound { .. }
         | AgentError::DuplicateSourceSymlinked { .. }
