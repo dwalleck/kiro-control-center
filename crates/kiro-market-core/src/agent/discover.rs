@@ -31,7 +31,7 @@ fn push_if_md_agent(path: PathBuf, out: &mut Vec<PathBuf>) {
     {
         return;
     }
-    if Path::new(name)
+    if path
         .extension()
         .is_some_and(|ext| ext.eq_ignore_ascii_case("md"))
     {
@@ -53,17 +53,14 @@ fn push_if_native_json(path: PathBuf, scan_root: PathBuf, out: &mut Vec<Discover
     };
     // README/CONTRIBUTING/CHANGELOG with .json extension are excluded
     // case-insensitively by stem to mirror the .md exclusion.
-    let stem = Path::new(name)
-        .file_stem()
-        .and_then(|s| s.to_str())
-        .unwrap_or(name);
+    let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or(name);
     if EXCLUDED_STEMS
         .iter()
         .any(|excluded| excluded.eq_ignore_ascii_case(stem))
     {
         return;
     }
-    if Path::new(name)
+    if path
         .extension()
         .is_some_and(|ext| ext.eq_ignore_ascii_case("json"))
     {
@@ -74,6 +71,53 @@ fn push_if_native_json(path: PathBuf, scan_root: PathBuf, out: &mut Vec<Discover
     }
 }
 
+/// Stat a directory entry with the symlink/reparse/`is_file` guards the
+/// scan loops require, returning the entry's path only if it is a regular,
+/// non-symlink file. Every rejection logs — `warn!` for an I/O error,
+/// `debug!` for a refused reparse/symlink — so a skipped entry is never
+/// silent.
+///
+/// `symlink_metadata` does NOT follow symlinks, so a malicious plugin
+/// cannot smuggle in a path that reads arbitrary files downstream. Both
+/// discovery directory loops and the companion-file walk route through
+/// this one definition so the security guard cannot drift between them.
+fn vetted_regular_file(entry: io::Result<fs::DirEntry>, scan_dir: &Path) -> Option<PathBuf> {
+    let entry = match entry {
+        Ok(e) => e,
+        Err(e) => {
+            warn!(
+                dir = %scan_dir.display(),
+                error = %e,
+                "failed to read directory entry; skipping"
+            );
+            return None;
+        }
+    };
+    let path = entry.path();
+    let meta = match fs::symlink_metadata(&path) {
+        Ok(m) => m,
+        Err(e) => {
+            warn!(
+                path = %path.display(),
+                error = %e,
+                "failed to stat scan candidate; skipping"
+            );
+            return None;
+        }
+    };
+    if crate::platform::is_reparse_or_symlink(&meta) {
+        debug!(
+            path = %path.display(),
+            "skipping symlink or reparse point in scan directory"
+        );
+        return None;
+    }
+    if !meta.file_type().is_file() {
+        return None;
+    }
+    Some(path)
+}
+
 /// Find agent markdown files inside `plugin_dir` according to `scan_paths`.
 ///
 /// `scan_paths` are relative to `plugin_dir`. Each entry is first validated
@@ -82,10 +126,12 @@ fn push_if_native_json(path: PathBuf, scan_root: PathBuf, out: &mut Vec<Discover
 /// components. Invalid entries are skipped with a `warn!`. This matches
 /// the skill discovery guard in `plugin::discover_skill_dirs`.
 ///
-/// Files whose extension is `md` (case-insensitive) are included; the
-/// caller uses `detect_dialect` at parse time to route to the right
-/// parser. Scans are non-recursive: only direct children of each scan
-/// directory are considered. This avoids grabbing nested `prompts/*.md`
+/// Each scan path may resolve to a directory (scanned for direct children)
+/// or directly to a single file (a plugin manifest may list individual
+/// agent files). Files whose extension is `md` (case-insensitive) are
+/// included; the caller uses `detect_dialect` at parse time to route to
+/// the right parser. Directory scans are non-recursive: only direct
+/// children are considered. This avoids grabbing nested `prompts/*.md`
 /// or editor backup files.
 ///
 /// README / CONTRIBUTING / CHANGELOG are excluded by filename so plugins
@@ -95,9 +141,11 @@ fn push_if_native_json(path: PathBuf, scan_root: PathBuf, out: &mut Vec<Discover
 /// warnings — the service layer demotes the `MissingFrontmatter` flavor
 /// specifically via a variant match on `ParseFailure`.
 ///
-/// `read_dir` failures are handled narrowly: `NotFound` silently yields
-/// an empty list (the scan dir may legitimately not exist), but every
-/// other I/O error is logged via `warn!` so a permission-denied or
+/// I/O failures are handled narrowly: the scan path is stat'd first via
+/// `symlink_metadata`, where `NotFound` silently continues (the path may
+/// legitimately not exist) and every other stat error is logged via
+/// `warn!`. A `read_dir` on a confirmed-present directory that then fails
+/// is likewise logged, never silently swallowed, so a permission-denied or
 /// filesystem error cannot present as "no agents here".
 #[must_use]
 pub fn discover_agents_in_dirs(plugin_dir: &Path, scan_paths: &[String]) -> Vec<PathBuf> {
@@ -130,9 +178,13 @@ pub fn discover_agents_in_dirs(plugin_dir: &Path, scan_paths: &[String]) -> Vec<
         };
 
         if crate::platform::is_reparse_or_symlink(&metadata) {
-            debug!(
+            // A scan path the manifest named explicitly should not be a
+            // symlink: it's either a broken manifest entry or an
+            // exfiltration probe, so surface it at warn! (unlike the
+            // incidental directory-walk skip below, which stays debug!).
+            warn!(
                 path = %resolved.display(),
-                "skipping symlink or reparse point in agent scan path"
+                "refusing symlink or reparse point at agent scan path; skipping"
             );
             continue;
         }
@@ -155,43 +207,9 @@ pub fn discover_agents_in_dirs(plugin_dir: &Path, scan_paths: &[String]) -> Vec<
             }
         };
         for entry in entries {
-            let entry = match entry {
-                Ok(e) => e,
-                Err(e) => {
-                    warn!(
-                        dir = %resolved.display(),
-                        error = %e,
-                        "failed to read directory entry; skipping"
-                    );
-                    continue;
-                }
-            };
-            let path = entry.path();
-            // Use symlink_metadata (does NOT follow symlinks) so a malicious
-            // plugin cannot smuggle in an agent path that reads arbitrary
-            // files via parse_agent_file. Matches project::copy_dir_recursive.
-            let entry_meta = match fs::symlink_metadata(&path) {
-                Ok(m) => m,
-                Err(e) => {
-                    warn!(
-                        path = %path.display(),
-                        error = %e,
-                        "failed to stat agent candidate; skipping"
-                    );
-                    continue;
-                }
-            };
-            if crate::platform::is_reparse_or_symlink(&entry_meta) {
-                debug!(
-                    path = %path.display(),
-                    "skipping symlink or reparse point in agent scan directory"
-                );
-                continue;
+            if let Some(path) = vetted_regular_file(entry, &resolved) {
+                push_if_md_agent(path, &mut out);
             }
-            if !entry_meta.file_type().is_file() {
-                continue;
-            }
-            push_if_md_agent(path, &mut out);
         }
     }
     out
@@ -212,7 +230,11 @@ pub fn discover_agents_in_dirs(plugin_dir: &Path, scan_paths: &[String]) -> Vec<
 pub struct DiscoveredNativeFile {
     /// Absolute path to the source file inside the plugin.
     pub source: PathBuf,
-    /// The resolved scan-path directory (e.g. `<plugin>/agents/`).
+    /// The directory `source` was discovered under (e.g. `<plugin>/agents/`).
+    /// For a directory-valued scan path this is the scan path itself; for a
+    /// file-valued scan path it is the file's containing directory. Either
+    /// way `source` is always a child of `scan_root`, so the install layer
+    /// can compute the destination-relative path via `strip_prefix`.
     pub scan_root: PathBuf,
 }
 
@@ -251,9 +273,13 @@ pub fn discover_native_kiro_agents_in_dirs(
         };
 
         if crate::platform::is_reparse_or_symlink(&metadata) {
-            debug!(
+            // A scan path the manifest named explicitly should not be a
+            // symlink: it's either a broken manifest entry or an
+            // exfiltration probe, so surface it at warn! (unlike the
+            // incidental directory-walk skip below, which stays debug!).
+            warn!(
                 path = %resolved.display(),
-                "skipping symlink or reparse point in native agent scan path"
+                "refusing symlink or reparse point at native agent scan path; skipping"
             );
             continue;
         }
@@ -278,40 +304,9 @@ pub fn discover_native_kiro_agents_in_dirs(
             }
         };
         for entry in entries {
-            let entry = match entry {
-                Ok(e) => e,
-                Err(e) => {
-                    warn!(
-                        dir = %resolved.display(),
-                        error = %e,
-                        "failed to read directory entry; skipping"
-                    );
-                    continue;
-                }
-            };
-            let path = entry.path();
-            let entry_meta = match fs::symlink_metadata(&path) {
-                Ok(m) => m,
-                Err(e) => {
-                    warn!(
-                        path = %path.display(),
-                        error = %e,
-                        "failed to stat native agent candidate; skipping"
-                    );
-                    continue;
-                }
-            };
-            if crate::platform::is_reparse_or_symlink(&entry_meta) {
-                debug!(
-                    path = %path.display(),
-                    "skipping symlink or reparse point in native agent scan directory"
-                );
-                continue;
+            if let Some(path) = vetted_regular_file(entry, &resolved) {
+                push_if_native_json(path, resolved.clone(), &mut out);
             }
-            if !entry_meta.file_type().is_file() {
-                continue;
-            }
-            push_if_native_json(path, resolved.clone(), &mut out);
         }
     }
     out
@@ -407,39 +402,9 @@ fn collect_companion_subdir_files(
         }
     };
     for inner_entry in inner {
-        let inner_entry = match inner_entry {
-            Ok(e) => e,
-            Err(e) => {
-                warn!(
-                    dir = %subdir.display(),
-                    error = %e,
-                    "failed to read companion entry; skipping"
-                );
-                continue;
-            }
-        };
-        let inner_path = inner_entry.path();
-        let inner_md = match fs::symlink_metadata(&inner_path) {
-            Ok(m) => m,
-            Err(e) => {
-                warn!(
-                    path = %inner_path.display(),
-                    error = %e,
-                    "failed to stat companion file; skipping"
-                );
-                continue;
-            }
-        };
-        if crate::platform::is_reparse_or_symlink(&inner_md) {
-            debug!(
-                path = %inner_path.display(),
-                "skipping symlink or reparse point in companion subdir"
-            );
+        let Some(inner_path) = vetted_regular_file(inner_entry, subdir) else {
             continue;
-        }
-        if !inner_md.file_type().is_file() {
-            continue;
-        }
+        };
         let Some(name) = inner_path.file_name().and_then(|n| n.to_str()) else {
             continue;
         };
@@ -914,9 +879,13 @@ mod tests {
             .iter()
             .map(|p| p.file_name().unwrap().to_string_lossy().to_string())
             .collect();
-        // a.md appears from the file path, and both a.md and b.md from the dir scan
-        assert!(names.contains(&"a.md".to_string()));
-        assert!(names.contains(&"b.md".to_string()));
+        // a.md is reached BOTH via the explicit file path and via the dir
+        // scan, so it appears twice — discovery intentionally does NOT
+        // deduplicate; collapsing duplicates is the parse/install layer's
+        // job. b.md comes only from the dir scan. Pin the exact multiset.
+        assert_eq!(names.iter().filter(|n| *n == "a.md").count(), 2);
+        assert_eq!(names.iter().filter(|n| *n == "b.md").count(), 1);
+        assert_eq!(names.len(), 3);
     }
 
     #[test]
@@ -946,6 +915,77 @@ mod tests {
 
         let found =
             discover_native_kiro_agents_in_dirs(tmp.path(), &["./agents/README.json".to_string()]);
+        assert!(found.is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn discover_file_path_skips_symlinked_file() {
+        // A manifest naming a symlinked file directly (e.g. `./agents/evil.md`
+        // -> an out-of-tree target) must be refused, just like a symlink found
+        // while walking a directory. Exercises the file-path-branch symlink
+        // guard, which is separate code from the directory-walk guard.
+        let tmp = tempdir().unwrap();
+        let agents = tmp.path().join("agents");
+        fs::create_dir_all(&agents).unwrap();
+        let target = tmp.path().join("secret.md");
+        fs::write(&target, "---\nname: secret\n---\nclassified\n").unwrap();
+        std::os::unix::fs::symlink(&target, agents.join("evil.md")).unwrap();
+
+        let found = discover_agents_in_dirs(tmp.path(), &["./agents/evil.md".to_string()]);
+        assert!(
+            found.is_empty(),
+            "directly-listed symlink file must be refused: {found:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_discovery_file_path_skips_symlinked_file() {
+        // Native analog of discover_file_path_skips_symlinked_file. The
+        // scan_root derivation runs only after the symlink check, so a
+        // regression here would also leak scan_root.
+        let tmp = tempdir().unwrap();
+        let agents = tmp.path().join("agents");
+        fs::create_dir_all(&agents).unwrap();
+        let target = tmp.path().join("outside.json");
+        fs::write(&target, b"{}").unwrap();
+        std::os::unix::fs::symlink(&target, agents.join("evil.json")).unwrap();
+
+        let found =
+            discover_native_kiro_agents_in_dirs(tmp.path(), &["./agents/evil.json".to_string()]);
+        assert!(
+            found.is_empty(),
+            "directly-listed symlink file must be refused: {found:?}"
+        );
+    }
+
+    #[test]
+    fn discover_file_path_skips_json_file() {
+        // A .json file listed in the markdown scan list is silently skipped
+        // (the native loop claims it instead). A plugin that lists every
+        // agent file individually mixes dialects in one flat list, so each
+        // pass must drop the entries it doesn't own.
+        let tmp = tempdir().unwrap();
+        let agents = tmp.path().join("agents");
+        fs::create_dir_all(&agents).unwrap();
+        fs::write(agents.join("agent.json"), b"{}").unwrap();
+
+        let found = discover_agents_in_dirs(tmp.path(), &["./agents/agent.json".to_string()]);
+        assert!(found.is_empty());
+    }
+
+    #[test]
+    fn native_discovery_file_path_skips_md_file() {
+        // Symmetric to discover_file_path_skips_json_file: a .md file in a
+        // native scan list is dropped by the native loop.
+        let tmp = tempdir().unwrap();
+        let agents = tmp.path().join("agents");
+        fs::create_dir_all(&agents).unwrap();
+        fs::write(agents.join("agent.md"), "---\nname: a\n---\n").unwrap();
+
+        let found =
+            discover_native_kiro_agents_in_dirs(tmp.path(), &["./agents/agent.md".to_string()]);
         assert!(found.is_empty());
     }
 }
