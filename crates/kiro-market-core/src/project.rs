@@ -1931,17 +1931,17 @@ impl KiroProject {
             update_latest(acc, meta.version.as_deref(), meta.installed_at);
         }
 
-        // Hoist `Utc::now()` out of the map closure (A-9): one syscall
-        // not N. Also makes the fallback substitution explicit at one
-        // site — a missing `installed_at` is a degenerate state the
+        // Compute `Utc::now()` once before the loop: it's the fallback
+        // substituted in when a tracking entry is missing its
+        // `installed_at` timestamp, and computing it once avoids N
+        // syscalls. A missing `installed_at` is a degenerate state the
         // tracking file shouldn't produce; substituting "now" is a
         // fallback the UI accepts but a future reader can scrutinize.
         let now = chrono::Utc::now();
         let plugins: Vec<InstalledPluginInfo> = by_pair
             .into_iter()
             .map(|((marketplace, plugin), mut acc)| {
-                let (latest_install_dt, installed_version) =
-                    acc.latest.map_or_else(|| (now, None), |(t, v)| (t, v));
+                let (latest_install_dt, installed_version) = acc.latest.unwrap_or((now, None));
                 let earliest_install_dt = acc.earliest.unwrap_or(now);
                 // Sort the per-plugin item Vecs (I1) so the wire-format
                 // ordering doesn't depend on HashMap iteration order.
