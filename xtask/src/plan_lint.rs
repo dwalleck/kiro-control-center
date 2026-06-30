@@ -285,6 +285,41 @@ WHERE s.kind = 'enum'
   )
 ORDER BY f.path, s.line";
 
+/// C7 fence for agents-view slice 1 (design-6g6r.md): the five user-agent
+/// authoring commands in `commands/agents_authoring.rs` MUST stay
+/// project-only — they never construct or accept a `MarketplaceService`.
+/// A future contributor copy-pasting from a service-consuming command
+/// (e.g. `install_agents` in `agents.rs`) would re-introduce the
+/// marketplace coupling, and the existing wrapper tests would not catch
+/// it. CLAUDE.md "Tauri command handlers": project-only commands inline
+/// the body in the wrapper (no `_impl(svc, ...)` pattern).
+///
+/// Detection is via the `imports` table, NOT text-grep: the target file's
+/// own module doc comment names `MarketplaceService` (to document that it
+/// deliberately does *not* use one), so a substring match would fail CI on
+/// the correct file. Doc comments are not `imports` rows; a real coupling
+/// is, in one of two forms — `use …service::MarketplaceService` (the type)
+/// or `use crate::commands::make_service` (the constructor helper). Both
+/// store `symbol_name` as the bare identifier, so the `IN (...)` predicate
+/// catches both. Empirically verified complete + comment-safe against a
+/// fresh tethys index (design-6g6r.md § Empirical verification).
+///
+/// A `refs`-based detection of the bare `make_service()` call is NOT used:
+/// tethys does not record bare free-function call refs (filed tethys-zp2j).
+/// This is not a coverage gap — the call cannot appear without an
+/// accompanying `use`, which this query catches.
+///
+/// `line = 0` sentinel because the `imports` table has no line column
+/// (same as `no-frontend-deps-in-core`); `format_path_line` renders a
+/// "grep for import" hint.
+const NO_SERVICE_IN_AGENTS_AUTHORING_SQL: &str = "\
+SELECT f.path, 0 AS line, i.symbol_name AS qualified_name, i.source_module AS signature
+FROM imports i
+JOIN files f ON f.id = i.file_id
+WHERE f.path LIKE '%commands/agents_authoring.rs'
+  AND i.symbol_name IN ('MarketplaceService', 'make_service')
+ORDER BY f.path, i.symbol_name";
+
 const ALL_GATES: &[Gate] = &[
     Gate {
         name: "gate-4-external-error-boundary",
@@ -315,6 +350,11 @@ const ALL_GATES: &[Gate] = &[
         name: "ffi-enum-serde-tag",
         description: "pub Serialize+specta::Type enum with non-unit variants missing #[serde(tag = \"...\")] / #[serde(untagged)]",
         sql: FFI_ENUM_TAG_SQL,
+    },
+    Gate {
+        name: "no-marketplace-service-in-agents-authoring",
+        description: "MarketplaceService / make_service import in commands/agents_authoring.rs (C7: authoring commands must be project-only)",
+        sql: NO_SERVICE_IN_AGENTS_AUTHORING_SQL,
     },
 ];
 
@@ -2138,5 +2178,125 @@ mod tests {
             "nested-module enum with payload must be flagged; got: {findings:?}"
         );
         assert_eq!(findings[0].qualified_name, "outer::Inner");
+    }
+
+    // ─── no-marketplace-service-in-agents-authoring (C7 fence) ──────────
+
+    fn no_service_in_authoring() -> &'static Gate {
+        ALL_GATES
+            .iter()
+            .find(|g| g.name == "no-marketplace-service-in-agents-authoring")
+            .expect("agents-authoring fence gate registered")
+    }
+
+    const AUTHORING_PATH: &str =
+        "crates/kiro-control-center/src-tauri/src/commands/agents_authoring.rs";
+
+    #[test]
+    fn fence_flags_marketplace_service_type_import() {
+        // `use kiro_market_core::service::MarketplaceService;` in the
+        // authoring file → tethys stores symbol_name='MarketplaceService'.
+        let conn = fresh_db();
+        seed_import(
+            &conn,
+            2,
+            AUTHORING_PATH,
+            "MarketplaceService",
+            "kiro_market_core::service",
+        );
+
+        let findings = no_service_in_authoring().run(&conn).expect("query");
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].qualified_name, "MarketplaceService");
+        assert_eq!(findings[0].line, 0, "imports has no line column → sentinel");
+    }
+
+    #[test]
+    fn fence_flags_make_service_import() {
+        // `use crate::commands::make_service;` — the constructor-helper
+        // import that always co-occurs with a `let svc = make_service()?`
+        // call (the call ref itself is not recorded; see tethys-zp2j).
+        let conn = fresh_db();
+        seed_import(&conn, 2, AUTHORING_PATH, "make_service", "crate::commands");
+
+        let findings = no_service_in_authoring().run(&conn).expect("query");
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].qualified_name, "make_service");
+    }
+
+    #[test]
+    fn fence_ignores_unrelated_imports_in_target_file() {
+        // The authoring file legitimately imports KiroProject,
+        // validate_kiro_project_path, etc. None of these are the
+        // forbidden symbols, so the gate must stay silent. This is the
+        // SQL-level analogue of comment-safety: only the two listed
+        // symbol_names fire, and doc-comment mentions never produce an
+        // imports row at all.
+        let conn = fresh_db();
+        seed_import(
+            &conn,
+            2,
+            AUTHORING_PATH,
+            "KiroProject",
+            "kiro_market_core::project",
+        );
+        seed_import(
+            &conn,
+            2,
+            AUTHORING_PATH,
+            "validate_kiro_project_path",
+            "crate::commands",
+        );
+
+        let findings = no_service_in_authoring().run(&conn).expect("query");
+        assert!(
+            findings.is_empty(),
+            "unrelated imports must not trip the fence; got {findings:?}"
+        );
+    }
+
+    #[test]
+    fn fence_ignores_make_service_outside_target_file() {
+        // `make_service` is legitimate everywhere except the authoring
+        // file. A real import in browse.rs must NOT be flagged — the gate
+        // is scoped by path.
+        let conn = fresh_db();
+        seed_import(
+            &conn,
+            2,
+            "crates/kiro-control-center/src-tauri/src/commands/browse.rs",
+            "make_service",
+            "crate::commands",
+        );
+
+        let findings = no_service_in_authoring().run(&conn).expect("query");
+        assert!(
+            findings.is_empty(),
+            "make_service is fine outside the authoring file; got {findings:?}"
+        );
+    }
+
+    #[test]
+    fn fence_flags_both_imports_when_present_together() {
+        // Copy-paste from a service-consuming command brings both the type
+        // import and the helper import. Both must be flagged (ordered by
+        // symbol_name: make_service before MarketplaceService).
+        let conn = fresh_db();
+        seed_import(
+            &conn,
+            2,
+            AUTHORING_PATH,
+            "MarketplaceService",
+            "kiro_market_core::service",
+        );
+        seed_import(&conn, 2, AUTHORING_PATH, "make_service", "crate::commands");
+
+        let findings = no_service_in_authoring().run(&conn).expect("query");
+        assert_eq!(findings.len(), 2);
+        // ORDER BY symbol_name uses SQLite's default BINARY collation:
+        // uppercase 'M' (0x4D) sorts before lowercase 'm' (0x6D), so
+        // "MarketplaceService" precedes "make_service".
+        assert_eq!(findings[0].qualified_name, "MarketplaceService");
+        assert_eq!(findings[1].qualified_name, "make_service");
     }
 }
