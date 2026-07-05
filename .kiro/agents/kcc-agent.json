@@ -14,7 +14,8 @@
     "read",
     "grep",
     "glob",
-    "code"
+    "code",
+    "@svelte"
   ],
   "toolsSettings": {
     "shell": {
@@ -64,5 +65,11 @@
         "timeout_ms": 120000
       }
     ]
+  },
+  "mcpServers": {
+    "svelte": {
+      "command": "npx",
+      "args": ["-y", "@sveltejs/mcp"]
+    }
   }
 }
