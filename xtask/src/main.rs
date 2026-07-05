@@ -310,9 +310,9 @@ fn run_svelte_check(project_dir: &Path) {
 }
 
 /// Fields the xtask hooks care about, projected from the JSON stdin payload
-/// Claude Code sends. Both are `Option` because Stop hooks omit `tool_input`
-/// entirely, and the rest of the wire format is intentionally not modeled
-/// (the xtask only acts on these two fields).
+/// Claude Code or Kiro sends. Both are `Option` because Stop hooks omit
+/// `tool_input` entirely, and the rest of the wire format is intentionally not
+/// modeled (the xtask only acts on these two fields).
 #[derive(Debug, Default, PartialEq, Eq)]
 struct HookInput {
     file_path: Option<PathBuf>,
@@ -323,6 +323,9 @@ struct HookInput {
 /// above is the post-projection shape. Routing through serde here means a
 /// wrong-typed field (e.g. `cwd: 42`) surfaces as a parse error rather than
 /// silently becoming `None` — that was the previous manual-pointer behavior.
+///
+/// Handles both Claude Code and Kiro hook payloads: `cwd` is common to both,
+/// and `tool_input` is projected across the two dialects (see `ToolInputWire`).
 #[derive(Debug, Default, serde::Deserialize)]
 #[serde(default)]
 struct HookInputWire {
@@ -333,7 +336,14 @@ struct HookInputWire {
 #[derive(Debug, Default, serde::Deserialize)]
 #[serde(default)]
 struct ToolInputWire {
+    /// Claude Code's `Write`/`Edit`/`MultiEdit` `tool_input` shape.
     file_path: Option<PathBuf>,
+    /// Kiro's `fs_write` (aka `write`) `tool_input` shape, which carries the
+    /// target as a top-level `path` field. (Kiro's `fs_read` uses a nested
+    /// `operations[].path`, but the edit/lockfile hooks only act on writes,
+    /// so only the write-tool `path` needs modeling here.) Claude's
+    /// `file_path` wins when both are present.
+    path: Option<PathBuf>,
 }
 
 fn read_hook_input() -> Result<HookInput> {
@@ -356,7 +366,10 @@ fn parse_hook_input(text: &str) -> Result<HookInput> {
     let wire: HookInputWire =
         serde_json::from_str(text).context("hook input was not valid JSON")?;
     Ok(HookInput {
-        file_path: wire.tool_input.and_then(|t| t.file_path),
+        // Claude sends `tool_input.file_path`; Kiro's `fs_write` sends
+        // `tool_input.path`. Accept either so the same hooks work under both
+        // runtimes. Claude's field wins if both somehow appear.
+        file_path: wire.tool_input.and_then(|t| t.file_path.or(t.path)),
         cwd: wire.cwd,
     })
 }
@@ -869,6 +882,58 @@ members = ["a", "b"]
         let json = r#"{"session_id": "abc", "hook_event_name": "Stop"}"#;
         let parsed = parse_hook_input(json).expect("valid JSON");
         assert_eq!(parsed, HookInput::default());
+    }
+
+    #[test]
+    fn parse_hook_input_extracts_kiro_fs_write_path() {
+        // Kiro's `fs_write` tool_input carries the target as a top-level
+        // `path` (not Claude's `file_path`). The hooks must see it, or
+        // hook-post-edit / hook-block-cargo-lock silently no-op under Kiro.
+        let json = r#"{
+            "hook_event_name": "preToolUse",
+            "cwd": "/home/user/kiro-control-center",
+            "tool_name": "fs_write",
+            "tool_input": {
+                "command": "strReplace",
+                "path": "/home/user/kiro-control-center/xtask/src/main.rs",
+                "oldStr": "a",
+                "newStr": "b"
+            }
+        }"#;
+        let parsed = parse_hook_input(json).expect("valid JSON");
+        assert_eq!(
+            parsed.file_path,
+            Some(PathBuf::from(
+                "/home/user/kiro-control-center/xtask/src/main.rs"
+            ))
+        );
+        assert_eq!(
+            parsed.cwd,
+            Some(PathBuf::from("/home/user/kiro-control-center"))
+        );
+    }
+
+    #[test]
+    fn parse_hook_input_kiro_cargo_lock_path_is_seen() {
+        // The lockfile guard must resolve a Kiro fs_write of Cargo.lock. This
+        // pins the projection that feeds evaluate_lockfile_edit.
+        let json = r#"{
+            "tool_name": "fs_write",
+            "tool_input": { "command": "create", "path": "/repo/Cargo.lock" }
+        }"#;
+        let parsed = parse_hook_input(json).expect("valid JSON");
+        assert_eq!(parsed.file_path, Some(PathBuf::from("/repo/Cargo.lock")));
+    }
+
+    #[test]
+    fn parse_hook_input_prefers_file_path_over_path() {
+        // If both dialects' fields somehow appear, Claude's `file_path` wins
+        // (deterministic projection, no ambiguity).
+        let json = r#"{
+            "tool_input": { "file_path": "/claude/main.rs", "path": "/kiro/main.rs" }
+        }"#;
+        let parsed = parse_hook_input(json).expect("valid JSON");
+        assert_eq!(parsed.file_path, Some(PathBuf::from("/claude/main.rs")));
     }
 
     #[test]
