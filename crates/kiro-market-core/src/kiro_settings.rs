@@ -34,6 +34,7 @@ pub enum SettingCategory {
     Mcp,
     App,
     ToolSearch,
+    Voice,
     Environment,
 }
 
@@ -51,6 +52,7 @@ impl SettingCategory {
             Self::Mcp => "MCP",
             Self::App => "App",
             Self::ToolSearch => "Tool Search",
+            Self::Voice => "Voice",
             Self::Environment => "Environment Variables",
         }
     }
@@ -278,6 +280,14 @@ pub fn registry() -> &'static [SettingDef] {
                 value_type: SettingType::String,
                 default: None,
             },
+            SettingDef {
+                key: "codeWhisperer.shareCodeWhispererContentWithAWS",
+                label: "Share Content with AWS",
+                description: "Share content with the CodeWhisperer service",
+                category: SettingCategory::Telemetry,
+                value_type: SettingType::Bool,
+                default: None,
+            },
             // ----------------------------------------------------------------
             // Chat Interface
             // ----------------------------------------------------------------
@@ -442,6 +452,54 @@ pub fn registry() -> &'static [SettingDef] {
                 default: None,
             },
             SettingDef {
+                key: "chat.agentEngine",
+                label: "Agent Engine",
+                description: "Default agent engine: 'v1', 'v2' (default), or 'v3'",
+                category: SettingCategory::Chat,
+                value_type: SettingType::Enum(vec!["v1", "v2", "v3"]),
+                default: Some(JsonValue::String("v2".into())),
+            },
+            SettingDef {
+                key: "chat.allowAnimations",
+                label: "Allow Animations",
+                description: "Enable animated spinners and progress indicators",
+                category: SettingCategory::Chat,
+                value_type: SettingType::Bool,
+                default: None,
+            },
+            SettingDef {
+                key: "chat.allowAsciiArt",
+                label: "Allow ASCII Art",
+                description: "Enable Unicode/braille symbols and decorative art",
+                category: SettingCategory::Chat,
+                value_type: SettingType::Bool,
+                default: None,
+            },
+            SettingDef {
+                key: "chat.allowIcons",
+                label: "Allow Icons",
+                description: "Show status indicator icons",
+                category: SettingCategory::Chat,
+                value_type: SettingType::Bool,
+                default: None,
+            },
+            SettingDef {
+                key: "chat.showThinking",
+                label: "Show Thinking",
+                description: "Show thinking/reasoning blocks in chat output (startup-only)",
+                category: SettingCategory::Chat,
+                value_type: SettingType::Bool,
+                default: Some(JsonValue::Bool(false)),
+            },
+            SettingDef {
+                key: "chat.terminalTitle",
+                label: "Terminal Title",
+                description: "Show dynamic title in terminal tab",
+                category: SettingCategory::Chat,
+                value_type: SettingType::Bool,
+                default: Some(JsonValue::Bool(false)),
+            },
+            SettingDef {
                 key: "hooks.showStatus",
                 label: "Show Hook Status",
                 description: "Show hook execution status messages in chat",
@@ -569,6 +627,30 @@ pub fn registry() -> &'static [SettingDef] {
                 value_type: SettingType::Char,
                 default: None,
             },
+            SettingDef {
+                key: "chat.keybindings.cancelStream",
+                label: "Cancel Stream Keybinding",
+                description: "V2 TUI keybinding to cancel streaming response (e.g. 'esc', 'ctrl+c')",
+                category: SettingCategory::KeyBindings,
+                value_type: SettingType::String,
+                default: Some(JsonValue::String("esc".into())),
+            },
+            SettingDef {
+                key: "chat.keybindings.closeMenu",
+                label: "Close Menu Keybinding",
+                description: "V2 TUI keybinding to close slash command menus and panels (e.g. 'esc', 'ctrl+c')",
+                category: SettingCategory::KeyBindings,
+                value_type: SettingType::String,
+                default: Some(JsonValue::String("esc".into())),
+            },
+            SettingDef {
+                key: "chat.keybindings.quit",
+                label: "Quit Keybinding",
+                description: "V2 TUI keybinding to quit the CLI; double-press still required (e.g. 'ctrl+c', 'ctrl+q')",
+                category: SettingCategory::KeyBindings,
+                value_type: SettingType::String,
+                default: Some(JsonValue::String("ctrl+c".into())),
+            },
             // ----------------------------------------------------------------
             // Feature Toggles
             // ----------------------------------------------------------------
@@ -663,6 +745,14 @@ pub fn registry() -> &'static [SettingDef] {
                 value_type: SettingType::String,
                 default: None,
             },
+            SettingDef {
+                key: "api.codewhisperer.service",
+                label: "CodeWhisperer Service URL",
+                description: "CodeWhisperer service endpoint URL",
+                category: SettingCategory::Api,
+                value_type: SettingType::String,
+                default: None,
+            },
             // ----------------------------------------------------------------
             // MCP
             // ----------------------------------------------------------------
@@ -729,6 +819,17 @@ pub fn registry() -> &'static [SettingDef] {
                 category: SettingCategory::ToolSearch,
                 value_type: SettingType::Number,
                 default: Some(JsonValue::from(50_000)),
+            },
+            // ----------------------------------------------------------------
+            // Voice
+            // ----------------------------------------------------------------
+            SettingDef {
+                key: "voice.serverUrl",
+                label: "Voice Server URL",
+                description: "Voice server URL for remote transcription",
+                category: SettingCategory::Voice,
+                value_type: SettingType::String,
+                default: None,
             },
             // ----------------------------------------------------------------
             // Environment Variables
@@ -1231,6 +1332,7 @@ mod tests {
             SettingCategory::Mcp,
             SettingCategory::App,
             SettingCategory::ToolSearch,
+            SettingCategory::Voice,
             SettingCategory::Environment,
         ];
 
@@ -1256,6 +1358,7 @@ mod tests {
             SettingCategory::Mcp,
             SettingCategory::App,
             SettingCategory::ToolSearch,
+            SettingCategory::Voice,
             SettingCategory::Environment,
         ];
 
@@ -1322,6 +1425,110 @@ mod tests {
                 }
             }
         }
+    }
+
+    // -----------------------------------------------------------------------
+    // Newly-added Kiro CLI settings (parity with `kiro-cli settings list`)
+    // -----------------------------------------------------------------------
+
+    /// Helper: look up a registry def by key, panicking with a clear message
+    /// if it is absent (so a dropped entry fails loudly in CI).
+    fn def_for(key: &str) -> &'static SettingDef {
+        registry()
+            .iter()
+            .find(|d| d.key == key)
+            .unwrap_or_else(|| panic!("expected registry to contain key {key:?}"))
+    }
+
+    #[rstest]
+    #[case(
+        "codeWhisperer.shareCodeWhispererContentWithAWS",
+        SettingCategory::Telemetry
+    )]
+    #[case("api.codewhisperer.service", SettingCategory::Api)]
+    #[case("chat.agentEngine", SettingCategory::Chat)]
+    #[case("chat.allowAnimations", SettingCategory::Chat)]
+    #[case("chat.allowAsciiArt", SettingCategory::Chat)]
+    #[case("chat.allowIcons", SettingCategory::Chat)]
+    #[case("chat.showThinking", SettingCategory::Chat)]
+    #[case("chat.terminalTitle", SettingCategory::Chat)]
+    #[case("chat.keybindings.cancelStream", SettingCategory::KeyBindings)]
+    #[case("chat.keybindings.closeMenu", SettingCategory::KeyBindings)]
+    #[case("chat.keybindings.quit", SettingCategory::KeyBindings)]
+    #[case("voice.serverUrl", SettingCategory::Voice)]
+    fn new_settings_are_registered_in_expected_category(
+        #[case] key: &str,
+        #[case] expected: SettingCategory,
+    ) {
+        assert_eq!(def_for(key).category, expected, "wrong category for {key}");
+    }
+
+    /// The three object-valued upstream settings (`api.krs.service`,
+    /// `api.cps.service`, `chat.modelDefaults`) and the internal
+    /// first-launch flag `chat.hasSeenLogo` were intentionally skipped:
+    /// `SettingType` has no object variant and `hasSeenLogo` is not a
+    /// user-facing preference. Pin that decision so a future "add the
+    /// rest" pass doesn't silently introduce keys the UI can't render.
+    #[rstest]
+    #[case("api.krs.service")]
+    #[case("api.cps.service")]
+    #[case("chat.modelDefaults")]
+    #[case("chat.hasSeenLogo")]
+    fn intentionally_skipped_settings_are_absent(#[case] key: &str) {
+        assert!(
+            registry().iter().all(|d| d.key != key),
+            "{key} was intentionally skipped (object-valued or internal state) \
+             but is now in the registry; if this is deliberate, update this test \
+             and the SettingType model"
+        );
+    }
+
+    #[test]
+    fn agent_engine_is_enum_with_v1_v2_v3() {
+        let def = def_for("chat.agentEngine");
+        match &def.value_type {
+            SettingType::Enum(opts) => assert_eq!(opts, &["v1", "v2", "v3"]),
+            other => panic!("chat.agentEngine should be Enum, got {}", other.type_name()),
+        }
+        assert_eq!(def.default.as_ref().and_then(JsonValue::as_str), Some("v2"));
+    }
+
+    #[test]
+    fn keybindings_are_strings_not_chars() {
+        // These hold combos like "ctrl+c", so Char (single-character)
+        // would reject every realistic value.
+        for key in [
+            "chat.keybindings.cancelStream",
+            "chat.keybindings.closeMenu",
+            "chat.keybindings.quit",
+        ] {
+            assert!(
+                matches!(def_for(key).value_type, SettingType::String),
+                "{key} must be String to hold multi-char key combos"
+            );
+        }
+    }
+
+    #[test]
+    fn new_bool_settings_round_trip_through_apply() {
+        // Exercise the full validate-and-write path for a representative
+        // new key, proving it is both registered and type-checked.
+        let mut json = serde_json::json!({});
+        apply_registered_setting(&mut json, "chat.allowIcons", JsonValue::Bool(true))
+            .expect("registered bool key should apply");
+        assert_eq!(
+            get_nested(&json, "chat.allowIcons"),
+            Some(&JsonValue::Bool(true))
+        );
+
+        // Wrong type is rejected, not written.
+        let err = apply_registered_setting(
+            &mut json,
+            "chat.allowIcons",
+            JsonValue::String("yes".into()),
+        )
+        .expect_err("string into a bool slot must be rejected");
+        assert!(matches!(err, ApplySettingError::TypeMismatch { .. }));
     }
 
     // -----------------------------------------------------------------------
