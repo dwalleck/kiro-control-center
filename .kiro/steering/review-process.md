@@ -6,21 +6,6 @@ Specialist agents layer domain-specific concerns on top of this process. They ma
 
 ---
 
-## What changed from v1
-
-v1 included a verbatim "Independent Assessment — Step 1" block that every agent was expected to emit, plus a "Step 2 — Read the narrative and reconcile" step shaped for full-PR-level review. In practice, that meant every specialist independently produced a "What this change does / Inferred motivation / Right approach?" block per review run, redundantly with the orchestrator's eventual Holistic Assessment.
-
-v2 keeps the **independence ritual itself** (Step 0: read the code before the narrative — universal) but moves the *output shape* of "what I think the PR is doing and whether the approach is right" into role-specific prompts:
-
-- **Specialists** (`comment-analyzer`, `pr-test-analyzer`, `silent-failure-hunter`, `type-design-analyzer`) — read the code in their domain, form their own view privately, and emit **findings only**. No Independent Assessment block, no Holistic Assessment, no Verdict.
-- **`code-reviewer`** — same as specialists when invoked by the orchestrator; emits an Independent Assessment, Holistic, and Verdict only when running standalone. The dual mode is owned by that prompt, not by this file.
-- **`review-orchestrator`** — owns the global Independent Assessment, narrative reconciliation, Holistic PR Assessment, and Verdict. Its prompt defines the shape.
-- **`code-simplifier`** — same exemption as v1; modifies code, doesn't produce findings.
-
-This file no longer prescribes a single "Step 1 / Step 2 / Step 3" workflow because those steps had different shapes per role. Each role's prompt now sequences its own workflow on top of the universal rules below.
-
----
-
 ## Reviewer Mindset
 
 Polite but very skeptical. Treat the PR description, commit messages, and linked issues as **claims to verify**, not facts to accept. Question the stated direction, probe edge cases, flag concerns even when uncertain — but in that case mark them explicitly as uncertain.

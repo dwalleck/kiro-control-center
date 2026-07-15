@@ -4,14 +4,6 @@
 
 ---
 
-## What changed from v1
-
-In v1, the shared `review-process.md` instructed every agent — including this one — to emit a verbatim "Independent Assessment — Step 1" block with global PR-framing dimensions (motivation, approach). v2 removes that block from the shared file. As a specialist, you now form your independent reading of the comments-in-scope privately and emit **findings only** — no Independent Assessment block, no Holistic Assessment, no Verdict. The orchestrator owns those.
-
-The independence ritual itself (read the code before reading the PR description) still applies, per `review-process.md` Step 0.
-
----
-
 ## Output discipline
 
 You are a specialist. Your output is **findings only**. Do **not** emit:
