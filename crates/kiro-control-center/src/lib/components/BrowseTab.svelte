@@ -12,6 +12,7 @@
     formatFailedAgent,
   } from "$lib/format";
   import { pluralize } from "$lib/drawer-diff";
+  import { runInstallBatches } from "$lib/install-batches";
   import {
     DELIM,
     pluginKey,
@@ -693,8 +694,8 @@
   }
 
   // Apply the customize drawer's diff across all three categories
-  // (skills, steering, agents). kiro-zx73 added the four Tauri
-  // commands the steering and agent paths use:
+  // (skills, steering, agents). The steering and agent paths use four
+  // dedicated Tauri commands:
   //   - commands.installSteeringFiles + commands.removeSteeringFile
   //   - commands.installAgents + commands.removeAgent
   // Each category's install is a single batch call; removes loop one
@@ -741,63 +742,52 @@
     const agentsSkipped: string[] = [];
     const agentsFailed: { name: string; error: string }[] = [];
 
-    // Generic install-batch wrapper. Translates a `commands.*` call into
-    // either the typed success payload (T) or null (empty diff slice OR
-    // a hard wrapper-level error that the caller surfaces via
-    // `installError`). Closure over `installError`, `marketplace`, and
-    // `plugin` so each caller only specifies the category label and the
-    // Tauri call. Locking the error-message wording in one place keeps
-    // the three category strings ("skill", "steering", "agent") from
-    // drifting.
-    async function runInstallBatch<T>(
-      category: "skill" | "steering" | "agent",
-      names: readonly string[],
-      call: () => Promise<
-        { status: "ok"; data: T } | { status: "error"; error: { message: string } }
-      >,
-    ): Promise<T | null> {
-      if (names.length === 0) return null;
-      try {
-        const r = await call();
-        if (r.status === "ok") return r.data;
-        installError = `Customize apply: ${category} install failed for ${marketplace}/${plugin}: ${r.error.message}`;
-        return null;
-      } catch (e) {
-        const reason = e instanceof Error ? e.message : String(e);
-        installError = `Customize apply: ${category} install threw for ${marketplace}/${plugin}: ${reason}`;
-        return null;
-      }
-    }
-
-    // Run all three install batches in parallel. Each `commands.*` call
-    // is independent (different tracking files, no shared lock). A
-    // wrapper-level failure on one category sets `installError` but
-    // doesn't abort the others — the remove loops below still run
+    // Fan out the three parallel install batches. The wrapper-level
+    // error composition lives in install-batches.ts (pure logic, unit
+    // tested); each `commands.*` call is injected as a closure. A
+    // wrapper-level failure on one category surfaces via `installError`
+    // but doesn't abort the others — the remove loops below still run
     // because they're user-requested removals.
-    const [skillsData, steeringData, agentsData] = await Promise.all([
-      runInstallBatch("skill", diff.skills.install, () =>
-        commands.installSkills(marketplace, plugin, diff.skills.install, forceInstall, projectPath),
-      ),
-      runInstallBatch("steering", diff.steering.install, () =>
-        commands.installSteeringFiles(
-          marketplace,
-          plugin,
-          diff.steering.install,
-          forceInstall,
-          projectPath,
-        ),
-      ),
-      runInstallBatch("agent", diff.agents.install, () =>
-        commands.installAgents(
-          marketplace,
-          plugin,
-          diff.agents.install,
-          forceInstall,
-          /* acceptMcp */ false,
-          projectPath,
-        ),
-      ),
-    ]);
+    const batchResult = await runInstallBatches(marketplace, plugin, {
+      skills: {
+        names: diff.skills.install,
+        call: () =>
+          commands.installSkills(
+            marketplace,
+            plugin,
+            diff.skills.install,
+            forceInstall,
+            projectPath,
+          ),
+      },
+      steering: {
+        names: diff.steering.install,
+        call: () =>
+          commands.installSteeringFiles(
+            marketplace,
+            plugin,
+            diff.steering.install,
+            forceInstall,
+            projectPath,
+          ),
+      },
+      agents: {
+        names: diff.agents.install,
+        call: () =>
+          commands.installAgents(
+            marketplace,
+            plugin,
+            diff.agents.install,
+            forceInstall,
+            /* acceptMcp */ false,
+            projectPath,
+          ),
+      },
+    });
+    if (batchResult.error !== null) {
+      installError = batchResult.error;
+    }
+    const { skills: skillsData, steering: steeringData, agents: agentsData } = batchResult;
 
     if (skillsData) {
       skillsInstalled.push(...skillsData.installed);
