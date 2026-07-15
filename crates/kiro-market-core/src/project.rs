@@ -3523,7 +3523,7 @@ impl KiroProject {
     ) -> Result<InstalledNativeAgentOutcome, AgentError> {
         let json_target = self
             .agents_dir()
-            .join(format!("{}.json", &input.bundle.name));
+            .join(format!("{}.json", input.bundle.name));
         let agent_name = input.bundle.name.to_string();
         let json_target_for_err = json_target.clone();
 
