@@ -2543,4 +2543,22 @@ mod tests {
             "error should name the refs table, got: {err}"
         );
     }
+
+    #[test]
+    fn every_canary_gate_name_is_registered() {
+        // The canary→gate link is a plain string. Renaming a gate without
+        // updating INDEX_CANARIES would orphan its canary — `applies`
+        // never matches, so the check silently stops running and the
+        // anti-silent-pass protection itself rots silently. This tripwire
+        // makes a rename a test failure instead.
+        for canary in INDEX_CANARIES {
+            for gate in canary.gates {
+                assert!(
+                    ALL_GATES.iter().any(|g| g.name == *gate),
+                    "canary '{}' references unregistered gate '{gate}'",
+                    canary.description,
+                );
+            }
+        }
+    }
 }
