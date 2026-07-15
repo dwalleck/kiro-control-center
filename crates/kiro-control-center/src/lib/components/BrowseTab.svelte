@@ -784,9 +784,10 @@
           ),
       },
     });
-    if (batchResult.error !== null) {
-      installError = batchResult.error;
-    }
+    // Direct assignment is safe: installError is nulled at the top of
+    // this function and nothing in between writes it, so a null result
+    // (no wrapper-level failures) is a no-op.
+    installError = batchResult.error;
     const { skills: skillsData, steering: steeringData, agents: agentsData } = batchResult;
 
     if (skillsData) {

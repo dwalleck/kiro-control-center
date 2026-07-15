@@ -109,12 +109,14 @@ describe("runInstallBatches", () => {
       steering: throwingBatch(["t1"], new Error("steering exploded")),
       agents: errorBatch(["a1"], "agents exploded"),
     });
-    // Every failing category's message must be visible to the user —
-    // resolution order must not decide which failure survives.
-    const visible = result.error ?? "";
-    expect(visible).toContain("skill install failed for acme/demo: skills exploded");
-    expect(visible).toContain("steering install threw for acme/demo: steering exploded");
-    expect(visible).toContain("agent install failed for acme/demo: agents exploded");
+    // Every failing category's message must be visible to the user, in
+    // fixed category order — resolution order must decide neither which
+    // failure survives nor the joined message's sequence.
+    expect(result.error).toBe(
+      "Customize apply: skill install failed for acme/demo: skills exploded"
+        + " | Customize apply: steering install threw for acme/demo: steering exploded"
+        + " | Customize apply: agent install failed for acme/demo: agents exploded",
+    );
   });
 
   it("accumulates both failures when exactly two batches fail", async () => {
