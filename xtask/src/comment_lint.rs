@@ -223,11 +223,6 @@ const ALLOWED_SITES: &[AllowedSite] = &[
         reason: LEGACY_BASELINE_REASON,
     },
     AllowedSite {
-        path: "crates/kiro-control-center/src/lib/components/BrowseTab.svelte",
-        line: 696,
-        reason: LEGACY_BASELINE_REASON,
-    },
-    AllowedSite {
         path: "crates/kiro-control-center/src/lib/components/CustomizeDrawer.svelte",
         line: 18,
         reason: LEGACY_BASELINE_REASON,
