@@ -319,8 +319,12 @@ pub fn discover_native_kiro_agents_in_dirs(
 /// treats the result as one atomic bundle owned by the plugin.
 ///
 /// `scan_paths` are the same agent scan paths used by
-/// [`discover_native_kiro_agents_in_dirs`]. README/CONTRIBUTING/CHANGELOG
-/// are excluded by basename (case-insensitive).
+/// [`discover_native_kiro_agents_in_dirs`], so an entry may resolve to an
+/// individual file rather than a directory. The companion model is
+/// directory-rooted — companions live in subdirectories of a scan path —
+/// so a file-valued entry has no companions by construction and is skipped
+/// silently. README/CONTRIBUTING/CHANGELOG are excluded by basename
+/// (case-insensitive).
 #[must_use]
 pub fn discover_native_companion_files(
     plugin_dir: &Path,
@@ -337,9 +341,43 @@ pub fn discover_native_companion_files(
             continue;
         }
         let scan_root = plugin_dir.join(rel.trim_start_matches("./"));
+
+        let metadata = match fs::symlink_metadata(&scan_root) {
+            Ok(m) => m,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
+            Err(e) => {
+                warn!(
+                    path = %scan_root.display(),
+                    error = %e,
+                    "failed to stat native companion scan path; skipping"
+                );
+                continue;
+            }
+        };
+
+        if crate::platform::is_reparse_or_symlink(&metadata) {
+            // A scan path the manifest named explicitly should not be a
+            // symlink: it's either a broken manifest entry or an
+            // exfiltration probe. Following it would surface out-of-tree
+            // files as companion candidates, so refuse it at warn!.
+            warn!(
+                path = %scan_root.display(),
+                "refusing symlink or reparse point at native companion scan path; skipping"
+            );
+            continue;
+        }
+
+        if metadata.file_type().is_file() {
+            // A file-valued scan path names an agent file directly; there
+            // are no subdirectories under a file, so it cannot contribute
+            // companions. Skip silently — this is a legitimate manifest
+            // shape, not an error.
+            continue;
+        }
+
+        // Directory path: scan its immediate children for companion subdirs.
         let entries = match fs::read_dir(&scan_root) {
             Ok(entries) => entries,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
             Err(e) => {
                 warn!(
                     path = %scan_root.display(),
@@ -424,7 +462,9 @@ fn collect_companion_subdir_files(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rstest::rstest;
     use tempfile::tempdir;
+    use tracing_test::traced_test;
 
     #[test]
     fn discover_finds_both_md_and_agent_md() {
@@ -987,5 +1027,135 @@ mod tests {
         let found =
             discover_native_kiro_agents_in_dirs(tmp.path(), &["./agents/agent.md".to_string()]);
         assert!(found.is_empty());
+    }
+
+    #[traced_test]
+    #[rstest]
+    #[case::dot_prefixed("./agents/a.json")]
+    #[case::bare_relative("agents/a.json")]
+    fn companion_scan_skips_file_valued_scan_path(#[case] rel: &str) {
+        // A plugin manifest may list an individual agent file as a scan
+        // path. The companion model is directory-rooted — companions live
+        // in subdirectories of a scan path — so a file-valued entry has no
+        // companions by construction. It must be skipped silently, not
+        // funneled into read_dir where the not-a-directory error would
+        // surface as warn spam on every install.
+        let tmp = tempdir().unwrap();
+        let agents = tmp.path().join("agents");
+        fs::create_dir_all(&agents).unwrap();
+        fs::write(agents.join("a.json"), b"{}").unwrap();
+
+        let found = discover_native_companion_files(tmp.path(), &[rel.to_string()]);
+
+        assert!(
+            found.is_empty(),
+            "file-valued scan path has no companion subdirs: {found:?}"
+        );
+        assert!(
+            !logs_contain("failed to read native companion scan directory"),
+            "file-valued scan path must not reach the read_dir failure arm"
+        );
+    }
+
+    #[traced_test]
+    #[test]
+    fn companion_scan_file_valued_entry_alongside_directory_entry() {
+        // Mixed manifest: one entry names an agent file directly, another
+        // names the directory holding the companion subdirs. The directory
+        // entry's companions must still be discovered and the file-valued
+        // entry must not surface as a directory-read failure.
+        let tmp = tempdir().unwrap();
+        let agents = tmp.path().join("agents");
+        let prompts = agents.join("prompts");
+        fs::create_dir_all(&prompts).unwrap();
+        fs::write(agents.join("a.json"), b"{}").unwrap();
+        fs::write(prompts.join("p.md"), b"prompt").unwrap();
+
+        let found = discover_native_companion_files(
+            tmp.path(),
+            &["./agents/a.json".to_string(), "./agents/".to_string()],
+        );
+
+        let names: Vec<_> = found
+            .iter()
+            .map(|f| f.source.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(names, vec!["p.md"]);
+        assert!(
+            !logs_contain("failed to read native companion scan directory"),
+            "file-valued entry must not reach the read_dir failure arm"
+        );
+    }
+
+    #[traced_test]
+    #[test]
+    fn companion_scan_missing_scan_path_is_silent() {
+        // A scan path that simply doesn't exist is a legitimate manifest
+        // shape (the plugin may ship no native agents); it must neither
+        // warn nor produce candidates.
+        let tmp = tempdir().unwrap();
+
+        let found = discover_native_companion_files(tmp.path(), &["./nope/".to_string()]);
+
+        assert!(found.is_empty());
+        assert!(!logs_contain("failed to stat native companion scan path"));
+        assert!(!logs_contain(
+            "failed to read native companion scan directory"
+        ));
+    }
+
+    #[cfg(unix)]
+    #[traced_test]
+    #[test]
+    fn companion_scan_skips_symlinked_scan_path() {
+        // A manifest naming a symlinked scan path (e.g. `./agents-link`
+        // resolving out of tree) must be refused like the agent scan loops
+        // refuse it: following the link would surface arbitrary host files
+        // as companion candidates.
+        use std::os::unix::fs::symlink;
+        let tmp = tempdir().unwrap();
+        let outside_prompts = tmp.path().join("outside/prompts");
+        fs::create_dir_all(&outside_prompts).unwrap();
+        fs::write(outside_prompts.join("smuggled.md"), b"smuggled").unwrap();
+        symlink(tmp.path().join("outside"), tmp.path().join("agents-link")).unwrap();
+
+        let found = discover_native_companion_files(tmp.path(), &["./agents-link".to_string()]);
+
+        assert!(
+            found.is_empty(),
+            "symlinked scan path must be refused: {found:?}"
+        );
+        assert!(
+            logs_contain("refusing symlink or reparse point at native companion scan path"),
+            "the refusal must be surfaced, not silent"
+        );
+    }
+
+    #[cfg(unix)]
+    #[traced_test]
+    #[test]
+    fn companion_scan_skips_symlinked_file_scan_path() {
+        // Companion analog of native_discovery_file_path_skips_symlinked_file:
+        // a scan path that is itself a symlink to a file is refused by the
+        // symlink guard before the file-vs-directory branch runs.
+        use std::os::unix::fs::symlink;
+        let tmp = tempdir().unwrap();
+        let agents = tmp.path().join("agents");
+        fs::create_dir_all(&agents).unwrap();
+        let target = tmp.path().join("outside.json");
+        fs::write(&target, b"{}").unwrap();
+        symlink(&target, agents.join("evil.json")).unwrap();
+
+        let found =
+            discover_native_companion_files(tmp.path(), &["./agents/evil.json".to_string()]);
+
+        assert!(
+            found.is_empty(),
+            "directly-listed symlink must be refused: {found:?}"
+        );
+        assert!(
+            logs_contain("refusing symlink or reparse point at native companion scan path"),
+            "the refusal must be surfaced, not silent"
+        );
     }
 }
