@@ -1537,7 +1537,7 @@ export type SaveOutcome = {
  *  `app.disableAutoupdates`; `ToolSearch` serializes as `tool_search`
  *  with keys `toolSearch.*`.
  */
-export type SettingCategory = "telemetry" | "chat" | "knowledge" | "key_bindings" | "features" | "api" | "mcp" | "app" | "tool_search" | "environment";
+export type SettingCategory = "telemetry" | "chat" | "knowledge" | "key_bindings" | "features" | "api" | "mcp" | "app" | "tool_search" | "voice" | "environment";
 
 // A fully-resolved setting entry suitable for serialisation to a frontend.
 export type SettingEntry = {
