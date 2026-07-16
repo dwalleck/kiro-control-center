@@ -53,6 +53,10 @@ pub async fn list_user_agents(project_path: String) -> Result<Vec<UserAgentRow>,
 /// counts can't reconstruct it. Without this command edit mode would
 /// have to start from a synthetic empty draft, and saving would
 /// silently truncate the agent.
+///
+/// Routes `name` through `AgentName::new` at the IPC boundary so a
+/// malformed name is rejected before project construction or any
+/// agent-file access.
 #[tauri::command]
 #[specta::specta]
 pub async fn load_user_agent_json(
@@ -60,11 +64,12 @@ pub async fn load_user_agent_json(
     project_path: String,
 ) -> Result<String, CommandError> {
     let project_root = validate_kiro_project_path(&project_path)?;
+    let name = validate_agent_name_at_boundary(&name)?;
     let project = KiroProject::new(project_root);
     let json = project
-        .read_user_agent_json(&name)
+        .read_user_agent_json(name.as_str())
         .map_err(CommandError::from)?;
-    debug!(agent = %name, bytes = json.len(), "user agent JSON loaded");
+    debug!(agent = %name.as_str(), bytes = json.len(), "user agent JSON loaded");
     Ok(json)
 }
 
@@ -259,6 +264,26 @@ mod tests {
             .await
             .expect_err("missing must error");
         assert_eq!(err.error_type, crate::error::ErrorType::NotFound);
+    }
+
+    #[tokio::test]
+    async fn load_user_agent_json_rejects_malformed_name_at_ipc_boundary() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        std::fs::create_dir_all(dir.path().join(".kiro/agents")).expect("mk .kiro/agents");
+        // A readable canary at `agents_dir().join("../../victim.json")`
+        // makes the command succeed if both name gates disappear.
+        std::fs::write(dir.path().join("victim.json"), b"{\"canary\":true}").expect("seed canary");
+        let path = dir.path().to_string_lossy().to_string();
+
+        let err = load_user_agent_json("../../victim".to_string(), path)
+            .await
+            .expect_err("malformed name must be refused at the wrapper");
+        assert_eq!(err.error_type, crate::error::ErrorType::Validation);
+        assert!(
+            err.message.starts_with("invalid agent name"),
+            "expected the wrapper boundary gate to answer, got: {}",
+            err.message,
+        );
     }
 
     /// `create_user_agent`'s wrapper must reject malformed JSON BEFORE
