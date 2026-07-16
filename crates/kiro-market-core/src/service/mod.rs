@@ -3037,14 +3037,13 @@ fn read_and_parse_skill_md(
                 error = %e,
                 "failed to read SKILL.md, skipping"
             );
-            result.skipped_skills.push(browse::SkippedSkill {
-                plugin: plugin.as_str().to_owned(),
-                name_hint: browse::name_hint_from_skill_dir(skill_dir),
-                path: skill_md_path,
-                reason: browse::SkippedSkillReason::ReadFailed {
-                    reason: error_full_chain(&e),
-                },
-            });
+            result
+                .skipped_skills
+                .push(browse::SkippedSkill::read_failed(
+                    plugin.as_str(),
+                    skill_md_path,
+                    &e,
+                ));
             return None;
         }
     };
@@ -3056,14 +3055,13 @@ fn read_and_parse_skill_md(
                 error = %e,
                 "failed to parse SKILL.md frontmatter, skipping"
             );
-            result.skipped_skills.push(browse::SkippedSkill {
-                plugin: plugin.as_str().to_owned(),
-                name_hint: browse::name_hint_from_skill_dir(skill_dir),
-                path: skill_md_path,
-                reason: browse::SkippedSkillReason::FrontmatterInvalid {
-                    reason: error_full_chain(&e),
-                },
-            });
+            result
+                .skipped_skills
+                .push(browse::SkippedSkill::frontmatter_invalid(
+                    plugin.as_str(),
+                    skill_md_path,
+                    &e,
+                ));
             None
         }
     }
@@ -6873,17 +6871,14 @@ mod tests {
 
         assert_eq!(result.installed, vec!["ok".to_string()]);
         assert_eq!(result.skipped_skills.len(), 1);
-        assert_eq!(
-            result.skipped_skills[0].name_hint.as_deref(),
-            Some("broken")
-        );
+        assert_eq!(result.skipped_skills[0].name_hint(), Some("broken"));
         assert!(
             matches!(
-                result.skipped_skills[0].reason,
+                result.skipped_skills[0].reason(),
                 browse::SkippedSkillReason::FrontmatterInvalid { .. }
             ),
             "expected FrontmatterInvalid, got: {:?}",
-            result.skipped_skills[0].reason
+            result.skipped_skills[0].reason()
         );
     }
 
@@ -7032,15 +7027,15 @@ mod tests {
             "unreadable skill must not install"
         );
         assert_eq!(result.skipped_skills.len(), 1);
-        assert_eq!(result.skipped_skills[0].name_hint.as_deref(), Some("vault"));
-        assert_eq!(result.skipped_skills[0].plugin, "plug1");
+        assert_eq!(result.skipped_skills[0].name_hint(), Some("vault"));
+        assert_eq!(result.skipped_skills[0].plugin(), "plug1");
         assert!(
             matches!(
-                result.skipped_skills[0].reason,
+                result.skipped_skills[0].reason(),
                 browse::SkippedSkillReason::ReadFailed { .. }
             ),
             "expected ReadFailed, got: {:?}",
-            result.skipped_skills[0].reason
+            result.skipped_skills[0].reason()
         );
     }
 

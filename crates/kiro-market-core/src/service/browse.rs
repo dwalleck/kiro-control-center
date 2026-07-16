@@ -452,7 +452,7 @@ pub struct SkippedSkill {
     /// surface strictly less useful than the per-plugin `warn!` it
     /// replaced. Per-plugin callers already have the plugin context
     /// but carry it anyway so both code paths produce identical shapes.
-    pub plugin: String,
+    plugin: String,
     /// Directory name of the skill as a best-effort label. Not a
     /// guarantee the skill *would* have had this name — the frontmatter
     /// `name` is authoritative, and parsing it is precisely what failed.
@@ -461,10 +461,89 @@ pub struct SkippedSkill {
     /// `Option<String>` rather than a sentinel empty string so the
     /// frontend's type system forces the "no label available" branch
     /// to be handled explicitly — specta renders it as `string | null`.
-    pub name_hint: Option<String>,
+    name_hint: Option<String>,
     /// Path to the `SKILL.md` file that could not be consumed.
-    pub path: PathBuf,
-    pub reason: SkippedSkillReason,
+    path: PathBuf,
+    reason: SkippedSkillReason,
+}
+
+impl SkippedSkill {
+    #[must_use]
+    pub(super) fn read_failed(
+        plugin: &str,
+        path: PathBuf,
+        error: &(dyn std::error::Error + 'static),
+    ) -> Self {
+        let name_hint = path.parent().and_then(name_hint_from_skill_dir);
+        Self {
+            plugin: plugin.to_owned(),
+            name_hint,
+            path,
+            reason: SkippedSkillReason::ReadFailed {
+                reason: error_full_chain(error),
+            },
+        }
+    }
+
+    #[must_use]
+    pub(super) fn frontmatter_invalid(
+        plugin: &str,
+        path: PathBuf,
+        error: &(dyn std::error::Error + 'static),
+    ) -> Self {
+        let name_hint = path.parent().and_then(name_hint_from_skill_dir);
+        Self {
+            plugin: plugin.to_owned(),
+            name_hint,
+            path,
+            reason: SkippedSkillReason::FrontmatterInvalid {
+                reason: error_full_chain(error),
+            },
+        }
+    }
+
+    #[must_use]
+    pub(super) fn duplicate_name(
+        plugin: &str,
+        name: String,
+        path: PathBuf,
+        existing_dir: PathBuf,
+        conflict_dir: PathBuf,
+    ) -> Self {
+        Self {
+            plugin: plugin.to_owned(),
+            name_hint: Some(name),
+            path,
+            reason: SkippedSkillReason::DuplicateName {
+                existing_dir,
+                conflict_dir,
+            },
+        }
+    }
+
+    /// Name of the plugin this skill was discovered under.
+    #[must_use]
+    pub fn plugin(&self) -> &str {
+        &self.plugin
+    }
+
+    /// Best-effort skill label derived from its directory or frontmatter.
+    #[must_use]
+    pub fn name_hint(&self) -> Option<&str> {
+        self.name_hint.as_deref()
+    }
+
+    /// Path to the `SKILL.md` file that could not be consumed.
+    #[must_use]
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Structured reason the skill was skipped.
+    #[must_use]
+    pub fn reason(&self) -> &SkippedSkillReason {
+        &self.reason
+    }
 }
 
 /// Why an individual skill was excluded from a listing. Both variants
@@ -1434,14 +1513,11 @@ fn collect_skills_with_manifest(
                     error = %e,
                     "failed to read SKILL.md, skipping"
                 );
-                skipped_skills.push(SkippedSkill {
-                    plugin: plugin_entry.name.clone(),
-                    name_hint: name_hint_from_skill_dir(skill_dir),
-                    path: skill_md_path,
-                    reason: SkippedSkillReason::ReadFailed {
-                        reason: error_full_chain(&e),
-                    },
-                });
+                skipped_skills.push(SkippedSkill::read_failed(
+                    &plugin_entry.name,
+                    skill_md_path,
+                    &e,
+                ));
                 continue;
             }
         };
@@ -1456,14 +1532,11 @@ fn collect_skills_with_manifest(
                     error = %e,
                     "failed to parse SKILL.md frontmatter, skipping"
                 );
-                skipped_skills.push(SkippedSkill {
-                    plugin: plugin_entry.name.clone(),
-                    name_hint: name_hint_from_skill_dir(skill_dir),
-                    path: skill_md_path,
-                    reason: SkippedSkillReason::FrontmatterInvalid {
-                        reason: error_full_chain(&e),
-                    },
-                });
+                skipped_skills.push(SkippedSkill::frontmatter_invalid(
+                    &plugin_entry.name,
+                    skill_md_path,
+                    &e,
+                ));
                 continue;
             }
         };
@@ -1481,15 +1554,13 @@ fn collect_skills_with_manifest(
                 conflict = %skill_dir.display(),
                 "duplicate skill name within plugin; keeping first-seen"
             );
-            skipped_skills.push(SkippedSkill {
-                plugin: plugin_entry.name.clone(),
-                name_hint: Some(frontmatter.name.clone()),
-                path: skill_md_path,
-                reason: SkippedSkillReason::DuplicateName {
-                    existing_dir: existing_dir.clone(),
-                    conflict_dir: skill_dir.clone(),
-                },
-            });
+            skipped_skills.push(SkippedSkill::duplicate_name(
+                &plugin_entry.name,
+                frontmatter.name.clone(),
+                skill_md_path,
+                existing_dir.clone(),
+                skill_dir.clone(),
+            ));
             continue;
         }
         seen_names.insert(frontmatter.name.clone(), skill_dir.clone());
@@ -1697,12 +1768,9 @@ fn list_agents_with_manifest(
 /// practice `skill_dir` always comes from [`discover_skill_dirs`] so
 /// the `None` arm is defensive rather than expected.
 ///
-/// `pub(crate)` so the install path in [`super::MarketplaceService::install_skills`]
-/// can populate [`SkippedSkill::name_hint`] consistently with the
-/// listing path — the two codepaths used to both reach for
-/// `skill_dir.file_name()` inline; sharing the helper means a future
-/// tweak (e.g. normalising Unicode) lands once.
-pub(crate) fn name_hint_from_skill_dir(skill_dir: &Path) -> Option<String> {
+/// Kept beside the [`SkippedSkill`] constructors so every read/parse
+/// failure derives the label from the same `SKILL.md` parent path.
+fn name_hint_from_skill_dir(skill_dir: &Path) -> Option<String> {
     skill_dir
         .file_name()
         .map(|s| s.to_string_lossy().into_owned())
