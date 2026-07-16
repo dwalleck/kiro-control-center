@@ -1509,26 +1509,51 @@ mod tests {
         }
     }
 
-    #[test]
-    fn new_bool_settings_round_trip_through_apply() {
-        // Exercise the full validate-and-write path for a representative
-        // new key, proving it is both registered and type-checked.
+    #[rstest]
+    #[case::bool(
+        "chat.allowIcons",
+        JsonValue::Bool(true),
+        JsonValue::String("yes".into())
+    )]
+    #[case::enum_option(
+        "chat.agentEngine",
+        JsonValue::String("v3".into()),
+        JsonValue::String("v4".into())
+    )]
+    #[case::keybinding(
+        "chat.keybindings.quit",
+        JsonValue::String("ctrl+x".into()),
+        JsonValue::Bool(false)
+    )]
+    fn new_settings_round_trip_through_apply(
+        #[case] key: &str,
+        #[case] valid: JsonValue,
+        #[case] invalid: JsonValue,
+    ) {
         let mut json = serde_json::json!({});
-        apply_registered_setting(&mut json, "chat.allowIcons", JsonValue::Bool(true))
-            .expect("registered bool key should apply");
-        assert_eq!(
-            get_nested(&json, "chat.allowIcons"),
-            Some(&JsonValue::Bool(true))
-        );
+        let expected = valid.clone();
 
-        // Wrong type is rejected, not written.
-        let err = apply_registered_setting(
-            &mut json,
-            "chat.allowIcons",
-            JsonValue::String("yes".into()),
-        )
-        .expect_err("string into a bool slot must be rejected");
-        assert!(matches!(err, ApplySettingError::TypeMismatch { .. }));
+        apply_registered_setting(&mut json, key, valid)
+            .expect("registered setting should accept a compatible value");
+        assert_eq!(get_nested(&json, key), Some(&expected));
+
+        let error = apply_registered_setting(&mut json, key, invalid)
+            .expect_err("registered setting should reject an incompatible value");
+        assert!(
+            matches!(
+                error,
+                ApplySettingError::TypeMismatch {
+                    key: ref rejected_key,
+                    ..
+                } if rejected_key == key
+            ),
+            "expected TypeMismatch for {key}, got {error:?}"
+        );
+        assert_eq!(
+            get_nested(&json, key),
+            Some(&expected),
+            "rejected value must not replace the valid value"
+        );
     }
 
     // -----------------------------------------------------------------------
