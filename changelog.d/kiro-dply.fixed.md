@@ -1,1 +1,1 @@
-- Harden plugin-relative path discovery by refusing trailing-slash symlink or reparse scan roots and Windows drive-relative prefixes, preventing paths from escaping plugin directories.
+- Harden plugin-relative path discovery by refusing trailing-slash symlink or reparse scan roots and paths that expose a filesystem root or Windows drive prefix after leading `./`, preventing escapes from plugin directories.
