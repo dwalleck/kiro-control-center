@@ -4,14 +4,6 @@
 
 ---
 
-## What changed from v1
-
-In v1, the shared `review-process.md` instructed every agent — including specialists — to emit a verbatim "Independent Assessment — Step 1" block. v2 removes that block from the shared file and concentrates the global PR-framing work *here*, in the orchestrator. Specialists now stay scoped to their domain and produce findings only.
-
-This means the orchestrator's workflow now has explicit Step 1 (Independent Assessment of the whole PR) and Step 2 (narrative reconciliation) sub-steps that were previously implicit because the shared file carried them. Nothing else about the orchestrator's role has changed.
-
----
-
 ## Role
 
 Coordinate specialized review agents to perform a comprehensive code review. Form your own independent view of the PR, reconcile it against the author's narrative, select and invoke the right specialists, verify their findings with code intelligence, aggregate into a severity-ranked report, and decide the verdict.

@@ -13,6 +13,14 @@
 //! `\n` in BRE/ERE is a literal — this command runs the same intent as a
 //! SQL query against the tethys index, which fails loud rather than
 //! silently clean.
+//!
+//! Before any gate result is trusted, [`IndexCanary`] pre-flight checks
+//! assert the index actually contains the rows the scheduled gates read.
+//! A stale or version-skewed tethys can exit 0 while writing an empty or
+//! partial index; without the canaries every gate would go vacuously
+//! green against it. Canary failure is an internal error (exit 2), not a
+//! finding (exit 1) — the tool is refusing to answer, not reporting
+//! violations.
 
 use std::env;
 use std::path::{Path, PathBuf};
@@ -285,6 +293,41 @@ WHERE s.kind = 'enum'
   )
 ORDER BY f.path, s.line";
 
+/// C7 fence for agents-view slice 1 (design-6g6r.md): the five user-agent
+/// authoring commands in `commands/agents_authoring.rs` MUST stay
+/// project-only — they never construct or accept a `MarketplaceService`.
+/// A future contributor copy-pasting from a service-consuming command
+/// (e.g. `install_agents` in `agents.rs`) would re-introduce the
+/// marketplace coupling, and the existing wrapper tests would not catch
+/// it. CLAUDE.md "Tauri command handlers": project-only commands inline
+/// the body in the wrapper (no `_impl(svc, ...)` pattern).
+///
+/// Detection is via the `imports` table, NOT text-grep: the target file's
+/// own module doc comment names `MarketplaceService` (to document that it
+/// deliberately does *not* use one), so a substring match would fail CI on
+/// the correct file. Doc comments are not `imports` rows; a real coupling
+/// is, in one of two forms — `use …service::MarketplaceService` (the type)
+/// or `use crate::commands::make_service` (the constructor helper). Both
+/// store `symbol_name` as the bare identifier, so the `IN (...)` predicate
+/// catches both. Empirically verified complete + comment-safe against a
+/// fresh tethys index (design-6g6r.md § Empirical verification).
+///
+/// A `refs`-based detection of the bare `make_service()` call is NOT used:
+/// tethys does not record bare free-function call refs (filed tethys-zp2j).
+/// This is not a coverage gap — the call cannot appear without an
+/// accompanying `use`, which this query catches.
+///
+/// `line = 0` sentinel because the `imports` table has no line column
+/// (same as `no-frontend-deps-in-core`); `format_path_line` renders a
+/// "grep for import" hint.
+const NO_SERVICE_IN_AGENTS_AUTHORING_SQL: &str = "\
+SELECT f.path, 0 AS line, i.symbol_name AS qualified_name, i.source_module AS signature
+FROM imports i
+JOIN files f ON f.id = i.file_id
+WHERE f.path LIKE '%commands/agents_authoring.rs'
+  AND i.symbol_name IN ('MarketplaceService', 'make_service')
+ORDER BY f.path, i.symbol_name";
+
 const ALL_GATES: &[Gate] = &[
     Gate {
         name: "gate-4-external-error-boundary",
@@ -316,7 +359,97 @@ const ALL_GATES: &[Gate] = &[
         description: "pub Serialize+specta::Type enum with non-unit variants missing #[serde(tag = \"...\")] / #[serde(untagged)]",
         sql: FFI_ENUM_TAG_SQL,
     },
+    Gate {
+        name: "no-marketplace-service-in-agents-authoring",
+        description: "MarketplaceService / make_service import in commands/agents_authoring.rs (C7: authoring commands must be project-only)",
+        sql: NO_SERVICE_IN_AGENTS_AUTHORING_SQL,
+    },
 ];
+
+/// A pre-flight assertion that the tethys index actually contains the
+/// rows a gate's query reads.
+///
+/// Guards against the silent-pass failure mode: `tethys index` exits 0
+/// but writes an empty or partial index (version skew, an extractor
+/// regression, pointing at the wrong workspace), every gate query
+/// returns zero rows, and plan-lint prints OK while verifying nothing.
+/// A canary counting zero turns that false green into a loud exit-2
+/// internal error before any gate runs.
+///
+/// `gates` scopes the check: an empty slice applies to every
+/// invocation; a non-empty slice only runs when at least one named gate
+/// is scheduled, so `--gate <name>` neither pays for nor fails on
+/// canaries protecting gates it isn't running.
+///
+/// Each `sql` must be a single-row `SELECT COUNT(*)`; zero is failure.
+/// Counts assert invariants of *this* workspace — e.g.
+/// `agents_authoring.rs` always imports `KiroProject` and friends, so
+/// zero import rows for that file means the indexer didn't see it, not
+/// that the file has no imports.
+struct IndexCanary {
+    gates: &'static [&'static str],
+    description: &'static str,
+    sql: &'static str,
+}
+
+const INDEX_CANARIES: &[IndexCanary] = &[
+    IndexCanary {
+        gates: &[],
+        description: "files table has at least one indexed file",
+        sql: "SELECT COUNT(*) FROM files",
+    },
+    IndexCanary {
+        gates: &[],
+        description: "symbols table has extracted symbols",
+        sql: "SELECT COUNT(*) FROM symbols",
+    },
+    IndexCanary {
+        gates: &["no-unwrap-in-production", "no-panic-in-production"],
+        description: "refs table has extracted references (the unwrap/panic gates query refs)",
+        sql: "SELECT COUNT(*) FROM refs",
+    },
+    IndexCanary {
+        gates: &["no-frontend-deps-in-core"],
+        description: "kiro-market-core sources have import rows (the dependency-direction gate queries imports)",
+        sql: "SELECT COUNT(*) FROM imports i JOIN files f ON f.id = i.file_id \
+              WHERE f.path LIKE '%kiro-market-core/src/%'",
+    },
+    IndexCanary {
+        gates: &["no-marketplace-service-in-agents-authoring"],
+        description: "commands/agents_authoring.rs is indexed with import rows (the C7 fence is vacuous otherwise)",
+        sql: "SELECT COUNT(*) FROM imports i JOIN files f ON f.id = i.file_id \
+              WHERE f.path LIKE '%commands/agents_authoring.rs'",
+    },
+];
+
+/// Run every applicable [`IndexCanary`] against the opened index and
+/// fail loud if any counts zero. Called before the gate loop so a stale
+/// or broken index can never produce a vacuously clean report.
+fn verify_index_health(
+    conn: &Connection,
+    canaries: &[IndexCanary],
+    gates_run: &std::collections::HashSet<&str>,
+) -> Result<()> {
+    for canary in canaries {
+        let applies = canary.gates.is_empty() || canary.gates.iter().any(|g| gates_run.contains(g));
+        if !applies {
+            continue;
+        }
+        let count: i64 = conn
+            .query_row(canary.sql, [], |row| row.get(0))
+            .with_context(|| format!("running index canary: {}", canary.description))?;
+        if count == 0 {
+            bail!(
+                "tethys index failed canary check: {}. A zero count means the index is empty \
+                 or stale where a scheduled gate expects rows, so its results would be \
+                 vacuously clean. Check the tethys binary version (TETHYS_BIN or `tethys` on \
+                 PATH) and re-run without --no-reindex.",
+                canary.description
+            );
+        }
+    }
+    Ok(())
+}
 
 /// A `(gate, path, line)` triple acknowledged as a deliberate exception.
 ///
@@ -352,13 +485,13 @@ const ALLOWED_SITES: &[AllowedSite] = &[
     AllowedSite {
         gate: "no-unwrap-in-production",
         path: "crates/kiro-control-center/src-tauri/src/lib.rs",
-        line: 55,
+        line: 66,
         reason: "Tauri scaffolding pattern — debug-only `specta_typescript::Typescript::default().export(...)` failure at app startup. Refactoring to `?` propagation would only move the panic into `fn main()`. Idiomatic Rust at the binary entry point.",
     },
     AllowedSite {
         gate: "no-unwrap-in-production",
         path: "crates/kiro-control-center/src-tauri/src/lib.rs",
-        line: 66,
+        line: 77,
         reason: "Tauri scaffolding pattern — `tauri::Builder::run` failure at app startup. Replacing with Result propagation would only move the panic into `fn main()`. Idiomatic Rust at the binary entry point.",
     },
 ];
@@ -498,7 +631,7 @@ ENVIRONMENT:
 EXIT CODES:
     0  no findings
     1  one or more gates produced findings (CI gate fails)
-    2  internal error (couldn't reach tethys, malformed DB, etc.)"
+    2  internal error (couldn't reach tethys, malformed DB, index failed canary checks, etc.)"
     );
 }
 
@@ -543,17 +676,32 @@ pub fn run(args: impl Iterator<Item = String>) -> Result<usize> {
     let conn = Connection::open(&db_path)
         .with_context(|| format!("opening tethys index at {}", db_path.display()))?;
 
+    // The set of gates this invocation will execute, computed up front:
+    // the canary checks scope to it, and the stale-allowlist pass reuses
+    // the same set.
+    let gates_run: std::collections::HashSet<&str> = ALL_GATES
+        .iter()
+        .filter(|g| {
+            opts.gate_filter
+                .as_deref()
+                .is_none_or(|name| g.name == name)
+        })
+        .map(|g| g.name)
+        .collect();
+
+    // Refuse to trust a 0-findings result from an index that plainly
+    // didn't see the code: a stale or version-skewed tethys that
+    // "indexes" successfully while missing files would otherwise turn
+    // every gate vacuously green.
+    verify_index_health(&conn, INDEX_CANARIES, &gates_run)?;
+
     let mut total_findings = 0usize;
     let mut matched_allowlist_indices: std::collections::HashSet<usize> =
         std::collections::HashSet::new();
-    let mut gates_run: std::collections::HashSet<&str> = std::collections::HashSet::new();
     for gate in ALL_GATES {
-        if let Some(name) = &opts.gate_filter
-            && gate.name != name
-        {
+        if !gates_run.contains(gate.name) {
             continue;
         }
-        gates_run.insert(gate.name);
         let raw = gate.run(&conn)?;
         let mut allowed: Vec<Finding> = Vec::new();
         let mut findings: Vec<Finding> = Vec::new();
@@ -1306,7 +1454,7 @@ mod tests {
     fn is_allowed_matches_gate_path_and_line_exactly() {
         let f = Finding {
             path: "crates/kiro-control-center/src-tauri/src/lib.rs".to_string(),
-            line: 55,
+            line: 66,
             qualified_name: "run".to_string(),
             signature: Some("expect".to_string()),
         };
@@ -2138,5 +2286,279 @@ mod tests {
             "nested-module enum with payload must be flagged; got: {findings:?}"
         );
         assert_eq!(findings[0].qualified_name, "outer::Inner");
+    }
+
+    // ─── no-marketplace-service-in-agents-authoring (C7 fence) ──────────
+
+    fn no_service_in_authoring() -> &'static Gate {
+        ALL_GATES
+            .iter()
+            .find(|g| g.name == "no-marketplace-service-in-agents-authoring")
+            .expect("agents-authoring fence gate registered")
+    }
+
+    const AUTHORING_PATH: &str =
+        "crates/kiro-control-center/src-tauri/src/commands/agents_authoring.rs";
+
+    #[test]
+    fn fence_flags_marketplace_service_type_import() {
+        // `use kiro_market_core::service::MarketplaceService;` in the
+        // authoring file → tethys stores symbol_name='MarketplaceService'.
+        let conn = fresh_db();
+        seed_import(
+            &conn,
+            2,
+            AUTHORING_PATH,
+            "MarketplaceService",
+            "kiro_market_core::service",
+        );
+
+        let findings = no_service_in_authoring().run(&conn).expect("query");
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].qualified_name, "MarketplaceService");
+        assert_eq!(findings[0].line, 0, "imports has no line column → sentinel");
+    }
+
+    #[test]
+    fn fence_flags_make_service_import() {
+        // `use crate::commands::make_service;` — the constructor-helper
+        // import that always co-occurs with a `let svc = make_service()?`
+        // call (the call ref itself is not recorded; see tethys-zp2j).
+        let conn = fresh_db();
+        seed_import(&conn, 2, AUTHORING_PATH, "make_service", "crate::commands");
+
+        let findings = no_service_in_authoring().run(&conn).expect("query");
+        assert_eq!(findings.len(), 1);
+        assert_eq!(findings[0].qualified_name, "make_service");
+    }
+
+    #[test]
+    fn fence_ignores_unrelated_imports_in_target_file() {
+        // The authoring file legitimately imports KiroProject,
+        // validate_kiro_project_path, etc. None of these are the
+        // forbidden symbols, so the gate must stay silent. This is the
+        // SQL-level analogue of comment-safety: only the two listed
+        // symbol_names fire, and doc-comment mentions never produce an
+        // imports row at all.
+        let conn = fresh_db();
+        seed_import(
+            &conn,
+            2,
+            AUTHORING_PATH,
+            "KiroProject",
+            "kiro_market_core::project",
+        );
+        seed_import(
+            &conn,
+            2,
+            AUTHORING_PATH,
+            "validate_kiro_project_path",
+            "crate::commands",
+        );
+
+        let findings = no_service_in_authoring().run(&conn).expect("query");
+        assert!(
+            findings.is_empty(),
+            "unrelated imports must not trip the fence; got {findings:?}"
+        );
+    }
+
+    #[test]
+    fn fence_ignores_make_service_outside_target_file() {
+        // `make_service` is legitimate everywhere except the authoring
+        // file. A real import in browse.rs must NOT be flagged — the gate
+        // is scoped by path.
+        let conn = fresh_db();
+        seed_import(
+            &conn,
+            2,
+            "crates/kiro-control-center/src-tauri/src/commands/browse.rs",
+            "make_service",
+            "crate::commands",
+        );
+
+        let findings = no_service_in_authoring().run(&conn).expect("query");
+        assert!(
+            findings.is_empty(),
+            "make_service is fine outside the authoring file; got {findings:?}"
+        );
+    }
+
+    #[test]
+    fn fence_flags_both_imports_when_present_together() {
+        // Copy-paste from a service-consuming command brings both the type
+        // import and the helper import. Both must be flagged (ordered by
+        // symbol_name: make_service before MarketplaceService).
+        let conn = fresh_db();
+        seed_import(
+            &conn,
+            2,
+            AUTHORING_PATH,
+            "MarketplaceService",
+            "kiro_market_core::service",
+        );
+        seed_import(&conn, 2, AUTHORING_PATH, "make_service", "crate::commands");
+
+        let findings = no_service_in_authoring().run(&conn).expect("query");
+        assert_eq!(findings.len(), 2);
+        // ORDER BY symbol_name uses SQLite's default BINARY collation:
+        // uppercase 'M' (0x4D) sorts before lowercase 'm' (0x6D), so
+        // "MarketplaceService" precedes "make_service".
+        assert_eq!(findings[0].qualified_name, "MarketplaceService");
+        assert_eq!(findings[1].qualified_name, "make_service");
+    }
+
+    // ─── Index canaries (anti-silent-pass pre-flight) ───────────────────
+
+    /// Seed the minimum rows that satisfy the two global canaries (files
+    /// and symbols non-empty; `fresh_db` already seeds one file).
+    /// Gate-scoped canary tests build on this so a failure exercises
+    /// exactly the canary under test.
+    fn seed_canary_baseline(conn: &Connection) {
+        conn.execute(
+            "INSERT INTO symbols (id, file_id, name, qualified_name, kind, line)
+             VALUES (900, 1, 'f', 'f', 'function', 1)",
+            [],
+        )
+        .expect("baseline symbol insert");
+    }
+
+    fn gates(names: &[&'static str]) -> std::collections::HashSet<&'static str> {
+        names.iter().copied().collect()
+    }
+
+    #[test]
+    fn canaries_pass_on_index_with_all_expected_rows() {
+        let conn = fresh_db();
+        seed_canary_baseline(&conn);
+        // A refs row for the unwrap/panic canary (any reference works —
+        // the canary counts extraction activity, not violations).
+        insert_panic_ref(&conn, 1, 900, 1, "unwrap_or");
+        // Import rows for the two path-scoped canaries.
+        seed_import(
+            &conn,
+            2,
+            "crates/kiro-market-core/src/lib.rs",
+            "PathBuf",
+            "std::path",
+        );
+        seed_import(
+            &conn,
+            3,
+            AUTHORING_PATH,
+            "KiroProject",
+            "kiro_market_core::project",
+        );
+
+        let all: std::collections::HashSet<&str> = ALL_GATES.iter().map(|g| g.name).collect();
+        verify_index_health(&conn, INDEX_CANARIES, &all)
+            .expect("healthy index passes every canary");
+    }
+
+    #[test]
+    fn canary_fails_loud_on_empty_index() {
+        // Schema exists but zero rows — the shape a version-skewed or
+        // wrong-workspace `tethys index` run can produce while still
+        // exiting 0.
+        let conn = Connection::open_in_memory().expect("in-memory open");
+        conn.execute_batch(TEST_SCHEMA).expect("schema setup");
+
+        let all: std::collections::HashSet<&str> = ALL_GATES.iter().map(|g| g.name).collect();
+        let err = verify_index_health(&conn, INDEX_CANARIES, &all).unwrap_err();
+        assert!(
+            err.to_string().contains("canary"),
+            "error should identify itself as a canary failure, got: {err}"
+        );
+    }
+
+    #[test]
+    fn canary_fails_when_agents_authoring_missing_from_index() {
+        // The concrete silent-pass shape this check exists for: an index
+        // that predates agents_authoring.rs reports the C7 fence clean
+        // because the gate's query has no rows to inspect — not because
+        // the file is coupling-free.
+        let conn = fresh_db();
+        seed_canary_baseline(&conn);
+
+        let err = verify_index_health(
+            &conn,
+            INDEX_CANARIES,
+            &gates(&["no-marketplace-service-in-agents-authoring"]),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("agents_authoring.rs"),
+            "error should name the missing file, got: {err}"
+        );
+    }
+
+    #[test]
+    fn canary_passes_when_agents_authoring_has_import_rows() {
+        let conn = fresh_db();
+        seed_canary_baseline(&conn);
+        seed_import(
+            &conn,
+            2,
+            AUTHORING_PATH,
+            "KiroProject",
+            "kiro_market_core::project",
+        );
+
+        verify_index_health(
+            &conn,
+            INDEX_CANARIES,
+            &gates(&["no-marketplace-service-in-agents-authoring"]),
+        )
+        .expect("indexed authoring file satisfies the fence canary");
+    }
+
+    #[test]
+    fn gate_scoped_canaries_skip_when_gate_not_scheduled() {
+        // `--gate gate-4-external-error-boundary` must not fail on the
+        // fence/refs/imports canaries — there is no reason to demand
+        // rows for gates that aren't running.
+        let conn = fresh_db();
+        seed_canary_baseline(&conn);
+
+        verify_index_health(
+            &conn,
+            INDEX_CANARIES,
+            &gates(&["gate-4-external-error-boundary"]),
+        )
+        .expect("only global canaries apply to a gate-4-only run");
+    }
+
+    #[test]
+    fn refs_canary_fails_for_unwrap_gate_on_refless_index() {
+        // An index whose ref extraction silently produced nothing would
+        // make no-unwrap-in-production vacuously green; scheduling that
+        // gate must demand refs rows.
+        let conn = fresh_db();
+        seed_canary_baseline(&conn);
+
+        let err = verify_index_health(&conn, INDEX_CANARIES, &gates(&["no-unwrap-in-production"]))
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("refs"),
+            "error should name the refs table, got: {err}"
+        );
+    }
+
+    #[test]
+    fn every_canary_gate_name_is_registered() {
+        // The canary→gate link is a plain string. Renaming a gate without
+        // updating INDEX_CANARIES would orphan its canary — `applies`
+        // never matches, so the check silently stops running and the
+        // anti-silent-pass protection itself rots silently. This tripwire
+        // makes a rename a test failure instead.
+        for canary in INDEX_CANARIES {
+            for gate in canary.gates {
+                assert!(
+                    ALL_GATES.iter().any(|g| g.name == *gate),
+                    "canary '{}' references unregistered gate '{gate}'",
+                    canary.description,
+                );
+            }
+        }
     }
 }

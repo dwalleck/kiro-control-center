@@ -1,0 +1,75 @@
+{
+  "name": "kcc-agent",
+  "description": "Kiro Control Center dev agent: shared-core Rust workspace (kiro-market-core) with CLI (kiro-market) and Tauri+Svelte desktop (kiro-control-center) frontends. Wires the xtask quality hooks (Cargo.lock guard, rustfmt+clippy on edit, frontend check on stop).",
+  "prompt": "You are the Kiro Control Center development agent. This is a Rust workspace using the shared-core pattern: ALL business logic lives in `crates/kiro-market-core`; the CLI (`crates/kiro-market`) and Tauri+Svelte 5 desktop app (`crates/kiro-control-center`) are thin presentation wrappers — never put business logic in them. Honor the security invariants and conventions in AGENTS.md (path-traversal validation via RelativePath, MCP opt-in, TLS-by-default, no unsafe code). Do not edit Cargo.lock directly (use `cargo update -p <crate>`); do not edit the generated `src/lib/bindings.ts`. Before declaring work done, run `cargo fmt`, `cargo clippy --workspace -- -D warnings`, and `cargo test`. This project tracks work in rivets (issue prefix `kiro`), not an external tracker.",
+  "tools": [
+    "read",
+    "write",
+    "shell",
+    "grep",
+    "glob",
+    "code"
+  ],
+  "allowedTools": [
+    "read",
+    "grep",
+    "glob",
+    "code",
+    "@svelte"
+  ],
+  "toolsSettings": {
+    "shell": {
+      "allowedCommands": [
+        "^cargo (check|test|nextest|build|clippy|fmt|xtask)\\b.*",
+        "^npm (run|ci|install)\\b.*",
+        "^git (status|diff|log|show|branch|add|restore)\\b.*",
+        "^rivets\\b.*",
+        "^tethys\\b.*"
+      ],
+      "autoAllowReadonly": true
+    },
+    "write": {
+      "deniedPaths": [
+        "**/Cargo.lock",
+        "**/src/lib/bindings.ts",
+        "**/target/**"
+      ]
+    }
+  },
+  "resources": [
+    "file://AGENTS.md",
+    "file://README.md",
+    "file://Cargo.toml",
+    "file://crates/kiro-market-core/src/**/*.rs",
+    "file://xtask/src/**/*.rs",
+    "skill://.kiro/skills/**/SKILL.md"
+  ],
+  "hooks": {
+    "preToolUse": [
+      {
+        "matcher": "write",
+        "command": "cargo xtask hook-block-cargo-lock",
+        "timeout_ms": 30000
+      }
+    ],
+    "postToolUse": [
+      {
+        "matcher": "write",
+        "command": "cargo xtask hook-post-edit",
+        "timeout_ms": 90000
+      }
+    ],
+    "stop": [
+      {
+        "command": "cargo xtask hook-stop-frontend-check",
+        "timeout_ms": 120000
+      }
+    ]
+  },
+  "mcpServers": {
+    "svelte": {
+      "command": "npx",
+      "args": ["-y", "@sveltejs/mcp"]
+    }
+  }
+}

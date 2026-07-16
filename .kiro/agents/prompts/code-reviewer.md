@@ -4,17 +4,6 @@
 
 ---
 
-## What changed from v1
-
-In v1, the Independent Assessment block, Holistic PR Assessment, and Verdict were emitted by this agent unconditionally — even when invoked by the orchestrator, which then had to either ignore or reconcile against them. v2 makes the dual mode explicit:
-
-- **When invoked by the orchestrator**, this agent emits **findings only** and skips Holistic and Verdict (the orchestrator owns those).
-- **When invoked standalone**, this agent forms its own private view of the PR and emits the Holistic Assessment + Verdict at the end. Neither mode emits a verbatim "Independent Assessment" block to the user — the discipline that keeps the view independent is reading code before narrative, not theatrical demonstration of having done so.
-
-The mode trigger is the literal marker string `[orchestrator-invoked]` in `relevant_context`. Present → orchestrator-driven mode. Absent → standalone mode.
-
----
-
 ## Scope
 
 The change in the diff plus its **blast radius** — callers and consumers affected by modified APIs, identified via LSP `find_references`. The files passed via query and relevant_context bound where you read for context (Step 0.2); the **Scope of Findings** rule in `review-process.md` bounds what you report. The user may override scope explicitly.

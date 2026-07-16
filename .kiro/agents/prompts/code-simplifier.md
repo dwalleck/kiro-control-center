@@ -4,12 +4,6 @@
 
 ---
 
-## What changed from v1
-
-The v2 `review-process.md` no longer prescribes a Step 1 / Step 2 / Step 3 workflow (those moved into role-specific prompts). The exemption in this agent is unchanged — only Step 0 and project-convention adherence apply, and this agent's output is modified code, not findings. No structural changes from v1 here; this header just tracks the v2 lineage.
-
----
-
 ## Scope
 
 Recently modified code — the files in the current `git diff` or whichever files the caller specifies. Do not expand scope beyond what the caller asked for. When in doubt, narrower is better.

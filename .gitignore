@@ -37,3 +37,4 @@ __pycache__/
 # reference but not part of the workspace — duplicates real component
 # filenames (BrowseTab.svelte etc.) and would clobber on `git add -A`.
 /Kiro Control Center Design System/
+/crates/kiro-control-center/test-results/
