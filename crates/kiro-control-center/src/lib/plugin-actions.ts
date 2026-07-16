@@ -3,7 +3,11 @@ import type {
   InstallPluginResult_Serialize,
   RemovePluginResult,
 } from "$lib/bindings";
-import { formatInstallPluginResult, formatRemovePluginResult } from "$lib/format";
+import {
+  formatCommandError,
+  formatInstallPluginResult,
+  formatRemovePluginResult,
+} from "$lib/format";
 
 // Mirrors the shape produced by `typedError<T, CommandError>` in bindings.ts.
 // Re-declared here so this module stays pure-logic — no runtime import of
@@ -177,7 +181,7 @@ export async function runPluginInstall(
     }
     return {
       kind: "fail",
-      error: `${failPrefix}: ${result.error.message ?? "Unknown error"}`,
+      error: `${failPrefix}: ${formatCommandError(result.error)}`,
     };
   } catch (e) {
     const reason = e instanceof Error ? e.message : String(e);

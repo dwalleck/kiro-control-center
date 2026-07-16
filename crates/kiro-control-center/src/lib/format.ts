@@ -1,4 +1,5 @@
 import type {
+  CommandError,
   FailedAgent,
   FailedSkill,
   FailedSkillReason,
@@ -13,6 +14,12 @@ import type {
   SkippedSkill,
   SteeringWarning,
 } from "$lib/bindings";
+
+export function formatCommandError(error: CommandError): string {
+  const message = error.message ?? "Unknown error";
+  const remediation = error.remediation ?? null;
+  return remediation === null ? message : `${message} — ${remediation}`;
+}
 
 // Render a structured SkippedReason as a one-line string. Total over
 // all eight variants (not just the six reachable via SkillCount) —

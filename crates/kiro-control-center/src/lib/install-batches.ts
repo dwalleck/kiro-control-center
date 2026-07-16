@@ -8,11 +8,14 @@
 // `commands`, matching the injection pattern on PluginActionContext /
 // PluginRemoveContext (tests construct fakes directly, no module mocks).
 
+import type { CommandError } from "$lib/bindings";
+import { formatCommandError } from "$lib/format";
+
 // Mirrors the shape produced by `typedError<T, CommandError>` in
 // bindings.ts. Re-declared here so this module stays pure-logic.
 type IpcResult<T> =
   | { status: "ok"; data: T }
-  | { status: "error"; error: { message: string } };
+  | { status: "error"; error: CommandError };
 
 export type InstallBatch<T> = {
   // Names selected for install in this category. An empty list means
@@ -72,7 +75,7 @@ export async function runInstallBatches<S, St, A>(
       if (r.status === "ok") return { data: r.data, error: null };
       return {
         data: null,
-        error: `Customize apply: ${category} install failed for ${marketplace}/${plugin}: ${r.error.message}`,
+        error: `Customize apply: ${category} install failed for ${marketplace}/${plugin}: ${formatCommandError(r.error)}`,
       };
     } catch (e) {
       const reason = e instanceof Error ? e.message : String(e);

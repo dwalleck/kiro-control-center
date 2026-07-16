@@ -3,6 +3,7 @@
   import { SvelteMap, SvelteSet } from "svelte/reactivity";
   import { commands } from "$lib/bindings";
   import {
+    formatCommandError,
     formatSkippedSkill,
     formatSkippedItemsForPlugin,
     formatSteeringWarning,
@@ -635,7 +636,9 @@
             // shorter "installed N" count with no explanation.
             unreadableAll.push(...result.data.skipped_skills);
           } else {
-            notAttempted.push(`${group.marketplace}/${group.plugin} (${result.error.message})`);
+            notAttempted.push(
+              `${group.marketplace}/${group.plugin} (${formatCommandError(result.error)})`
+            );
           }
         } catch (e) {
           const reason = e instanceof Error ? e.message : String(e);
@@ -1061,7 +1064,7 @@
           installMessage = `Steering for ${plugin}: ${parts.join(" | ")}`;
         }
       } else {
-        installError = `Steering install failed for ${plugin}: ${result.error.message}`;
+        installError = `Steering install failed for ${plugin}: ${formatCommandError(result.error)}`;
       }
     } catch (e) {
       const reason = e instanceof Error ? e.message : String(e);
