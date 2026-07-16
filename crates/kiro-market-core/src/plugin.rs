@@ -4,11 +4,55 @@
 //! declares the plugin name, version, description, and the list of skill
 //! subdirectories it ships.
 
+use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use serde::Deserialize;
+use serde::de::{self, SeqAccess, Visitor};
+use serde::{Deserialize, Deserializer};
 use tracing::{debug, warn};
+
+fn deserialize_one_or_many_strings<'de, D>(deserializer: D) -> Result<Vec<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    struct OneOrManyStringsVisitor;
+
+    impl<'de> Visitor<'de> for OneOrManyStringsVisitor {
+        type Value = Vec<String>;
+
+        fn expecting(&self, formatter: &mut fmt::Formatter) -> fmt::Result {
+            formatter.write_str("a string or an array of strings")
+        }
+
+        fn visit_str<E>(self, value: &str) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            Ok(vec![value.to_owned()])
+        }
+
+        fn visit_string<E>(self, value: String) -> Result<Self::Value, E>
+        where
+            E: de::Error,
+        {
+            Ok(vec![value])
+        }
+
+        fn visit_seq<A>(self, mut sequence: A) -> Result<Self::Value, A::Error>
+        where
+            A: SeqAccess<'de>,
+        {
+            let mut values = Vec::with_capacity(sequence.size_hint().unwrap_or(0));
+            while let Some(value) = sequence.next_element()? {
+                values.push(value);
+            }
+            Ok(values)
+        }
+    }
+
+    deserializer.deserialize_any(OneOrManyStringsVisitor)
+}
 
 /// A plugin manifest as found in `plugin.json`.
 #[derive(Debug, Clone, Deserialize)]
@@ -16,12 +60,12 @@ pub struct PluginManifest {
     pub name: String,
     pub version: Option<String>,
     pub description: Option<String>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_one_or_many_strings")]
     pub skills: Vec<String>,
     /// Optional list of directories (relative to the plugin root) to scan
     /// for agent markdown files. Empty means "use the default scan paths"
     /// ([`crate::DEFAULT_AGENT_PATHS`]).
-    #[serde(default)]
+    #[serde(default, deserialize_with = "deserialize_one_or_many_strings")]
     pub agents: Vec<String>,
     /// Authoring format for this plugin. See [`PluginFormat`]. Omitted
     /// fields default to [`PluginFormat::Translated`] via the type's
@@ -555,6 +599,45 @@ mod tests {
     }
 
     #[test]
+    fn parse_with_single_skill_path() {
+        let json = br#"{
+            "name": "aws-agents",
+            "skills": "./skills/"
+        }"#;
+
+        let manifest = PluginManifest::from_json(json).expect("should parse");
+        assert_eq!(manifest.skills, vec!["./skills/"]);
+    }
+
+    #[test]
+    fn parse_rejects_invalid_component_path_types() {
+        let cases: &[(&str, &[u8])] = &[
+            ("numeric skills", br#"{"name": "p", "skills": 42}"#),
+            ("null skills", br#"{"name": "p", "skills": null}"#),
+            ("object skills", br#"{"name": "p", "skills": {}}"#),
+            (
+                "mixed skills",
+                br#"{"name": "p", "skills": ["./skills/", 42]}"#,
+            ),
+            ("null agents", br#"{"name": "p", "agents": null}"#),
+            ("object agents", br#"{"name": "p", "agents": {}}"#),
+            (
+                "mixed agents",
+                br#"{"name": "p", "agents": ["./agents/", 42]}"#,
+            ),
+            (
+                "scalar steering",
+                br#"{"name": "p", "steering": "./steering/"}"#,
+            ),
+        ];
+
+        for &(case, json) in cases {
+            let error = PluginManifest::from_json(json).expect_err(case);
+            assert!(error.is_data(), "{case}: expected data error, got {error}");
+        }
+    }
+
+    #[test]
     fn parse_without_skills_defaults_to_empty() {
         let json = br#"{
             "name": "minimal-plugin"
@@ -577,6 +660,16 @@ mod tests {
         }"#;
         let m = PluginManifest::from_json(json).expect("should parse");
         assert_eq!(m.agents, vec!["./agents/"]);
+    }
+
+    #[test]
+    fn parse_with_single_agent_path() {
+        let json = br#"{
+            "name": "agent-plugin",
+            "agents": "./agents/"
+        }"#;
+        let manifest = PluginManifest::from_json(json).expect("should parse");
+        assert_eq!(manifest.agents, vec!["./agents/"]);
     }
 
     #[test]
