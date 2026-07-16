@@ -1081,6 +1081,7 @@
     marketplace: string,
     plugin: string,
     mode: BrowseAction,
+    acceptMcp: boolean,
   ) {
     const key = pluginKey(marketplace, plugin);
     if (pendingPluginActions.has(key)) return;
@@ -1117,7 +1118,7 @@
           marketplace,
           plugin,
           projectPath,
-          acceptMcp: false,
+          acceptMcp,
           refresh: () => fetchInstalledPlugins(),
           installPlugin: commands.installPlugin,
           storeRefresh: (p) => pluginUpdates.refresh(p),
@@ -1549,8 +1550,10 @@
               update={pluginUpdates.updateFor(ap.marketplace, ap.entry.plugin)}
               failure={pluginUpdates.failureFor(ap.marketplace, ap.entry.plugin)}
               projectPicked={!!projectPath}
-              onInstall={() => runPluginInstall(ap.marketplace, ap.entry.plugin, "install")}
-              onUpdate={() => runPluginInstall(ap.marketplace, ap.entry.plugin, "update")}
+              onInstall={(acceptMcp) =>
+                runPluginInstall(ap.marketplace, ap.entry.plugin, "install", acceptMcp)}
+              onUpdate={(acceptMcp) =>
+                runPluginInstall(ap.marketplace, ap.entry.plugin, "update", acceptMcp)}
               onCustomize={() => openDrawer(ap.marketplace, ap.entry)}
             />
           {/each}
