@@ -21,20 +21,25 @@ if agent_match is None:
     raise SystemExit("AgentItemInfo binding not found")
 
 agent_fields = re.findall(r"^\s*([a-zA-Z_][a-zA-Z0-9_]*):", agent_match["body"], re.MULTILINE)
-drawer_values = re.findall(r"/\* acceptMcp \*/\s*(true|false)", browse)
-whole_values = re.findall(r"acceptMcp:\s*(true|false)", browse)
+drawer_expressions = re.findall(r"/\* acceptMcp \*/\s*([^,\n]+)", browse)
+whole_expressions = re.findall(r"acceptMcp:\s*([^,\n}]+)", browse)
 warning_present = 'kind: "mcp_servers_require_opt_in"' in bindings
 
-if len(drawer_values) != 1 or len(whole_values) != 1:
+if len(drawer_expressions) != 1 or len(whole_expressions) != 1:
     raise SystemExit(
-        f"expected one drawer and one whole-plugin value, got {drawer_values=} {whole_values=}"
+        "expected one drawer and one whole-plugin value, got "
+        f"{drawer_expressions=} {whole_expressions=}"
     )
+
+def classify(expression: str) -> str:
+    value = expression.strip()
+    return value if value in {"true", "false"} else "dynamic"
 
 result = {
     "agent_catalog_fields": agent_fields,
     "catalog_has_preinstall_mcp_signal": any("mcp" in field for field in agent_fields),
-    "drawer_accept_mcp": drawer_values[0],
-    "whole_plugin_accept_mcp": whole_values[0],
+    "drawer_accept_mcp": classify(drawer_expressions[0]),
+    "whole_plugin_accept_mcp": classify(whole_expressions[0]),
     "post_install_warning_available": warning_present,
 }
 print(json.dumps(result, indent=2, sort_keys=True))

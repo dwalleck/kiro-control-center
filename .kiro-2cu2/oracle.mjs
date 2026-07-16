@@ -53,14 +53,19 @@ ts.forEachChild(bindingsAst, function visit(node) {
   }
   ts.forEachChild(node, visit);
 });
-if (!agentItemInfo || drawerAcceptMcp?.type !== "Literal" || wholeAcceptMcp?.type !== "Literal") {
+if (!agentItemInfo || !drawerAcceptMcp || !wholeAcceptMcp) {
   throw new Error("expected MCP call-site and AgentItemInfo AST nodes were not found");
+}
+function classify(node) {
+  return node.type === "Literal" && typeof node.value === "boolean"
+    ? String(node.value)
+    : "dynamic";
 }
 const fields = agentItemInfo.type.members.map((member) => member.name.text);
 console.log(JSON.stringify({
   agent_catalog_fields: fields,
   catalog_has_preinstall_mcp_signal: fields.some((field) => field.includes("mcp")),
-  drawer_accept_mcp: String(drawerAcceptMcp.value),
+  drawer_accept_mcp: classify(drawerAcceptMcp),
   post_install_warning_available: warningPresent,
-  whole_plugin_accept_mcp: String(wholeAcceptMcp.value),
+  whole_plugin_accept_mcp: classify(wholeAcceptMcp),
 }, null, 2));
