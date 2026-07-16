@@ -28,7 +28,7 @@ Frontend slices also run `npm run test:unit`, `npm run check`, and `npm run buil
 
 **Claim:** C1 + C2 — every valid Copilot/native catalog agent carries one normalized label per declared MCP server; no-MCP agents carry `[]`; malformed MCP remains an `AgentParseSkip` rather than fabricated metadata.
 
-**Oracle:** The Python regex probe and Svelte/TypeScript AST oracle agree that `AgentItemInfo` now has an MCP field while both BrowseTab consent arguments remain literal `false`. Hand-authored MCP maps independently establish expected labels/counts.
+**Oracle:** Hand-authored MCP maps independently establish expected labels/counts against the core catalog result. The Python probe and TypeScript AST oracle must still agree exactly; until Slice 2 regenerates the frontend contract, both intentionally continue to report the old generated binding shape and literal-false BrowseTab call sites.
 
 **Stress fixture:** In one catalog fixture, include: a Copilot agent with BTreeMap entries `a=stdio`, `b=stdio`, `c=http`; a native agent with `x=sse`; a Claude agent with no MCP; and a malformed Copilot MCP entry missing required transport data. Expected vectors are `['stdio','stdio','http']` in key order, `['sse']`, and `[]`; the malformed source appears only in parse skips. This targets one-dialect-only projection, accidental deduplication, and permissive parse fallback.
 

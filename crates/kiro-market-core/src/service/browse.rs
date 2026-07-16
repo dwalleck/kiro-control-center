@@ -6,6 +6,7 @@
 //! they do not duplicate the enumeration loop or the per-skill
 //! frontmatter-parsing logic.
 
+use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -13,6 +14,7 @@ use serde::Serialize;
 use tracing::{debug, error, warn};
 
 use crate::agent::parse_native::parse_native_kiro_agent_file;
+use crate::agent::types::McpServerConfig;
 use crate::agent::{
     AgentDialect, discover_agents_in_dirs, discover_native_kiro_agents_in_dirs, parse_agent_file,
 };
@@ -183,6 +185,9 @@ pub struct AgentItemInfo {
     /// `true` iff `installed_agents.agents.contains_key(&name)`.
     pub installed: bool,
     pub dialect: AgentDialect,
+    /// One normalized transport label per declared MCP server. Empty
+    /// means the agent does not require MCP consent.
+    pub mcp_server_transports: Vec<String>,
 }
 
 /// Per-item failure surfaced inside a working plugin's
@@ -1590,6 +1595,15 @@ fn list_steering_with_manifest(
     PluginSteeringResult { steering, warnings }
 }
 
+fn mcp_server_transports(servers: &BTreeMap<String, McpServerConfig>) -> Vec<String> {
+    // Incremental catalog cost is O(servers), bounded at roughly ten
+    // entries per production agent.
+    servers
+        .values()
+        .map(|server| server.transport_label().to_owned())
+        .collect()
+}
+
 /// Per-plugin agent listing with the manifest pre-loaded. Covers BOTH
 /// translated dialects (markdown frontmatter via [`parse_agent_file`])
 /// AND native Kiro agents (JSON via [`parse_native_kiro_agent_file`]) —
@@ -1625,6 +1639,7 @@ fn list_agents_with_manifest(
                         && meta.marketplace.as_str() == marketplace_name
                 }),
                 dialect: def.dialect,
+                mcp_server_transports: mcp_server_transports(&def.mcp_servers),
             }),
             Err(e) => skipped.push(AgentParseSkip {
                 plugin: plugin_name.to_owned(),
@@ -1662,6 +1677,7 @@ fn list_agents_with_manifest(
                             && meta.marketplace.as_str() == marketplace_name
                     }),
                 dialect: AgentDialect::Native,
+                mcp_server_transports: mcp_server_transports(&bundle.mcp_servers),
             }),
             Err(e) => skipped.push(AgentParseSkip {
                 plugin: plugin_name.to_owned(),
@@ -3278,6 +3294,99 @@ mod tests {
         assert!(
             !by_name.contains_key("helper"),
             "native filename stem MUST NOT appear as the join key either"
+        );
+    }
+
+    #[test]
+    fn list_agents_for_plugin_surfaces_translated_mcp_transports() {
+        let (dir, svc) = temp_service();
+        let entries = vec![relative_path_entry("alpha", "plugins/alpha")];
+        let marketplace_path = seed_marketplace_with_registry(dir.path(), &svc, "mp1", &entries);
+        let agents_dir = marketplace_path.join("plugins/alpha/agents");
+        fs::create_dir_all(&agents_dir).expect("create agents dir");
+        fs::write(
+            agents_dir.join("mcp.agent.md"),
+            "---\nname: mcp-agent\nmcp-servers:\n  a:\n    type: local\n    command: first\n  b:\n    type: stdio\n    command: second\n  c:\n    type: http\n    url: https://example.com/mcp\n---\nbody\n",
+        )
+        .expect("write MCP agent");
+        make_plugin_with_markdown_agent(&marketplace_path, "alpha", "plain.md", "plain-agent");
+
+        let result = svc
+            .list_agents_for_plugin("mp1", "alpha", &InstalledAgents::default())
+            .expect("agent catalog");
+        assert!(result.skipped.is_empty(), "all agents should parse");
+
+        let mcp = result
+            .agents
+            .iter()
+            .find(|agent| agent.name == "mcp-agent")
+            .expect("MCP agent");
+        assert_eq!(
+            mcp.mcp_server_transports,
+            ["stdio", "stdio", "http"],
+            "retain one normalized label per BTreeMap-ordered server"
+        );
+        let plain = result
+            .agents
+            .iter()
+            .find(|agent| agent.name == "plain-agent")
+            .expect("plain agent");
+        assert!(
+            plain.mcp_server_transports.is_empty(),
+            "no MCP declarations must project as an empty vector"
+        );
+    }
+
+    #[test]
+    fn list_agents_for_plugin_surfaces_native_mcp_transports() {
+        let (dir, svc) = temp_service();
+        let entries = vec![relative_path_entry("alpha", "plugins/alpha")];
+        let marketplace_path = seed_marketplace_with_registry(dir.path(), &svc, "mp1", &entries);
+        let agents_dir = marketplace_path.join("plugins/alpha/agents");
+        fs::create_dir_all(&agents_dir).expect("create agents dir");
+        fs::write(
+            agents_dir.join("native.json"),
+            r#"{
+                "name": "native-mcp",
+                "mcpServers": {
+                    "events": { "type": "sse", "url": "https://example.com/events" }
+                }
+            }"#,
+        )
+        .expect("write native MCP agent");
+
+        let result = svc
+            .list_agents_for_plugin("mp1", "alpha", &InstalledAgents::default())
+            .expect("agent catalog");
+        assert!(result.skipped.is_empty(), "native agent should parse");
+        assert_eq!(result.agents.len(), 1);
+        assert_eq!(result.agents[0].mcp_server_transports, ["sse"]);
+    }
+
+    #[test]
+    fn list_agents_for_plugin_malformed_mcp_remains_skipped() {
+        let (dir, svc) = temp_service();
+        let entries = vec![relative_path_entry("alpha", "plugins/alpha")];
+        let marketplace_path = seed_marketplace_with_registry(dir.path(), &svc, "mp1", &entries);
+        let agents_dir = marketplace_path.join("plugins/alpha/agents");
+        fs::create_dir_all(&agents_dir).expect("create agents dir");
+        fs::write(
+            agents_dir.join("bad.agent.md"),
+            "---\nname: bad-agent\nmcp-servers:\n  missing-command:\n    type: stdio\n---\nbody\n",
+        )
+        .expect("write malformed MCP agent");
+
+        let result = svc
+            .list_agents_for_plugin("mp1", "alpha", &InstalledAgents::default())
+            .expect("agent catalog");
+        assert!(
+            result.agents.is_empty(),
+            "malformed agent must not be projected"
+        );
+        assert_eq!(result.skipped.len(), 1, "parse failure remains observable");
+        assert!(
+            result.skipped[0].reason.contains("missing field"),
+            "skip should preserve the parser error chain"
         );
     }
 
