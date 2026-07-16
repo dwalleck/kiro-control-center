@@ -1,0 +1,1 @@
+- Refuse trailing-slash agent scan paths whose final component is a symlink or reparse point, preventing discovery outside the plugin directory.
