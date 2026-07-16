@@ -4229,6 +4229,122 @@ mod tests {
         assert_eq!(json["mcpServers"]["tf"]["command"], "docker");
     }
 
+    fn write_mixed_mcp_agent_fixtures(agents_dir: &Path) {
+        for (filename, body) in [
+            (
+                "safe.agent.md",
+                "---\nname: safe-agent\ndescription: Safe\n---\nbody\n",
+            ),
+            (
+                "stdio.agent.md",
+                "---\nname: mcp-stdio\ndescription: Local MCP\nmcp-servers:\n  local:\n    type: stdio\n    command: echo\n---\nbody\n",
+            ),
+            (
+                "http.agent.md",
+                "---\nname: mcp-http\ndescription: Remote MCP\nmcp-servers:\n  remote:\n    type: http\n    url: https://example.com/mcp\n---\nbody\n",
+            ),
+        ] {
+            fs::write(agents_dir.join(filename), body).expect("write agent fixture");
+        }
+    }
+
+    #[test]
+    fn install_plugin_agents_mixed_batch_is_partial_without_opt_in_and_complete_with_it() {
+        use crate::project::KiroProject;
+
+        let (_dir, _svc) = temp_service();
+        let plugin_tmp = tempfile::tempdir().expect("plugin tempdir");
+        let agents_dir = plugin_tmp.path().join("agents");
+        fs::create_dir_all(&agents_dir).expect("create agents dir");
+        write_mixed_mcp_agent_fixtures(&agents_dir);
+
+        let gated_tmp = tempfile::tempdir().expect("gated project tempdir");
+        let gated_project = KiroProject::new(gated_tmp.path().to_path_buf());
+        let gated = MarketplaceService::install_plugin_agents(
+            &gated_project,
+            plugin_tmp.path(),
+            &["./agents/".to_string()],
+            crate::plugin::PluginFormat::Translated,
+            &InstallFilter::All,
+            default_install_ctx(&mp("mp"), &pn("p")),
+        );
+
+        assert_eq!(gated.installed, ["safe-agent"]);
+        assert!(gated.failed.is_empty());
+        assert!(
+            gated_tmp
+                .path()
+                .join(".kiro/agents/safe-agent.json")
+                .exists(),
+            "safe work must continue when MCP agents are gated"
+        );
+        for name in ["mcp-stdio", "mcp-http"] {
+            assert!(
+                !gated_tmp
+                    .path()
+                    .join(format!(".kiro/agents/{name}.json"))
+                    .exists(),
+                "{name} must not be written without opt-in"
+            );
+        }
+        assert!(
+            gated.warnings.iter().any(|warning| matches!(
+                warning,
+                InstallWarning::McpServersRequireOptIn { agent, transports }
+                    if agent == "mcp-stdio" && transports == &["stdio"]
+            )),
+            "stdio MCP warning should retain its transport"
+        );
+        assert!(
+            gated.warnings.iter().any(|warning| matches!(
+                warning,
+                InstallWarning::McpServersRequireOptIn { agent, transports }
+                    if agent == "mcp-http" && transports == &["http"]
+            )),
+            "HTTP MCP warning should retain its transport"
+        );
+
+        let accepted_tmp = tempfile::tempdir().expect("accepted project tempdir");
+        let accepted_project = KiroProject::new(accepted_tmp.path().to_path_buf());
+        let accepted = MarketplaceService::install_plugin_agents(
+            &accepted_project,
+            plugin_tmp.path(),
+            &["./agents/".to_string()],
+            crate::plugin::PluginFormat::Translated,
+            &InstallFilter::All,
+            AgentInstallContext {
+                accept_mcp: true,
+                ..default_install_ctx(&mp("mp"), &pn("p"))
+            },
+        );
+
+        assert_eq!(
+            accepted.installed.len(),
+            3,
+            "opt-in installs every source agent"
+        );
+        assert!(accepted.failed.is_empty());
+        assert!(
+            !accepted
+                .warnings
+                .iter()
+                .any(|warning| matches!(warning, InstallWarning::McpServersRequireOptIn { .. }))
+        );
+        for name in ["safe-agent", "mcp-stdio", "mcp-http"] {
+            assert!(
+                accepted.installed.iter().any(|installed| installed == name),
+                "{name} should be reported as installed after explicit opt-in"
+            );
+            assert!(
+                accepted_tmp
+                    .path()
+                    .join(format!(".kiro/agents/{name}.json"))
+                    .exists(),
+                "{name} should be written after explicit opt-in"
+            );
+        }
+    }
+
     #[test]
     fn install_plugin_agents_lists_all_mcp_transports_in_warning() {
         // An agent with multiple MCP servers of different transports
