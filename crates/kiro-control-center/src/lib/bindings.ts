@@ -257,6 +257,10 @@ export const commands = {
 	 *  counts can't reconstruct it. Without this command edit mode would
 	 *  have to start from a synthetic empty draft, and saving would
 	 *  silently truncate the agent.
+	 * 
+	 *  Routes `name` through `AgentName::new` at the IPC boundary so a
+	 *  malformed name is rejected before project construction or any
+	 *  agent-file access.
 	 */
 	loadUserAgentJson: (name: string, projectPath: string) => typedError<string, CommandError>(__TAURI_INVOKE("load_user_agent_json", { name, projectPath })),
 	/**
@@ -1438,8 +1442,9 @@ export type ProjectInfo = {
  * 
  *  Construction goes through [`RelativePath::new`], which applies
  *  [`validate_relative_path`] — so holding a `RelativePath` is a static
- *  guarantee that the inner string is non-empty, contains no `..`
- *  components, no NUL bytes, and is not an absolute path.
+ *  guarantee that the inner string is non-empty, contains no `..` components
+ *  or NUL bytes, and cannot expose an absolute path or Windows drive prefix
+ *  when consumers strip leading `./` prefixes.
  * 
  *  The newtype replaces a plain `String` in the manifest data model
  *  (`PluginSource::RelativePath`, `StructuredSource::GitSubdir.path`) so
