@@ -46,14 +46,7 @@
   const consentId = $props.id();
 
   function mcpBadgeLabel(transports: readonly string[]): string {
-    const seen: Record<string, true> = Object.create(null);
-    const labels: string[] = [];
-    for (const transport of transports) {
-      if (seen[transport]) continue;
-      seen[transport] = true;
-      labels.push(transport);
-    }
-    return labels.join(", ");
+    return [...new Set(transports)].join(", ");
   }
 
   function toggleItem(set: SvelteSet<string>, name: string) {
