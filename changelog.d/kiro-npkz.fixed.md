@@ -1,0 +1,1 @@
+- Report malformed user-agent names as validation errors at the command boundary before the core read path runs.
