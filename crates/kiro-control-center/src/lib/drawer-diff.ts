@@ -1,3 +1,5 @@
+import type { AgentItemInfo } from "$lib/bindings";
+
 /**
  * Pure-function helpers for the CustomizeDrawer's per-item diff math.
  *
@@ -15,6 +17,61 @@ export type SectionToggleState = "empty" | "none" | "partial" | "all";
 export interface SelectedSet {
   has(name: string): boolean;
   readonly size: number;
+}
+
+export type CustomizeDrawerApply = {
+  skills: { install: string[]; remove: string[] };
+  steering: { install: string[]; remove: string[] };
+  agents: { install: string[]; remove: string[] };
+  acceptMcp: boolean;
+};
+
+export type McpConsentSummary = {
+  readonly agentNames: readonly string[];
+  readonly serverCount: number;
+  readonly transports: readonly { label: string; count: number }[];
+};
+
+function summarizeMcp(
+  agents: readonly AgentItemInfo[],
+  selected: SelectedSet | null,
+): McpConsentSummary | null {
+  const agentNames: string[] = [];
+  const transportCounts = new Map<string, number>();
+  let serverCount = 0;
+
+  for (const agent of agents) {
+    if (selected !== null && (agent.installed || !selected.has(agent.name))) continue;
+    if (agent.mcp_server_transports.length === 0) continue;
+
+    agentNames.push(agent.name);
+    for (const label of agent.mcp_server_transports) {
+      serverCount++;
+      transportCounts.set(label, (transportCounts.get(label) ?? 0) + 1);
+    }
+  }
+
+  if (serverCount === 0) return null;
+  const transports = Array.from(transportCounts, ([label, count]) => ({ label, count }));
+  transports.sort((left, right) =>
+    left.label < right.label ? -1 : left.label > right.label ? 1 : 0,
+  );
+  return { agentNames, serverCount, transports };
+}
+
+/** Summarize every MCP-bearing agent in a whole-plugin action. */
+export function summarizePluginMcp(
+  agents: readonly AgentItemInfo[],
+): McpConsentSummary | null {
+  return summarizeMcp(agents, null);
+}
+
+/** Summarize selected, not-installed MCP agents in a drawer action. */
+export function summarizeSelectedMcpInstalls(
+  agents: readonly AgentItemInfo[],
+  selected: SelectedSet,
+): McpConsentSummary | null {
+  return summarizeMcp(agents, selected);
 }
 
 /**

@@ -1,5 +1,12 @@
 import { describe, expect, it } from "vitest";
-import { deriveDiff, deriveSectionState, pluralize } from "./drawer-diff";
+import type { AgentItemInfo } from "./bindings";
+import {
+  deriveDiff,
+  deriveSectionState,
+  pluralize,
+  summarizePluginMcp,
+  summarizeSelectedMcpInstalls,
+} from "./drawer-diff";
 
 // SvelteSet ≡ Set for the read-only contract (`.has`, `.size`) — vitest
 // doesn't need the reactive shim, so use plain Set for fixtures.
@@ -129,5 +136,88 @@ describe("pluralize", () => {
   it("works with multi-word nouns", () => {
     expect(pluralize(1, "steering file", "steering files")).toBe("steering file");
     expect(pluralize(3, "steering file", "steering files")).toBe("steering files");
+  });
+});
+
+function agent(
+  name: string,
+  installed: boolean,
+  mcpServerTransports: string[],
+): AgentItemInfo {
+  return {
+    name,
+    description: null,
+    plugin: "demo",
+    marketplace: "test",
+    installed,
+    dialect: "copilot",
+    mcp_server_transports: mcpServerTransports,
+  };
+}
+
+describe("MCP consent summaries", () => {
+  const agents = [
+    agent("selected-new", false, ["stdio", "stdio"]),
+    agent("unselected-new", false, ["http"]),
+    agent("selected-installed", true, ["sse"]),
+    agent("selected-future", false, ["quic"]),
+    agent("plain", false, []),
+  ];
+
+  it("whole-plugin scope preserves agent order and counts every server", () => {
+    expect(summarizePluginMcp(agents)).toEqual({
+      agentNames: [
+        "selected-new",
+        "unselected-new",
+        "selected-installed",
+        "selected-future",
+      ],
+      serverCount: 5,
+      transports: [
+        { label: "http", count: 1 },
+        { label: "quic", count: 1 },
+        { label: "sse", count: 1 },
+        { label: "stdio", count: 2 },
+      ],
+    });
+  });
+
+  it("drawer scope includes only selected agents that are not installed", () => {
+    expect(
+      summarizeSelectedMcpInstalls(
+        agents,
+        new Set(["selected-new", "selected-installed", "selected-future", "phantom"]),
+      ),
+    ).toEqual({
+      agentNames: ["selected-new", "selected-future"],
+      serverCount: 3,
+      transports: [
+        { label: "quic", count: 1 },
+        { label: "stdio", count: 2 },
+      ],
+    });
+  });
+
+  it("empty and MCP-free scopes need no consent", () => {
+    expect(summarizePluginMcp([])).toBeNull();
+    expect(summarizePluginMcp([agent("plain", false, [])])).toBeNull();
+    expect(
+      summarizeSelectedMcpInstalls(agents, new Set(["plain", "unselected-new"])),
+    ).toEqual({
+      agentNames: ["unselected-new"],
+      serverCount: 1,
+      transports: [{ label: "http", count: 1 }],
+    });
+    expect(summarizeSelectedMcpInstalls(agents, new Set(["plain"]))).toBeNull();
+  });
+
+  it("unknown transport labels remain consent-requiring and renderable", () => {
+    expect(
+      summarizeSelectedMcpInstalls(agents, new Set(["selected-future"])),
+    ).toEqual({
+      agentNames: ["selected-future"],
+      serverCount: 1,
+      transports: [{ label: "quic", count: 1 }],
+    });
   });
 });
