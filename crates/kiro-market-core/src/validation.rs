@@ -15,7 +15,8 @@ use crate::error::ValidationError;
 /// Construction goes through [`RelativePath::new`], which applies
 /// [`validate_relative_path`] — so holding a `RelativePath` is a static
 /// guarantee that the inner string is non-empty, contains no `..`
-/// components, no NUL bytes, and is not an absolute path.
+/// components, no NUL bytes or Windows drive prefix, and is not an absolute
+/// path.
 ///
 /// The newtype replaces a plain `String` in the manifest data model
 /// (`PluginSource::RelativePath`, `StructuredSource::GitSubdir.path`) so
@@ -46,8 +47,9 @@ impl RelativePath {
     ///
     /// **Caller contract:** `value` must already satisfy
     /// `validate_relative_path` — non-empty, no leading `/` or `\`, no
-    /// embedded `\` or NUL, no `..` component. The current caller —
-    /// [`crate::plugin::DiscoveredPlugin::as_relative_path`] — is sound
+    /// Windows drive prefix, no embedded `\` or NUL, no `..` component. The
+    /// current caller — [`crate::plugin::DiscoveredPlugin::as_relative_path`]
+    /// — is sound
     /// only because [`crate::plugin::try_read_plugin`] runs
     /// `validate_relative_path` against the assembled path before
     /// constructing the `DiscoveredPlugin`. Adding a new internal caller
@@ -648,7 +650,8 @@ pub fn validate_name(name: &str) -> Result<(), ValidationError> {
 
 /// Validate that a relative path does not escape its root via `..` components.
 ///
-/// Also rejects absolute paths (starting with `/` or `\`).
+/// Also rejects absolute paths (starting with `/` or `\`) and ASCII Windows
+/// drive prefixes such as `C:`.
 ///
 /// # Errors
 ///
@@ -665,6 +668,15 @@ pub fn validate_relative_path(path: &str) -> Result<(), ValidationError> {
         return Err(ValidationError::InvalidRelativePath {
             path: path.to_owned(),
             reason: "must not be an absolute path".into(),
+        });
+    }
+
+    let bytes = path.as_bytes();
+    if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+        let prefix = &path[..2];
+        return Err(ValidationError::InvalidRelativePath {
+            path: path.to_owned(),
+            reason: format!("must not start with Windows drive prefix `{prefix}`"),
         });
     }
 
@@ -883,6 +895,22 @@ mod tests {
     #[test]
     fn validate_relative_path_rejects_absolute() {
         assert!(validate_relative_path("/etc/passwd").is_err());
+    }
+
+    #[rstest]
+    #[case("C:agents")]
+    #[case("z:plugins/agent.md")]
+    fn validate_relative_path_rejects_windows_drive_relative_prefix(#[case] path: &str) {
+        let err = validate_relative_path(path).unwrap_err();
+
+        assert!(
+            matches!(
+                &err,
+                ValidationError::InvalidRelativePath { reason, .. }
+                    if reason.contains("Windows drive prefix")
+            ),
+            "expected Windows-drive-prefix rejection for {path:?}, got {err:?}"
+        );
     }
 
     #[test]

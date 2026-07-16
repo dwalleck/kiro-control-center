@@ -1,1 +1,1 @@
-- Refuse trailing-slash agent scan paths whose final component is a symlink or reparse point, preventing discovery outside the plugin directory.
+- Harden plugin-relative path discovery by refusing trailing-slash symlink or reparse scan roots and Windows drive-relative prefixes, preventing paths from escaping plugin directories.
