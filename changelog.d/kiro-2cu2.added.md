@@ -1,0 +1,1 @@
+- Add MCP transport disclosures and one-shot opt-in controls to Control Center Browse plugin cards and Customize drawers; unchecked MCP agents are skipped while MCP-free plugin items continue installing.
