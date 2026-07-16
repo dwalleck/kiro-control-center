@@ -154,7 +154,7 @@ Apply will install 2 skills. 1 selected MCP agent will be skipped.
 
 The dynamic footer status uses `aria-live="polite"` without stealing focus. The native checkbox uses visible label/detail text linked with `aria-describedby`.
 
-Any agent selection mutation resets `acceptMcp` to false; skill and steering mutations do not. The emitted payload uses the final guard `acceptMcp: summary !== null && acceptMcp`, then immediately resets local state before awaiting the parent. Apply remains usable while unchecked: safe items/removals proceed, MCP agents are skipped, and the structured warning remains visible after the drawer closes.
+Any agent selection mutation resets `acceptMcp` to false; skill and steering mutations do not. The emitted payload uses the final guard `acceptMcp: summary !== null && acceptMcp`. Apply is disabled while awaiting the parent; a `finally` reset consumes consent after that attempt settles without changing the visible summary mid-flight. Apply remains usable while unchecked: safe items/removals proceed, MCP agents are skipped, and the structured warning remains visible after the drawer closes.
 
 Move the apply payload type out of the component into `drawer-diff.ts` so BrowseTab and the drawer share one interface. `applyDrawerDiff` consumes `diff.acceptMcp` only in `commands.installAgents`.
 
