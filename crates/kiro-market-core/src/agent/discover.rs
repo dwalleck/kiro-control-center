@@ -118,6 +118,66 @@ fn vetted_regular_file(entry: io::Result<fs::DirEntry>, scan_dir: &Path) -> Opti
     Some(path)
 }
 
+/// Validate and stat a manifest-provided scan path without following a
+/// symlink or reparse point at its final component.
+///
+/// The normalized path is stat'd so a trailing separator cannot make the
+/// operating system dereference a directory symlink before returning its
+/// metadata. The original spelling is retained only to preserve the warning
+/// path and directory-only semantics of trailing separators.
+fn vetted_scan_path(
+    plugin_dir: &Path,
+    rel: &str,
+    scan_kind: &'static str,
+) -> Option<(PathBuf, fs::Metadata)> {
+    if let Err(e) = crate::validation::validate_relative_path(rel) {
+        warn!(
+            path = %rel,
+            error = %e,
+            "skipping {scan_kind} scan path that fails validation"
+        );
+        return None;
+    }
+
+    let relative = rel.trim_start_matches("./");
+    let requested = plugin_dir.join(relative);
+    let normalized_relative = Path::new(relative).components().collect::<PathBuf>();
+    let resolved = plugin_dir.join(normalized_relative);
+    let metadata = match fs::symlink_metadata(&resolved) {
+        Ok(metadata) => metadata,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return None,
+        Err(e) => {
+            warn!(
+                path = %resolved.display(),
+                error = %e,
+                "failed to stat {scan_kind} scan path; skipping"
+            );
+            return None;
+        }
+    };
+    if crate::platform::is_reparse_or_symlink(&metadata) {
+        warn!(
+            path = %resolved.display(),
+            "refusing symlink or reparse point at {scan_kind} scan path; skipping"
+        );
+        return None;
+    }
+
+    if rel.chars().next_back().is_some_and(std::path::is_separator)
+        && !metadata.file_type().is_dir()
+    {
+        let error = io::Error::from(io::ErrorKind::NotADirectory);
+        warn!(
+            path = %requested.display(),
+            error = %error,
+            "failed to stat {scan_kind} scan path; skipping"
+        );
+        return None;
+    }
+
+    Some((resolved, metadata))
+}
+
 /// Find agent markdown files inside `plugin_dir` according to `scan_paths`.
 ///
 /// `scan_paths` are relative to `plugin_dir`. Each entry is first validated
@@ -151,43 +211,9 @@ fn vetted_regular_file(entry: io::Result<fs::DirEntry>, scan_dir: &Path) -> Opti
 pub fn discover_agents_in_dirs(plugin_dir: &Path, scan_paths: &[String]) -> Vec<PathBuf> {
     let mut out = Vec::new();
     for rel in scan_paths {
-        if let Err(e) = crate::validation::validate_relative_path(rel) {
-            warn!(
-                path = %rel,
-                error = %e,
-                "skipping agent scan path that fails validation"
-            );
+        let Some((resolved, metadata)) = vetted_scan_path(plugin_dir, rel, "agent") else {
             continue;
-        }
-        let resolved = plugin_dir.join(rel.trim_start_matches("./"));
-
-        // Check if the scan path points directly to a file (plugin.json
-        // may list individual agent files, e.g.
-        // `./agents/code-testing-generator.agent.md`).
-        let metadata = match fs::symlink_metadata(&resolved) {
-            Ok(m) => m,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
-            Err(e) => {
-                warn!(
-                    path = %resolved.display(),
-                    error = %e,
-                    "failed to stat agent scan path; skipping"
-                );
-                continue;
-            }
         };
-
-        if crate::platform::is_reparse_or_symlink(&metadata) {
-            // A scan path the manifest named explicitly should not be a
-            // symlink: it's either a broken manifest entry or an
-            // exfiltration probe, so surface it at warn! (unlike the
-            // incidental directory-walk skip below, which stays debug!).
-            warn!(
-                path = %resolved.display(),
-                "refusing symlink or reparse point at agent scan path; skipping"
-            );
-            continue;
-        }
 
         if metadata.file_type().is_file() {
             push_if_md_agent(resolved, &mut out);
@@ -249,40 +275,9 @@ pub fn discover_native_kiro_agents_in_dirs(
 ) -> Vec<DiscoveredNativeFile> {
     let mut out = Vec::new();
     for rel in scan_paths {
-        if let Err(e) = crate::validation::validate_relative_path(rel) {
-            warn!(
-                path = %rel,
-                error = %e,
-                "skipping native agent scan path that fails validation"
-            );
+        let Some((resolved, metadata)) = vetted_scan_path(plugin_dir, rel, "native agent") else {
             continue;
-        }
-        let resolved = plugin_dir.join(rel.trim_start_matches("./"));
-
-        let metadata = match fs::symlink_metadata(&resolved) {
-            Ok(m) => m,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
-            Err(e) => {
-                warn!(
-                    path = %resolved.display(),
-                    error = %e,
-                    "failed to stat native agent scan path; skipping"
-                );
-                continue;
-            }
         };
-
-        if crate::platform::is_reparse_or_symlink(&metadata) {
-            // A scan path the manifest named explicitly should not be a
-            // symlink: it's either a broken manifest entry or an
-            // exfiltration probe, so surface it at warn! (unlike the
-            // incidental directory-walk skip below, which stays debug!).
-            warn!(
-                path = %resolved.display(),
-                "refusing symlink or reparse point at native agent scan path; skipping"
-            );
-            continue;
-        }
 
         if metadata.file_type().is_file() {
             // For a file path, derive scan_root from the parent directory.
@@ -332,40 +327,10 @@ pub fn discover_native_companion_files(
 ) -> Vec<DiscoveredNativeFile> {
     let mut out = Vec::new();
     for rel in scan_paths {
-        if let Err(e) = crate::validation::validate_relative_path(rel) {
-            warn!(
-                path = %rel,
-                error = %e,
-                "skipping native companion scan path that fails validation"
-            );
+        let Some((scan_root, metadata)) = vetted_scan_path(plugin_dir, rel, "native companion")
+        else {
             continue;
-        }
-        let scan_root = plugin_dir.join(rel.trim_start_matches("./"));
-
-        let metadata = match fs::symlink_metadata(&scan_root) {
-            Ok(m) => m,
-            Err(e) if e.kind() == io::ErrorKind::NotFound => continue,
-            Err(e) => {
-                warn!(
-                    path = %scan_root.display(),
-                    error = %e,
-                    "failed to stat native companion scan path; skipping"
-                );
-                continue;
-            }
         };
-
-        if crate::platform::is_reparse_or_symlink(&metadata) {
-            // A scan path the manifest named explicitly should not be a
-            // symlink: it's either a broken manifest entry or an
-            // exfiltration probe. Following it would surface out-of-tree
-            // files as companion candidates, so refuse it at warn!.
-            warn!(
-                path = %scan_root.display(),
-                "refusing symlink or reparse point at native companion scan path; skipping"
-            );
-            continue;
-        }
 
         if metadata.file_type().is_file() {
             // A file-valued scan path names an agent file directly; there
@@ -632,6 +597,25 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn discover_rejects_trailing_slash_symlinked_scan_directory() {
+        let tmp = tempdir().unwrap();
+        let plugin = tmp.path().join("plugin");
+        let outside = tmp.path().join("outside");
+        fs::create_dir_all(&plugin).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("smuggled.md"), "---\nname: smuggled\n---\n").unwrap();
+        std::os::unix::fs::symlink(&outside, plugin.join("agents-link")).unwrap();
+
+        let found = discover_agents_in_dirs(&plugin, &["./agents-link/".to_string()]);
+
+        assert!(
+            found.is_empty(),
+            "trailing slash must not bypass the scan-path symlink guard: {found:?}"
+        );
+    }
+
     #[test]
     fn discover_scans_multiple_paths() {
         let tmp = tempdir().unwrap();
@@ -720,6 +704,25 @@ mod tests {
             .map(|f| f.source.file_name().unwrap().to_string_lossy().into_owned())
             .collect();
         assert_eq!(names, vec!["real.json"]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_discovery_rejects_trailing_slash_symlinked_scan_directory() {
+        let tmp = tempdir().unwrap();
+        let plugin = tmp.path().join("plugin");
+        let outside = tmp.path().join("outside");
+        fs::create_dir_all(&plugin).unwrap();
+        fs::create_dir_all(&outside).unwrap();
+        fs::write(outside.join("smuggled.json"), b"{}").unwrap();
+        std::os::unix::fs::symlink(&outside, plugin.join("agents-link")).unwrap();
+
+        let found = discover_native_kiro_agents_in_dirs(&plugin, &["./agents-link/".to_string()]);
+
+        assert!(
+            found.is_empty(),
+            "trailing slash must not bypass the scan-path symlink guard: {found:?}"
+        );
     }
 
     #[cfg(windows)]
@@ -1029,6 +1032,59 @@ mod tests {
         assert!(found.is_empty());
     }
 
+    #[cfg(unix)]
+    #[traced_test]
+    #[test]
+    fn discover_rejects_trailing_slash_regular_file_scan_path() {
+        let tmp = tempdir().unwrap();
+        let agents = tmp.path().join("agents");
+        fs::create_dir_all(&agents).unwrap();
+        fs::write(agents.join("agent.md"), "---\nname: agent\n---\n").unwrap();
+
+        let found = discover_agents_in_dirs(tmp.path(), &["./agents/agent.md/".to_string()]);
+
+        assert!(
+            found.is_empty(),
+            "a trailing slash must not turn a regular file into a valid scan path: {found:?}"
+        );
+        assert!(logs_contain("failed to stat agent scan path"));
+    }
+
+    #[cfg(unix)]
+    #[traced_test]
+    #[test]
+    fn native_discovery_rejects_trailing_slash_regular_file_scan_path() {
+        let tmp = tempdir().unwrap();
+        let agents = tmp.path().join("agents");
+        fs::create_dir_all(&agents).unwrap();
+        fs::write(agents.join("agent.json"), b"{}").unwrap();
+
+        let found =
+            discover_native_kiro_agents_in_dirs(tmp.path(), &["./agents/agent.json/".to_string()]);
+
+        assert!(
+            found.is_empty(),
+            "a trailing slash must not turn a regular file into a valid scan path: {found:?}"
+        );
+        assert!(logs_contain("failed to stat native agent scan path"));
+    }
+
+    #[cfg(unix)]
+    #[traced_test]
+    #[test]
+    fn companion_discovery_rejects_trailing_slash_regular_file_scan_path() {
+        let tmp = tempdir().unwrap();
+        let agents = tmp.path().join("agents");
+        fs::create_dir_all(&agents).unwrap();
+        fs::write(agents.join("agent.json"), b"{}").unwrap();
+
+        let found =
+            discover_native_companion_files(tmp.path(), &["./agents/agent.json/".to_string()]);
+
+        assert!(found.is_empty());
+        assert!(logs_contain("failed to stat native companion scan path"));
+    }
+
     #[traced_test]
     #[rstest]
     #[case::dot_prefixed("./agents/a.json")]
@@ -1128,6 +1184,25 @@ mod tests {
         assert!(
             logs_contain("refusing symlink or reparse point at native companion scan path"),
             "the refusal must be surfaced, not silent"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn companion_discovery_rejects_trailing_slash_symlinked_scan_directory() {
+        let tmp = tempdir().unwrap();
+        let plugin = tmp.path().join("plugin");
+        let outside_prompts = tmp.path().join("outside/prompts");
+        fs::create_dir_all(&plugin).unwrap();
+        fs::create_dir_all(&outside_prompts).unwrap();
+        fs::write(outside_prompts.join("smuggled.md"), b"smuggled").unwrap();
+        std::os::unix::fs::symlink(tmp.path().join("outside"), plugin.join("agents-link")).unwrap();
+
+        let found = discover_native_companion_files(&plugin, &["./agents-link/".to_string()]);
+
+        assert!(
+            found.is_empty(),
+            "trailing slash must not bypass the scan-path symlink guard: {found:?}"
         );
     }
 

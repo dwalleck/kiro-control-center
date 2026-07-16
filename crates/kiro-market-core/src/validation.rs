@@ -14,8 +14,9 @@ use crate::error::ValidationError;
 ///
 /// Construction goes through [`RelativePath::new`], which applies
 /// [`validate_relative_path`] — so holding a `RelativePath` is a static
-/// guarantee that the inner string is non-empty, contains no `..`
-/// components, no NUL bytes, and is not an absolute path.
+/// guarantee that the inner string is non-empty, contains no `..` components
+/// or NUL bytes, and cannot expose an absolute path or Windows drive prefix
+/// when consumers strip leading `./` prefixes.
 ///
 /// The newtype replaces a plain `String` in the manifest data model
 /// (`PluginSource::RelativePath`, `StructuredSource::GitSubdir.path`) so
@@ -45,8 +46,9 @@ impl RelativePath {
     /// `validate_relative_path`.
     ///
     /// **Caller contract:** `value` must already satisfy
-    /// `validate_relative_path` — non-empty, no leading `/` or `\`, no
-    /// embedded `\` or NUL, no `..` component. The current caller —
+    /// `validate_relative_path` — non-empty, no embedded `\` or NUL, no `..`
+    /// component, and no absolute path or Windows drive prefix after leading
+    /// `./` prefixes are stripped. The current caller —
     /// [`crate::plugin::DiscoveredPlugin::as_relative_path`] — is sound
     /// only because [`crate::plugin::try_read_plugin`] runs
     /// `validate_relative_path` against the assembled path before
@@ -648,7 +650,9 @@ pub fn validate_name(name: &str) -> Result<(), ValidationError> {
 
 /// Validate that a relative path does not escape its root via `..` components.
 ///
-/// Also rejects absolute paths (starting with `/` or `\`).
+/// Also rejects absolute paths (starting with `/` or `\`) and ASCII Windows
+/// drive prefixes such as `C:` after removing the same repeated leading `./`
+/// spelling that filesystem consumers remove before joining to a trusted root.
 ///
 /// # Errors
 ///
@@ -661,10 +665,20 @@ pub fn validate_relative_path(path: &str) -> Result<(), ValidationError> {
         });
     }
 
-    if path.starts_with('/') || path.starts_with('\\') {
+    let stripped = path.trim_start_matches("./");
+    if stripped.starts_with('/') || stripped.starts_with('\\') {
         return Err(ValidationError::InvalidRelativePath {
             path: path.to_owned(),
-            reason: "must not be an absolute path".into(),
+            reason: "must not be an absolute path after stripping leading `./` prefixes".into(),
+        });
+    }
+
+    let bytes = stripped.as_bytes();
+    if bytes.len() >= 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+        let prefix = &stripped[..2];
+        return Err(ValidationError::InvalidRelativePath {
+            path: path.to_owned(),
+            reason: format!("must not start with Windows drive prefix `{prefix}`"),
         });
     }
 
@@ -883,6 +897,38 @@ mod tests {
     #[test]
     fn validate_relative_path_rejects_absolute() {
         assert!(validate_relative_path("/etc/passwd").is_err());
+    }
+
+    #[test]
+    fn validate_relative_path_rejects_root_exposed_after_current_dir_prefix() {
+        let err = validate_relative_path(".//escape").unwrap_err();
+
+        assert!(
+            matches!(
+                &err,
+                ValidationError::InvalidRelativePath { reason, .. }
+                    if reason.contains("absolute path")
+            ),
+            "expected absolute-path rejection after stripping `./`, got {err:?}"
+        );
+    }
+
+    #[rstest]
+    #[case("C:agents")]
+    #[case("z:plugins/agent.md")]
+    #[case("./C:agents")]
+    #[case("././z:plugins/agent.md")]
+    fn validate_relative_path_rejects_windows_drive_relative_prefix(#[case] path: &str) {
+        let err = validate_relative_path(path).unwrap_err();
+
+        assert!(
+            matches!(
+                &err,
+                ValidationError::InvalidRelativePath { reason, .. }
+                    if reason.contains("Windows drive prefix")
+            ),
+            "expected Windows-drive-prefix rejection for {path:?}, got {err:?}"
+        );
     }
 
     #[test]
