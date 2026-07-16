@@ -11,7 +11,7 @@
     formatFailedSteeringFile,
     formatFailedAgent,
   } from "$lib/format";
-  import { pluralize } from "$lib/drawer-diff";
+  import { pluralize, type CustomizeDrawerApply } from "$lib/drawer-diff";
   import { runInstallBatches } from "$lib/install-batches";
   import {
     DELIM,
@@ -708,11 +708,7 @@
   async function applyDrawerDiff(
     marketplace: string,
     plugin: string,
-    diff: {
-      skills: { install: string[]; remove: string[] };
-      steering: { install: string[]; remove: string[] };
-      agents: { install: string[]; remove: string[] };
-    },
+    diff: CustomizeDrawerApply,
   ) {
     installError = null;
     installMessage = null;
@@ -779,7 +775,7 @@
             plugin,
             diff.agents.install,
             forceInstall,
-            /* acceptMcp */ false,
+            /* acceptMcp */ diff.acceptMcp,
             projectPath,
           ),
       },
@@ -1615,15 +1611,17 @@
 <!--
   Customize drawer host. Rendered outside the main BrowseTab flex
   column so its position:fixed overlay isn't constrained by the
-  flex parent. The drawer's onApply receives a per-category diff
-  (skills + steering + agents); applyDrawerDiff fans out to one
-  batch install + one remove loop per category.
+  flex parent. The drawer's onApply receives the shared scoped-consent
+  payload; applyDrawerDiff fans out to one batch install + one remove
+  loop per category.
 -->
 {#if drawerEntry && drawerMarketplace}
-  <CustomizeDrawer
-    entry={drawerEntry}
-    marketplace={drawerMarketplace}
-    onClose={closeDrawer}
-    onApply={(diff) => applyDrawerDiff(drawerMarketplace!, drawerEntry!.plugin, diff)}
-  />
+  {#key pluginKey(drawerMarketplace, drawerEntry.plugin)}
+    <CustomizeDrawer
+      entry={drawerEntry}
+      marketplace={drawerMarketplace}
+      onClose={closeDrawer}
+      onApply={(diff) => applyDrawerDiff(drawerMarketplace!, drawerEntry!.plugin, diff)}
+    />
+  {/key}
 {/if}
