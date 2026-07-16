@@ -12,6 +12,7 @@ import {
   runPluginInstall,
   runPluginRemove,
   type PluginActionContext,
+  type PluginActionMode,
   type PluginRemoveContext,
 } from "./plugin-actions";
 
@@ -517,26 +518,43 @@ describe("runPluginInstall", () => {
     expect(storeRefresh).not.toHaveBeenCalled();
   });
 
-  it("acceptMcp: true propagates to Tauri command", async () => {
-    const r = emptyInstallResult();
-    r.skills.installed = ["a"];
-    const installPlugin: PluginActionContext["installPlugin"] = vi
-      .fn()
-      .mockResolvedValue({ status: "ok", data: r });
+  it.each(
+    [
+      ["install, force=false, consent=false", { kind: "install", force: false }, false, false],
+      ["install, force=false, consent=true", { kind: "install", force: false }, true, false],
+      ["install, force=true, consent=false", { kind: "install", force: true }, false, true],
+      ["install, force=true, consent=true", { kind: "install", force: true }, true, true],
+      ["update, consent=false", { kind: "update" }, false, true],
+      ["update, consent=true", { kind: "update" }, true, true],
+    ] satisfies ReadonlyArray<
+      readonly [
+        label: string,
+        mode: PluginActionMode,
+        acceptMcp: boolean,
+        expectedForce: boolean,
+      ]
+    >,
+  )(
+    "$label forwards force and MCP consent independently",
+    async (_label, mode, acceptMcp, expectedForce) => {
+      const installPlugin: PluginActionContext["installPlugin"] = vi
+        .fn()
+        .mockResolvedValue({ status: "ok", data: emptyInstallResult() });
 
-    await runPluginInstall(
-      makeInstallCtx({ installPlugin, acceptMcp: true }),
-      { kind: "install", force: false },
-    );
+      await runPluginInstall(
+        makeInstallCtx({ installPlugin, acceptMcp }),
+        mode,
+      );
 
-    expect(installPlugin).toHaveBeenCalledWith(
-      "acme",
-      "demo-plugin",
-      false,
-      true,
-      "/test/project",
-    );
-  });
+      expect(installPlugin).toHaveBeenCalledWith(
+        "acme",
+        "demo-plugin",
+        expectedForce,
+        acceptMcp,
+        "/test/project",
+      );
+    },
+  );
 });
 
 describe("runPluginRemove", () => {
