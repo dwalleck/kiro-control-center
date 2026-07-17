@@ -43,7 +43,9 @@ pub struct CommandError {
     /// `None` for most errors; populated by `From<CoreError>` via
     /// [`kiro_market_core::error::PluginError::remediation_hint`]
     /// with [`kiro_market_core::error::Surface::Ui`].
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// `skip_serializing_if` is NOT used here — `tauri-specta` 2.0.0-rc.24
+    /// unified mode rejects conditional field omission (mirrors
+    /// `InstalledNativeAgentOutcome` and `InstallAgentsResult_Serialize`).
     pub remediation: Option<String>,
 }
 
@@ -515,7 +517,9 @@ mod tests {
             },
         });
         let cmd = CommandError::from(err);
-        let rem = cmd.remediation.expect("remediation must be Some for RemoteSourceNotLocal");
+        let rem = cmd
+            .remediation
+            .expect("remediation must be Some for RemoteSourceNotLocal");
         assert!(
             rem.contains("detail page"),
             "UI remediation must mention detail page: {rem}"

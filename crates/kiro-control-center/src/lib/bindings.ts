@@ -439,6 +439,17 @@ export type BulkSkillsResult = {
 export type CommandError = {
 	message: string,
 	error_type: ErrorType,
+	/**
+	 *  Surface-appropriate remediation text for errors that have a
+	 *  next step for the user (e.g., "clone this plugin locally").
+	 *  `None` for most errors; populated by `From<CoreError>` via
+	 *  [`kiro_market_core::error::PluginError::remediation_hint`]
+	 *  with [`kiro_market_core::error::Surface::Ui`].
+	 *  `skip_serializing_if` is NOT used here — `tauri-specta` 2.0.0-rc.24
+	 *  unified mode rejects conditional field omission (mirrors
+	 *  `InstalledNativeAgentOutcome` and `InstallAgentsResult_Serialize`).
+	 */
+	remediation: string | null,
 };
 
 /**

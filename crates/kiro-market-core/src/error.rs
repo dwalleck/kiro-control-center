@@ -727,10 +727,10 @@ pub fn error_full_chain(err: &(dyn std::error::Error + 'static)) -> String {
 #[must_use]
 pub fn format_error_for_surface(err: &Error, surface: Surface) -> String {
     let chain = error_full_chain(err);
-    if let Error::Plugin(e) = err {
-        if let Some(hint) = e.remediation_hint(surface) {
-            return format!("{chain}\n\n{hint}");
-        }
+    if let Error::Plugin(e) = err
+        && let Some(hint) = e.remediation_hint(surface)
+    {
+        return format!("{chain}\n\n{hint}");
     }
     chain
 }
@@ -1563,4 +1563,3 @@ fn format_error_for_surface_ui_excludes_cli_remediation() {
         "must contain the original error text: {formatted}"
     );
 }
-
