@@ -1482,6 +1482,25 @@ mod tests {
             "chain must have Display + source joined by `: `: {chain}"
         );
     }
+
+    #[rstest::rstest]
+    #[case::not_found(PluginError::NotFound { plugin: "ghost".into(), marketplace: "mkt".into() })]
+    #[case::invalid_manifest(PluginError::InvalidManifest { path: PathBuf::from("/x/plugin.json"), reason: "bad".into() })]
+    #[case::manifest_not_found(PluginError::ManifestNotFound { path: PathBuf::from("/x/plugin.json") })]
+    #[case::no_skills(PluginError::NoSkills { name: "empty".into(), path: PathBuf::from("/x") })]
+    #[case::directory_missing(PluginError::DirectoryMissing { path: PathBuf::from("/x") })]
+    #[case::not_a_directory(PluginError::NotADirectory { path: PathBuf::from("/x/plugin.json") })]
+    #[case::symlink_refused(PluginError::SymlinkRefused { path: PathBuf::from("/x") })]
+    #[case::cache_manifest_invalid(PluginError::CacheManifestInvalid { path: PathBuf::from("/x/plugin.json"), reason: "bad".into() })]
+    fn format_error_for_surface_non_remote_unchanged(#[case] variant: PluginError) {
+        let err = Error::Plugin(variant);
+        let formatted = format_error_for_surface(&err, Surface::Cli);
+        let chain = error_full_chain(&err);
+        assert_eq!(
+            formatted, chain,
+            "non-remote errors must pass through unchanged"
+        );
+    }
 }
 
 #[test]
@@ -1516,16 +1535,32 @@ fn format_error_for_surface_cli_includes_remediation() {
 }
 
 #[test]
-fn format_error_for_surface_non_remote_unchanged() {
-    let err = crate::error::Error::Plugin(PluginError::NotFound {
-        plugin: "ghost".into(),
-        marketplace: "test-market".into(),
+fn format_error_for_surface_ui_excludes_cli_remediation() {
+    use crate::error::PluginError;
+    use crate::error::Surface;
+    use crate::marketplace::StructuredSource;
+
+    let err = crate::error::Error::Plugin(PluginError::RemoteSourceNotLocal {
+        plugin: "test-plugin".into(),
+        plugin_source: StructuredSource::GitHub {
+            repo: "owner/repo".into(),
+            git_ref: None,
+            sha: None,
+        },
     });
 
-    let formatted = crate::error::format_error_for_surface(&err, crate::error::Surface::Cli);
-    let chain = crate::error::error_full_chain(&err);
-    assert_eq!(
-        formatted, chain,
-        "non-remote errors must pass through unchanged"
+    let formatted = crate::error::format_error_for_surface(&err, Surface::Ui);
+    assert!(
+        formatted.contains("detail page"),
+        "UI surface must mention detail page: {formatted}"
+    );
+    assert!(
+        !formatted.contains("kiro-market install"),
+        "UI surface must not contain CLI command: {formatted}"
+    );
+    assert!(
+        formatted.contains("remote source") || formatted.contains("not available locally"),
+        "must contain the original error text: {formatted}"
     );
 }
+
