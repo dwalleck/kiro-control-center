@@ -5,11 +5,24 @@ mod commands;
 
 use std::io::IsTerminal;
 
-use anyhow::Result;
 use clap::Parser;
 use tracing_subscriber::EnvFilter;
 
-fn main() -> Result<()> {
+fn main() {
+    if let Err(e) = try_main() {
+        use kiro_market_core::error::{Surface, format_error_for_surface};
+        let msg = e
+            .downcast_ref::<kiro_market_core::error::Error>()
+            .map_or_else(
+                || format!("{e:#}"),
+                |core| format_error_for_surface(core, Surface::Cli),
+            );
+        eprintln!("{msg}");
+        std::process::exit(1);
+    }
+}
+
+fn try_main() -> anyhow::Result<()> {
     let cli = cli::Cli::parse();
 
     // Disable ANSI color codes when stdout is redirected to a file/pipe

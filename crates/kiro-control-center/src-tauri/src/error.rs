@@ -1,6 +1,6 @@
 use kiro_market_core::error::{
     error_full_chain, AgentError, Error as CoreError, MarketplaceError, PluginError, SkillError,
-    ValidationError,
+    Surface, ValidationError,
 };
 use serde::Serialize;
 use tracing::warn;
@@ -38,6 +38,15 @@ pub enum ErrorType {
 pub struct CommandError {
     pub message: String,
     pub error_type: ErrorType,
+    /// Surface-appropriate remediation text for errors that have a
+    /// next step for the user (e.g., "clone this plugin locally").
+    /// `None` for most errors; populated by `From<CoreError>` via
+    /// [`kiro_market_core::error::PluginError::remediation_hint`]
+    /// with [`kiro_market_core::error::Surface::Ui`].
+    /// `skip_serializing_if` is NOT used here — `tauri-specta` 2.0.0-rc.24
+    /// unified mode rejects conditional field omission (mirrors
+    /// `InstalledNativeAgentOutcome` and `InstallAgentsResult_Serialize`).
+    pub remediation: Option<String>,
 }
 
 impl CommandError {
@@ -45,10 +54,10 @@ impl CommandError {
         Self {
             message: message.into(),
             error_type,
+            remediation: None,
         }
     }
 }
-
 impl From<CoreError> for CommandError {
     #[allow(clippy::match_same_arms)]
     fn from(err: CoreError) -> Self {
@@ -138,9 +147,15 @@ impl From<CoreError> for CommandError {
             "command failed"
         );
 
+        let remediation = match &err {
+            CoreError::Plugin(e) => e.remediation_hint(Surface::Ui),
+            _ => None,
+        };
+
         Self {
             message,
             error_type,
+            remediation,
         }
     }
 }
@@ -150,6 +165,7 @@ impl From<String> for CommandError {
         Self {
             message,
             error_type: ErrorType::Unknown,
+            remediation: None,
         }
     }
 }
@@ -184,6 +200,7 @@ impl From<std::io::Error> for CommandError {
         Self {
             message: error_full_chain(&e),
             error_type: ErrorType::IoError,
+            remediation: None,
         }
     }
 }
@@ -465,6 +482,7 @@ mod tests {
         let err = CommandError::new("boom", ErrorType::Validation);
         assert_eq!(err.message, "boom");
         assert_eq!(err.error_type, ErrorType::Validation);
+        assert_eq!(err.remediation, None);
     }
 
     /// Pin the wire format for `ErrorType::Internal`. The frontend relies
@@ -482,5 +500,46 @@ mod tests {
             r#""unknown""#
         );
         assert_ne!(ErrorType::Internal, ErrorType::Unknown);
+    }
+
+    // -----------------------------------------------------------------------
+    // CommandError.remediation
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn commander_remote_source_not_local_carries_remediation() {
+        let err = CoreError::Plugin(PluginError::RemoteSourceNotLocal {
+            plugin: "test".into(),
+            plugin_source: kiro_market_core::marketplace::StructuredSource::GitHub {
+                repo: "owner/repo".into(),
+                git_ref: None,
+                sha: None,
+            },
+        });
+        let cmd = CommandError::from(err);
+        let rem = cmd
+            .remediation
+            .expect("remediation must be Some for RemoteSourceNotLocal");
+        assert!(
+            rem.contains("detail page"),
+            "UI remediation must mention detail page: {rem}"
+        );
+        assert!(
+            !rem.contains("kiro-market install"),
+            "UI remediation must not contain CLI command: {rem}"
+        );
+    }
+
+    #[test]
+    fn commander_non_remote_remediation_is_none() {
+        let err = CoreError::Plugin(PluginError::NotFound {
+            plugin: "ghost".into(),
+            marketplace: "mkt".into(),
+        });
+        let cmd = CommandError::from(err);
+        assert_eq!(
+            cmd.remediation, None,
+            "remediation must be None for non-remote PluginError variants"
+        );
     }
 }
