@@ -1,0 +1,2 @@
+- Surface remediation guidance when `kiro-market list`, `info`, or `search` encounters a remote-only plugin, telling the user how to clone it locally.
+- The desktop app now carries surface-appropriate remediation text on error responses for remote-only plugins.
