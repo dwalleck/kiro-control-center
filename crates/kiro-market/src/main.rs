@@ -10,19 +10,14 @@ use tracing_subscriber::EnvFilter;
 
 fn main() {
     if let Err(e) = try_main() {
-        let hint = e
+        use kiro_market_core::error::{format_error_for_surface, Surface};
+        let msg = e
             .root_cause()
             .downcast_ref::<kiro_market_core::error::Error>()
-            .and_then(|core| match core {
-                kiro_market_core::error::Error::Plugin(plugin_err) => {
-                    plugin_err.remediation_hint(kiro_market_core::error::Surface::Cli)
-                }
-                _ => None,
-            });
-        let msg = match hint {
-            Some(h) => format!("{e}\n\n{h}"),
-            None => format!("{e:#}"),
-        };
+            .map_or_else(
+                || format!("{e:#}"),
+                |core| format_error_for_surface(core, Surface::Cli),
+            );
         eprintln!("{msg}");
         std::process::exit(1);
     }
