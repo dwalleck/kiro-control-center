@@ -713,6 +713,28 @@ pub fn error_full_chain(err: &(dyn std::error::Error + 'static)) -> String {
     detail
 }
 
+/// Format an error for display on a specific user-facing surface.
+///
+/// Combines [`error_full_chain`] with an optional surface-specific
+/// remediation paragraph from [`PluginError::remediation_hint`].
+/// This is the single call site a surface (CLI or Tauri) needs to
+/// produce a complete user-facing error message — the surface supplies
+/// its [`Surface`] variant and the function composes Display + hint
+/// if one exists.
+///
+/// Errors that are not `Error::Plugin(PluginError::RemoteSourceNotLocal)`
+/// pass through unchanged (the hint is `None` for all other variants).
+#[must_use]
+pub fn format_error_for_surface(err: &Error, surface: Surface) -> String {
+    let chain = error_full_chain(err);
+    if let Error::Plugin(e) = err {
+        if let Some(hint) = e.remediation_hint(surface) {
+            return format!("{chain}\n\n{hint}");
+        }
+    }
+    chain
+}
+
 #[cfg(test)]
 mod tests {
     use std::io;
@@ -1460,4 +1482,50 @@ mod tests {
             "chain must have Display + source joined by `: `: {chain}"
         );
     }
+}
+
+#[test]
+fn format_error_for_surface_cli_includes_remediation() {
+    use crate::error::PluginError;
+    use crate::error::Surface;
+    use crate::marketplace::StructuredSource;
+
+    let err = crate::error::Error::Plugin(PluginError::RemoteSourceNotLocal {
+        plugin: "test-plugin".into(),
+        plugin_source: StructuredSource::GitHub {
+            repo: "owner/repo".into(),
+            git_ref: None,
+            sha: None,
+        },
+    });
+
+    let formatted = crate::error::format_error_for_surface(&err, Surface::Cli);
+    assert!(
+        formatted.contains("kiro-market install"),
+        "CLI surface must mention the install command: {formatted}"
+    );
+    assert!(
+        formatted.contains("remote source") || formatted.contains("not available locally"),
+        "must contain the original error text: {formatted}"
+    );
+    // Must not contain the UI hint
+    assert!(
+        !formatted.contains("detail page"),
+        "CLI surface must not contain UI hint: {formatted}"
+    );
+}
+
+#[test]
+fn format_error_for_surface_non_remote_unchanged() {
+    let err = crate::error::Error::Plugin(PluginError::NotFound {
+        plugin: "ghost".into(),
+        marketplace: "test-market".into(),
+    });
+
+    let formatted = crate::error::format_error_for_surface(&err, crate::error::Surface::Cli);
+    let chain = crate::error::error_full_chain(&err);
+    assert_eq!(
+        formatted, chain,
+        "non-remote errors must pass through unchanged"
+    );
 }
