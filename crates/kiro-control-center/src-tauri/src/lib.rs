@@ -135,6 +135,20 @@ mod tests {
             );
         }
 
+        let agent_start = bindings
+            .find("export type AgentItemInfo = {")
+            .expect("AgentItemInfo export should have been fenced above");
+        let agent_tail = &bindings[agent_start..];
+        let agent_end = agent_tail
+            .find("};")
+            .expect("AgentItemInfo export should have a closing delimiter");
+        let agent_body = &agent_tail[..agent_end];
+        assert!(
+            agent_body.contains("mcp_server_transports: string[]"),
+            "AgentItemInfo must require one normalized transport string per MCP server; \
+             run the binding generator after changing the Rust wire type"
+        );
+
         // kiro-zx73 commands — per-item steering/agent install/remove.
         // The drawer's apply-diff path (BrowseTab.applyDrawerDiff) calls
         // these directly; if they vanish from bindings.ts, the drawer's

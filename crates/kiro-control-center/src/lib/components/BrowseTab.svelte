@@ -11,7 +11,7 @@
     formatFailedSteeringFile,
     formatFailedAgent,
   } from "$lib/format";
-  import { pluralize } from "$lib/drawer-diff";
+  import { pluralize, type CustomizeDrawerApply } from "$lib/drawer-diff";
   import { runInstallBatches } from "$lib/install-batches";
   import {
     DELIM,
@@ -708,11 +708,7 @@
   async function applyDrawerDiff(
     marketplace: string,
     plugin: string,
-    diff: {
-      skills: { install: string[]; remove: string[] };
-      steering: { install: string[]; remove: string[] };
-      agents: { install: string[]; remove: string[] };
-    },
+    diff: CustomizeDrawerApply,
   ) {
     installError = null;
     installMessage = null;
@@ -779,7 +775,7 @@
             plugin,
             diff.agents.install,
             forceInstall,
-            /* acceptMcp */ false,
+            /* acceptMcp */ diff.acceptMcp,
             projectPath,
           ),
       },
@@ -1081,6 +1077,7 @@
     marketplace: string,
     plugin: string,
     mode: BrowseAction,
+    acceptMcp: boolean,
   ) {
     const key = pluginKey(marketplace, plugin);
     if (pendingPluginActions.has(key)) return;
@@ -1117,7 +1114,7 @@
           marketplace,
           plugin,
           projectPath,
-          acceptMcp: false,
+          acceptMcp,
           refresh: () => fetchInstalledPlugins(),
           installPlugin: commands.installPlugin,
           storeRefresh: (p) => pluginUpdates.refresh(p),
@@ -1549,8 +1546,10 @@
               update={pluginUpdates.updateFor(ap.marketplace, ap.entry.plugin)}
               failure={pluginUpdates.failureFor(ap.marketplace, ap.entry.plugin)}
               projectPicked={!!projectPath}
-              onInstall={() => runPluginInstall(ap.marketplace, ap.entry.plugin, "install")}
-              onUpdate={() => runPluginInstall(ap.marketplace, ap.entry.plugin, "update")}
+              onInstall={(acceptMcp) =>
+                runPluginInstall(ap.marketplace, ap.entry.plugin, "install", acceptMcp)}
+              onUpdate={(acceptMcp) =>
+                runPluginInstall(ap.marketplace, ap.entry.plugin, "update", acceptMcp)}
               onCustomize={() => openDrawer(ap.marketplace, ap.entry)}
             />
           {/each}
@@ -1612,15 +1611,17 @@
 <!--
   Customize drawer host. Rendered outside the main BrowseTab flex
   column so its position:fixed overlay isn't constrained by the
-  flex parent. The drawer's onApply receives a per-category diff
-  (skills + steering + agents); applyDrawerDiff fans out to one
-  batch install + one remove loop per category.
+  flex parent. The drawer's onApply receives the shared scoped-consent
+  payload; applyDrawerDiff fans out to one batch install + one remove
+  loop per category.
 -->
 {#if drawerEntry && drawerMarketplace}
-  <CustomizeDrawer
-    entry={drawerEntry}
-    marketplace={drawerMarketplace}
-    onClose={closeDrawer}
-    onApply={(diff) => applyDrawerDiff(drawerMarketplace!, drawerEntry!.plugin, diff)}
-  />
+  {#key pluginKey(drawerMarketplace, drawerEntry.plugin)}
+    <CustomizeDrawer
+      entry={drawerEntry}
+      marketplace={drawerMarketplace}
+      onClose={closeDrawer}
+      onApply={(diff) => applyDrawerDiff(drawerMarketplace!, drawerEntry!.plugin, diff)}
+    />
+  {/key}
 {/if}

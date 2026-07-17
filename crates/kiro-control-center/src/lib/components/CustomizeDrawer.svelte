@@ -6,25 +6,10 @@
     deriveDiff,
     deriveSectionState,
     pluralize,
+    summarizeSelectedMcpInstalls,
+    type CustomizeDrawerApply,
     type SectionToggleState,
   } from "$lib/drawer-diff";
-
-  /// Diff payload emitted to the BrowseTab apply handler. Per-category
-  /// install/remove name lists. Skills join on frontmatter name (catalog
-  /// `SkillInfo.name`); steering joins on the file's relative path under
-  /// `.kiro/steering/` (catalog `SteeringItemInfo.name`); agents join on
-  /// the parsed agent name (catalog `AgentItemInfo.name`).
-  ///
-  /// All three categories are now per-item granular following kiro-zx73,
-  /// which added the four Tauri commands the BrowseTab apply path uses
-  /// (installSteeringFiles, removeSteeringFile, installAgents, removeAgent).
-  /// The slice-4 noInteractiveItems banner and "read-only" section
-  /// labels are gone because every category now toggles.
-  export type CustomizeDrawerDiff = {
-    skills: { install: string[]; remove: string[] };
-    steering: { install: string[]; remove: string[] };
-    agents: { install: string[]; remove: string[] };
-  };
 
   type Props = {
     entry: PluginCatalogEntryView;
@@ -34,7 +19,7 @@
     /// keep the Apply button in its busy state until the catalog
     /// refresh completes — otherwise the user can re-click Apply
     /// against stale state.
-    onApply: (diff: CustomizeDrawerDiff) => Promise<void>;
+    onApply: (diff: CustomizeDrawerApply) => Promise<void>;
   };
 
   let { entry, marketplace, onClose, onApply }: Props = $props();
@@ -44,11 +29,9 @@
   // so the initial diff is empty; every checkbox toggle is a change
   // relative to that baseline.
   //
-  // `untrack` makes the "initial-value-only" read explicit — the
-  // drawer is destroyed/recreated by the {#if drawerEntry} guard in
-  // BrowseTab whenever the user opens a different plugin's drawer,
-  // so we deliberately want to capture the entry's flags ONCE at
-  // mount and not re-seed on prop changes.
+  // `untrack` makes the "initial-value-only" read explicit. BrowseTab
+  // keys this component by marketplace/plugin, so switching entries
+  // remounts the drawer and seeds fresh selections and consent.
   let selectedSkills = new SvelteSet<string>(
     untrack(() => entry.skills.filter((s) => s.installed).map((s) => s.name)),
   );
@@ -58,6 +41,13 @@
   let selectedAgents = new SvelteSet<string>(
     untrack(() => entry.agents.filter((a) => a.installed).map((a) => a.name)),
   );
+
+  let acceptMcp = $state(false);
+  const consentId = $props.id();
+
+  function mcpBadgeLabel(transports: readonly string[]): string {
+    return [...new Set(transports)].join(", ");
+  }
 
   function toggleItem(set: SvelteSet<string>, name: string) {
     if (set.has(name)) set.delete(name);
@@ -77,6 +67,16 @@
     }
   }
 
+  function toggleAgent(name: string) {
+    acceptMcp = false;
+    toggleItem(selectedAgents, name);
+  }
+
+  function toggleAllAgents() {
+    acceptMcp = false;
+    toggleAll(entry.agents, selectedAgents, agentsSectionState);
+  }
+
   const skillsSectionState = $derived.by(() =>
     deriveSectionState(entry.skills, selectedSkills),
   );
@@ -93,6 +93,13 @@
     agents: deriveDiff(entry.agents, selectedAgents),
   }));
 
+  const mcpSummary = $derived.by(() =>
+    summarizeSelectedMcpInstalls(entry.agents, selectedAgents),
+  );
+  const mcpTransportSummary = $derived(
+    mcpSummary?.transports.map(({ label, count }) => `${count} ${label}`).join(", ") ?? "",
+  );
+
   const noChanges = $derived(
     diff.skills.install.length === 0
       && diff.skills.remove.length === 0
@@ -104,6 +111,9 @@
 
   const summary = $derived.by(() => {
     if (noChanges) return "No changes to apply.";
+    const skippedMcpAgents =
+      mcpSummary !== null && !acceptMcp ? mcpSummary.agentNames.length : 0;
+    const agentsToInstall = diff.agents.install.length - skippedMcpAgents;
     const installParts: string[] = [];
     if (diff.skills.install.length > 0) {
       installParts.push(
@@ -115,9 +125,9 @@
         `${diff.steering.install.length} ${pluralize(diff.steering.install.length, "steering file", "steering files")}`,
       );
     }
-    if (diff.agents.install.length > 0) {
+    if (agentsToInstall > 0) {
       installParts.push(
-        `${diff.agents.install.length} ${pluralize(diff.agents.install.length, "agent", "agents")}`,
+        `${agentsToInstall} ${pluralize(agentsToInstall, "agent", "agents")}`,
       );
     }
     const removeParts: string[] = [];
@@ -139,7 +149,12 @@
     const phrases: string[] = [];
     if (installParts.length > 0) phrases.push(`install ${installParts.join(", ")}`);
     if (removeParts.length > 0) phrases.push(`remove ${removeParts.join(", ")}`);
-    return `Apply will ${phrases.join(" and ")}.`;
+    const action =
+      phrases.length > 0
+        ? `Apply will ${phrases.join(" and ")}.`
+        : "Apply will make no other changes.";
+    if (skippedMcpAgents === 0) return action;
+    return `${action} ${skippedMcpAgents} selected MCP ${pluralize(skippedMcpAgents, "agent", "agents")} will be skipped.`;
   });
 
   let applying = $state(false);
@@ -147,22 +162,25 @@
   async function apply() {
     if (noChanges || applying) return;
     applying = true;
+    const payload: CustomizeDrawerApply = {
+      skills: {
+        install: [...diff.skills.install],
+        remove: [...diff.skills.remove],
+      },
+      steering: {
+        install: [...diff.steering.install],
+        remove: [...diff.steering.remove],
+      },
+      agents: {
+        install: [...diff.agents.install],
+        remove: [...diff.agents.remove],
+      },
+      acceptMcp: mcpSummary !== null && acceptMcp,
+    };
     try {
-      await onApply({
-        skills: {
-          install: [...diff.skills.install],
-          remove: [...diff.skills.remove],
-        },
-        steering: {
-          install: [...diff.steering.install],
-          remove: [...diff.steering.remove],
-        },
-        agents: {
-          install: [...diff.agents.install],
-          remove: [...diff.agents.remove],
-        },
-      });
+      await onApply(payload);
     } finally {
+      acceptMcp = false;
       applying = false;
     }
   }
@@ -275,6 +293,7 @@
         installed: boolean,
         checked: boolean,
         onchange: () => void,
+        mcpBadge: string | null,
       )}
         <label
           class="flex items-center gap-2 px-4 py-1.5 text-[13px] cursor-pointer transition-colors hover:bg-kiro-accent-900/[0.12] hover:text-kiro-text
@@ -288,6 +307,13 @@
             class="h-3.5 w-3.5 rounded border-kiro-muted text-kiro-accent-500 focus:ring-kiro-accent-500"
           />
           <span class="flex-1 min-w-0 truncate" title={description ?? ""}>{name}</span>
+          {#if mcpBadge}
+            <span
+              class="inline-flex items-center px-1.5 py-0.5 text-[10px] font-medium rounded-full border border-kiro-warning/40 bg-kiro-warning/5 text-kiro-warning"
+            >
+              MCP · {mcpBadge}
+            </span>
+          {/if}
           {#if installed}
             <span
               class="inline-flex items-center px-1.5 py-0.5 text-[10px] font-medium rounded-full bg-kiro-success/[0.18] text-kiro-success"
@@ -316,6 +342,7 @@
                 skill.installed,
                 selectedSkills.has(skill.name),
                 () => toggleItem(selectedSkills, skill.name),
+                null,
               )}
             {/each}
           </div>
@@ -340,6 +367,7 @@
                 item.installed,
                 selectedSteering.has(item.name),
                 () => toggleItem(selectedSteering, item.name),
+                null,
               )}
             {/each}
           </div>
@@ -354,7 +382,7 @@
             installedCount,
             entry.agents.length,
             agentsSectionState,
-            () => toggleAll(entry.agents, selectedAgents, agentsSectionState),
+            toggleAllAgents,
           )}
           <div class="flex flex-col py-1">
             {#each entry.agents as agent (agent.name)}
@@ -363,7 +391,8 @@
                 agent.description,
                 agent.installed,
                 selectedAgents.has(agent.name),
-                () => toggleItem(selectedAgents, agent.name),
+                () => toggleAgent(agent.name),
+                mcpBadgeLabel(agent.mcp_server_transports),
               )}
             {/each}
           </div>
@@ -380,7 +409,45 @@
     <footer
       class="flex flex-col gap-2 px-4 py-3 border-t border-kiro-muted bg-kiro-surface"
     >
-      <span class="text-xs text-kiro-text-secondary">{summary}</span>
+      {#if mcpSummary}
+        <div
+          class="-mx-4 -mt-3 px-4 py-3 border-b border-kiro-warning/40 bg-kiro-warning/5"
+        >
+          <div class="text-xs font-semibold text-kiro-warning">MCP access</div>
+          <label
+            for="{consentId}-accept-mcp"
+            class="mt-2 flex items-start gap-2 text-xs font-medium text-kiro-text-secondary
+              {applying ? 'cursor-not-allowed opacity-60' : 'cursor-pointer'}"
+          >
+            <input
+              id="{consentId}-accept-mcp"
+              type="checkbox"
+              bind:checked={acceptMcp}
+              disabled={applying}
+              aria-describedby="{consentId}-mcp-detail"
+              class="mt-0.5 h-3.5 w-3.5 flex-shrink-0 accent-kiro-warning
+                focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-kiro-warning/60
+                focus-visible:ring-offset-2 focus-visible:ring-offset-kiro-overlay
+                disabled:cursor-not-allowed disabled:opacity-50"
+            />
+            <span>Allow MCP servers declared by {mcpSummary.agentNames.join(", ")}</span>
+          </label>
+          <p
+            id="{consentId}-mcp-detail"
+            class="mt-1 pl-5.5 text-[11px] leading-relaxed text-kiro-subtle"
+          >
+            {mcpSummary.agentNames.length} selected
+            {pluralize(mcpSummary.agentNames.length, "agent", "agents")}
+            {mcpSummary.agentNames.length === 1 ? "uses" : "use"}
+            {mcpSummary.serverCount} MCP
+            {pluralize(mcpSummary.serverCount, "server", "servers")}
+            ({mcpTransportSummary}). MCP servers can run local commands or connect to external services. If
+            unchecked, {pluralize(mcpSummary.agentNames.length, "that agent is", "those agents are")} skipped;
+            other selected changes still apply. This choice is not saved.
+          </p>
+        </div>
+      {/if}
+      <span aria-live="polite" class="text-xs text-kiro-text-secondary">{summary}</span>
       <button
         type="button"
         onclick={apply}

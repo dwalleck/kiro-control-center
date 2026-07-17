@@ -199,6 +199,10 @@ export const commands = {
 	 * 
 	 *  `draft_json` is the agent JSON as a UTF-8 string; the wrapper
 	 *  passes its bytes directly to the core write path. No re-serialization.
+	 * 
+	 *  Routes `name` through `AgentName::new` at the IPC boundary so a
+	 *  malformed name is rejected before payload validation, project
+	 *  construction, or any filesystem access.
 	 */
 	createUserAgent: (name: string, draftJson: string, projectPath: string) => typedError<null, CommandError>(__TAURI_INVOKE("create_user_agent", { name, draftJson, projectPath })),
 	/**
@@ -210,6 +214,10 @@ export const commands = {
 	 *  `draft_name` is the post-edit name (may equal `from_name` for
 	 *  in-place; differ for rename). `detach=true` drops the
 	 *  `InstalledAgents` entry for `from_name` if present.
+	 * 
+	 *  Routes both `from_name` and `draft_name` through `AgentName::new`
+	 *  at the IPC boundary so a malformed name is rejected before payload
+	 *  validation, project construction, or any filesystem access.
 	 */
 	saveUserAgent: (fromName: string, draftName: string, draftJson: string, detach: boolean, projectPath: string) => typedError<SaveOutcome, CommandError>(__TAURI_INVOKE("save_user_agent", { fromName, draftName, draftJson, detach, projectPath })),
 	/**
@@ -217,6 +225,10 @@ export const commands = {
 	 *  lineage take the full `remove_agent` path (file lock + tracking
 	 *  update + rollback on unlink failure); user-authored agents take a
 	 *  direct `fs::remove_file` that is idempotent on `NotFound`.
+	 * 
+	 *  Routes `name` through `AgentName::new` at the IPC boundary so a
+	 *  malformed name is rejected before project construction or any
+	 *  filesystem access.
 	 */
 	deleteUserAgent: (name: string, projectPath: string) => typedError<null, CommandError>(__TAURI_INVOKE("delete_user_agent", { name, projectPath })),
 	/**
@@ -227,6 +239,10 @@ export const commands = {
 	 * 
 	 *  Returns the new agent's name as a string so the UI can navigate
 	 *  to the duplicate or refresh the list.
+	 * 
+	 *  Routes `source_name` through `AgentName::new` at the IPC boundary
+	 *  so a malformed name is rejected before project construction or any
+	 *  filesystem access.
 	 */
 	duplicateUserAgent: (sourceName: string, projectPath: string) => typedError<string, CommandError>(__TAURI_INVOKE("duplicate_user_agent", { sourceName, projectPath })),
 	/**
@@ -241,6 +257,10 @@ export const commands = {
 	 *  counts can't reconstruct it. Without this command edit mode would
 	 *  have to start from a synthetic empty draft, and saving would
 	 *  silently truncate the agent.
+	 * 
+	 *  Routes `name` through `AgentName::new` at the IPC boundary so a
+	 *  malformed name is rejected before project construction or any
+	 *  agent-file access.
 	 */
 	loadUserAgentJson: (name: string, projectPath: string) => typedError<string, CommandError>(__TAURI_INVOKE("load_user_agent_json", { name, projectPath })),
 	/**
@@ -346,6 +366,11 @@ export type AgentItemInfo = {
 	// `true` iff `installed_agents.agents.contains_key(&name)`.
 	installed: boolean,
 	dialect: AgentDialect,
+	/**
+	 *  One normalized transport label per declared MCP server. Empty
+	 *  means the agent does not require MCP consent.
+	 */
+	mcp_server_transports: string[],
 };
 
 /**
@@ -1417,8 +1442,9 @@ export type ProjectInfo = {
  * 
  *  Construction goes through [`RelativePath::new`], which applies
  *  [`validate_relative_path`] — so holding a `RelativePath` is a static
- *  guarantee that the inner string is non-empty, contains no `..`
- *  components, no NUL bytes, and is not an absolute path.
+ *  guarantee that the inner string is non-empty, contains no `..` components
+ *  or NUL bytes, and cannot expose an absolute path or Windows drive prefix
+ *  when consumers strip leading `./` prefixes.
  * 
  *  The newtype replaces a plain `String` in the manifest data model
  *  (`PluginSource::RelativePath`, `StructuredSource::GitSubdir.path`) so

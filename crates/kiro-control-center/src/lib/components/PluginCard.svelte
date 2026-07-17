@@ -4,7 +4,7 @@
     PluginUpdateFailure,
     PluginUpdateInfo,
   } from "$lib/bindings";
-  import { pluralize } from "$lib/drawer-diff";
+  import { pluralize, summarizePluginMcp } from "$lib/drawer-diff";
   import { actionUpdateLabel, kindLabel } from "$lib/stores/plugin-updates";
   import type { BrowseAction } from "$lib/stores/plugin-updates";
 
@@ -31,8 +31,8 @@
     update: PluginUpdateInfo | undefined;
     failure: PluginUpdateFailure | undefined;
     projectPicked: boolean;
-    onInstall: () => void;
-    onUpdate: () => void;
+    onInstall: (acceptMcp: boolean) => void;
+    onUpdate: (acceptMcp: boolean) => void;
     /// Slice 4: opens the customize drawer for per-skill granular
     /// install/remove. No-op-tolerant — the parent decides whether
     /// the click does anything (e.g., disabled when no project
@@ -52,6 +52,13 @@
     onUpdate,
     onCustomize,
   }: Props = $props();
+
+  let acceptMcp = $state(false);
+  const consentId = $props.id();
+  const mcpSummary = $derived.by(() => summarizePluginMcp(entry.agents));
+  const mcpTransportSummary = $derived(
+    mcpSummary?.transports.map(({ label, count }) => `${count} ${label}`).join(", ") ?? "",
+  );
 
   // Per-item state, derived purely from the catalog entry's per-item
   // `installed` flags. Independent of the `installed` prop (which
@@ -135,6 +142,11 @@
   );
 
   const updateLabel = $derived(update ? actionUpdateLabel(update) : "Update");
+  const showMcpConsent = $derived(
+    mcpSummary !== null &&
+      (pending !== undefined ||
+        (!(failure && installed) && (update !== undefined || !effectiveInstalled))),
+  );
 
   // Exhaustive label helper for the `pending` discriminator. A future
   // BrowseAction arm becomes a compile error in the default branch
@@ -151,10 +163,22 @@
       }
     }
   }
+
+  function handleInstall(): void {
+    const consent = mcpSummary !== null && acceptMcp;
+    acceptMcp = false;
+    onInstall(consent);
+  }
+
+  function handleUpdate(): void {
+    const consent = mcpSummary !== null && acceptMcp;
+    acceptMcp = false;
+    onUpdate(consent);
+  }
 </script>
 
 <div
-  class="flex items-start gap-3 px-3 py-3 rounded-md border border-kiro-muted bg-kiro-overlay border-l-2 {stripeClass}"
+  class="grid grid-cols-[minmax(0,1fr)_auto] items-start gap-x-3 px-3 py-3 rounded-md border border-kiro-muted bg-kiro-overlay border-l-2 {stripeClass}"
 >
   <div class="flex-1 min-w-0">
     <div class="flex items-center gap-2 flex-wrap">
@@ -181,7 +205,40 @@
     {/if}
   </div>
 
-  <div class="flex items-center gap-1.5 flex-shrink-0">
+  {#if showMcpConsent && mcpSummary}
+    <div
+      class="col-span-2 mt-3 -mx-3 -mb-3 px-3 py-2.5 border-t border-kiro-warning/40 bg-kiro-warning/5"
+    >
+      <div class="text-xs font-semibold text-kiro-warning">
+        MCP access · {mcpSummary.agentNames.length}
+        {pluralize(mcpSummary.agentNames.length, "agent", "agents")} · {mcpTransportSummary}
+      </div>
+      <label
+        for="{consentId}-accept-mcp"
+        class="mt-2 flex items-start gap-2 text-xs font-medium text-kiro-text-secondary
+          {pending ? 'cursor-not-allowed opacity-60' : 'cursor-pointer'}"
+      >
+        <input
+          id="{consentId}-accept-mcp"
+          type="checkbox"
+          bind:checked={acceptMcp}
+          disabled={pending !== undefined}
+          aria-describedby="{consentId}-mcp-detail"
+          class="mt-0.5 h-3.5 w-3.5 flex-shrink-0 accent-kiro-warning
+            focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-kiro-warning/60
+            focus-visible:ring-offset-2 focus-visible:ring-offset-kiro-overlay
+            disabled:cursor-not-allowed disabled:opacity-50"
+        />
+        <span>Allow MCP servers declared by {entry.plugin}</span>
+      </label>
+      <p id="{consentId}-mcp-detail" class="mt-1 pl-5.5 text-[11px] leading-relaxed text-kiro-subtle">
+        MCP servers can run local commands or connect to external services. If unchecked, those agents are
+        skipped; other plugin items still install. This choice is not saved.
+      </p>
+    </div>
+  {/if}
+
+  <div class="col-start-2 row-start-1 flex items-center gap-1.5 flex-shrink-0">
     {#if pending}
       {@const label = pendingLabel(pending)}
       <button
@@ -236,7 +293,7 @@
       </button>
       <button
         type="button"
-        onclick={onUpdate}
+        onclick={handleUpdate}
         disabled={!projectPicked}
         title="Update will replace local edits to plugin files"
         aria-label="Update {entry.plugin}"
@@ -289,7 +346,7 @@
       </button>
       <button
         type="button"
-        onclick={onInstall}
+        onclick={handleInstall}
         disabled={!projectPicked}
         title={installTitle}
         aria-label="Install {entry.plugin}"
