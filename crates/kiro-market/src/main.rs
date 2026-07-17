@@ -10,7 +10,7 @@ use tracing_subscriber::EnvFilter;
 
 fn main() {
     if let Err(e) = try_main() {
-        use kiro_market_core::error::{format_error_for_surface, Surface};
+        use kiro_market_core::error::{Surface, format_error_for_surface};
         let msg = e
             .root_cause()
             .downcast_ref::<kiro_market_core::error::Error>()
