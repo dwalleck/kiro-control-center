@@ -162,11 +162,7 @@ impl From<CoreError> for CommandError {
 
 impl From<String> for CommandError {
     fn from(message: String) -> Self {
-        Self {
-            message,
-            error_type: ErrorType::Unknown,
-            remediation: None,
-        }
+        Self::new(message, ErrorType::Unknown)
     }
 }
 
@@ -197,11 +193,7 @@ impl From<ValidationError> for CommandError {
 /// validation or parse errors.
 impl From<std::io::Error> for CommandError {
     fn from(e: std::io::Error) -> Self {
-        Self {
-            message: error_full_chain(&e),
-            error_type: ErrorType::IoError,
-            remediation: None,
-        }
+        Self::new(error_full_chain(&e), ErrorType::IoError)
     }
 }
 
