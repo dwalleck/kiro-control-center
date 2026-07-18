@@ -1,5 +1,4 @@
 import type {
-  CommandError,
   InstallPluginResult_Serialize,
   RemovePluginResult,
 } from "$lib/bindings";
@@ -8,15 +7,7 @@ import {
   formatInstallPluginResult,
   formatRemovePluginResult,
 } from "$lib/format";
-
-// Mirrors the shape produced by `typedError<T, CommandError>` in bindings.ts.
-// Re-declared here so this module stays pure-logic — no runtime import of
-// `commands` or any Tauri IPC machinery; callers inject the IPC functions
-// via context (CLAUDE.md "no Tauri-IPC mocks" — tests construct fakes
-// directly without `vi.mock`).
-type IpcResult<T> =
-  | { status: "ok"; data: T }
-  | { status: "error"; error: CommandError };
+import type { IpcResult } from "$lib/ipc";
 
 export type InstallPluginFn = (
   marketplace: string,
