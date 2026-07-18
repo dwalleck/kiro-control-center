@@ -452,7 +452,7 @@ pub struct SkippedSkill {
     /// surface strictly less useful than the per-plugin `warn!` it
     /// replaced. Per-plugin callers already have the plugin context
     /// but carry it anyway so both code paths produce identical shapes.
-    plugin: String,
+    pub plugin: String,
     /// Directory name of the skill as a best-effort label. Not a
     /// guarantee the skill *would* have had this name — the frontmatter
     /// `name` is authoritative, and parsing it is precisely what failed.
@@ -461,10 +461,10 @@ pub struct SkippedSkill {
     /// `Option<String>` rather than a sentinel empty string so the
     /// frontend's type system forces the "no label available" branch
     /// to be handled explicitly — specta renders it as `string | null`.
-    name_hint: Option<String>,
+    pub name_hint: Option<String>,
     /// Path to the `SKILL.md` file that could not be consumed.
-    path: PathBuf,
-    reason: SkippedSkillReason,
+    pub path: PathBuf,
+    pub reason: SkippedSkillReason,
 }
 
 impl SkippedSkill {

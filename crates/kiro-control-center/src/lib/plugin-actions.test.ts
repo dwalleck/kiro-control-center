@@ -660,7 +660,7 @@ describe("runPluginRemove", () => {
     }
   });
 
-  it("Tauri command returns error: kind=fail", async () => {
+  it("Tauri command returns error with remediation: kind=fail", async () => {
     const removePlugin: PluginRemoveContext["removePlugin"] = vi
       .fn()
       .mockResolvedValue({
@@ -668,7 +668,7 @@ describe("runPluginRemove", () => {
         error: {
           message: "project not found",
           error_type: "not_found" as ErrorType,
-          remediation: null,
+          remediation: "refresh the project list",
         },
       });
 
@@ -677,7 +677,7 @@ describe("runPluginRemove", () => {
     expect(outcome.kind).toBe("fail");
     if (outcome.kind === "fail") {
       expect(outcome.error).toBe(
-        "Remove failed for demo-plugin: project not found",
+        "Remove failed for demo-plugin: project not found — refresh the project list",
       );
     }
   });

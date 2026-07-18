@@ -189,12 +189,12 @@ const ALLOWED_SITES: &[AllowedSite] = &[
     },
     AllowedSite {
         path: "crates/kiro-control-center/src-tauri/src/error.rs",
-        line: 84,
+        line: 93,
         reason: LEGACY_BASELINE_REASON,
     },
     AllowedSite {
         path: "crates/kiro-control-center/src-tauri/src/error.rs",
-        line: 321,
+        line: 330,
         reason: LEGACY_BASELINE_REASON,
     },
     AllowedSite {
@@ -204,7 +204,7 @@ const ALLOWED_SITES: &[AllowedSite] = &[
     },
     AllowedSite {
         path: "crates/kiro-control-center/src-tauri/src/lib.rs",
-        line: 138,
+        line: 152,
         reason: LEGACY_BASELINE_REASON,
     },
     AllowedSite {
@@ -223,18 +223,13 @@ const ALLOWED_SITES: &[AllowedSite] = &[
         reason: LEGACY_BASELINE_REASON,
     },
     AllowedSite {
-        path: "crates/kiro-control-center/src/lib/components/CustomizeDrawer.svelte",
-        line: 18,
-        reason: LEGACY_BASELINE_REASON,
-    },
-    AllowedSite {
         path: "crates/kiro-control-center/src/lib/components/editor/IdentityPanel.svelte",
         line: 17,
         reason: LEGACY_BASELINE_REASON,
     },
     AllowedSite {
         path: "crates/kiro-control-center/src/lib/format.test.ts",
-        line: 367,
+        line: 414,
         reason: LEGACY_BASELINE_REASON,
     },
     AllowedSite {
@@ -264,32 +259,32 @@ const ALLOWED_SITES: &[AllowedSite] = &[
     },
     AllowedSite {
         path: "crates/kiro-market-core/src/service/browse.rs",
-        line: 166,
+        line: 168,
         reason: LEGACY_BASELINE_REASON,
     },
     AllowedSite {
         path: "crates/kiro-market-core/src/service/mod.rs",
-        line: 3690,
+        line: 3688,
         reason: LEGACY_BASELINE_REASON,
     },
     AllowedSite {
         path: "crates/kiro-market-core/src/service/mod.rs",
-        line: 4718,
+        line: 4832,
         reason: LEGACY_BASELINE_REASON,
     },
     AllowedSite {
         path: "crates/kiro-market-core/src/service/mod.rs",
-        line: 5051,
+        line: 5165,
         reason: LEGACY_BASELINE_REASON,
     },
     AllowedSite {
         path: "crates/kiro-market-core/src/service/mod.rs",
-        line: 5101,
+        line: 5215,
         reason: LEGACY_BASELINE_REASON,
     },
     AllowedSite {
         path: "crates/kiro-market-core/src/service/mod.rs",
-        line: 8768,
+        line: 8879,
         reason: LEGACY_BASELINE_REASON,
     },
     AllowedSite {
@@ -375,7 +370,7 @@ const ALLOWED_SITES: &[AllowedSite] = &[
     },
     AllowedSite {
         path: "crates/kiro-market-core/src/service/browse.rs",
-        line: 1898,
+        line: 1982,
         reason: LEGACY_BASELINE_REASON,
     },
     // ── process-ref legacy baseline (added with the process-ref detector) ──
@@ -391,7 +386,7 @@ const ALLOWED_SITES: &[AllowedSite] = &[
     },
     AllowedSite {
         path: "crates/kiro-market-core/src/service/mod.rs",
-        line: 7063,
+        line: 7174,
         reason: LEGACY_BASELINE_REASON,
     },
     AllowedSite {

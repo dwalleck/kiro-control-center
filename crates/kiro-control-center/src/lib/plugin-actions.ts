@@ -255,7 +255,7 @@ export async function runPluginRemove(
     }
     return {
       kind: "fail",
-      error: `Remove failed for ${ctx.plugin}: ${result.error.message ?? "Unknown error"}`,
+      error: `Remove failed for ${ctx.plugin}: ${formatCommandError(result.error)}`,
     };
   } catch (e) {
     const reason = e instanceof Error ? e.message : String(e);

@@ -72,10 +72,29 @@ describe("formatCommandError", () => {
       error: {
         message: "plugin is not available locally",
         error_type: "validation",
-        remediation: "open the plugin detail to clone it",
+        remediation:
+          "use the CLI: run `kiro-market install p@<marketplace>` to clone it locally",
       } satisfies CommandError,
       expected:
-        "plugin is not available locally — open the plugin detail to clone it",
+        "plugin is not available locally — use the CLI: run `kiro-market install p@<marketplace>` to clone it locally",
+    },
+    {
+      name: "treats whitespace-only remediation as absent",
+      error: {
+        message: "disk full",
+        error_type: "io_error",
+        remediation: "   ",
+      } satisfies CommandError,
+      expected: "disk full",
+    },
+    {
+      name: "uses a fallback for an empty message",
+      error: {
+        message: "   ",
+        error_type: "unknown",
+        remediation: null,
+      } satisfies CommandError,
+      expected: "Unknown error",
     },
   ])("$name", ({ error, expected }) => {
     expect(formatCommandError(error)).toBe(expected);
