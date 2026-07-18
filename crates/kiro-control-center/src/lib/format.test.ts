@@ -96,6 +96,16 @@ describe("formatCommandError", () => {
       } satisfies CommandError,
       expected: "Unknown error",
     },
+    {
+      name: "keeps a raw string error verbatim",
+      error: "raw error message",
+      expected: "raw error message",
+    },
+    {
+      name: "uses a fallback for a null error",
+      error: null,
+      expected: "Unknown error",
+    },
   ])("$name", ({ error, expected }) => {
     expect(formatCommandError(error)).toBe(expected);
   });

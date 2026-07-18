@@ -1556,7 +1556,7 @@ fn collect_skills_with_manifest(
             );
             skipped_skills.push(SkippedSkill::duplicate_name(
                 &plugin_entry.name,
-                frontmatter.name.clone(),
+                frontmatter.name,
                 skill_md_path,
                 existing_dir.clone(),
                 skill_dir.clone(),

@@ -1,5 +1,4 @@
 import type {
-  CommandError,
   FailedAgent,
   FailedSkill,
   FailedSkillReason,
@@ -15,10 +14,25 @@ import type {
   SteeringWarning,
 } from "$lib/bindings";
 
-export function formatCommandError(error: CommandError): string {
-  const message = error.message?.trim() || "Unknown error";
-  const remediation = error.remediation?.trim();
-  return remediation ? `${message} — ${remediation}` : message;
+export function formatCommandError(error: unknown): string {
+  if (typeof error === "string") {
+    return error.trim() ? error : "Unknown error";
+  }
+  if (error === null || typeof error !== "object") {
+    return "Unknown error";
+  }
+
+  const candidate = error as { message?: unknown; remediation?: unknown };
+  const message =
+    typeof candidate.message === "string" ? candidate.message.trim() : "";
+  const remediation =
+    typeof candidate.remediation === "string"
+      ? candidate.remediation.trim()
+      : "";
+  const displayMessage = message || "Unknown error";
+  return remediation
+    ? `${displayMessage} — ${remediation}`
+    : displayMessage;
 }
 
 // Render a structured SkippedReason as a one-line string. Total over

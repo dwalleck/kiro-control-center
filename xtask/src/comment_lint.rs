@@ -229,7 +229,7 @@ const ALLOWED_SITES: &[AllowedSite] = &[
     },
     AllowedSite {
         path: "crates/kiro-control-center/src/lib/format.test.ts",
-        line: 414,
+        line: 424,
         reason: LEGACY_BASELINE_REASON,
     },
     AllowedSite {
