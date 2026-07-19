@@ -1,175 +1,720 @@
-# kiro-market — Developer Guide
+# kiro-control-center — Agent and Developer Guide
 
-## Build
+<!-- tags: navigation, architecture, conventions, ci, security, workflow -->
+
+> Shared instructions for this repository. `CLAUDE.md` and `AGENTS.md` must
+> remain byte-identical; update both together. For deeper documentation, see
+> `.agents/summary/index.md`.
+
+## Table of Contents
+
+- [Quick Commands](#quick-commands)
+- [Directory Map](#directory-map)
+- [Architecture](#architecture)
+- [Non-Obvious Patterns](#non-obvious-patterns)
+- [Tooling and Hooks](#tooling-and-hooks)
+- [Work Tracking](#work-tracking-rivets)
+- [Planning](#planning)
+- [Worktree Convention](#worktree-convention)
+- [Code Style](#code-style)
+- [CI](#ci)
+- [Security Invariants](#security-invariants)
+- [Key Crate Dependencies](#key-crate-dependencies)
+- [Custom Instructions](#custom-instructions)
+
+---
+
+## Quick Commands
+
+### Build
+
 ```bash
 cargo build
 ```
 
-## Test
+### Test
+
 ```bash
 cargo test                                             # all tests
 cargo test -p kiro-market-core                         # core library tests
 cargo test -p kiro-market                              # CLI + integration tests
-cargo test -p kiro-control-center --lib -- --ignored   # regenerate bindings.ts
+cargo test -p kiro-control-center tests::generate_types -- --exact --ignored
 ```
 
-## Frontend (Tauri crate)
-From `crates/kiro-control-center/`:
-- `npm run check` — Svelte + TypeScript typecheck via `svelte-check`. Run after any core type change that flows through `bindings.ts`.
-- `npm run dev` — vite serves on `http://localhost:1420` (Tauri convention; NOT vite's default 5173).
-- `npm run test:e2e` — Playwright e2e at `tests/e2e/app.spec.ts`. Tests gate on `FIXTURE_MARKETPLACE_PATH` and `test.skip` cleanly when unset.
+The final command regenerates `crates/kiro-control-center/src/lib/bindings.ts`.
+CI runs it and verifies that regeneration leaves no diff.
 
-## Lint
+### Frontend
+
+Run frontend commands from `crates/kiro-control-center/`:
+
+- `npm run check` — Svelte and TypeScript checks via `svelte-check`; run after
+  any core type change that flows through `bindings.ts`.
+- `npm run dev` — Vite on `http://localhost:1420` (Tauri convention, not Vite's
+  default 5173).
+- `npm run test:unit` — Vitest unit tests.
+- `npm run test:e2e` — the Playwright suite under `tests/e2e/*.spec.ts`.
+  Fixture-backed cases in `app.spec.ts` gate on `FIXTURE_MARKETPLACE_PATH` and
+  call `test.skip` cleanly when it is unset; suites such as `agents.spec.ts`
+  create their own temporary project.
+
+Vitest covers extracted pure-logic helpers only: no jsdom, no
+`@testing-library/svelte`, and no Tauri IPC module mocks. Component-level
+testing is intentionally future scope. If logic in a `.svelte` file or a runes
+store's `$state` /`$derived` needs testing, factor it into a non-`.svelte.ts`
+module and test the helper.
+
+For helpers that call Tauri commands or runes-based stores, inject dependencies
+through the context type instead of `vi.mock` -ing `$lib/bindings` or
+`$lib/stores/*.svelte.ts`. Tests construct `vi.fn()` fakes and pass them through
+the context. `PluginActionContext` and `PluginRemoveContext`, including the
+`installPlugin`, `removePlugin`, and `storeRefresh` dependencies, are the
+canonical pattern.
+
+### Lint and Pre-Commit
+
 ```bash
 cargo clippy --workspace -- -D warnings
 ```
 
-## Pre-commit
-Run all three before committing — CI enforces each:
-- `cargo fmt --all --check`
-- `cargo test --workspace`
-- `cargo clippy --workspace --tests -- -D warnings`
+Before committing, run the stronger local checks:
 
-For changes under `crates/kiro-control-center/` also run:
-- `cd crates/kiro-control-center && npm run check`
-- `cd crates/kiro-control-center && npm run test:unit`
+```bash
+cargo fmt --all --check
+cargo test --workspace
+cargo clippy --workspace --tests -- -D warnings
+```
 
-Vitest covers pure-logic helpers only (no jsdom, no `@testing-library/svelte`,
-no Tauri-IPC mocks). Component-level testing is intentionally future scope.
-If you find yourself wanting to test a `.svelte` file or a reactive store's
-`$state`/`$derived`, factor the testable logic out into a non-`.svelte.ts`
-module and test the helper instead.
+For changes under `crates/kiro-control-center/`, also run:
 
-For helpers that *call* Tauri commands or runes-based stores, inject those
-dependencies via the context type rather than `vi.mock`-ing `$lib/bindings`
-or `$lib/stores/*.svelte.ts`. Tests construct `vi.fn()` fakes directly and
-pass them through the context — no module mocks needed. Canonical pattern:
-the `installPlugin` / `removePlugin` / `storeRefresh` injection on
-`PluginActionContext` and `PluginRemoveContext`.
+```bash
+cd crates/kiro-control-center && npm run check
+cd crates/kiro-control-center && npm run test:unit
+```
 
-## Commit messages
-CI's `Validate Commits` step enforces this regex on every commit since
-`origin/main`:
-`^(feat|fix|docs|style|refactor|perf|test|build|ci|chore|review)(\([a-z][a-z0-9-]*\))?!?: .{3,}`
+### Commit Messages
 
-The scope must start with a **lowercase letter** — `fix(2b): ...` fails
-(digit-first). Use `(ui)`, `(phase-2b)`, or no scope. Existing commits on
-`main` aren't re-checked, so prior `(2b)`-scoped history doesn't trip the
-gate; new commits do.
+CI validates every commit since `origin/main` against:
 
-## xtask
-- `cargo xtask hook-post-edit` — wired into Claude Code `PostToolUse` for `.rs` edits. Runs `rustfmt` then `cargo clippy --package <derived> -- -D warnings`. The package is derived by walking up ancestors for the nearest `Cargo.toml` with a `[package]` table (`xtask::derive_package`), so new workspace crates are picked up automatically. Read/parse failures log to stderr; loop exhaust emits a "no usable Cargo.toml" diagnostic. The settings.json matcher is `Write|Edit|MultiEdit`; the `.rs` extension gate lives in Rust (`hook_post_edit`), so non-Rust edits return in microseconds.
-- `cargo xtask hook-stop-frontend-check` — wired into Claude Code `Stop` (fires once per turn, not per edit). Runs `npm run check` (svelte-check + tsc) from `crates/kiro-control-center/` **only when** `git status --porcelain` reports any `.ts` / `.svelte` file dirty under that crate. A pure-Rust turn pays zero cost; a mixed-bag turn pays one ~5–15s check. Findings (and user-actionable failures like a missing `git`/`npm`) are emitted as a `{"systemMessage": ...}` JSON envelope on stdout — Stop hooks send plain stdout to the debug log only, so the envelope is the documented route to the transcript. Exit code is always 0 from `hook_stop_frontend_check`: every error path (stdin parse, workspace-dir resolution, dirty-check, svelte-check spawn) is swallowed inside the function so a turn is never aborted over an infrastructure hiccup. The dirty-path filter (`is_frontend_path`, `parse_dirty_paths_from_git_status`) is pure Rust with unit tests; cross-platform npm invocation handles Windows's `.cmd` shim explicitly via `#[cfg(windows)]`. The git invocation uses `-c core.quotePath=false` so non-ASCII filenames don't get octal-escaped and silently miss the prefix check.
-- **Worktree-correctness for both hooks.** Both hooks resolve their workspace dir from the JSON stdin payload's `cwd` field (`resolve_workspace_dir` → `resolve_workspace_dir_inner`), falling back to `$CLAUDE_PROJECT_DIR` and then `current_dir`, and erroring when all three are absent (no more `Path::new(".")` pretend-success). Claude Code populates `cwd` with the actual working directory of the tool call, so a subagent operating in an isolated worktree gets clippy / svelte-check runs in the *worktree's* tree rather than the parent session's. The fallback chain keeps direct `cargo xtask ...` invocations working outside Claude Code. `frontend_files_dirty` classifies non-zero `git status` exits via `classify_git_status_failure`: benign cases (not a git repo, dir missing) skip silently; surfaceable cases (index corrupt, permission denied, lockfile contention) emit a `systemMessage` so the user sees the real symptom instead of a silent no-op.
-- `cargo xtask hook-block-cargo-lock` — blocks direct `Cargo.lock` edits. Override for one session via `KIRO_ALLOW_LOCKFILE_EDIT=1`.
-- `cargo xtask plan-lint` — runs structural lint queries against the [tethys](https://github.com/dwalleck/rivets/tree/main/crates/tethys) index. Gates implemented:
-  - **gate-4-external-error-boundary** — SQL query against `attributes` and `symbols` that flags any `pub` enum variant carrying an external crate's error type (`serde_json`, `gix`, `reqwest`, `toml`) via `#[source]`. Replaces the broken grep in `docs/plan-review-checklist.md`.
-  - **no-unwrap-in-production** — SQL query against `refs` joined to `symbols` and `files` that flags `.unwrap()` and `.expect()` calls in non-test production code, enforcing the CLAUDE.md "zero-tolerance" rule. Filters: `is_test = 0`, plus path-based exemptions for `tests/`, `benches/`, `test_support`, and `test_utils`.
+<!-- markdownlint-disable MD013 -->
+```text
+^(feat|fix|docs|style|refactor|perf|test|build|ci|chore|review)(\([a-z][a-z0-9-]*\))?!?: .{3,}
+```
+<!-- markdownlint-enable MD013 -->
 
-  Requires the `tethys` binary on PATH (or `TETHYS_BIN` env var); pass `--no-reindex` to query the existing `.rivets/index/tethys.db` without re-indexing first; pass `--gate <NAME>` to run a single gate. Exits 1 on findings (CI gate fails).
-- `cargo xtask comment-lint` — filesystem walk that flags four smell categories inside `//` line comments under `crates/` and `xtask/`:
-  - `kiro-XXXX` rivets-IDs
-  - `PR #N` / `issue #N`
-  - Reviewer-agent attribution names (per `REVIEWER_AGENT_NAMES`: `code-reviewer`, `silent-failure-hunter`, `marketplace-security-reviewer`, etc.)
-  - Process-references — bare word `amendment` (case-insensitive) and `per A<digits>` shorthand attributing code to a plan-amendment ID (e.g. `Per A1`, `per A2 amendment`)
+The optional scope must start with a lowercase letter. `fix(2b): ...` fails; use
+`fix(ui): ...`, `fix(phase-2b): ...`, or no scope. Existing history on `main` is
+not rechecked.
 
-  Enforces the "no PR/issue/reviewer/process refs in committed comments" rule below. Pattern matching is `//`-comment-scoped (block comments and string literals are skipped) and word-boundary aware on both sides (`mykiro-uphh`, `kiro-uphhx`, `kiro-code-reviewer-v2`, `preamendment` don't match their embedded substrings). Self-skips `xtask/src/comment_lint.rs` (its docstring documents the patterns it detects) and `xtask/src/plan_lint.rs` (its gate-query rationale is anchored to originating PRs). Other deliberate exceptions register in `comment_lint::ALLOWED_SITES` with a written-down reason. Exits 1 on findings.
+---
 
-## Work tracking (rivets)
+## Directory Map
 
-The deferred-work backlog lives in `.rivets/issues.jsonl` (committed to git) and is managed by the [`rivets`](https://github.com/dwalleck/rivets) CLI — a JSONL-backed issue tracker. The binary must be on PATH; the sibling repo is at `~/repos/rivets`. Issue-ID prefix is `kiro-` (set once in `.rivets/config.yaml` by `rivets init -p kiro`; do not change). Initialized in commit `5e85b6e` with 17 issues seeded from the PR #113-#115 retrospectives.
+<!-- tags: navigation, structure -->
 
-**Check before you build.** Before starting any non-trivial change, run `rivets ready` and `rivets list --status open`. There is a good chance the work is already filed — often with `--design` notes or `--acceptance` criteria that should shape the implementation. Duplicating an existing issue as a fresh PR loses the linked context. `rivets show <id>` prints the full issue including dependencies.
+```text
+crates/
+├── kiro-market-core/src/       # Shared library — all business logic lives here
+│   ├── service/mod.rs          # MarketplaceService: primary orchestrator
+│   ├── service/browse.rs       # Enumeration, install context, catalog assembly
+│   ├── cache.rs                # CacheDir and marketplace source detection
+│   ├── project.rs              # .kiro/ skill, agent, and steering operations
+│   ├── git.rs                  # gix-first clone with system-git fallback
+│   ├── agent/                  # Claude, Copilot, and Native agent dialects
+│   ├── steering/               # Steering discovery and installation
+│   ├── plugin.rs               # Plugin discovery and plugin.json parsing
+│   ├── skill.rs                # SKILL.md frontmatter parsing
+│   ├── validation.rs           # Security-critical path/name newtypes
+│   ├── kiro_settings.rs        # Typed .kiro/settings.json registry
+│   ├── platform.rs             # Symlink, junction, and copy abstraction
+│   ├── file_lock.rs            # Cross-process fs4 locking
+│   ├── hash.rs                 # BLAKE3 change detection
+│   ├── raii.rs                 # DirCleanupGuard
+│   └── error.rs                # Structured error hierarchy
+├── kiro-market/src/            # Thin clap CLI
+│   ├── cli.rs                  # Clap derive definitions
+│   ├── main.rs                 # Command dispatch
+│   └── commands/               # One module per subcommand
+└── kiro-control-center/        # Tauri 2 + Svelte 5 desktop app
+    ├── src-tauri/src/
+    │   ├── lib.rs              # Tauri command registration via tauri-specta
+    │   └── commands/           # Thin IPC handlers over kiro-market-core
+    └── src/
+        ├── lib/bindings.ts     # Generated TypeScript bindings — do not edit
+        ├── lib/stores/         # Svelte 5 $state module pattern
+        └── lib/components/     # BrowseTab, InstalledTab, and other UI
+xtask/src/
+├── main.rs                     # Hook and xtask dispatch
+└── plan_lint.rs                # Tethys-backed structural gates
+```
 
-**Daily commands:**
-- `rivets ready` — issues with no open blockers (default sort: hybrid priority/age, limit 10)
-- `rivets list --status open` / `--label <name>` / `--type bug` / `-p <0-4>` — filtered backlog
-- `rivets show <id> [<id>...]` — full issue(s) including dependencies, design notes, acceptance criteria
-- `rivets stats` — totals by status (use to confirm the tracker is reachable)
-- `rivets blocked` — issues waiting on dependencies
-- `rivets update <id> --status in_progress` — claim work when you start
-- `rivets close <id> --reason "PR #NNN: <one-line summary>"` — close on merge
-- `rivets dep tree <id>` — visualize the dependency graph rooted at an issue
-- `rivets list --json | jq ...` — every subcommand supports `--json` for scripting
+**Key entry points:**
 
-**Creating issues.** When PR review surfaces follow-up work, file it as a rivets issue rather than letting it die in a stale comment thread. Match the existing seeded-issue style: `--description` includes the originating PR number, the file path(s) involved, and what the reviewer flagged; `--design` captures the fix approach; `--deps` wires up blockers. Use the `blocks` dependency type for "must-happen-in-the-same-commit-as <other>" coupling, not just strict predecessor ordering — that's how `kiro-5qcb` (a diagnostic-removal cleanup) couples to `kiro-kmj4` (the F3 UI work that enables the cleanup). The cleanup blocks the enabler so `rivets ready` correctly hides it until F3 closes.
+- CLI: `crates/kiro-market/src/main.rs` → `commands/`.
+- Desktop: `crates/kiro-control-center/src-tauri/src/lib.rs` → Tauri commands.
+- Core: `crates/kiro-market-core/src/service/mod.rs` → `MarketplaceService`.
 
-**The ID-placeholder footgun.** Rivets generates the 4-character suffix at creation time, so when issue A's description needs to reference issue B, you cannot pre-name B. If you write `kiro-<this-id>` or `kiro-CONTINGENT` as a stand-in, you MUST backfill the real ID after creating B. Commit `e7e3d9b` exists precisely because this was missed during the initial seeding and PR review caught it. After creating any issue whose description was authored before its ID existed, immediately re-read it and replace placeholders with real IDs.
-
-**Direct JSONL edits.** Editing `.rivets/issues.jsonl` directly (rather than via `rivets update`) is acceptable *only* for fixes that intentionally should NOT bump `updated_at` — e.g., the placeholder-backfill cleanup in `e7e3d9b`. Any change to a semantic field (status, priority, description content, dependencies, labels) must go through `rivets update <id>` so the timestamp reflects the real change and `rivets stale` stays meaningful.
-
-**Shared namespace with tethys.** `.rivets/` is a shared directory: rivets writes `config.yaml` and `issues.jsonl` at the top level (tracked), tethys writes its SQLite index under `.rivets/index/` (untracked, regenerable via `cargo xtask plan-lint`). The root `.gitignore` line is precisely `/.rivets/index/` for this reason — broadening it to `/.rivets/` would un-track the entire issue backlog. Do not change that line without recognizing both consumers.
-
-## Planning
-After writing a plan and before starting implementation, apply the 6 gates in `docs/plan-review-checklist.md` (Grounding / Threat Model / Wire Format / External Type Boundary / Type Design / Reference vs Transcription). The gates also fire as code-review questions on any change touching the public API of `kiro-market-core`. Originated from the PR #64 retrospective; Gate 6 added from the PR #96 retrospective (steering/agents scan-path bug — a faithful encoding of a plan that transcribed install-time *output* instead of citing install-time *mechanism*). Complement to (not replacement for) the upstream `superpowers:writing-plans` skill: invoke that skill first, then run the gates as a self-review pass before declaring the plan implementation-ready.
-
-Plan-review = **two complementary passes**, not one:
-1. **LSP-first** — `documentSymbol` on every file the plan modifies; `workspaceSymbol` to confirm cross-file references. Catches signature drift, missing exports, field-access typos in one call (vs. many greps). Cheap; do this first.
-2. **Code-reviewer-style** — walk each task asking "does this do the right thing?" Catches behavioral semantics (cascade abort patterns, recoverable-vs-fatal classification), cross-task drift (when fixing pattern X in task N, search siblings for the same shape), action-item linkage (did the design doc say to do X, does any task actually do X?), and data-shape ambiguity (HashMap keyed by enough fields?).
-
-Neither pass substitutes for the other. PR #93's experience: 11 LSP-first findings + 12 code-reviewer-style findings, almost no overlap. A plan that passes only LSP is half-reviewed. Diminishing-returns signal: when findings shrink to compiler-catchable shapes (`DateTime<Utc>` vs. specta features, `self.` vs. `Self::` for associated functions), stop adding plan-time amendments and let the implementation forcing-functions catch the rest.
-
-## Project Structure
-- `crates/kiro-market-core/` — library crate (types, parsing, git, cache, project state)
-- `crates/kiro-market/` — binary crate (CLI commands)
-
-## Worktree convention
-Feature branches go in sibling directories: `~/repos/kiro-marketplace-cli-<topic>` (e.g. `kiro-marketplace-cli-plugin-impl`). Each worktree has its own `target/` and `node_modules/` — run `npm install` in `crates/kiro-control-center/` after creating a fresh worktree. Tethys also indexes per-worktree under `.rivets/index/`; the parent's index doesn't transfer.
-
-Pattern: `git worktree add /home/dwalleck/repos/kiro-marketplace-cli-<topic> -b <branch> origin/main`. Cleanup after merge: `git worktree remove <path> && git branch -d <branch> && git pull --ff-only`.
-
-## Code Style
-- Edition 2024, rust-version 1.85.0
-- `thiserror` for typed errors in kiro-market-core
-- Error chain: `#[source]` on inner variants (e.g. `PluginError::ManifestReadFailed { #[source] source: io::Error }`), `#[error(transparent)]` on top-level `Error` variants so `.source()` walks through. At Tauri/log boundaries, AND in any wire-format `reason`/`error: String` field that crosses the FFI, use `error_full_chain(&err)` — not `err.to_string()`, which drops the source chain. See `SkippedPlugin::from_plugin_error` and `FailedSkill::install_failed` as the canonical constructors.
-- Don't name a non-`Error` payload field `source` on a `thiserror`-derived variant — the name is reserved for the `Error::source()` impl and requires the type to implement `Error`. Rename (e.g. `plugin_source: StructuredSource`) and keep the wire-format name via the projection to `SkippedReason`.
-- Prefer dedicated enum variants over `reason: String` sentinels when callers might branch on the semantic (e.g. `NotADirectory` / `SymlinkRefused` vs. a shared `DirectoryUnreadable { reason }`). `io::Error` goes directly in `#[source]` — no `Box` needed, it's `Send + Sync + 'static`.
-- **Parse, don't validate, at deserialization boundaries.** Untrusted string fields from manifests (`marketplace.json`, `plugin.json`, agent frontmatter) get wrapped in a newtype with a private inner field and a fallible `new` — see `RelativePath` (`validation.rs:28`), `GitRef` (`git.rs:34`), and `AgentName` (`validation.rs`) as templates. Implement `Deserialize` to route through `new` so `serde_json::from_slice` rejects bad input at parse time, not later. A free `validate_xyz(&Thing) -> Result<()>` that nothing constructs is usually a missed newtype. **Exception:** keep raw `Option<String>` on a transient projection struct when post-parse routing needs to split failures across distinct error variants (e.g. `NativeAgentProjection.name` stays `Option<String>` so `MissingName` / `InvalidName(reason)` / `InvalidJson` route to three distinct `AgentError` variants instead of collapsing into `InvalidJson(serde_json::Error)`). The type-level guarantee still lands at the *bundle* boundary (`NativeAgentBundle.name: AgentName`).
-- **Validation newtypes that may flow through Tauri bindings need `#[cfg_attr(feature = "specta", derive(specta::Type))]`** so they emit a TypeScript alias via `bindings.ts`. Match `RelativePath`'s shape (`validation.rs:26`). Skipping this on initial creation is a latent break — adding it later is harmless, but the moment a `#[tauri::command]` returns a type embedding the newtype, the Tauri crate stops compiling.
-- **`chrono::DateTime<Utc>` cannot appear on `specta::Type`-derived structs.** `kiro-market-core`'s `specta` feature set is `["derive", "serde_json"]` — no `"chrono"` flag. Convert to `String` at the FFI boundary via `.to_rfc3339()` (precedent: `commands/installed.rs::InstalledSkillInfo.installed_at`). Every `DateTime<Utc>` in `project.rs` lives on a struct that intentionally does NOT derive `specta::Type`.
-- **Classifier functions over error enums enumerate every variant.** `SkippedReason::from_plugin_error`, `PluginError::remediation_hint`, and any similar "project a `PluginError` into a narrower type or pick a branch per variant" function must match every variant explicitly — no `_ => None` / `_ => default`. A new `PluginError` variant should then force a compile-time classification decision rather than silently defaulting. Two classifiers that share the same input enum drift one `_` apart otherwise.
-- **Classifier idempotent-payload rule.** When `classify_*_collision` returns `CollisionDecision::Idempotent(Box<T>)`, `T` must contain only data the classifier *actually sees* — not data the caller has but didn't pass in. The steering classifier shipped a bug where `T = InstalledSteeringOutcome` led it to substitute `dest` for the missing `source` path, leaking the destination into the wire-format `source` field on idempotent reinstalls. Fix: classifier returns a minimal echo type (e.g. `SteeringIdempotentEcho { prior_installed_hash: String }`) and the caller assembles the full outcome where `source.source` is in scope.
-- `anyhow` for error propagation in kiro-market binary
-- `rstest` for parameterized tests, `tempfile` for test fixtures
-- `clippy::all` and `clippy::pedantic` enabled as warnings
-- `unsafe_code` is forbidden
-- **Zero-tolerance in production code** (tests are exempt): no `.unwrap()`, no `.expect()`, no `let _ = ...` discarding a `Result`, no `#[allow(...)]` directives. If a lint or warning is wrong, fix the code or the lint config — don't suppress at the call site. **Enforced by `cargo xtask plan-lint --gate no-unwrap-in-production`**. Deliberate exceptions (idiomatic Tauri/Specta startup panics, etc.) are registered in `xtask/src/plan_lint.rs`'s `ALLOWED_SITES` const with a written-down reason — that's the audit trail. Adding to the allowlist requires a code change reviewed in PR; there is no inline `#[allow(...)]` escape hatch.
-- **No PR numbers, rivets-IDs, issue numbers, reviewer-agent attributions, or process-references in committed comments.** This rule binds *all* `//` line comments under `crates/` and `xtask/` — including production code, tests, doc-comments (`///`, `//!`), and frontmatter. Forbidden shapes: `kiro-XXXX` (4-char rivets IDs like `kiro-uphh`), `PR #N` / `pr#N` (case-insensitive), `issue #N`, reviewer-agent attribution names (`code-reviewer`, `silent-failure-hunter`, `comment-analyzer`, `pr-test-analyzer`, `type-design-analyzer`, `code-simplifier`, `marketplace-security-reviewer`, `tauri-ipc-auditor`, `plugin-validator`, `skill-reviewer`, `gemini-code-assist`), AND process-references (bare word `amendment` case-insensitive, or `per A<digits>` shorthand like `Per A1`, `per A2 amendment` — these attribute code to a plan-amendment ID that rots once the slice ships and the plan is archived). Why: the referenced PR/issue/reviewer pass/plan amendment is the *contemporaneous* changelog entry. Once the issue closes and rivets archives it, the in-code reference is a stale pointer the next reviewer has to grep `.rivets/issues.jsonl` (often gone), GitHub, or `.agents-view/plan-slice-N.md` for. PR descriptions, commit messages, and `git blame` are the durable audit trail; comments that duplicate them rot. The same rule applies to coined PR-review phrases (`"silent-install gap from PR #119 review"`, `"Closes marketplace-security-reviewer Minor finding"`, `"per code-reviewer #1 / silent-failure-hunter #2"`, `"the A1 amendment removed that side-effect"`) — describe the invariant, not its origin. **Enforced by `cargo xtask comment-lint`**. Deliberate exceptions (e.g. plan_lint gate rationale anchored to its originating PR, or fixture comments that quote an agent name in prose) register in `xtask/src/comment_lint.rs`'s `ALLOWED_SITES` with a reason (`LEGACY_BASELINE_REASON` or `FIXTURE_NAME_REASON`); the gate's own module is self-skipped because its docstring necessarily quotes the patterns it detects. **Rationale comments that explain WHY a defensive measure exists are still valuable** — just describe the failure shape (`"refusing hardlinked source — exfiltration risk"`) rather than the historical commit (`"closes kiro-uphh from PR #119 review"`), the reviewer attribution (`"per silent-failure-hunter HIGH #2"`), or the plan amendment (`"per A1 amendment, addExternalTool no longer touches allowedTools"` → just `"addExternalTool only touches tools[] — visibility and auto-allow are orthogonal"`).
-- **Map external errors at the adapter boundary.** `gix`, `serde_json`, `toml`, `reqwest` errors get translated into typed `ErrorKind` variants inside the module that calls them (e.g. `git.rs`, `cache.rs`, `agent/parse_native.rs`) — they never appear in the public API of `kiro-market-core`. (`io::Error` is std-library and exempted; it can carry through `#[source]`.) Recipe when the variant *would* carry an external error: `#[non_exhaustive]` enum + variant field `reason: String` (not `#[source]`) + a `pub(crate) fn` constructor that calls `error_full_chain(&err)`. Canonical examples: `parse_native::NativeParseFailure::invalid_json` (for `serde_json::Error`), `steering::tracking_malformed` (for `serde_json::Error` in `SteeringError::TrackingMalformed`). Tests should assert `err.source().is_none()` to lock the contract. **Enforced by `cargo xtask plan-lint --gate gate-4-external-error-boundary`** — a SQL query against the tethys index that flags any `pub` enum variant carrying an external crate's error type via `#[source]`.
-- **Discriminated unions: `switch` with exhaustiveness, never chained ternaries (TS).** When branching on a tagged-union discriminator (`mode.kind`, `result.kind`, etc.), use `switch (x.kind)` with `default: { const _exhaustive: never = x; throw new Error(...); }` so a future arm becomes a compile error rather than silently falling through. Canonical examples: `formatSkippedSkill`, `formatSteeringWarning`, `runPluginInstall`. Chained `x.kind === "A" ? ... : ...` ternaries fail this discipline — the else-branch doesn't narrow, and a third arm silently maps to whichever branch the ternary defaults to. Pair the runtime switch with a type-level guard at the definition site: a `satisfies`-anchored values list + `Exclude<U, (typeof _VALUES)[number]> extends never ? true : never` (canonical: `_PLUGIN_ACTION_VALUES` + `_AssertPluginActionExhaustive`). The `satisfies` catches arm-shape changes (literal becomes object); the `Exclude<>` catches arm additions; **both need a value-position `const _assert: T = true`** to actually fire — an unused type alias resolving to `never` is valid TS, so the const assignment is what makes the tripwire active. The PR #112 review pass established this as the full discriminator-pushdown discipline; partial application (type definition without consumer-side switches, or guards without value-position) leaves silent-failure surfaces.
+---
 
 ## Architecture
-The tool reads Claude Code `marketplace.json` catalogs, discovers plugins and skills,
-and installs them into Kiro CLI projects at `.kiro/skills/`.
 
-**Dependencies point inward.** `kiro-market-core` is the domain core and must stay free of UI, Tauri, async-runtime, and frontend deps. The Tauri crate (`crates/kiro-control-center/src-tauri`) and the CLI both depend on the core; the core never depends on them. If you find yourself wanting to add `tauri`, `tokio`, or a UI crate to `kiro-market-core/Cargo.toml`, the abstraction belongs in the consumer crate instead.
+<!-- tags: architecture, patterns -->
 
-Skill directories are copied wholesale (SKILL.md + `references/` companion files)
-so that Kiro's native lazy loading can resolve companion files on demand.
+The tool reads Claude Code `marketplace.json` catalogs, discovers plugins,
+skills, agents, and steering, and installs them into Kiro projects under
+`.kiro/`, including skills at `.kiro/skills/`.
 
-### Service Layer
-Marketplace operations (add/remove/update/list) live in `kiro-market-core::service::MarketplaceService`.
-CLI and Tauri handlers are thin wrappers that construct the service, call it, and format output.
-Domain logic is never duplicated between frontends.
+### Shared Core and Service Layer
 
-### Tauri command handlers
-Each `#[tauri::command]` splits into a thin wrapper plus a private `fn <name>_impl(svc: &MarketplaceService, ...) -> Result<T, CommandError>`. The wrapper does the globals work (`make_service()?`) and calls the `_impl`; the `_impl` is pure Rust and takes the service + primitives by reference. Tests exercise `_impl` directly using fixtures from `kiro_market_core::service::test_support` (activated via a `dev-dependencies` feature override). See `install_skills_impl` in `crates/kiro-control-center/src-tauri/src/commands/browse.rs` and its `#[cfg(test)] mod tests` for the exemplar. New commands follow this shape so their bodies are testable without a Tauri runtime.
+Dependencies point inward. `kiro-market-core` is the domain core and must stay
+free of UI, Tauri, async-runtime, and frontend dependencies. The CLI and Tauri
+crates depend on core; core never depends on them. If code in core appears to
+need `tauri`, `tokio`, or a UI crate, the abstraction belongs in the consumer
+crate instead.
 
-The `_impl(svc, ...)` rule applies to **service-consuming** commands. Project-only reads (no `MarketplaceService` needed — e.g. `list_installed_skills`, `remove_skill` in `commands/installed.rs`) put the body inline in the wrapper with no `_impl` at all. Don't add an unused `svc` parameter to satisfy the rule mechanically.
+Marketplace operations live in `kiro_market_core::service::MarketplaceService`
+(the Rust path corresponding to
+`kiro-market-core::service::MarketplaceService`). The service stores a boxed
+`GitBackend`, while its constructor accepts any `'static` backend so tests can
+inject mocks. CLI and Tauri handlers construct the service, call it, and format
+output; never duplicate domain logic between frontends. Keep `tauri`, `tokio`,
+and UI dependencies out of `kiro-market-core/Cargo.toml`.
+
+### Tauri Command Handlers
+
+A service-consuming `#[tauri::command]` splits into a thin wrapper and a private
+`fn <name>_impl(svc: &MarketplaceService, ...) -> Result<T, CommandError>`. The
+wrapper handles globals such as `make_service()?`; `_impl(svc, ...)` takes the
+service and primitives by reference and is tested directly in a
+`#[cfg(test)] mod tests` with `kiro_market_core::service::test_support`.
+`install_skills_impl` in
+`crates/kiro-control-center/src-tauri/src/commands/browse.rs` is the exemplar.
+
+Project-only commands that do not need `MarketplaceService`, such as
+`list_installed_skills` and `remove_skill` in `commands/installed.rs`, keep
+their body inline. Do not add an unused service parameter merely to match the
+pattern.
+
+### State, Cleanup, and IPC
+
+Registry and install-tracking metadata is JSON on disk and guarded by `fs4` file
+locks. Marketplace caches and installed content are filesystem trees; there is
+no database.
+
+`DirCleanupGuard` removes staging directories on failure. Call `.defuse()` only
+after successful completion.
+
+`tauri-specta` generates typed IPC bindings. Never edit
+`crates/kiro-control-center/src/lib/bindings.ts` manually; regenerate it with
+the command in [Test](#test). The `bindings_export_plugin_catalog_view` test
+also guards the exported catalog shape.
+
+Skill directories are copied wholesale, including `SKILL.md` and `references/`,
+so Kiro's lazy loading can resolve companion files.
 
 ### Git Abstraction
-Git operations are abstracted behind the `GitBackend` trait (`kiro-market-core::git`).
-`GixCliBackend` implements the trait using `gix` for clone/open and the system `git` CLI
-for pull/checkout. The trait enables mock-based testing without filesystem git repos.
+
+Git operations are behind `kiro_market_core::git::GitBackend` (the
+`kiro-market-core::git` module), implemented in production by `GixCliBackend`.
+Cloning tries gix first, cleans up a partial destination on failure, and retries
+with system git. If both clone backends fail, both causes are retained.
+Requested-ref checkout and pull use system git; repository open and SHA
+verification use gix. Recognized CLI authentication failures receive remediation
+text.
 
 ### Platform Abstraction
-Local marketplace linking uses `kiro-market-core::platform` which provides
-`create_local_link`/`is_local_link`/`remove_local_link`. On Unix this uses symlinks,
-on Windows it uses directory junctions with copy fallback.
+
+Local marketplace linking uses the `kiro_market_core::platform` functions
+`create_local_link`, `is_local_link`, and `remove_local_link`. Unix uses
+symlinks. Windows uses NTFS
+directory junctions and falls back to recursive copy if junction creation fails.
+`MarketplaceStorage` records which storage method was used.
+
+### Core Feature Flags
+
+- `cli` — clap derives used by the CLI crate.
+- `specta` — TypeScript binding derives used by the Tauri crate.
+- `test-support` — test utilities for integration and frontend-wrapper tests.
+
+---
+
+## Non-Obvious Patterns
+
+<!-- tags: patterns, gotchas -->
+
+- **curl is a TLS feature shim:** `kiro-market-core` depends on
+  `curl = { workspace = true }` only to activate the `ssl` feature on transitive
+  `curl-sys` from `gix-transport`. It is not used for HTTP requests. Removing it
+  breaks TLS on static-libcurl builds.
+- **Cargo.lock is generated:** the Claude hook blocks direct edits. Use
+  `cargo update -p <crate>` instead. `KIRO_ALLOW_LOCKFILE_EDIT=1` is the
+  explicit one-session override.
+- **Bindings are generated:** never edit `src/lib/bindings.ts` manually; the
+  `generate_types` test overwrites it.
+- **Svelte 5 runes:** stores export const `$state` objects rather than Svelte 4
+  stores. Mutate through the deep state proxy.
+- **Plugin references:** always `plugin@marketplace`, split on the first `@`.
+- **Default scan paths:** when `plugin.json` is absent or the relevant manifest
+  list is empty, discover skills from `./skills/`, agents from `./agents/`, and
+  steering from `./steering/`.
+- **Self-cycle dev dependency:** `kiro-market-core` lists itself under
+  `dev-dependencies` with `features = ["test-support"]`; Cargo handles this
+  without recursion.
+- **BLAKE3 tracking:** source and installed content hashes are stored. Matching
+  hashes make reinstalls idempotent; changed content requires `--force`.
+- **chrono and IPC:** `chrono::DateTime<Utc>` cannot appear on `specta::Type`
+  IPC structs because the Tauri crate does not enable Specta's chrono feature.
+  Convert timestamps to RFC 3339 strings at the FFI boundary. The binding export
+  test asserts that generated TypeScript contains no `DateTime` types.
+
+---
+
+## Tooling and Hooks
+
+<!-- tags: automation, hooks, lint -->
+
+### Claude Hooks
+
+Hook registration lives in `.claude/settings.json`.
+
+- **PreToolUse (`Write|Edit|MultiEdit`):** `cargo xtask hook-block-cargo-lock`
+  blocks direct `Cargo.lock` edits.
+- **PostToolUse (`Write|Edit|MultiEdit`):** `cargo xtask hook-post-edit` gates
+  on `.rs` inside `hook_post_edit`, runs rustfmt, derives the nearest package
+  with `xtask::derive_package` by walking ancestors for a `[package]`
+  `Cargo.toml`, and runs `cargo clippy --package <derived> -- -D warnings`.
+  Read/parse failures are reported; non-Rust edits return quickly.
+- **Stop:** `cargo xtask hook-stop-frontend-check` dispatches to
+  `hook_stop_frontend_check` and runs `npm run check` once per turn only when
+  `git status --porcelain` reports dirty `.ts` or `.svelte` files under
+  `crates/kiro-control-center/`. Pure-Rust turns pay no frontend-check cost.
+
+The Stop hook emits findings and actionable infrastructure failures in a
+`{"systemMessage": ...}` JSON envelope. It exits 0 so an infrastructure problem
+does not abort the turn. `is_frontend_path` and
+`parse_dirty_paths_from_git_status` keep dirty-path classification pure and
+unit-testable. npm invocation handles Windows's `.cmd` shim via
+`#[cfg(windows)]`, and git uses `-c core.quotePath=false` so non-ASCII paths are
+not silently missed.
+
+The PostToolUse and Stop hooks call `resolve_workspace_dir`
+/`resolve_workspace_dir_inner` and resolve the workspace from the tool payload's
+`cwd`, then `$CLAUDE_PROJECT_DIR`, then `current_dir`; failure of all three is
+reported instead of silently using `Path::new(".")`. This keeps checks in an
+isolated worktree rather than the parent checkout. `frontend_files_dirty` and
+`classify_git_status_failure` treat benign failures such as “not a git
+repository” as skips, while permissions, corruption, or lock contention produce
+a system message.
+
+### Plan Lint
+
+`cargo xtask plan-lint` runs structural SQL queries against a
+[tethys](https://github.com/dwalleck/rivets/tree/main/crates/tethys) index. The
+registered gates are:
+
+- `gate-4-external-error-boundary` — external crate error type behind
+  `#[source]` on a public enum or struct.
+- `no-unwrap-in-production` — `.unwrap()` or `.expect()` in non-test production
+  code.
+- `no-panic-in-production` — `panic!`, `todo!`, or `unimplemented!` in non-test
+  production code.
+- `non-exhaustive-error-enum` — public `*Error` enum in core missing
+  `#[non_exhaustive]`.
+- `no-frontend-deps-in-core` — `tauri` or `tokio` import in core.
+- `ffi-enum-serde-tag` — public `Serialize + specta::Type` enum with payload
+  variants missing an explicit serde representation.
+- `no-marketplace-service-in-agents-authoring` — service imports in project-only
+  agent-authoring commands.
+
+Run one policy directly with commands such as
+`cargo xtask plan-lint --gate no-unwrap-in-production` or
+`cargo xtask plan-lint --gate gate-4-external-error-boundary`. `tethys` must be
+on `PATH`, or set `TETHYS_BIN`. Use `--no-reindex` to query the existing
+`.rivets/index/tethys.db`, or `--gate <NAME>` to run one gate. Index canaries
+fail loudly when the index is empty or incomplete so gates cannot report a
+vacuous success. The external-boundary query uses indexed `attributes` and
+`symbols`. The unwrap/panic queries use indexed `refs`, `symbols`, and `files`,
+require `is_test = 0`, and exempt `tests/`, `benches/`, `test_support`, and
+`test_utils`. Findings exit 1. Plan-lint is currently a local/review gate unless
+CI is explicitly updated to invoke it.
+
+### Comment Lint
+
+`cargo xtask comment-lint` scans `//` comments under `crates/` and `xtask/` for:
+
+- four-character `kiro-XXXX` Rivets IDs;
+- case-insensitive `PR #N` /`pr#N` (with or without the space) or `issue #N`
+  references;
+- reviewer-agent attribution names;
+- process references such as bare `amendment` or `per A<digits>`.
+
+Reviewer names include `code-reviewer`, `silent-failure-hunter`,
+`comment-analyzer`, `pr-test-analyzer`, `type-design-analyzer`,
+`code-simplifier`, `marketplace-security-reviewer`, `tauri-ipc-auditor`,
+`plugin-validator`, `skill-reviewer`, and `gemini-code-assist` (see
+`REVIEWER_AGENT_NAMES`).
+
+Matching is comment-scoped, case-aware where appropriate, and word-boundary
+aware; block comments and string literals are skipped. Embedded strings such as
+`mykiro-uphh`, `kiro-uphhx`, `kiro-code-reviewer-v2`, and `preamendment` do not
+match. `xtask/src/comment_lint.rs` self-skips because it must document the
+patterns, and `xtask/src/plan_lint.rs` may contain originating rationale.
+Deliberate exceptions belong in `comment_lint::ALLOWED_SITES` with a written
+reason such as `LEGACY_BASELINE_REASON` or `FIXTURE_NAME_REASON`. Findings exit
+
+1. Comment-lint is currently a local/review gate unless CI is explicitly updated
+to invoke it.
+
+Committed comments, including `///` and `//!` doc comments, tests, and
+frontmatter under `crates/` and `xtask/`, must describe the invariant rather
+than its historical PR, issue, reviewer, or plan-amendment origin. PR
+descriptions, commit messages, and `git blame` are the durable audit trail;
+`.agents-view/plan-slice-N.md` is not a durable in-code reference. Rationale
+comments remain valuable: write “refusing hardlinked source — exfiltration
+risk,” not “closes kiro-uphh from PR #119 review,” “per silent-failure-hunter
+HIGH #2,” or “per A1 amendment.” Describe the behavior directly, for example:
+“addExternalTool only touches tools[] — visibility and auto-allow are
+orthogonal.”
+
+---
+
+## Work Tracking (Rivets)
+
+The deferred-work backlog is `.rivets/issues.jsonl`, committed to git and
+managed by the [`rivets`](https://github.com/dwalleck/rivets) CLI. The binary
+must be on `PATH`; the sibling repository is `~/repos/rivets`. The issue prefix
+is `kiro-`, configured once with `rivets init -p kiro` in `.rivets/config.yaml`;
+do not change it. The tracker was initialized in commit `5e85b6e` with 17 issues
+seeded from PR #113–#115 retrospectives.
+
+### Check Before You Build
+
+Before any non-trivial change, run:
+
+```bash
+rivets ready
+rivets list --status open
+```
+
+Work may already be filed with design notes, acceptance criteria, and
+dependencies. Use `rivets show <id>` before duplicating it in a new change.
+
+### Daily Commands
+
+- `rivets ready` — unblocked issues, hybrid priority/age order, default limit
+  10.
+- `rivets list --status open` — open backlog; combine with `--label <name>`,
+  `--type bug`, or `-p <0-4>`.
+- `rivets show <id> [<id>...]` — full issues, dependencies, design, and
+  acceptance criteria.
+- `rivets stats` — status totals and tracker reachability.
+- `rivets blocked` — issues waiting on dependencies.
+- `rivets update <id> --status in_progress` — claim work when starting.
+- `rivets close <id> --reason "PR #NNN: <one-line summary>"` — close on merge.
+- `rivets dep tree <id>` — dependency graph.
+- `rivets list --json | jq ...` — JSON scripting; all subcommands support
+  `--json`.
+
+### Creating and Editing Issues
+
+When review surfaces follow-up work, file a Rivets issue rather than leaving it
+in a stale comment. Match the seeded style: `--description` names the
+originating PR, paths, and finding; `--design` records the approach;
+`--acceptance` records success criteria; and `--deps` records blockers. Use the
+`blocks` relationship for changes that must happen together, not only strict
+predecessor ordering; for example, `kiro-5qcb` cleanup blocks on its `kiro-kmj4`
+enabler so `rivets ready` hides it until the enabler closes.
+
+Rivets creates the four-character suffix at issue creation. If an earlier
+description uses `kiro-<this-id>` or `kiro-CONTINGENT`, create the referenced
+issue, immediately reread the original issue, and replace every placeholder with
+the real ID. Commit `e7e3d9b` exists because this backfill was previously
+missed.
+
+Edit `.rivets/issues.jsonl` directly only for corrections that intentionally
+must not change `updated_at`, such as placeholder backfills. Semantic changes to
+status, priority, description, dependencies, or labels must use `rivets update`
+so timestamps and `rivets stale` remain meaningful.
+
+`.rivets/` is shared: Rivets writes tracked `config.yaml` and `issues.jsonl`;
+tethys writes the untracked, regenerable `.rivets/index/`. The root ignore rule
+must remain exactly `/.rivets/index/`; broadening it to `/.rivets/` would
+untrack the backlog.
+
+---
+
+## Planning
+
+After writing a plan and before implementation, apply all six gates in
+`docs/plan-review-checklist.md`:
+
+1. Grounding
+2. Threat Model
+3. Wire Format
+4. External Type Boundary
+5. Type Design
+6. Reference vs. Transcription
+
+These also apply as review questions to changes touching the public API of
+`kiro-market-core`. They complement rather than replace
+`superpowers:writing-plans`: invoke that skill first, then apply the six gates
+before calling the plan implementation-ready. Gate 6 prevents plans from
+transcribing observed output when they should cite and preserve the underlying
+mechanism.
+
+Plan review requires two complementary passes:
+
+1. **LSP-first:** run `documentSymbol` for every modified file and
+   `workspaceSymbol` for cross-file references. This catches signature drift,
+   missing exports, and field-access mistakes cheaply.
+2. **Behavioral review:** ask whether every task does the right thing. Check
+   cascade behavior, recoverable-versus-fatal classification, sibling
+   occurrences of the same pattern, linkage from design actions to tasks, and
+   whether map keys/data shapes contain enough information.
+
+Neither pass substitutes for the other. A prior review found 11 LSP-first issues
+and 12 behavioral issues with almost no overlap. Stop adding plan-time
+amendments when findings have diminished to compiler-catchable details such as
+`DateTime<Utc>` versus Specta features or `self.` versus `Self::`; let
+implementation checks handle the remainder.
+
+---
+
+## Worktree Convention
+
+Feature worktrees live in sibling directories such as
+`~/repos/kiro-control-center-<topic>`. Each worktree has its own `target/`,
+`node_modules/`, and `.rivets/index/`. After creating one, run `npm install` in
+`crates/kiro-control-center/`; the parent worktree's Tethys index does not
+transfer.
+
+```bash
+git worktree add ~/repos/kiro-control-center-<topic> -b <branch> origin/main
+```
+
+After merge:
+
+```bash
+git worktree remove <path>
+git branch -d <branch>
+git pull --ff-only
+```
+
+---
+
+## Code Style
+
+<!-- tags: rust, typescript, errors, validation -->
+
+- Rust edition 2024; minimum Rust version 1.85.0.
+- `thiserror` for typed errors in `kiro-market-core`; `anyhow` for propagation
+  in the `kiro-market` binary.
+- `rstest` for parameterized tests and `tempfile` for filesystem fixtures.
+- Workspace lints set `clippy::all = "warn"` and `clippy::pedantic = "warn"`.
+- Workspace `unsafe_code = "forbid"`.
+
+### Model Invalid States Out
+
+Prefer models that make invalid states unrepresentable instead of permitting
+bad combinations and validating them later.
+
+- Use distinct newtypes for values that share a representation but not a
+  meaning, so IDs, names, paths, and references cannot be accidentally mixed.
+- Use enums or other sum types for mutually exclusive states. Each variant
+  should carry only the fields valid in that state; avoid independent booleans
+  or a bag of `Option` fields that permits contradictory combinations.
+- Keep invariant-bearing fields private and expose fallible constructors or
+  transition methods. Once constructed, a domain value should remain valid.
+- Parse untrusted input into invariant-bearing types at the boundary. A
+  permissive projection type is acceptable only when needed to classify parse
+  failures; convert it immediately into the stricter domain model.
+- When the type system cannot express an invariant alone, enforce it at the
+  nearest durable boundary and cover that constraint with tests. Do not rely
+  only on comments or downstream application checks.
+
+### Error Chains and Boundaries
+
+Use `#[source]` on inner typed-error variants (for example,
+`PluginError::ManifestReadFailed { #[source] source: io::Error }`) and
+`#[error(transparent)]` on top-level wrappers so `Error::source()` traverses the
+chain. At Tauri/log boundaries, and for any wire-format `reason` or
+`error: String`, use `error_full_chain(&err)` rather than `err.to_string()`.
+`SkippedPlugin::from_plugin_error` and `FailedSkill::install_failed` are
+canonical constructors.
+
+Do not name a non-`Error` payload field `source` in a `thiserror` variant; that
+name is reserved for `Error::source()`. Rename it, for example to
+`plugin_source: StructuredSource`, and preserve the external wire name in a
+projection such as `SkippedReason`.
+
+Prefer dedicated variants over `reason: String` sentinels when callers may
+branch on the semantic, such as `NotADirectory` and `SymlinkRefused`, rather
+than `DirectoryUnreadable { reason }`. `io::Error` is `Send + Sync + 'static`
+and can be stored directly behind `#[source]`; no `Box` is required.
+
+Map external errors at the adapter boundary. Translate `gix`, `serde_json`,
+`toml`, and `reqwest` failures into core-owned error types and variants, such as
+`PluginError` or `NativeParseFailure`, in modules such as `git.rs`, `cache.rs`,
+and `agent/parse_native.rs`; external crate error types must not appear in the
+public API of `kiro-market-core`. `io::Error` is the standard-library exception.
+When an external error would otherwise be a source field, use a `pub(crate) fn`
+constructor that renders `error_full_chain` into a `reason: String`, and test
+that `err.source().is_none()` locks the boundary contract.
+`parse_native::NativeParseFailure::invalid_json` and
+`steering::tracking_malformed` producing `SteeringError::TrackingMalformed` are
+canonical mappings for `serde_json::Error`.
+
+### Validation and IPC Types
+
+Parse, do not merely validate, at deserialization boundaries. Wrap untrusted
+manifest strings in newtypes with private fields and fallible constructors;
+implement `Deserialize` through the constructor so `serde_json::from_slice`
+fails at parse time. `RelativePath` (`validation.rs`), `GitRef` (`git.rs`), and
+`AgentName` are templates. A free `validate_xyz(&Thing) -> Result<()>` that no
+constructor invokes usually signals a missed newtype.
+
+A transient projection may retain raw `Option<String>` only when post-parse
+routing must distinguish errors. For example, `NativeAgentProjection.name`
+permits separate `NativeParseFailure::{MissingName, InvalidName, InvalidJson}`
+outcomes, while `NativeAgentBundle.name: AgentName` restores the type-level
+invariant. `InvalidJson` stores a rendered `reason: String`, not the external
+`serde_json::Error`.
+
+Validation newtypes that can cross Tauri need
+`#[cfg_attr(feature = "specta", derive(specta::Type))]`, matching
+`RelativePath`. Core's Specta feature list is `["derive", "serde_json"]` and
+intentionally omits `"chrono"`; convert `DateTime<Utc>` to `.to_rfc3339()` at
+the FFI boundary, as `commands/installed.rs::InstalledSkillInfo.installed_at`
+does.
+
+### Exhaustiveness and Classifiers
+
+Classifier functions such as `SkippedReason::from_plugin_error` and
+`PluginError::remediation_hint` must enumerate every `PluginError` variant
+explicitly; do not use `_ => None` or `_ => default`. A new error variant should
+force a compile-time classification decision.
+
+When `classify_*_collision` returns `CollisionDecision::Idempotent(Box<T>)`, `T`
+may contain only data visible to the classifier. Do not use a full type such as
+`InstalledSteeringOutcome` when the classifier cannot populate fields like
+`source.source`; return a minimal echo such as
+`SteeringIdempotentEcho { prior_installed_hash: String }` and let the caller
+assemble the complete outcome.
+
+For TypeScript discriminated unions such as `mode.kind` or `result.kind`, use an
+exhaustive `switch (x.kind)` rather than `x.kind === "A" ? ... : ...` chains.
+Include `default: { const _exhaustive: never = x; throw new Error(...); }`.
+`formatSkippedSkill`, `formatSteeringWarning`, and `runPluginInstall` are
+exemplars. At the definition site, pair a `satisfies` -anchored values list with
+`Exclude<U, (typeof _VALUES)[number]> extends never ? true : never`, as
+`_PLUGIN_ACTION_VALUES` and `_AssertPluginActionExhaustive` do. Instantiate the
+check in value position (`const _assert: T = true`); an unused alias resolving
+to `never` does not fail compilation.
+
+### Production Failure Policy
+
+Production code must not use `.unwrap()`, `.expect()`, `panic!`, `todo!`,
+`unimplemented!`, `let _ = ...` to discard a `Result`, or inline `#[allow(...)]`
+to hide a finding. Tests are exempt where appropriate. Fix the code or lint
+configuration rather than suppressing locally. Deliberate framework-level
+exceptions belong in audited `ALLOWED_SITES` constants with written reasons.
+
+Automation covers part of this policy: plan-lint detects unwrap/expect and
+selected panic macros. Discarded Results and arbitrary inline lint suppressions
+remain compiler/review checks; do not claim the automated gates cover them.
+
+---
+
+## CI
+
+<!-- tags: ci, automation -->
+
+All required jobs are defined in `.github/workflows/ci.yml`:
+
+- `commitlint` — validates the commit format above.
+- `format` — `cargo fmt --all -- --check`.
+- `lint` — `cargo clippy --workspace -- -D warnings`.
+- `test` — full workspace on Linux and core + CLI on macOS/Windows; Linux also
+  regenerates bindings and requires a clean diff.
+- `frontend` — `npm run test:unit`, `npm run check`, and `npm run build`.
+- `build-cli` — release CLI builds on Linux, macOS, and Windows.
+- `build-tauri` — desktop builds on Linux, macOS, and Windows.
+- `cargo-deny` — license and advisory policy.
+- `assert-curl-tls` — confirms `curl-sys` has SSL enabled.
+- `coverage` — `cargo-llvm-cov` uploaded to Codecov.
+- `ci-success` — aggregate required gate.
+
+Release artifacts include CLI binaries plus platform Tauri packages such as deb,
+dmg, and msi outputs.
+
+---
+
+## Security Invariants
+
+<!-- tags: security, constraints -->
+
+These must hold in every change:
+
+1. **Path traversal prevention:** user-supplied names must pass
+   `validate_name()` and paths must pass `validate_relative_path()` or enter
+   validated newtypes such as `RelativePath` before any filesystem boundary.
+2. **MCP opt-in:** agents with MCP servers require `--accept-mcp`; never
+   auto-install an MCP-bearing agent.
+3. **TLS by default:** reject `http://` marketplace sources unless
+   `--allow-insecure-http` is explicit.
+4. **Link rejection during copy:** `copy_dir_recursive` skips symlinks on all
+   supported platforms and hardlinked files on Unix. Windows-specific copy paths
+   reject reparse points. Do not weaken these checks.
+5. **No unsafe code:** workspace-level `unsafe_code = "forbid"`.
+
+---
 
 ## Key Crate Dependencies
-- `gix` + system `git` CLI — git operations (gix for clone/open, system git for pull/checkout)
-- `clap` (derive) — CLI framework
-- `serde` / `serde_json` / `serde_yaml` — JSON and YAML parsing
-- `colored` — terminal output
-- `dirs` — XDG path resolution
+
+- `gix` plus system `git` — repository operations and fallback behavior.
+- `clap` derive — CLI parsing.
+- `serde`, `serde_json`, and `serde_yaml_ng` — serialization and JSON/YAML
+  parsing.
+- `thiserror` and `anyhow` — typed library errors and binary-level propagation.
+- `colored` — terminal output.
+- `dirs` — XDG and platform directory resolution.
+- `fs4` — cross-process file locking.
+- `blake3` — content-change detection.
+- `tauri`, `tauri-specta`, and `specta` — desktop IPC and generated TypeScript
+  types.
+- `rstest` and `tempfile` — tests and fixtures.
+
+---
+
+## Custom Instructions
+
+<!-- This section is for human and agent-maintained operational knowledge.
+     Add repo-specific conventions, gotchas, and workflow rules here.
+     This section is preserved exactly as-is when re-running
+     codebase-summary. -->
+
+The Svelte MCP server provides comprehensive Svelte 5 and SvelteKit
+documentation. Use it as follows.
+
+### Available Svelte MCP Tools
+
+#### 1. `list-sections`
+
+Use this first for any Svelte or SvelteKit task. It returns documentation
+titles, use cases, and paths.
+
+#### 2. `get-documentation`
+
+After `list-sections`, inspect the reported use cases and fetch every
+documentation section relevant to the task. It accepts one or multiple sections.
+
+#### 3. `svelte-autofixer`
+
+Whenever writing Svelte code, run `svelte-autofixer` before presenting or
+finalizing it. Repeat until it returns no issues or suggestions.
+
+#### 4. `playground-link`
+
+After completing standalone example code, ask whether the user wants a Svelte
+Playground link. Call this tool only after confirmation, and never when the code
+was written into the user's project files.
