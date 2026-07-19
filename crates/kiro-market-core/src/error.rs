@@ -233,22 +233,23 @@ impl PluginError {
         // which enumerates for the same reason — the two classifications
         // cannot drift.
         match self {
-            Self::RemoteSourceNotLocal { plugin, .. } => Some(match surface {
+            Self::RemoteSourceNotLocal { plugin, .. } => {
                 // `kiro-market install` uses the cloning resolver
                 // (`resolve_plugin_dir`), whereas `list`/`info`/`search`
                 // use `resolve_local_plugin_dir` — the non-cloning
                 // variant that produces this error. Installing is the
-                // user-facing remediation that triggers the clone.
-                Surface::Cli => {
-                    format!("run `kiro-market install {plugin}@<marketplace>` to clone it locally")
-                }
-                // The desktop app cannot clone structured remote sources yet,
-                // so point to the supported cloning path instead of naming a
-                // UI affordance that does not exist.
-                Surface::Ui => format!(
-                    "use the CLI: run `kiro-market install {plugin}@<marketplace>` to clone it locally"
-                ),
-            }),
+                // user-facing remediation that triggers the clone. Bound
+                // once so the two surface phrasings cannot drift apart.
+                let install_cmd =
+                    format!("run `kiro-market install {plugin}@<marketplace>` to clone it locally");
+                Some(match surface {
+                    Surface::Cli => install_cmd,
+                    // The desktop app cannot clone structured remote sources
+                    // yet, so point to the supported cloning path instead of
+                    // naming a UI affordance that does not exist.
+                    Surface::Ui => format!("use the CLI: {install_cmd}"),
+                })
+            }
             Self::NotFound { .. }
             | Self::InvalidManifest { .. }
             | Self::ManifestNotFound { .. }
