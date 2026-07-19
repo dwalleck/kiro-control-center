@@ -14,6 +14,27 @@ import type {
   SteeringWarning,
 } from "$lib/bindings";
 
+export function formatCommandError(error: unknown): string {
+  if (typeof error === "string") {
+    return error.trim() ? error : "Unknown error";
+  }
+  if (error === null || typeof error !== "object") {
+    return "Unknown error";
+  }
+
+  const candidate = error as { message?: unknown; remediation?: unknown };
+  const message =
+    typeof candidate.message === "string" ? candidate.message.trim() : "";
+  const remediation =
+    typeof candidate.remediation === "string"
+      ? candidate.remediation.trim()
+      : "";
+  const displayMessage = message || "Unknown error";
+  return remediation
+    ? `${displayMessage} — ${remediation}`
+    : displayMessage;
+}
+
 // Render a structured SkippedReason as a one-line string. Total over
 // all eight variants (not just the six reachable via SkillCount) —
 // TypeScript's exhaustiveness check forces full coverage. The two
@@ -143,6 +164,7 @@ export function formatSteeringWarning(w: SteeringWarning): string {
 const _STEERING_WARNING_KINDS = ["scan_path_invalid", "scan_dir_unreadable", "source_not_utf8", "unclosed_frontmatter"] as const satisfies readonly SteeringWarning["kind"][];
 type _AssertSteeringWarningExhaustive = Exclude<SteeringWarning["kind"], (typeof _STEERING_WARNING_KINDS)[number]> extends never ? true : never;
 const _assertSteeringWarningExhaustive: _AssertSteeringWarningExhaustive = true;
+void _assertSteeringWarningExhaustive;
 
 // Render an `InstallWarning` (from agent installs) as a one-line
 // label. The `mcp_servers_require_opt_in` variant is the
@@ -222,6 +244,7 @@ export function formatFailedSkill(f: FailedSkill): string {
 const _FAILED_SKILL_REASON_KINDS = ["install_failed", "requested_but_not_found"] as const satisfies readonly FailedSkillReason["kind"][];
 type _AssertFailedSkillReasonExhaustive = Exclude<FailedSkillReason["kind"], (typeof _FAILED_SKILL_REASON_KINDS)[number]> extends never ? true : never;
 const _assertFailedSkillReasonExhaustive: _AssertFailedSkillReasonExhaustive = true;
+void _assertFailedSkillReasonExhaustive;
 
 // `entry.error` is opaque pre-rendered text from Rust's error_full_chain —
 // render directly. The companion_bundle `|| "no enumeration"` fallback
@@ -253,6 +276,7 @@ export function formatFailedAgent(entry: FailedAgent): string {
 const _FAILED_AGENT_KINDS = ["agent", "unparseable_agent", "companion_bundle", "requested_but_not_found"] as const satisfies readonly FailedAgent["kind"][];
 type _AssertFailedAgentKindExhaustive = Exclude<FailedAgent["kind"], (typeof _FAILED_AGENT_KINDS)[number]> extends never ? true : never;
 const _assertFailedAgentKindExhaustive: _AssertFailedAgentKindExhaustive = true;
+void _assertFailedAgentKindExhaustive;
 
 // Render a FailedSteeringFile as a one-line label. Single-shape type today
 // (source + error), so no switch is needed. If FailedSteeringFile grows
@@ -340,6 +364,7 @@ export function formatSkippedItemsForPlugin(items: readonly SkippedItem[]): stri
 const _SKIPPED_ITEM_KINDS = ["skill", "steering_discovery", "agent_parse"] as const satisfies readonly SkippedItem["kind"][];
 type _AssertSkippedItemKindExhaustive = Exclude<SkippedItem["kind"], (typeof _SKIPPED_ITEM_KINDS)[number]> extends never ? true : never;
 const _assertSkippedItemKindExhaustive: _AssertSkippedItemKindExhaustive = true;
+void _assertSkippedItemKindExhaustive;
 
 export type FormattedInstallPluginResult = {
   summary: string;

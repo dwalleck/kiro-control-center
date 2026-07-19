@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import type {
   AgentName,
+  CommandError,
   FailedAgent,
   FailedSkill,
   FailedSkillReason,
@@ -14,6 +15,7 @@ import type {
 } from "$lib/bindings";
 import type { SteeringWarning } from "$lib/bindings";
 import {
+  formatCommandError,
   formatFailedAgent,
   formatFailedSkill,
   formatFailedSteeringFile,
@@ -53,6 +55,61 @@ function emptyInstallResult(): InstallPluginResult_Serialize {
     },
   };
 }
+
+describe("formatCommandError", () => {
+  it.each([
+    {
+      name: "keeps an error without remediation unchanged",
+      error: {
+        message: "disk full",
+        error_type: "io_error",
+        remediation: null,
+      } satisfies CommandError,
+      expected: "disk full",
+    },
+    {
+      name: "appends remediation after the stable message",
+      error: {
+        message: "plugin is not available locally",
+        error_type: "validation",
+        remediation:
+          "use the CLI: run `kiro-market install p@<marketplace>` to clone it locally",
+      } satisfies CommandError,
+      expected:
+        "plugin is not available locally — use the CLI: run `kiro-market install p@<marketplace>` to clone it locally",
+    },
+    {
+      name: "treats whitespace-only remediation as absent",
+      error: {
+        message: "disk full",
+        error_type: "io_error",
+        remediation: "   ",
+      } satisfies CommandError,
+      expected: "disk full",
+    },
+    {
+      name: "uses a fallback for an empty message",
+      error: {
+        message: "   ",
+        error_type: "unknown",
+        remediation: null,
+      } satisfies CommandError,
+      expected: "Unknown error",
+    },
+    {
+      name: "keeps a raw string error verbatim",
+      error: "raw error message",
+      expected: "raw error message",
+    },
+    {
+      name: "uses a fallback for a null error",
+      error: null,
+      expected: "Unknown error",
+    },
+  ])("$name", ({ error, expected }) => {
+    expect(formatCommandError(error)).toBe(expected);
+  });
+});
 
 describe("formatInstallPluginResult", () => {
   it("happy path: counts all 3 sub-results joined by mid-dot", () => {

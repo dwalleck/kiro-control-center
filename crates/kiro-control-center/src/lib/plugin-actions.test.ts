@@ -309,7 +309,11 @@ describe("runPluginInstall", () => {
       .fn()
       .mockResolvedValue({
         status: "error",
-        error: { message: "network unreachable", error_type: "internal" as ErrorType },
+        error: {
+          message: "plugin is not available locally",
+          error_type: "validation" as ErrorType,
+          remediation: "open the plugin detail to clone it",
+        },
       });
 
     const outcome = await runPluginInstall(
@@ -320,7 +324,8 @@ describe("runPluginInstall", () => {
     expect(outcome.kind).toBe("fail");
     if (outcome.kind === "fail") {
       expect(outcome.error).toBe(
-        "Plugin install failed for demo-plugin: network unreachable",
+        "Plugin install failed for demo-plugin: plugin is not available locally"
+          + " — open the plugin detail to clone it",
       );
     }
   });
@@ -330,7 +335,11 @@ describe("runPluginInstall", () => {
       .fn()
       .mockResolvedValue({
         status: "error",
-        error: { message: undefined, error_type: "internal" as ErrorType },
+        error: {
+          message: undefined,
+          error_type: "internal" as ErrorType,
+          remediation: null,
+        },
       });
 
     const outcome = await runPluginInstall(
@@ -369,7 +378,11 @@ describe("runPluginInstall", () => {
       .fn()
       .mockResolvedValue({
         status: "error",
-        error: { message: "disk full", error_type: "io_error" as ErrorType },
+        error: {
+          message: "disk full",
+          error_type: "io_error" as ErrorType,
+          remediation: null,
+        },
       });
 
     const outcome = await runPluginInstall(
@@ -492,7 +505,11 @@ describe("runPluginInstall", () => {
       .fn()
       .mockResolvedValue({
         status: "error",
-        error: { message: "network unreachable", error_type: "internal" as ErrorType },
+        error: {
+          message: "network unreachable",
+          error_type: "internal" as ErrorType,
+          remediation: null,
+        },
       });
     const storeRefresh = vi.fn().mockResolvedValue(undefined);
 
@@ -643,12 +660,16 @@ describe("runPluginRemove", () => {
     }
   });
 
-  it("Tauri command returns error: kind=fail", async () => {
+  it("Tauri command returns error with remediation: kind=fail", async () => {
     const removePlugin: PluginRemoveContext["removePlugin"] = vi
       .fn()
       .mockResolvedValue({
         status: "error",
-        error: { message: "project not found", error_type: "not_found" as ErrorType },
+        error: {
+          message: "project not found",
+          error_type: "not_found" as ErrorType,
+          remediation: "refresh the project list",
+        },
       });
 
     const outcome = await runPluginRemove(makeRemoveCtx({ removePlugin }));
@@ -656,7 +677,7 @@ describe("runPluginRemove", () => {
     expect(outcome.kind).toBe("fail");
     if (outcome.kind === "fail") {
       expect(outcome.error).toBe(
-        "Remove failed for demo-plugin: project not found",
+        "Remove failed for demo-plugin: project not found — refresh the project list",
       );
     }
   });
@@ -787,7 +808,11 @@ describe("runPluginRemove", () => {
       .fn()
       .mockResolvedValue({
         status: "error",
-        error: { message: "project not found", error_type: "not_found" as ErrorType },
+        error: {
+          message: "project not found",
+          error_type: "not_found" as ErrorType,
+          remediation: null,
+        },
       });
     const storeRefresh = vi.fn().mockResolvedValue(undefined);
 

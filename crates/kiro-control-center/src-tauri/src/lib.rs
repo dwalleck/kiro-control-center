@@ -82,7 +82,7 @@ mod tests {
     use super::*;
 
     /// Generate TypeScript bindings.
-    /// Run with: cargo test -p kiro-control-center generate_types -- --exact --ignored
+    /// Run with: cargo test -p kiro-control-center tests::generate_types -- --exact --ignored
     #[test]
     #[ignore = "build-only: regenerates bindings, not a regression test"]
     fn generate_types() {
@@ -130,7 +130,7 @@ mod tests {
                 bindings.contains(&needle),
                 "bindings.ts must export `{ty}` — missing `{needle}`. \
                  If this test fails after type changes, run \
-                 `cargo test -p kiro-control-center --lib generate_types -- --exact --ignored` \
+                 `cargo test -p kiro-control-center --lib tests::generate_types -- --exact --ignored` \
                  to regenerate, then re-run this test."
             );
         }
@@ -165,7 +165,7 @@ mod tests {
                 bindings.contains(cmd),
                 "bindings.ts must export `{cmd}` (kiro-zx73) — missing. \
                  If this fires after backend changes, regenerate via \
-                 `cargo test -p kiro-control-center --lib generate_types -- --exact --ignored`."
+                 `cargo test -p kiro-control-center --lib tests::generate_types -- --exact --ignored`."
             );
         }
 

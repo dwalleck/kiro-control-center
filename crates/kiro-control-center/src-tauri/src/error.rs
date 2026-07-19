@@ -162,11 +162,7 @@ impl From<CoreError> for CommandError {
 
 impl From<String> for CommandError {
     fn from(message: String) -> Self {
-        Self {
-            message,
-            error_type: ErrorType::Unknown,
-            remediation: None,
-        }
+        Self::new(message, ErrorType::Unknown)
     }
 }
 
@@ -197,11 +193,7 @@ impl From<ValidationError> for CommandError {
 /// validation or parse errors.
 impl From<std::io::Error> for CommandError {
     fn from(e: std::io::Error) -> Self {
-        Self {
-            message: error_full_chain(&e),
-            error_type: ErrorType::IoError,
-            remediation: None,
-        }
+        Self::new(error_full_chain(&e), ErrorType::IoError)
     }
 }
 
@@ -485,6 +477,20 @@ mod tests {
         assert_eq!(err.remediation, None);
     }
 
+    #[test]
+    fn command_error_without_remediation_serializes_explicit_null() {
+        let json = serde_json::to_value(CommandError::new("boom", ErrorType::Validation))
+            .expect("serialize CommandError");
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "message": "boom",
+                "error_type": "validation",
+                "remediation": null
+            })
+        );
+    }
+
     /// Pin the wire format for `ErrorType::Internal`. The frontend relies
     /// on the snake-case discriminator (`"internal"`) being distinct from
     /// `"unknown"` so it can render "please file an issue" UX without
@@ -507,7 +513,7 @@ mod tests {
     // -----------------------------------------------------------------------
 
     #[test]
-    fn commander_remote_source_not_local_carries_remediation() {
+    fn remote_source_not_local_serializes_supported_ui_remediation() {
         let err = CoreError::Plugin(PluginError::RemoteSourceNotLocal {
             plugin: "test".into(),
             plugin_source: kiro_market_core::marketplace::StructuredSource::GitHub {
@@ -516,17 +522,15 @@ mod tests {
                 sha: None,
             },
         });
-        let cmd = CommandError::from(err);
-        let rem = cmd
-            .remediation
-            .expect("remediation must be Some for RemoteSourceNotLocal");
-        assert!(
-            rem.contains("detail page"),
-            "UI remediation must mention detail page: {rem}"
-        );
-        assert!(
-            !rem.contains("kiro-market install"),
-            "UI remediation must not contain CLI command: {rem}"
+        let json = serde_json::to_value(CommandError::from(err))
+            .expect("serialize CommandError with remediation");
+        assert_eq!(
+            json,
+            serde_json::json!({
+                "message": "plugin `test` uses a remote source and is not available locally",
+                "error_type": "validation",
+                "remediation": "use the CLI: run `kiro-market install test@<marketplace>` to clone it locally"
+            })
         );
     }
 

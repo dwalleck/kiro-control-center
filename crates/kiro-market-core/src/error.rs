@@ -207,8 +207,8 @@ pub enum Surface {
     /// Terminal / CLI output. Remediation may reference CLI flags or
     /// commands.
     Cli,
-    /// Tauri desktop UI. Remediation may reference UI navigation or
-    /// buttons.
+    /// Tauri desktop UI. Remediation may reference UI navigation or a
+    /// supported external fallback when the desktop app lacks the action.
     Ui,
 }
 
@@ -217,14 +217,12 @@ impl PluginError {
     /// if the variant is self-explanatory / no actionable next step
     /// exists at this layer.
     ///
-    /// The hint is deliberately NOT embedded in [`Display`] — a CLI
-    /// sentence ("use `kiro-market add` to clone it") renders as
-    /// misleading noise in the Tauri UI (which has no CLI), and a UI
-    /// sentence ("open the marketplace detail page") renders as
-    /// misleading noise in the CLI. Returning `Option<String>` also
-    /// lets callers decide how to compose the hint with the error
-    /// message (a trailing paragraph in the CLI, an inline badge in the
-    /// UI, etc.) rather than baking the composition into `Display`.
+    /// The hint is deliberately NOT embedded in [`Display`] so each
+    /// consumer can choose a supported action and surface-appropriate
+    /// phrasing without changing the stable error message. Returning
+    /// `Option<String>` also lets callers decide how to compose the hint
+    /// (a trailing paragraph in the CLI, an inline badge in the UI, etc.)
+    /// rather than baking the composition into `Display`.
     #[must_use]
     pub fn remediation_hint(&self, surface: Surface) -> Option<String> {
         // Every variant is enumerated explicitly (no `_ => None`) so a
@@ -235,19 +233,23 @@ impl PluginError {
         // which enumerates for the same reason — the two classifications
         // cannot drift.
         match self {
-            Self::RemoteSourceNotLocal { plugin, .. } => Some(match surface {
+            Self::RemoteSourceNotLocal { plugin, .. } => {
                 // `kiro-market install` uses the cloning resolver
                 // (`resolve_plugin_dir`), whereas `list`/`info`/`search`
                 // use `resolve_local_plugin_dir` — the non-cloning
                 // variant that produces this error. Installing is the
-                // user-facing remediation that triggers the clone.
-                Surface::Cli => {
-                    format!("run `kiro-market install {plugin}@<marketplace>` to clone it locally")
-                }
-                Surface::Ui => {
-                    "open the plugin's detail page in the marketplace to clone it".to_owned()
-                }
-            }),
+                // user-facing remediation that triggers the clone. Bound
+                // once so the two surface phrasings cannot drift apart.
+                let install_cmd =
+                    format!("run `kiro-market install {plugin}@<marketplace>` to clone it locally");
+                Some(match surface {
+                    Surface::Cli => install_cmd,
+                    // The desktop app cannot clone structured remote sources
+                    // yet, so point to the supported cloning path instead of
+                    // naming a UI affordance that does not exist.
+                    Surface::Ui => format!("use the CLI: {install_cmd}"),
+                })
+            }
             Self::NotFound { .. }
             | Self::InvalidManifest { .. }
             | Self::ManifestNotFound { .. }
@@ -891,8 +893,6 @@ mod tests {
             .remediation_hint(Surface::Ui)
             .expect("UI hint must be present for RemoteSourceNotLocal");
         assert_ne!(cli, ui, "CLI and UI hints must differ");
-        // Each hint must only reference its own surface's vocabulary —
-        // swapping them would be the whole point of bug.
         assert!(
             cli.to_lowercase().contains("cli") || cli.to_lowercase().contains("kiro-market"),
             "CLI hint should reference CLI vocabulary, got: {cli}"
@@ -916,8 +916,12 @@ mod tests {
              payload, got: {cli}"
         );
         assert!(
-            !ui.to_lowercase().contains("cli") && !ui.contains("kiro-market"),
-            "UI hint must not reference CLI commands, got: {ui}"
+            ui.contains("use the CLI:") && ui.contains("kiro-market install"),
+            "UI hint must identify the supported CLI fallback, got: {ui}"
+        );
+        assert!(
+            ui.contains("acme"),
+            "UI hint must interpolate the plugin name from the error payload, got: {ui}"
         );
     }
 
@@ -1527,15 +1531,14 @@ fn format_error_for_surface_cli_includes_remediation() {
         formatted.contains("remote source") || formatted.contains("not available locally"),
         "must contain the original error text: {formatted}"
     );
-    // Must not contain the UI hint
     assert!(
-        !formatted.contains("detail page"),
-        "CLI surface must not contain UI hint: {formatted}"
+        !formatted.contains("use the CLI:"),
+        "CLI surface must not include the UI-specific fallback prefix: {formatted}"
     );
 }
 
 #[test]
-fn format_error_for_surface_ui_excludes_cli_remediation() {
+fn format_error_for_surface_ui_uses_supported_cli_fallback() {
     use crate::error::PluginError;
     use crate::error::Surface;
     use crate::marketplace::StructuredSource;
@@ -1551,12 +1554,12 @@ fn format_error_for_surface_ui_excludes_cli_remediation() {
 
     let formatted = crate::error::format_error_for_surface(&err, Surface::Ui);
     assert!(
-        formatted.contains("detail page"),
-        "UI surface must mention detail page: {formatted}"
+        formatted.contains("use the CLI:") && formatted.contains("kiro-market install"),
+        "UI surface must identify the supported cloning path: {formatted}"
     );
     assert!(
-        !formatted.contains("kiro-market install"),
-        "UI surface must not contain CLI command: {formatted}"
+        formatted.contains("test-plugin"),
+        "UI surface must identify the plugin to install: {formatted}"
     );
     assert!(
         formatted.contains("remote source") || formatted.contains("not available locally"),

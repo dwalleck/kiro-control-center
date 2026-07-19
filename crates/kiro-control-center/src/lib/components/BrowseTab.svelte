@@ -3,6 +3,7 @@
   import { SvelteMap, SvelteSet } from "svelte/reactivity";
   import { commands } from "$lib/bindings";
   import {
+    formatCommandError,
     formatSkippedSkill,
     formatSkippedItemsForPlugin,
     formatSteeringWarning,
@@ -13,6 +14,7 @@
   } from "$lib/format";
   import { pluralize, type CustomizeDrawerApply } from "$lib/drawer-diff";
   import { runInstallBatches } from "$lib/install-batches";
+  import type { IpcResult } from "$lib/ipc";
   import {
     DELIM,
     pluginKey,
@@ -335,7 +337,7 @@
   async function withFetchGuard<T>(
     pendingKey: ErrorSource,
     label: string,
-    op: () => Promise<{ status: "ok"; data: T } | { status: "error"; error: { message: string } }>,
+    op: () => Promise<IpcResult<T>>,
     callbacks: {
       onSuccess: (data: T) => void;
       onError: (message: string) => void;
@@ -348,7 +350,7 @@
         callbacks.onSuccess(result.data);
       } else {
         console.error(`[BrowseTab] ${label} returned error`, result.error);
-        callbacks.onError(result.error.message);
+        callbacks.onError(formatCommandError(result.error));
       }
     } catch (e) {
       console.error(`[BrowseTab] ${label} threw`, e);
@@ -635,7 +637,9 @@
             // shorter "installed N" count with no explanation.
             unreadableAll.push(...result.data.skipped_skills);
           } else {
-            notAttempted.push(`${group.marketplace}/${group.plugin} (${result.error.message})`);
+            notAttempted.push(
+              `${group.marketplace}/${group.plugin} (${formatCommandError(result.error)})`
+            );
           }
         } catch (e) {
           const reason = e instanceof Error ? e.message : String(e);
@@ -828,9 +832,7 @@
       names: readonly string[],
       remove: (
         name: string,
-      ) => Promise<
-        { status: "ok"; data: R } | { status: "error"; error: { message: string } }
-      >,
+      ) => Promise<IpcResult<R>>,
     ): Promise<{ removed: number; failed: { name: string; error: string }[] }> {
       let removed = 0;
       const failed: { name: string; error: string }[] = [];
@@ -838,7 +840,7 @@
         try {
           const r = await remove(name);
           if (r.status === "ok") removed++;
-          else failed.push({ name, error: r.error.message });
+          else failed.push({ name, error: formatCommandError(r.error) });
         } catch (e) {
           failed.push({ name, error: e instanceof Error ? e.message : String(e) });
         }
@@ -1061,7 +1063,7 @@
           installMessage = `Steering for ${plugin}: ${parts.join(" | ")}`;
         }
       } else {
-        installError = `Steering install failed for ${plugin}: ${result.error.message}`;
+        installError = `Steering install failed for ${plugin}: ${formatCommandError(result.error)}`;
       }
     } catch (e) {
       const reason = e instanceof Error ? e.message : String(e);

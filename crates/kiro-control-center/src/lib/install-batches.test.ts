@@ -9,10 +9,17 @@ function okBatch<T>(names: readonly string[], data: T): InstallBatch<T> {
   };
 }
 
-function errorBatch<T>(names: readonly string[], message: string): InstallBatch<T> {
+function errorBatch<T>(
+  names: readonly string[],
+  message: string,
+  remediation: string | null = null,
+): InstallBatch<T> {
   return {
     names,
-    call: vi.fn().mockResolvedValue({ status: "error", error: { message } }),
+    call: vi.fn().mockResolvedValue({
+      status: "error",
+      error: { message, error_type: "validation", remediation },
+    }),
   };
 }
 
@@ -66,6 +73,23 @@ describe("runInstallBatches", () => {
     expect(result.skills).toBeNull();
     expect(result.error).toBe(
       "Customize apply: skill install failed for acme/demo: tracking file locked",
+    );
+  });
+
+  it("appends remediation to a wrapper-level status=error", async () => {
+    const result = await runInstallBatches("acme", "demo", {
+      skills: errorBatch(
+        ["s1"],
+        "plugin is not available locally",
+        "open the plugin detail to clone it",
+      ),
+      steering: emptyBatch(),
+      agents: emptyBatch(),
+    });
+
+    expect(result.error).toBe(
+      "Customize apply: skill install failed for acme/demo: "
+        + "plugin is not available locally — open the plugin detail to clone it",
     );
   });
 

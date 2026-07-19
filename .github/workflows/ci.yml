@@ -137,6 +137,12 @@ jobs:
         if: matrix.os == 'ubuntu-latest'
         run: cargo test --workspace
 
+      - name: Verify generated TypeScript bindings
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          cargo test -p kiro-control-center tests::generate_types -- --exact --ignored
+          git diff --exit-code -- crates/kiro-control-center/src/lib/bindings.ts
+
       - name: Run tests (core + CLI, macOS/Windows)
         if: matrix.os != 'ubuntu-latest'
         run: cargo test -p kiro-market-core -p kiro-market
@@ -154,12 +160,15 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v6
         with:
-          node-version: '20'
-          cache: 'npm'
+          node-version: "20"
+          cache: "npm"
           cache-dependency-path: crates/kiro-control-center/package-lock.json
 
       - name: Install dependencies
         run: npm ci
+
+      - name: Unit tests
+        run: npm run test:unit
 
       - name: Svelte check
         run: npm run check
@@ -231,8 +240,8 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v6
         with:
-          node-version: '20'
-          cache: 'npm'
+          node-version: "20"
+          cache: "npm"
           cache-dependency-path: crates/kiro-control-center/package-lock.json
 
       - name: Setup Rust toolchain

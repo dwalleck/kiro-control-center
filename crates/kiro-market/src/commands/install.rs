@@ -534,7 +534,7 @@ fn print_install_outcome(plugin_ref: &str, result: &InstallSkillsResult) {
         // label because it at least surfaces the variant payload in
         // terminal output. Safer than a compile error in the downstream
         // binary every time core gains a variant.
-        let reason = match &sk.reason {
+        let reason = match sk.reason() {
             kiro_market_core::service::SkippedSkillReason::ReadFailed { reason } => {
                 format!("could not read SKILL.md: {reason}")
             }
@@ -548,11 +548,11 @@ fn print_install_outcome(plugin_ref: &str, result: &InstallSkillsResult) {
         // terminated). Fall back to a `<unnamed>` placeholder; the
         // skill's file path is still printed on the same line below,
         // so the user retains a locator even when the label is empty.
-        let label = sk.name_hint.as_deref().unwrap_or("<unnamed>");
+        let label = sk.name_hint().unwrap_or("<unnamed>");
         eprintln!(
             "  {} Skipped unreadable skill '{label}' ({}): {reason}",
             "⚠".yellow().bold(),
-            sk.path.display()
+            sk.path().display()
         );
     }
 
